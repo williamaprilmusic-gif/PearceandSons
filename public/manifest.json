@@ -1,13 +1,13 @@
 {
-  "name": "TransitOS — Pearce and Sons Staff Transport",
+  "name": "TransitOS — Staff Transport",
   "short_name": "TransitOS",
-  "description": "Staff transport booking and dispatch platform for Pearce and Sons.",
+  "description": "Staff transport booking and dispatch platform",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "orientation": "portrait",
-  "background_color": "#0a0a0f",
-  "theme_color": "#f5a623",
+  "orientation": "portrait-primary",
+  "background_color": "#0A0C0F",
+  "theme_color": "#0A0C0F",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },

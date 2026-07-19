@@ -1,7 +1,7 @@
 import React, { useState, useReducer, useEffect, useRef, useCallback } from "react";
 
 /* ============================================================
-   TransitOS — Corporate Transport Operations Platform (Web)
+   Pearce & Sons — Corporate Transport Operations Platform (Web)
    Converted from the React Native version back to standard web
    React: View/Text/Pressable -> div/span/button, StyleSheet ->
    CSS-in-JS via a single injected <style> block, react-navigation
@@ -49,7 +49,10 @@ input, select, textarea { font-family: inherit; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
 
 .app-root { min-height: 100vh; background: ${COLORS.ink}; }
-.screen { min-height: 100vh; background: ${COLORS.ink}; display: flex; flex-direction: column; }
+.screen { min-height: 100vh; background: ${COLORS.ink}; display: flex; flex-direction: column; padding-bottom: env(safe-area-inset-bottom, 0px); }
+@media (max-width: 420px) {
+  .pad { padding-left: 12px; padding-right: 12px; }
+}
 .pad { padding: 16px; display: flex; flex-direction: column; gap: 14px; max-width: 720px; width: 100%; margin: 0 auto; padding-bottom: 60px; }
 
 .btn { border: 1px solid; border-radius: 4px; padding: 10px 16px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; transition: opacity .12s; }
@@ -99,8 +102,8 @@ input, select, textarea { font-family: inherit; }
 .cap-track { height: 8px; background: ${COLORS.surface}; border-radius: 4px; overflow: hidden; border: 1px solid ${COLORS.wire}; }
 .cap-fill { height: 100%; border-radius: 4px; transition: width .2s; }
 
-.toast-stack { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; width: 300px; z-index: 999; }
-.toast { background: ${COLORS.card}; border: 1px solid ${COLORS.wire}; border-left: 3px solid; border-radius: 4px; padding: 12px; animation: fadeIn .2s ease; }
+.toast-stack { position: fixed; top: calc(16px + env(safe-area-inset-top, 0px)); right: 16px; left: 16px; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; z-index: 999; }
+.toast { width: min(300px, 100%); background: ${COLORS.card}; border: 1px solid ${COLORS.wire}; border-left: 3px solid; border-radius: 4px; padding: 12px; animation: fadeIn .2s ease; }
 .toast-title { font-size: 11px; font-weight: 700; color: ${COLORS.chalk}; }
 .toast-body { font-size: 10px; color: ${COLORS.mist}; margin-top: 3px; }
 
@@ -627,6 +630,24 @@ function coordForArea(areaName) {
   const entry = CPT_ADDRESS_DB.find(a => a.area === areaName);
   if (entry) return { lat: entry.lat, lng: entry.lng };
   return { lat: -33.9249, lng: 18.4241 };
+}
+
+// Reacts to the viewport crossing the phone/tablet breakpoint — via
+// matchMedia's change event, not a one-time window.innerWidth read at
+// mount, so rotating a tablet or resizing a browser window updates the
+// layout live instead of only being correct on initial page load.
+function useIsNarrowScreen(breakpointPx = 768) {
+  const [isNarrow, setIsNarrow] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia ? window.matchMedia(`(max-width: ${breakpointPx}px)`).matches : false
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia(`(max-width: ${breakpointPx}px)`);
+    const onChange = (e) => setIsNarrow(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, [breakpointPx]);
+  return isNarrow;
 }
 
 function haversineKm(lat1, lng1, lat2, lng2) {
@@ -1311,8 +1332,8 @@ const SEED_USERS = [
   { id: "USR_D2", role: ROLE.DRIVER, name: "Fatima Adams", staff_number: "DR2002", auth: { login: "Fatima Adams", pass: "DR2002" } },
 ];
 const SEED_DRIVER_STATUS = [
-  { driver_id: "USR_D1", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "Toyota Hiace - CA 123-456", phone: "071 234 5678", capacity: DRIVER_CAPACITY },
-  { driver_id: "USR_D2", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "VW Transporter - CA 789-012", phone: "082 345 6789", capacity: DRIVER_CAPACITY },
+  { driver_id: "USR_D1", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "Toyota Hiace - CA 123-456", phone: "071 234 5678", capacity: DRIVER_CAPACITY, is_online: false },
+  { driver_id: "USR_D2", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "VW Transporter - CA 789-012", phone: "082 345 6789", capacity: DRIVER_CAPACITY, is_online: false },
 ];
 const INITIAL_STATE = {
   // tickets/campaigns/companies live in reducer state so demo mode is
@@ -1339,10 +1360,23 @@ function appReducer(state, action) {
     case "AUTH/LOGIN": {
       const user = state.users.find(u => u.auth.login === action.login && u.auth.pass === action.pass);
       if (!user) return { ...state, _error: "Invalid credentials" };
-      return { ...state, active_user_id: user.id, _error: null };
+      // Per explicit decision: "online" means logged in right now — set
+      // the instant login succeeds, cleared on logout, no idle timeout.
+      // Only drivers have a driver_status row to carry this on.
+      const driverStatusAfterLogin = user.role === ROLE.DRIVER
+        ? state.driver_status.map(d => d.driver_id === user.id ? { ...d, is_online: true } : d)
+        : state.driver_status;
+      return { ...state, active_user_id: user.id, driver_status: driverStatusAfterLogin, _error: null };
     }
-    case "AUTH/LOGOUT":
-      return { ...state, active_user_id: null };
+    case "AUTH/LOGOUT": {
+      // The outgoing user's id is needed to find their driver_status row
+      // BEFORE active_user_id is cleared below.
+      const loggedOutUser = state.users.find(u => u.id === state.active_user_id);
+      const driverStatusAfterLogout = loggedOutUser?.role === ROLE.DRIVER
+        ? state.driver_status.map(d => d.driver_id === loggedOutUser.id ? { ...d, is_online: false } : d)
+        : state.driver_status;
+      return { ...state, active_user_id: null, driver_status: driverStatusAfterLogout };
+    }
 
     case "ADMIN/DELETE_USERS": {
       // Batch delete, processed per-user rather than all-or-nothing —
@@ -2083,7 +2117,8 @@ function appReducer(state, action) {
       return { ...state, notifications: [adminNotif, ...agentNotif, ...state.notifications], _error: null };
     }
 
-    case "DM/SEND": {
+    case "DM/SEND":
+    case "DM/REPLY": {
       // Direct message (demo-mode parity). No direct_messages table in
       // the in-memory model — the live UI fetches those separately — so
       // in demo mode this is accepted as a clean no-op success rather
@@ -2148,6 +2183,57 @@ function appReducer(state, action) {
         message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       }] : [];
+      return { ...state, trips: newTrips, notifications: [...notifs, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/MARK_NO_SHOW": {
+      // Driver marks an agent as a no-show at pickup — counts as that
+      // stop being HANDLED for trip-progression purposes (same as a
+      // successful pickup: the driver moves on, and the trip can still
+      // reach IN_TRANSIT once every OTHER agent is picked up), rather
+      // than leaving the driver stuck waiting on someone who isn't
+      // there. Recorded distinctly from a real pickup in no_shows —
+      // driver's location AT THE MOMENT of marking (not a later
+      // position) plus an optional note, both needed for the trip
+      // sheet CSV per explicit requirement.
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is not on this trip" };
+      const newCompleted = trip.completed_pickups.includes(action.agent_id) ? trip.completed_pickups : [...trip.completed_pickups, action.agent_id];
+      const allHandled = trip.agent_ids.every(id => newCompleted.includes(id));
+      const nextNavIdx = (trip.current_nav_idx || 0) + 1;
+      const nowTs = now();
+      const noShowRecord = {
+        agent_id: action.agent_id, ts: nowTs,
+        location: action.driver_coord ? { lat: action.driver_coord.lat, lng: action.driver_coord.lng } : null,
+        note: action.note?.trim() || null,
+      };
+      let newState = trip.state;
+      let inTransitAt = trip.in_transit_at;
+      if (allHandled && trip.state !== TRIP_STATE.IN_TRANSIT) {
+        try { assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT); }
+        catch (e) { return { ...state, _error: e.message }; }
+        newState = TRIP_STATE.IN_TRANSIT;
+        inTransitAt = nowTs;
+      }
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, no_shows: [...(t.no_shows || []), noShowRecord], is_exception: true }
+          : t
+      );
+      const noShowAgent = state.users.find(u => u.id === action.agent_id);
+      const notifs = [
+        {
+          id: mkId(), type: "NO_SHOW", for_roles: [ROLE.ADMIN],
+          message: `🚫 NO SHOW: ${noShowAgent?.name || "An agent"} wasn't at pickup for trip ${action.trip_id}.${action.note?.trim() ? ` Note: ${action.note.trim()}` : ""}`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        },
+        ...(allHandled ? [{
+          id: mkId(), type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id}: all passengers handled. Now in transit.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        }] : []),
+      ];
       return { ...state, trips: newTrips, notifications: [...notifs, ...state.notifications], _error: null };
     }
 
@@ -2247,6 +2333,112 @@ function appReducer(state, action) {
         notifications: state.notifications.filter(n => n.trip_id !== action.trip_id),
         _error: null,
       };
+    }
+
+    case "TRIP/AGENT_CANCEL": {
+      // New capability (agents previously could only cancel a STILL-
+      // UNASSIGNED booking via TRIP/CANCEL above) — an agent can now
+      // cancel their own spot on a trip that already has a driver
+      // assigned. Flagged as a LATE CANCELLATION under the same <2hr
+      // threshold LATE_BOOKING already uses, so "late" means the same
+      // thing whether it's how close to departure someone booked or
+      // how close to departure someone cancelled.
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Completed trips can't be cancelled." };
+      if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "You're not on this trip." };
+
+      const cancellingAgent = state.users.find(u => u.id === action.agent_id);
+      const cancelNowTs = now();
+      const scheduledDt = parseScheduledDateTime(trip.scheduled_date, trip.scheduled_time);
+      const hoursUntilStart = scheduledDt ? (scheduledDt.getTime() - Date.now()) / 3600000 : null;
+      // Silently NOT late if the scheduled time can't be parsed, same
+      // fail-open choice LATE_BOOKING already makes — a malformed date
+      // shouldn't manufacture a false exception flag.
+      const isLate = hoursUntilStart != null && hoursUntilStart < 2;
+
+      const otherAgentIds = trip.agent_ids.filter(id => id !== action.agent_id);
+      const wasOnlyAgent = otherAgentIds.length === 0;
+
+      const cancelNotifs = [];
+      // Driver + admin notification fires for EVERY agent-initiated
+      // cancellation on an assigned trip (late or not) — a driver who
+      // was counting on this pickup should always hear about it, not
+      // just when it's late.
+      if (trip.driver_id) {
+        cancelNotifs.push({
+          id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [trip.driver_id],
+          message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — the trip has been cancelled" : ""}.`,
+          trip_id: trip.trip_id, ts: cancelNowTs, read: false,
+        });
+      }
+      cancelNotifs.push({
+        id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.ADMIN],
+        message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — trip cancelled, driver freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
+        trip_id: trip.trip_id, ts: cancelNowTs, read: false,
+      });
+      if (isLate) {
+        cancelNotifs.push({
+          id: mkId(), type: "LATE_CANCELLATION", for_roles: [ROLE.ADMIN],
+          message: `⏰ LATE CANCELLATION: ${cancellingAgent?.name || "An agent"} cancelled trip ${trip.trip_id} only ${hoursUntilStart < 0 ? "after" : hoursUntilStart.toFixed(1) + "h before"} the scheduled time (${trip.scheduled_date} ${trip.scheduled_time}).`,
+          trip_id: trip.trip_id, ts: cancelNowTs, read: false,
+        });
+      }
+
+      if (wasOnlyAgent) {
+        // Only agent on the trip — cancel the whole thing and free the
+        // driver, same logic ADMIN_CANCEL already uses.
+        const newTrips = state.trips.filter(t => t.trip_id !== action.trip_id);
+        let newDriverStatus = state.driver_status;
+        if (trip.driver_id) {
+          const remaining = newTrips.filter(t =>
+            t.driver_id === trip.driver_id &&
+            [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+          );
+          newDriverStatus = state.driver_status.map(d =>
+            d.driver_id === trip.driver_id
+              ? { ...d, state: remaining.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remaining[0]?.trip_id || null }
+              : d
+          );
+        }
+        return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...cancelNotifs, ...state.notifications], _error: null };
+      }
+
+      // Other agents remain — just remove this one, reusing the exact
+      // re-sequencing math TRIP/REMOVE_AGENT already does (route/policy
+      // recompute across the driver's whole run), so the trip stays
+      // correct for whoever's left.
+      const newAgentIds = otherAgentIds;
+      const newPickupCoords = trip.pickup_sequence_coords.filter((c, i) => {
+        const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        return !belongsToRemoved;
+      });
+      const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
+      const newAgentName = newAgentIds[0] ? (state.users.find(u => u.id === newAgentIds[0])?.name || trip.agent_name) : trip.agent_name;
+
+      let newTripsAgentCancel;
+      if (trip.driver_id) {
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
+        const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
+        const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
+        const dropOrderedAgentCancel = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMap = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrderedAgentCancel.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+        const totalAgentCountAC = allForDriver.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+        const routeDistanceKmAC = computeDriverRouteDistanceKm(defaultCompanyAnchor(state), ordered, dropOrderedAgentCancel);
+        const policyCapKmAC = companyPolicyDistanceCapKm(totalAgentCountAC);
+        const exceedsPolicyAC = routeDistanceKmAC > policyCapKmAC;
+        newTripsAgentCancel = state.trips.map(t => {
+          if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAC, driver_route_cap_km: policyCapKmAC, driver_route_exceeds_policy: exceedsPolicyAC };
+          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAC, driver_route_cap_km: policyCapKmAC, driver_route_exceeds_policy: exceedsPolicyAC };
+          return t;
+        });
+      } else {
+        newTripsAgentCancel = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
+      }
+      return { ...state, trips: newTripsAgentCancel, notifications: [...cancelNotifs, ...state.notifications], _error: null };
     }
 
     case "TICKET/CREATE": {
@@ -2452,7 +2644,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -2462,6 +2654,7 @@ function tripRowToApp(row, chatByTrip) {
     pickup_sequence_coords: [...firstPickup, ...extraPickups],
     dropoff_sequence_coords: row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel }] : [],
     completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
+    no_shows: row.noshows || [],
     pickup_company_id: row.pickupcompanyid, dropoff_company_id: row.dropoffcompanyid,
     pickup_is_manual: row.pickupismanual || false, dropoff_is_manual: row.dropoffismanual || false,
     direction: row.direction, is_exception: row.isexception || false, completed_dropoffs: row.completeddropoffs || [],
@@ -2619,6 +2812,42 @@ async function fetchDirectMessages(userIdA, userIdB) {
     id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole,
     recipient_id: m.recipientid, text: m.content, ts: epochToDisplay(m.timestamp), ts_epoch: m.timestamp,
   }));
+}
+
+// Discovers every conversation a user is part of (as either sender or
+// recipient) — needed by the agent/driver Messages tab, which has to
+// find out WHO has messaged them before it can open any specific
+// thread. The admin side never needed this: it always starts from a
+// known recipient (picked from the staff directory), so it could go
+// straight to fetchDirectMessages. Returns one entry per counterpart,
+// each carrying their most recent message (for a preview) and an
+// unread count (messages sent TO this user that haven't been marked
+// read — direct_messages doesn't have its own read flag, so "unread"
+// here means "arrived after this thread's own last-read timestamp,"
+// tracked client-side in localStorage per counterpart since there's no
+// server-side read-state column to add without a schema change).
+async function fetchMyConversations(myUserId, users) {
+  const { data, error } = await supabase.from("direct_messages").select("*")
+    .or(`senderid.eq.${myUserId},recipientid.eq.${myUserId}`)
+    .order("timestamp", { ascending: false });
+  if (error) throw error;
+  const byCounterpart = new Map();
+  for (const m of data || []) {
+    const counterpartId = m.senderid === myUserId ? m.recipientid : m.senderid;
+    if (!counterpartId || byCounterpart.has(counterpartId)) continue;
+    // direct_messages only stores the SENDER's name, never the
+    // recipient's — if the most recent message in this thread was one
+    // I sent, m.sendername is MY name, not the counterpart's, so it has
+    // to be looked up from the user list instead.
+    const counterpartName = m.senderid === myUserId
+      ? (users.find(u => u.id === counterpartId)?.name || "Unknown")
+      : m.sendername;
+    byCounterpart.set(counterpartId, {
+      counterpart_id: counterpartId, counterpart_name: counterpartName,
+      last_message: m.content, last_ts_epoch: m.timestamp, last_sender_id: m.senderid,
+    });
+  }
+  return [...byCounterpart.values()];
 }
 
 // The real notifications table has a single nullable `userid` column, not
@@ -2788,14 +3017,30 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!valid) throw new Error("Invalid credentials");
       activeUserRef.current = data.id;
       persistActiveUserId(data.id);
+      // Per explicit decision: "online" means logged in right now — set
+      // the instant login succeeds, no idle timeout. Best-effort (a
+      // failed update here shouldn't block a successful login).
+      if (data.role === ROLE.DRIVER) {
+        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", data.id).then(() => {}, () => {});
+      }
       await refetch();
       return;
     }
-    case "AUTH/LOGOUT":
+    case "AUTH/LOGOUT": {
+      // The outgoing user's role/id are needed BEFORE activeUserRef is
+      // cleared below — there's nothing left to look up afterward.
+      const loggedOutUserId = activeUserRef.current;
+      if (loggedOutUserId) {
+        const { data: loggedOutUserRow } = await supabase.from("users").select("role").eq("id", loggedOutUserId).maybeSingle();
+        if (loggedOutUserRow?.role === ROLE.DRIVER) {
+          await supabase.from("driver_status").update({ isonline: false }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
+        }
+      }
       activeUserRef.current = null;
       persistActiveUserId(null);
       await refetch();
       return;
+    }
     case "ADMIN/DELETE_USERS": {
       // Batch delete processed per-user (see the in-memory reducer's
       // case for the full rationale). Permission is checked per TARGET's
@@ -3416,6 +3661,32 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else await refetch();
       return;
     }
+    case "DM/REPLY": {
+      // Agent/driver side of a DM conversation — no admin-permission
+      // gate (unlike DM/SEND), since this has to work for whichever
+      // staff member the conversation belongs to, not just admins.
+      // Matches TRIP/SEND_CHAT's existing security model: trusts
+      // action.sender_id the same way every other agent/driver-
+      // initiated action in this codebase already does, rather than
+      // inventing a stricter re-check for this one action alone.
+      if (!action.message?.trim()) throw new Error("Message can't be empty.");
+      const dmReplyTs = nowEpoch();
+      const { error: dmReplyError } = await supabase.from("direct_messages").insert({
+        senderid: action.sender_id, sendername: action.sender_name, senderrole: action.sender_role,
+        recipientid: action.recipient_id, content: action.message.trim(), timestamp: dmReplyTs,
+      });
+      if (dmReplyError) throw dmReplyError;
+      await insertNotification({
+        type: "DIRECT_MESSAGE", for_roles: [], for_user_ids: [action.recipient_id],
+        message: `💬 Message from ${action.sender_name}: ${action.message.trim().slice(0, 80)}`,
+        ts: dmReplyTs, read: false,
+      });
+      await logAuditAction({
+        actorId: action.sender_id, actorName: action.sender_name, actionType: "DM/REPLY",
+        targetUserId: action.recipient_id, details: `Sent direct message: "${action.message.trim().slice(0, 100)}"`,
+      });
+      return;
+    }
     case "DM/SEND": {
       // Fleet Ops + Standard only — Viewer can't initiate contact with
       // anyone, matching the read-only pattern applied everywhere else.
@@ -3605,6 +3876,121 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
         if (!remaining || remaining.length === 0) {
           await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", tripRow.driverid);
+        }
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/AGENT_CANCEL": {
+      // New capability: an agent cancelling their spot on a trip that
+      // ALREADY has a driver assigned (TRIP/CANCEL above is limited to
+      // still-unassigned bookings). No admin-permission gate — this has
+      // to work for whichever agent it belongs to, matching TRIP/SEND_CHAT
+      // and DM/REPLY's existing pattern (trusts action.agent_id the same
+      // way every other agent-initiated action already does).
+      const { data: acTripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!acTripRow) throw new Error("Trip not found");
+      if (acTripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Completed trips can't be cancelled.");
+      const acAgentIds = [acTripRow.agentid, ...(acTripRow.extraagentids || [])].filter(Boolean);
+      if (!acAgentIds.includes(action.agent_id)) throw new Error("You're not on this trip.");
+
+      const { data: cancellingAgentRow } = await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle();
+      const cancellingAgentName = cancellingAgentRow?.fullname || "An agent";
+      const acNowTs = nowEpoch();
+      const acScheduledDt = parseScheduledDateTime(acTripRow.scheduleddate, acTripRow.scheduledtimestr);
+      const acHoursUntil = acScheduledDt ? (acScheduledDt.getTime() - Date.now()) / 3600000 : null;
+      const acIsLate = acHoursUntil != null && acHoursUntil < 2;
+      const acOtherAgentIds = acAgentIds.filter(id => id !== action.agent_id);
+      const acWasOnlyAgent = acOtherAgentIds.length === 0;
+
+      if (acTripRow.driverid) {
+        await insertNotification({
+          type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [acTripRow.driverid],
+          message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — the trip has been cancelled" : ""}.`,
+          trip_id: action.trip_id, ts: acNowTs, read: false,
+        });
+      }
+      await insertNotification({
+        type: "TRIP_CANCELLED", for_roles: [ROLE.ADMIN],
+        message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — trip cancelled, driver freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
+        trip_id: action.trip_id, ts: acNowTs, read: false,
+      });
+      if (acIsLate) {
+        await insertNotification({
+          type: "LATE_CANCELLATION", for_roles: [ROLE.ADMIN],
+          message: `⏰ LATE CANCELLATION: ${cancellingAgentName} cancelled trip ${action.trip_id} only ${acHoursUntil < 0 ? "after" : acHoursUntil.toFixed(1) + "h before"} the scheduled time (${acTripRow.scheduleddate || ""} ${acTripRow.scheduledtimestr || ""}).`,
+          trip_id: action.trip_id, ts: acNowTs, read: false,
+        });
+      }
+      await logAuditAction({
+        actorId: action.agent_id, actorName: cancellingAgentName, actionType: "TRIP/AGENT_CANCEL",
+        tripId: action.trip_id, details: `Agent cancelled their own spot${acIsLate ? " (LATE)" : ""}${acWasOnlyAgent ? " — whole trip cancelled" : " — removed, trip continues"}`,
+      });
+
+      if (acWasOnlyAgent) {
+        must(await supabase.from("trips").delete().eq("id", action.trip_id));
+        if (acTripRow.driverid) {
+          const { data: acRemaining } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+          if (!acRemaining || acRemaining.length === 0) {
+            await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(acNowTs).toISOString() }).eq("driverid", acTripRow.driverid);
+          }
+        }
+        await refetch();
+        return;
+      }
+
+      // Other agents remain on the trip — remove just this one, same
+      // primary-slot-promotion and re-sequencing logic REMOVE_AGENT uses.
+      const acWasPrimary = acTripRow.agentid === action.agent_id;
+      const acNewExtraPickups = (acTripRow.extrapickups || []).filter(p => p.agent_id !== action.agent_id);
+      const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => id !== action.agent_id);
+      const acUpdate = {
+        completedpickups: (acTripRow.completedpickups || []).filter(id => id !== action.agent_id),
+        extrapickups: acNewExtraPickups, extraagentids: acNewExtraAgentIds,
+      };
+      if (acWasPrimary) {
+        const acPromoted = acNewExtraPickups[0];
+        acUpdate.agentid = acPromoted?.agent_id ?? acNewExtraAgentIds[0] ?? null;
+        if (acPromoted) {
+          acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label;
+          acUpdate.extrapickups = acNewExtraPickups.slice(1);
+          acUpdate.extraagentids = acNewExtraAgentIds.filter(id => id !== acPromoted.agent_id);
+        }
+        const { data: acNewPrimaryUser } = await supabase.from("users").select("fullname").eq("id", acUpdate.agentid).maybeSingle();
+        if (acNewPrimaryUser) acUpdate.agentname = acNewPrimaryUser.fullname;
+      }
+      const { error: acErr } = await supabase.from("trips").update(acUpdate).eq("id", action.trip_id);
+      if (acErr) throw acErr;
+
+      if (acTripRow.driverid) {
+        const { data: acDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", acTripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const acAllForDriver = (acDriverTripsRaw || []).map(r => {
+          const isThisTrip = r.id === action.trip_id;
+          const first = (isThisTrip ? acUpdate.pickuplat ?? r.pickuplat : r.pickuplat) != null
+            ? [{ lat: isThisTrip ? (acUpdate.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (acUpdate.pickuplng ?? r.pickuplng) : r.pickuplng }]
+            : [];
+          const extra = (isThisTrip ? (acUpdate.extrapickups ?? acNewExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          return {
+            trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
+            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          };
+        });
+        const acOrdered = buildPickupSequence(acAllForDriver, null);
+        const acDropOrdered = buildDropoffSequence(acAllForDriver, acOrdered[acOrdered.length - 1]?.coord);
+        const acSeqMap = {}, acDropMap = {};
+        acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
+        acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
+        const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+        const acRouteDistanceKm = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, acOrdered, acDropOrdered);
+        const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
+        const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
+        for (const t of acDriverTripsRaw || []) {
+          const patch = {};
+          if (acSeqMap[t.id] != null && acSeqMap[t.id] !== t.pickupordernum) patch.pickupordernum = acSeqMap[t.id];
+          if (acDropMap[t.id] != null && acDropMap[t.id] !== t.dropsequencenum) patch.dropsequencenum = acDropMap[t.id];
+          patch.driverroutekm = acRouteDistanceKm; patch.driverroutecapkm = acPolicyCapKm; patch.driverrouteexceedspolicy = acExceedsPolicy;
+          if (Object.keys(patch).length) await supabase.from("trips").update(patch).eq("id", t.id);
         }
       }
       await refetch();
@@ -3966,6 +4352,51 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         await insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`, trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/MARK_NO_SHOW": {
+      // Driver marks an agent as a no-show — see the in-memory reducer's
+      // case for the full rationale (counts as that stop being handled
+      // so the trip can still progress, distinct noshows record rather
+      // than a real pickuptimestamps entry, flagged as an exception).
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const nsAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (!nsAgentIds.includes(action.agent_id)) throw new Error("Agent is not on this trip");
+      const nsCompletedPrior = tripRow.completedpickups || [];
+      const nsNewCompleted = nsCompletedPrior.includes(action.agent_id) ? nsCompletedPrior : [...nsCompletedPrior, action.agent_id];
+      const nsAllHandled = nsAgentIds.every(id => nsNewCompleted.includes(id));
+      const nsNowTs = nowEpoch();
+      let nsNewState = tripRow.status, nsInTransitAt = tripRow.intransitat;
+      if (nsAllHandled && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
+        assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
+        nsNewState = TRIP_STATE.IN_TRANSIT;
+        nsInTransitAt = nsNowTs;
+      }
+      const noShowRecord = {
+        agent_id: action.agent_id, ts: nsNowTs,
+        location: action.driver_coord ? { lat: action.driver_coord.lat, lng: action.driver_coord.lng } : null,
+        note: action.note?.trim() || null,
+      };
+      const newNoShows = [...(tripRow.noshows || []), noShowRecord];
+      must(await supabase.from("trips").update({
+        status: nsNewState, intransitat: nsInTransitAt, completedpickups: nsNewCompleted,
+        noshows: newNoShows, isexception: true, updatedat: nsNowTs,
+      }).eq("id", action.trip_id));
+      const { data: noShowAgentRow } = await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle();
+      await insertNotification({
+        type: "NO_SHOW", for_roles: [ROLE.ADMIN],
+        message: `🚫 NO SHOW: ${noShowAgentRow?.fullname || "An agent"} wasn't at pickup for trip ${action.trip_id}.${action.note?.trim() ? ` Note: ${action.note.trim()}` : ""}`,
+        trip_id: action.trip_id, ts: nsNowTs, read: false,
+      });
+      if (nsAllHandled) {
+        await insertNotification({
+          type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id}: all passengers handled. Now in transit.`,
+          trip_id: action.trip_id, ts: nsNowTs, read: false,
         });
       }
       await refetch();
@@ -5021,21 +5452,29 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
 
 function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const [text, setText] = useState("");
-  // Agent-facing cancel — only while the trip is still UNASSIGNED (no
-  // driver involved yet), matching TRIP/CANCEL's own guard. Anything
-  // already dispatched needs an admin (who can free the driver and
-  // notify everyone properly).
+  // Agent-facing cancel — works for BOTH a still-unassigned booking
+  // (TRIP/CANCEL, the original narrow rollback primitive) and, per
+  // explicit decision, an already-assigned trip too (TRIP/AGENT_CANCEL,
+  // which additionally flags a LATE CANCELLATION if within 2 hours of
+  // the scheduled time, notifies the driver/admins, and either removes
+  // just this agent or cancels the whole trip depending on whether
+  // other agents are still on it).
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [cancelError, setCancelError] = useState(null);
+  const isUnassignedBooking = trip.state === TRIP_STATE.UNASSIGNED_BOOKING;
   const cancelTrip = async () => {
     setCancelling(true);
     setCancelError(null);
     try {
-      await dispatch({ type: "TRIP/CANCEL", trip_id: trip.trip_id, agent_id: user.id });
+      if (isUnassignedBooking) {
+        await dispatch({ type: "TRIP/CANCEL", trip_id: trip.trip_id, agent_id: user.id });
+      } else {
+        await dispatch({ type: "TRIP/AGENT_CANCEL", trip_id: trip.trip_id, agent_id: user.id });
+      }
       onBack();
     } catch (e) {
-      setCancelError(e.message || "Couldn't cancel the booking — please try again.");
+      setCancelError(e.message || "Couldn't cancel — please try again.");
     } finally {
       setCancelling(false);
     }
@@ -5101,23 +5540,35 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
         </div>
       )}
 
-      {trip.state === TRIP_STATE.UNASSIGNED_BOOKING && (
-        !confirmingCancel ? (
-          <Button title="✕ CANCEL THIS TRIP" variant="ghost" size="sm" onClick={() => setConfirmingCancel(true)} style={{ alignSelf: "flex-start" }} />
+      {trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (() => {
+        const scheduledDt = parseScheduledDateTime(trip.scheduled_date, trip.scheduled_time);
+        const hoursUntil = scheduledDt ? (scheduledDt.getTime() - Date.now()) / 3600000 : null;
+        const wouldBeLate = hoursUntil != null && hoursUntil < 2;
+        const otherAgentsRemain = (trip.agent_ids || []).length > 1;
+        return !confirmingCancel ? (
+          <Button title={`✕ CANCEL THIS ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" onClick={() => setConfirmingCancel(true)} style={{ alignSelf: "flex-start" }} />
         ) : (
           <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-            <span style={{ fontSize: 10, color: COLORS.chalk }}>Cancel this booking? It hasn't been assigned to a driver yet, so it will just be removed.</span>
+            <span style={{ fontSize: 10, color: COLORS.chalk }}>
+              {isUnassignedBooking
+                ? "Cancel this booking? It hasn't been assigned to a driver yet, so it will just be removed."
+                : otherAgentsRemain
+                ? "Cancel your spot on this trip? Your driver and admin will be notified — the trip continues for the other passengers."
+                : "Cancel this trip? Your driver will be notified and freed up, and admin will be notified."}
+            </span>
+            {wouldBeLate && (
+              <span style={{ fontSize: 10, color: COLORS.red, fontWeight: 700 }}>
+                ⏰ This is within 2 hours of the scheduled time — it will be recorded as a late cancellation.
+              </span>
+            )}
             {cancelError && <span style={{ fontSize: 10, color: COLORS.red }}>{cancelError}</span>}
             <div style={{ display: "flex", gap: 8 }}>
-              <Button title="KEEP TRIP" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setConfirmingCancel(false); setCancelError(null); }} />
+              <Button title={`KEEP ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setConfirmingCancel(false); setCancelError(null); }} />
               <Button title={cancelling ? "CANCELLING…" : "YES, CANCEL IT"} variant="danger" size="sm" style={{ flex: 1 }} onClick={cancelTrip} disabled={cancelling} loading={cancelling} />
             </div>
           </div>
-        )
-      )}
-      {trip.state !== TRIP_STATE.UNASSIGNED_BOOKING && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
-        <span style={{ fontSize: 9, color: COLORS.ghost }}>Need to cancel? A driver is already assigned — contact your admin to cancel this trip.</span>
-      )}
+        );
+      })()}
 
       <Card>
         <SectionHeader label="Route" />
@@ -5494,7 +5945,7 @@ function AgentProfileTab({ user, myTrips, dispatch }) {
   );
 }
 
-const AGENT_TABS = [["home", "◈", "Home"], ["book", "⊕", "Book"], ["trips", "⊟", "Trips"], ["help", "🎫", "Help"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
+const AGENT_TABS = [["home", "◈", "Home"], ["book", "⊕", "Book"], ["trips", "⊟", "Trips"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
 
 /* ============================================================
    IN-APP VOICE CALLING (WebRTC)
@@ -5570,7 +6021,7 @@ function driverPositionChannelName(driverId) {
 const BROADCAST_INTERVAL_MS = 4000;
 const DB_PERSIST_INTERVAL_MS = 25000;
 
-function useDriverLocationTracking(user, hasActiveTrip, currentTripId) {
+function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
   const watchIdRef = useRef(null);
@@ -5579,7 +6030,7 @@ function useDriverLocationTracking(user, hasActiveTrip, currentTripId) {
   const channelRef = useRef(null);
 
   useEffect(() => {
-    if (!hasActiveTrip || !user?.id || !navigator.geolocation || !supabase) {
+    if (!isLoggedIn || !user?.id || !navigator.geolocation || !supabase) {
       if (watchIdRef.current != null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
         watchIdRef.current = null;
@@ -5658,7 +6109,7 @@ function useDriverLocationTracking(user, hasActiveTrip, currentTripId) {
       watchIdRef.current = null;
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
     };
-  }, [hasActiveTrip, user?.id, currentTripId]);
+  }, [isLoggedIn, user?.id, currentTripId]);
 
   return { tracking, lastError };
 }
@@ -6062,7 +6513,7 @@ function AgentApp({ state, dispatch, user }) {
   return (
     <div className="screen">
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
-        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>TRANSIT/OS</span>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>PEARCE & SONS</span>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {myNotifs.length > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 6px", fontSize: 9, fontWeight: 800, color: "#000" }}>{myNotifs.length}</span>}
           <RoleBadge role={ROLE.AGENT} />
@@ -6073,6 +6524,7 @@ function AgentApp({ state, dispatch, user }) {
         {tab === "home" && <AgentHomeTab myTrips={myTrips} dispatch={dispatch} goToTrip={goToTrip} setTab={setTab} />}
         {tab === "book" && <AgentBookTab user={user} state={state} dispatch={dispatch} setTab={setTab} myTrips={myTrips} />}
         {tab === "trips" && <AgentTripsTab myTrips={myTrips} state={state} dispatch={dispatch} user={user} call={call} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
+        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
         {tab === "me" && <AgentProfileTab user={user} myTrips={myTrips} dispatch={dispatch} />}
@@ -6099,6 +6551,136 @@ function AgentApp({ state, dispatch, user }) {
 // is messaging (driver messaging one specific agent on a multi-passenger
 // trip, or an agent messaging their driver) rather than showing one
 // merged thread with everyone on a multi-passenger trip mixed together.
+// Shared between the agent and driver apps — the receiving/replying half
+// of admin-to-agent/driver direct messages. Previously DM/SEND and
+// fetchDirectMessages were only ever called from AdminContacts (the
+// admin always starts from a known recipient picked out of the staff
+// directory), so there was no screen at all for an agent or driver to
+// see or reply to a message an admin sent them — this closes that gap.
+// Trip-scoped chat (TripChatModal below) already worked both ways and
+// stays completely separate; this is specifically the DM system.
+function MessagesTab({ user, dispatch }) {
+  const [conversations, setConversations] = useState(null); // null = loading
+  const [openWith, setOpenWith] = useState(null); // { id, name } | null
+  const [err, setErr] = useState(null);
+
+  const load = useCallback(async () => {
+    if (!supabase) { setConversations([]); return; }
+    try {
+      // Needs the staff directory to resolve a counterpart's name when
+      // the most recent message in a thread is one the current user
+      // sent (see fetchMyConversations' comment) — a lightweight
+      // targeted query rather than pulling in the whole app's users
+      // list, since this tab doesn't otherwise need it.
+      const { data: usersData } = await supabase.from("users").select("id, fullname").eq("role", ROLE.ADMIN);
+      const adminUsers = (usersData || []).map(u => ({ id: u.id, name: u.fullname }));
+      const convos = await fetchMyConversations(user.id, adminUsers);
+      setConversations(convos.sort((a, b) => b.last_ts_epoch - a.last_ts_epoch));
+    } catch (e) {
+      setErr(e.message || "Couldn't load messages.");
+      setConversations([]);
+    }
+  }, [user.id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, letterSpacing: 1 }}>MESSAGES</div>
+      {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+      {conversations === null ? (
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>Loading…</span>
+      ) : conversations.length === 0 ? (
+        <Empty icon="✉" text="No messages yet — an admin's message to you will show up here." />
+      ) : conversations.map(c => (
+        <div key={c.counterpart_id} onClick={() => setOpenWith({ id: c.counterpart_id, name: c.counterpart_name })}
+          style={{ display: "flex", alignItems: "center", gap: 10, background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: 12, cursor: "pointer" }}>
+          <DriverAvatar name={c.counterpart_name} size={36} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 12, fontWeight: 700 }}>{c.counterpart_name}</div>
+            <div style={{ fontSize: 10, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+              {c.last_sender_id === user.id ? "You: " : ""}{c.last_message}
+            </div>
+          </div>
+          <span style={{ fontSize: 9, color: COLORS.ghost, flexShrink: 0 }}>{epochToDisplay(c.last_ts_epoch)}</span>
+        </div>
+      ))}
+      {openWith && <DmThreadModal currentUser={user} counterpart={openWith} dispatch={dispatch} onClose={() => { setOpenWith(null); load(); }} />}
+    </div>
+  );
+}
+
+function DmThreadModal({ currentUser, counterpart, dispatch, onClose }) {
+  const [msgs, setMsgs] = useState(null);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      setMsgs(await fetchDirectMessages(currentUser.id, counterpart.id));
+    } catch (e) {
+      setErr(e.message || "Couldn't load this conversation.");
+      setMsgs([]);
+    }
+  }, [currentUser.id, counterpart.id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const send = async () => {
+    if (!text.trim()) return;
+    setSending(true);
+    try {
+      // DM/SEND's manageTrips permission check is admin-only (see the
+      // Supabase case) — but that gate exists to stop a random Viewer
+      // admin from initiating contact with a staff member, not to block
+      // a staff member REPLYING to a conversation an admin already
+      // started. Dispatching plain DM/SEND here would hit that same
+      // gate and fail for anyone who isn't an admin, so agent/driver
+      // replies go through a dedicated action instead.
+      await dispatch({ type: "DM/REPLY", sender_id: currentUser.id, sender_name: currentUser.name, sender_role: currentUser.role, recipient_id: counterpart.id, message: text.trim() });
+      setText("");
+      await load();
+    } catch (e) {
+      setErr(e.message || "Message failed to send — please try again.");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", display: "flex", flexDirection: "column", maxHeight: "80vh" }}>
+        <div style={{ padding: 14, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1 }}>MESSAGING</div>
+            <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{counterpart.name}</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+          {msgs === null && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 20 }}>Loading…</span>}
+          {msgs?.length === 0 && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 20 }}>No messages yet.</span>}
+          {msgs?.map(m => {
+            const mine = m.sender_id === currentUser.id;
+            return (
+              <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "82%", borderRadius: 6, padding: 9, background: mine ? "rgba(45,140,240,.15)" : COLORS.surface, border: `1px solid ${mine ? "rgba(45,140,240,.3)" : COLORS.wire}` }}>
+                <div style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, marginBottom: 3 }}>{m.sender_name} · {m.ts}</div>
+                <div style={{ fontSize: 11 }}>{m.text}</div>
+              </div>
+            );
+          })}
+        </div>
+        {err && <span style={{ fontSize: 10, color: COLORS.red, padding: "0 14px" }}>{err}</span>}
+        <div style={{ display: "flex", gap: 7, padding: 14, borderTop: `1px solid ${COLORS.wire}` }}>
+          <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && !sending && send()} placeholder="Type a reply…" autoFocus disabled={sending} />
+          <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim() || sending} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
   const [text, setText] = useState("");
   const allMsgs = trip.chat_messages || [];
@@ -6287,6 +6869,75 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
 
 const DELAY_REASONS = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
 
+function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose }) {
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState(null);
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    if (!trip) { setErr("No active trip found."); return; }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      // Fresh GPS read at the moment of confirming — more accurate than
+      // whatever was last broadcast, since a driver marking a no-show
+      // is standing right at the failed pickup point RIGHT NOW. Falls
+      // back to the last live-tracked position (still meaningfully
+      // "at or near the pickup") rather than losing the location
+      // entirely if a fresh read times out or permission was revoked
+      // mid-session.
+      const driverCoord = await new Promise((resolve) => {
+        if (!navigator.geolocation) { resolve(null); return; }
+        navigator.geolocation.getCurrentPosition(
+          (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          () => resolve(null),
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
+        );
+      });
+      await dispatch({
+        type: "TRIP/MARK_NO_SHOW", trip_id: trip.trip_id, agent_id: agentId,
+        driver_coord: driverCoord, note: note.trim() || undefined,
+      });
+      setDone(true);
+    } catch (e) {
+      setErr(e.message || "Failed to record the no-show.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>MARK NO SHOW</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+
+        {done ? (
+          <>
+            <div style={{ fontSize: 12, color: COLORS.green, textAlign: "center", padding: 16 }}>✓ Recorded. Admins have been notified — you can continue your route.</div>
+            <Button title="CLOSE" variant="amber" full onClick={onClose} />
+          </>
+        ) : (
+          <>
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>
+              Confirm <b>{agentName}</b> wasn't at the pickup point. Your current location will be saved with this record, and you'll be able to continue your route.
+            </span>
+            <div>
+              <label className="field-label">Note (optional)</label>
+              <textarea className="inp" rows={3} value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Waited 5 minutes, called, no answer" />
+            </div>
+            {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+            <Button title={submitting ? "SAVING…" : "CONFIRM NO SHOW"} variant="danger" full onClick={submit} disabled={submitting} loading={submitting} />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DelayReportModal({ trip, user, dispatch, onClose }) {
   const [reason, setReason] = useState("");
   const [note, setNote] = useState("");
@@ -6349,6 +7000,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const [tripStarted, setTripStarted] = useState(false);
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
+  const [noShowFor, setNoShowFor] = useState(null); // { trip_id, agent_id, agent_name } | null
   // myTrips comes from DriverApp already filtered through the week-series
   // progressive reveal (day N hidden until day N-1 completes). Deriving
   // from raw state.trips here bypassed that: ASSIGN_DRIVER auto-confirms,
@@ -6525,6 +7177,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           onClose={() => setShowDelayForm(false)}
         />
       )}
+      {noShowFor && (
+        <NoShowModal
+          trip={myActiveTrips.find(t => t.trip_id === noShowFor.trip_id)}
+          agentId={noShowFor.agent_id} agentName={noShowFor.agent_name}
+          user={user} dispatch={dispatch}
+          onClose={() => setNoShowFor(null)}
+        />
+      )}
 
       {tripStarted && !allPickedUp && curPickup && (
         <>
@@ -6562,7 +7222,10 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
               <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
             </div>
             <Button title={`🧭 WAZE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)} style={{ padding: 16, fontSize: 14 }} />
-            <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} />
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} style={{ flex: 2 }} />
+              <Button title="🚫 NO SHOW" variant="danger" full onClick={() => setNoShowFor({ trip_id: curPickup.trip_id, agent_id: curPickup.agent_id, agent_name: curPickup.agent_name })} style={{ flex: 1 }} />
+            </div>
           </Card>
           {pickupStops.slice(curPickupIdx + 1).length > 0 && (
             <>
@@ -6757,7 +7420,7 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
   );
 }
 
-const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
+const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
 
 function DriverApp({ state, dispatch, user }) {
   const [tab, setTab] = useState("trips");
@@ -6787,12 +7450,12 @@ function DriverApp({ state, dispatch, user }) {
   // position logging context; falls back to the first active trip if
   // none are in transit yet (still assigned/confirmed but not started).
   const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
-  const location = useDriverLocationTracking(user, load > 0, trackedTripId);
+  const location = useDriverLocationTracking(user, !!user, trackedTripId);
 
   return (
     <div className="screen">
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
-        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>TRANSIT/OS</span>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>PEARCE & SONS</span>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {location.tracking && !location.lastError && (
             <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, display: "flex", alignItems: "center", gap: 3 }}>
@@ -6809,6 +7472,7 @@ function DriverApp({ state, dispatch, user }) {
       <div style={{ flex: 1, overflowY: "auto" }}>
         {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} />}
         {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} />}
+        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "history" && <DriverHistoryTab myTrips={myTrips} />}
         {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
@@ -7223,7 +7887,7 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
     "Trip ID", "Exception", "Direction", "Trip Type", "Agent", "Driver", "Status",
     "Pickup", "Drop-off", "Scheduled Date", "Scheduled Time",
     "Booked At", "Driver Confirmed At", "Agent Picked Up At", "Agent Dropped Off At",
-    "Distance (km)", "Driver's Full Route (km)", "Long Distance", "Delay/Detour Reported", "Admin Edits", "Admin Note", "Phone",
+    "Distance (km)", "Driver's Full Route (km)", "Long Distance", "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note", "Phone",
   ];
   const escapeCsv = (val) => {
     const s = val == null ? "" : String(val);
@@ -7276,6 +7940,12 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
         t.route_total_km != null ? t.route_total_km.toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
+        (t.no_shows || []).length === 0 ? "" : t.no_shows.map(ns => {
+          const noShowAgentName = users.find(u => u.id === ns.agent_id)?.name || ns.agent_id;
+          const locStr = ns.location ? ` @ ${ns.location.lat.toFixed(5)},${ns.location.lng.toFixed(5)}` : "";
+          const noteStr = ns.note ? ` — "${ns.note}"` : "";
+          return `${noShowAgentName}${locStr}${noteStr}`;
+        }).join("; "),
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
         t.admin_note || "", t.phone || "",
@@ -8173,6 +8843,12 @@ function tomtomTileUrl(x, y, zoom) {
 // recomputes which tiles are needed on every viewport change, which is
 // what makes real pan/zoom possible — zooming in requests more, smaller
 // tiles; panning requests a different set of tiles for the new center.
+// Module-level (not a hook) — LiveMapTiles renders many sibling <img>
+// tiles in one pass, so a per-component useRef wouldn't dedupe the log
+// across them; this flag persists for the whole page session instead,
+// so a bad key logs its diagnostic exactly once, not once per tile.
+let tomtomTileErrorLoggedOnce = { current: false };
+
 function LiveMapTiles({ width, height, viewport }) {
   if (!TOMTOM_API_KEY) {
     return <div style={{ position: "absolute", inset: 0, background: COLORS.surface }} />;
@@ -8202,7 +8878,20 @@ function LiveMapTiles({ width, height, viewport }) {
           alt=""
           draggable={false}
           style={{ position: "absolute", left: p1.x, top: p1.y, width: p2.x - p1.x, height: p2.y - p1.y, pointerEvents: "none" }}
-          onError={(e) => { e.target.style.display = "none"; }}
+          onError={(e) => {
+            e.target.style.display = "none";
+            if (!tomtomTileErrorLoggedOnce.current) {
+              tomtomTileErrorLoggedOnce.current = true;
+              console.error(
+                "[TomTom] Map tile failed to load even though an API key is configured. " +
+                "This usually means the key is invalid, expired, or not authorized for the " +
+                "Maps/tile product specifically (a key can be valid for Search/Geocoding but " +
+                "still be rejected here if your TomTom plan gates them separately) — check " +
+                "the failed request's status in the Network tab (401/403 = key/auth problem) " +
+                "and your TomTom developer dashboard for which products this key is enabled for."
+              );
+            }
+          }}
         />
       );
     }
@@ -8275,7 +8964,7 @@ function AdminLiveMap({ state, user }) {
     // catches a driver whose tab was closed or lost signal, not just normal
     // jitter between updates.
     const stale = pos ? (Date.now() - new Date(pos.updated_at).getTime()) > 30000 : true;
-    return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale };
+    return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale, is_online: ds.is_online };
   });
 
   const withPosition = driverPoints.filter(d => d.pos);
@@ -8339,6 +9028,14 @@ function AdminLiveMap({ state, user }) {
     setViewport(v => ({ ...v, centerLat: newCenterLonLat.lat, centerLng: newCenterLonLat.lon }));
   };
   const handlePointerUp = () => { dragRef.current = null; };
+  // Expanding the map doesn't touch any of the pan/zoom/projection logic
+  // above — the SVG already scales to fill its container via width/
+  // height: 100%, so making the container itself fullscreen is enough.
+  // A dedicated button (not a click-anywhere-on-the-map handler) since
+  // the map surface itself already uses clicks to select a driver pin —
+  // overloading that same gesture to also expand the map would make
+  // selecting a driver and expanding the map fight over the same tap.
+  const [isMapExpanded, setIsMapExpanded] = useState(false);
 
   return (
     <div className="pad">
@@ -8348,14 +9045,28 @@ function AdminLiveMap({ state, user }) {
           <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
           <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
           <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
+          <Button title={isMapExpanded ? "⤡ SHRINK" : "⤢ EXPAND"} variant="ghost" size="sm" onClick={() => setIsMapExpanded(v => !v)} />
         </div>
       </div>
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
         Positions update while a driver has the app open and an active trip. Grey pins haven't reported in over 30 seconds. Drag to pan, use +/− or scroll to zoom.
       </div>
 
-      <Card body={false} style={{ padding: 0, overflow: "hidden" }}>
-        <div style={{ position: "relative", width: "100%", aspectRatio: `${W} / ${H}` }}>
+      {isMapExpanded && (
+        <div onClick={() => setIsMapExpanded(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.7)", zIndex: 199, animation: "fadeIn .15s ease" }} />
+      )}
+      <div style={isMapExpanded ? {
+        position: "fixed", zIndex: 200,
+        top: "calc(3vh + env(safe-area-inset-top, 0px))", left: "3vw", right: "3vw", bottom: "calc(3vh + env(safe-area-inset-bottom, 0px))",
+        display: "flex", flexDirection: "column",
+      } : undefined}>
+        {isMapExpanded && (
+          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+            <Button title="✕ CLOSE" variant="ghost" size="sm" onClick={() => setIsMapExpanded(false)} />
+          </div>
+        )}
+        <Card body={false} style={{ padding: 0, overflow: "hidden", ...(isMapExpanded ? { flex: 1, minHeight: 0 } : {}) }}>
+          <div style={{ position: "relative", width: "100%", height: isMapExpanded ? "100%" : undefined, aspectRatio: isMapExpanded ? undefined : `${W} / ${H}` }}>
           <LiveMapTiles width={W} height={H} viewport={viewport} />
           <svg
             ref={svgRef}
@@ -8399,6 +9110,7 @@ function AdminLiveMap({ state, user }) {
           </svg>
         </div>
       </Card>
+      </div>
 
       {selected && (
         <Card>
@@ -8430,7 +9142,10 @@ function AdminLiveMap({ state, user }) {
           style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}`, background: d.driverId === selectedDriverId ? "rgba(245,166,35,.05)" : "transparent" }}>
           <span style={{ width: 8, height: 8, borderRadius: 4, background: !d.pos || d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green, flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 11, fontWeight: 700 }}>{d.name}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 700 }}>{d.name}</span>
+              {d.is_online && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, letterSpacing: .5, border: `1px solid ${COLORS.green}`, borderRadius: 2, padding: "1px 4px" }}>ONLINE</span>}
+            </div>
             <div style={{ fontSize: 9, color: COLORS.ghost }}>{d.pos ? timeSinceLabel(d.pos.updated_at) : "never reported"}</div>
           </div>
           <StateBadge state={!d.pos || d.stale ? "OFFLINE" : d.state} />
@@ -8466,8 +9181,12 @@ function AdminDrivers({ state, user }) {
               <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                 <DriverAvatar name={driverUser?.name} size={40} />
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{driverUser?.name}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{driverUser?.name}</span>
+                    <span style={{ width: 7, height: 7, borderRadius: 4, background: ds.is_online ? COLORS.green : COLORS.ghost, flexShrink: 0 }} title={ds.is_online ? "Online" : "Offline"} />
+                  </div>
                   <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
+                  <div style={{ fontSize: 9, color: ds.is_online ? COLORS.green : COLORS.ghost, marginTop: 2, fontWeight: 700, letterSpacing: .5 }}>{ds.is_online ? "● ONLINE" : "○ OFFLINE"}</div>
                 </div>
               </div>
             </Card>
@@ -8490,7 +9209,11 @@ function AdminDrivers({ state, user }) {
             <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
               <DriverAvatar name={driverUser?.name} size={46} />
               <div style={{ flex: 1 }}>
-                <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>{driverUser?.name}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>{driverUser?.name}</span>
+                  <span style={{ width: 7, height: 7, borderRadius: 4, background: ds.is_online ? COLORS.green : COLORS.ghost, flexShrink: 0 }} title={ds.is_online ? "Online" : "Offline"} />
+                  <span style={{ fontSize: 9, color: ds.is_online ? COLORS.green : COLORS.ghost, fontWeight: 700, letterSpacing: .5 }}>{ds.is_online ? "ONLINE" : "OFFLINE"}</span>
+                </div>
                 <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
                 <div style={{ fontSize: 10, color: COLORS.ghost }}>{ds.phone}</div>
                 {driverUser?.home_address && (
@@ -9880,6 +10603,7 @@ const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDAR
 function AdminApp({ state, dispatch, user }) {
   const [tab, setTab] = useState("dashboard");
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const isNarrow = useIsNarrowScreen();
   const notifCount = state.notifications.filter(n => !n.read && n.for_roles?.includes(ROLE.ADMIN)).length;
   const call = useWebRTCCall(user);
 
@@ -9913,47 +10637,103 @@ function AdminApp({ state, dispatch, user }) {
     return true;
   });
 
+  // Shared nav content — identical markup whether it's rendered as the
+  // permanent wide-screen sidebar or the narrow-screen slide-in drawer,
+  // so the two never drift apart into two different navs to maintain.
+  const navContent = (
+    <>
+      <div style={{ padding: 16, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 13, letterSpacing: 2 }}>PEARCE & SONS</span>
+        <RoleBadge role={ROLE.ADMIN} />
+      </div>
+      <div style={{ flex: 1, paddingTop: 12, overflowY: "auto" }}>
+        {visibleNav.map(([id, icon, label]) => {
+          const active = tab === id;
+          const badge = id === "notifs" ? notifCount : 0;
+          return (
+            <div key={id} onClick={() => { setTab(id); setDrawerOpen(false); }} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", cursor: "pointer", background: active ? "rgba(245,166,35,.06)" : "transparent", borderLeft: `2px solid ${active ? COLORS.amber : "transparent"}` }}>
+              <span style={{ fontSize: 14, width: 16, textAlign: "center", color: COLORS.ghost }}>{icon}</span>
+              <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1, color: active ? COLORS.amber : COLORS.ghost, flex: 1, textTransform: "uppercase" }}>{label}</span>
+              {badge > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 5px", fontSize: 9, fontWeight: 800, color: "#000" }}>{badge}</span>}
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ padding: 16, borderTop: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", gap: 4 }}>
+        <DriverAvatar name={user.name} size={32} />
+        <span style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{user.name}</span>
+        <span style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 10 }}>{ADMIN_LEVEL_LABEL[user.admin_level] || "Administrator"}</span>
+        <AlertSoundToggle />
+        <Button title="LOGOUT" variant="ghost" size="sm" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
+      </div>
+    </>
+  );
+
+  const mainContent = (
+    <div style={{ flex: 1, overflowY: "auto", minWidth: 0 }}>
+      {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
+      {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} />}
+      {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
+      {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
+      {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
+      {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
+      {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
+      {tab === "history" && <AdminHistory state={scopedState} user={user} />}
+      {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
+      {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
+      {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} />}
+    </div>
+  );
+
+  if (!isNarrow) {
+    // Wide screens: the original permanent sidebar, unchanged.
+    return (
+      <div style={{ display: "flex", minHeight: "100vh" }}>
+        <div style={{ width: 220, flexShrink: 0, background: COLORS.panel, borderRight: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" }}>
+          {navContent}
+        </div>
+        {mainContent}
+        <CallOverlay call={call} />
+      </div>
+    );
+  }
+
+  // Narrow (phone/tablet) screens: a compact top bar with a hamburger
+  // button, and the same nav content sliding in as an overlay drawer
+  // instead of permanently eating ~60% of a phone's width. This was the
+  // single biggest mobile-usability gap in the admin app — a fixed
+  // 220px sidebar left almost no room for content on a ~375px screen.
+  const activeNavItem = visibleNav.find(([id]) => id === tab);
   return (
-    <div style={{ display: "flex", minHeight: "100vh" }}>
-      <div style={{ width: 220, flexShrink: 0, background: COLORS.panel, borderRight: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" }}>
-        <div style={{ padding: 16, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 13, letterSpacing: 2 }}>TRANSIT/OS</span>
-          <RoleBadge role={ROLE.ADMIN} />
-        </div>
-        <div style={{ flex: 1, paddingTop: 12 }}>
-          {visibleNav.map(([id, icon, label]) => {
-            const active = tab === id;
-            const badge = id === "notifs" ? notifCount : 0;
-            return (
-              <div key={id} onClick={() => setTab(id)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", cursor: "pointer", background: active ? "rgba(245,166,35,.06)" : "transparent", borderLeft: `2px solid ${active ? COLORS.amber : "transparent"}` }}>
-                <span style={{ fontSize: 14, width: 16, textAlign: "center", color: COLORS.ghost }}>{icon}</span>
-                <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1, color: active ? COLORS.amber : COLORS.ghost, flex: 1, textTransform: "uppercase" }}>{label}</span>
-                {badge > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 5px", fontSize: 9, fontWeight: 800, color: "#000" }}>{badge}</span>}
-              </div>
-            );
-          })}
-        </div>
-        <div style={{ padding: 16, borderTop: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", gap: 4 }}>
-          <DriverAvatar name={user.name} size={32} />
-          <span style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{user.name}</span>
-          <span style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 10 }}>{ADMIN_LEVEL_LABEL[user.admin_level] || "Administrator"}</span>
-          <AlertSoundToggle />
-          <Button title="LOGOUT" variant="ghost" size="sm" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
-        </div>
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column" }}>
+      <div style={{
+        position: "sticky", top: 0, zIndex: 40, background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`,
+        display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+        paddingTop: "calc(12px + env(safe-area-inset-top, 0px))",
+      }}>
+        <button onClick={() => setDrawerOpen(true)} aria-label="Open menu" style={{ background: "transparent", border: `1px solid ${COLORS.wire}`, borderRadius: 4, width: 34, height: 34, display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.chalk, fontSize: 16, flexShrink: 0 }}>
+          ☰
+        </button>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 12, letterSpacing: 1.5, flexShrink: 0 }}>PEARCE & SONS</span>
+        <span style={{ fontSize: 10, color: COLORS.ghost, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {activeNavItem ? activeNavItem[2] : ""}
+        </span>
+        {notifCount > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 6px", fontSize: 9, fontWeight: 800, color: "#000", flexShrink: 0 }}>{notifCount}</span>}
       </div>
-      <div style={{ flex: 1, overflowY: "auto" }}>
-        {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
-        {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} />}
-        {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
-        {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
-        {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
-        {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
-        {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
-        {tab === "history" && <AdminHistory state={scopedState} user={user} />}
-        {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
-        {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
-        {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} />}
-      </div>
+      {drawerOpen && (
+        <>
+          <div onClick={() => setDrawerOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.55)", zIndex: 49, animation: "fadeIn .15s ease" }} />
+          <div style={{
+            position: "fixed", top: 0, left: 0, bottom: 0, width: "min(280px, 84vw)", zIndex: 50,
+            background: COLORS.panel, borderRight: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column",
+            paddingTop: "env(safe-area-inset-top, 0px)", paddingBottom: "env(safe-area-inset-bottom, 0px)",
+            boxShadow: "4px 0 24px rgba(0,0,0,.4)",
+          }}>
+            {navContent}
+          </div>
+        </>
+      )}
+      {mainContent}
       <CallOverlay call={call} />
     </div>
   );
@@ -9973,13 +10753,13 @@ function AdminApp({ state, dispatch, user }) {
 class AppErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { error: null }; }
   static getDerivedStateFromError(error) { return { error }; }
-  componentDidCatch(error, info) { console.error("[TransitOS] render error:", error, info); }
+  componentDidCatch(error, info) { console.error("[Pearce & Sons] render error:", error, info); }
   render() {
     if (!this.state.error) return this.props.children;
     return (
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 24, background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif", textAlign: "center" }}>
         <div style={{ fontSize: 18, fontWeight: 800 }}>Something went wrong</div>
-        <div style={{ fontSize: 12, color: "#888", maxWidth: 340 }}>TransitOS hit an unexpected error and couldn't continue. Reloading should fix it.</div>
+        <div style={{ fontSize: 12, color: "#888", maxWidth: 340 }}>Pearce & Sons hit an unexpected error and couldn't continue. Reloading should fix it.</div>
         <button
           onClick={() => { try { localStorage.removeItem("transitos_active_user_id"); } catch (e) {} window.location.reload(); }}
           style={{ background: "#f5a623", color: "#000", border: "none", borderRadius: 4, padding: "10px 20px", fontWeight: 700, cursor: "pointer" }}
@@ -10105,7 +10885,7 @@ function AppInner() {
     return (
       <div className="loading-screen">
         <div className="spinner" />
-        <span style={{ color: COLORS.ghost, fontSize: 11, letterSpacing: 1 }}>Connecting to TransitOS…</span>
+        <span style={{ color: COLORS.ghost, fontSize: 11, letterSpacing: 1 }}>Connecting to Pearce & Sons…</span>
       </div>
     );
   }
