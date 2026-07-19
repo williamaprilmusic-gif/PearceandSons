@@ -1,0 +1,10157 @@
+import React, { useState, useReducer, useEffect, useRef, useCallback } from "react";
+
+/* ============================================================
+   TransitOS — Corporate Transport Operations Platform (Web)
+   Converted from the React Native version back to standard web
+   React: View/Text/Pressable -> div/span/button, StyleSheet ->
+   CSS-in-JS via a single injected <style> block, react-navigation
+   -> simple useState-driven view switching, Waze Linking ->
+   window.open, Supabase RN client -> Supabase JS web client.
+   ============================================================ */
+
+/* ---------- THEME ---------- */
+const COLORS = {
+  ink: "#0A0C0F", panel: "#0E1117", surface: "#141820", card: "#1A1F2A",
+  rim: "#252D3A", wire: "#2E3847", dim: "#3D4A5C", ghost: "#4E5F74",
+  mist: "#8B9BAF", fog: "#B0BEC8", chalk: "#D8E2EC", white: "#EEF2F7",
+  amber: "#F5A623", amber2: "#E8911A", green: "#1DB954", green2: "#17A346",
+  red: "#E83A3A", red2: "#C22E2E", blue: "#2D8CF0", blue2: "#1A6FCC",
+  purple: "#7C4DFF", teal: "#00BCD4", black: "#000000",
+};
+const FONTS = { mono: "'JetBrains Mono', 'Courier New', monospace", head: "'Rajdhani', 'Arial Narrow', sans-serif" };
+
+const STATE_BADGE_MAP = {
+  UNASSIGNED_BOOKING: { bg: "rgba(78,95,116,0.2)",   fg: COLORS.ghost,  border: COLORS.wire,             label: "UNASSIGNED" },
+  ASSIGNED:           { bg: "rgba(45,140,240,0.15)", fg: COLORS.blue,   border: "rgba(45,140,240,0.3)",  label: "ASSIGNED" },
+  DRIVER_CONFIRMED:   { bg: "rgba(124,77,255,0.15)", fg: COLORS.purple, border: "rgba(124,77,255,0.3)",  label: "CONFIRMED" },
+  IN_TRANSIT:         { bg: "rgba(245,166,35,0.15)", fg: COLORS.amber,  border: "rgba(245,166,35,0.3)",  label: "IN TRANSIT" },
+  ARCHIVED_COMPLETED: { bg: "rgba(29,185,84,0.15)",  fg: COLORS.green,  border: "rgba(29,185,84,0.3)",   label: "ARCHIVED" },
+  AVAILABLE:          { bg: "rgba(29,185,84,0.12)",  fg: COLORS.green,  border: "rgba(29,185,84,0.25)",  label: "AVAILABLE" },
+  BUSY:               { bg: "rgba(245,166,35,0.12)", fg: COLORS.amber,  border: "rgba(245,166,35,0.25)", label: "BUSY" },
+  FULLY_BOOKED:       { bg: "rgba(232,58,58,0.15)",  fg: COLORS.red,    border: "rgba(232,58,58,0.3)",   label: "FULLY BOOKED" },
+  OFFLINE:            { bg: "rgba(78,95,116,0.15)",  fg: COLORS.ghost,  border: "rgba(78,95,116,0.3)",   label: "OFFLINE" },
+};
+const ROLE_BADGE_MAP = {
+  ADMIN:  { bg: "rgba(124,77,255,0.15)", fg: COLORS.purple, border: "rgba(124,77,255,0.3)" },
+  AGENT:  { bg: "rgba(45,140,240,0.15)", fg: COLORS.blue,   border: "rgba(45,140,240,0.3)" },
+  DRIVER: { bg: "rgba(245,166,35,0.15)", fg: COLORS.amber,  border: "rgba(245,166,35,0.3)" },
+};
+
+const CSS = `
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; background: ${COLORS.ink}; }
+body { font-family: ${FONTS.mono}; color: ${COLORS.chalk}; -webkit-font-smoothing: antialiased; }
+button { font-family: inherit; cursor: pointer; }
+input, select, textarea { font-family: inherit; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: ${COLORS.wire}; border-radius: 4px; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px);} to { opacity: 1; transform: translateY(0);} }
+
+.app-root { min-height: 100vh; background: ${COLORS.ink}; }
+.screen { min-height: 100vh; background: ${COLORS.ink}; display: flex; flex-direction: column; }
+.pad { padding: 16px; display: flex; flex-direction: column; gap: 14px; max-width: 720px; width: 100%; margin: 0 auto; padding-bottom: 60px; }
+
+.btn { border: 1px solid; border-radius: 4px; padding: 10px 16px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; transition: opacity .12s; }
+.btn:hover { opacity: .88; }
+.btn:disabled { opacity: .3; cursor: not-allowed; }
+.btn-sm { padding: 7px 12px; font-size: 10px; }
+.btn-full { width: 100%; }
+.btn-amber  { background: ${COLORS.amber};  border-color: ${COLORS.amber2}; color: ${COLORS.ink}; }
+.btn-green  { background: ${COLORS.green};  border-color: ${COLORS.green2}; color: ${COLORS.ink}; }
+.btn-red, .btn-danger { background: ${COLORS.red}; border-color: ${COLORS.red2}; color: ${COLORS.white}; }
+.btn-ghost  { background: transparent; border-color: ${COLORS.wire}; color: ${COLORS.fog}; }
+.btn-blue   { background: ${COLORS.blue}; border-color: ${COLORS.blue2}; color: ${COLORS.white}; }
+.btn-purple { background: ${COLORS.purple}; border-color: #6a3de8; color: ${COLORS.white}; }
+.btn-waze   { background: #00CCFF; border-color: #00AAFF; color: #000; }
+
+.card { background: ${COLORS.card}; border: 1px solid ${COLORS.wire}; border-radius: 4px; overflow: hidden; }
+.card-body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field-label { font-size: 10px; font-weight: 700; letter-spacing: 1.2px; color: ${COLORS.mist}; text-transform: uppercase; }
+.inp { background: ${COLORS.card}; border: 1px solid ${COLORS.wire}; border-radius: 3px; padding: 10px 12px; color: ${COLORS.chalk}; font-size: 12px; font-family: ${FONTS.mono}; outline: none; }
+.inp:focus { border-color: ${COLORS.amber}; }
+.inp.err { border-color: ${COLORS.red}; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+.state-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 2px; border: 1px solid; font-size: 9px; font-weight: 700; letter-spacing: 1.2px; font-family: ${FONTS.mono}; text-transform: uppercase; width: fit-content; }
+.state-dot { width: 5px; height: 5px; border-radius: 3px; }
+.role-badge { padding: 2px 7px; border-radius: 2px; border: 1px solid; font-size: 9px; font-weight: 700; letter-spacing: 1.5px; font-family: ${FONTS.mono}; width: fit-content; }
+
+.sec-hdr { display: flex; align-items: center; gap: 10px; margin: 4px 0; }
+.sec-hdr-txt { font-size: 9px; font-weight: 700; letter-spacing: 2px; color: ${COLORS.dim}; font-family: ${FONTS.mono}; text-transform: uppercase; white-space: nowrap; }
+.sec-hdr-line { flex: 1; height: 1px; background: ${COLORS.wire}; }
+
+.empty { display: flex; flex-direction: column; align-items: center; padding: 36px 0; gap: 10px; }
+.empty-ico { font-size: 28px; opacity: .2; }
+.empty-txt { font-size: 11px; color: ${COLORS.ghost}; letter-spacing: 1px; }
+
+.gps-block { background: ${COLORS.surface}; border: 1px solid ${COLORS.wire}; border-radius: 3px; padding: 10px; display: flex; flex-direction: column; gap: 5px; }
+.gps-row { display: flex; gap: 8px; font-size: 10px; }
+.gps-key { color: ${COLORS.ghost}; width: 28px; }
+.gps-val { color: ${COLORS.chalk}; }
+
+.driver-av { background: ${COLORS.surface}; border: 1px solid ${COLORS.wire}; display: flex; align-items: center; justify-content: center; border-radius: 4px; font-family: ${FONTS.head}; font-weight: 700; color: ${COLORS.amber}; flex-shrink: 0; }
+
+.cap-wrap { display: flex; flex-direction: column; gap: 4px; }
+.cap-label-row { display: flex; justify-content: space-between; font-size: 9px; font-family: ${FONTS.mono}; }
+.cap-track { height: 8px; background: ${COLORS.surface}; border-radius: 4px; overflow: hidden; border: 1px solid ${COLORS.wire}; }
+.cap-fill { height: 100%; border-radius: 4px; transition: width .2s; }
+
+.toast-stack { position: fixed; top: 16px; right: 16px; display: flex; flex-direction: column; gap: 8px; width: 300px; z-index: 999; }
+.toast { background: ${COLORS.card}; border: 1px solid ${COLORS.wire}; border-left: 3px solid; border-radius: 4px; padding: 12px; animation: fadeIn .2s ease; }
+.toast-title { font-size: 11px; font-weight: 700; color: ${COLORS.chalk}; }
+.toast-body { font-size: 10px; color: ${COLORS.mist}; margin-top: 3px; }
+
+.loading-screen { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: ${COLORS.ink}; }
+.spinner { width: 32px; height: 32px; border: 3px solid ${COLORS.wire}; border-top-color: ${COLORS.amber}; border-radius: 50%; animation: spin .8s linear infinite; }
+`;
+
+/* ---------- DATA LAYER (enums, state machine, address DB, geo helpers) ---------- */
+// src/data/constants.js
+// Enums, state machine, geo helpers, and the Cape Town address database.
+// This file is pure JS — ported byte-for-byte from the web app's
+// SECTION 1, 2, 4 (no DOM/CSS dependency existed there to begin with).
+
+const ROLE = Object.freeze({ ADMIN: "ADMIN", AGENT: "AGENT", DRIVER: "DRIVER" });
+
+const ADMIN_LEVEL = Object.freeze({ FLEET_OPS: "FLEET_OPS", STANDARD: "STANDARD", VIEWER: "VIEWER" });
+
+// Central permission table for the 3 admin sub-roles. Checked in BOTH the
+// UI (to hide controls) and inside handleSupabaseAction (to actually block
+// the write) — a hidden button is not security, since anyone with devtools
+// can still fire the underlying dispatch call directly.
+const ADMIN_PERMISSIONS = {
+  [ADMIN_LEVEL.FLEET_OPS]: {
+    viewUsers: true, manageAgentsDrivers: true, manageAdmins: true,
+    manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
+  },
+  [ADMIN_LEVEL.STANDARD]: {
+    viewUsers: true, manageAgentsDrivers: true, manageAdmins: false,
+    manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
+  },
+  [ADMIN_LEVEL.VIEWER]: {
+    // Viewer can see that a driver was ASSIGNED to a trip (name only,
+    // wherever trip records already show it) plus, in the Drivers tab,
+    // a reduced list of driver name + vehicle registration — but never
+    // the rest of the profile (phone, home address, live status, active
+    // route detail), and can never export data in any form.
+    // viewDriverProfiles gates that FULL profile view; the reduced
+    // name+vehicle list in AdminDrivers is deliberately available to
+    // Viewer (confirmed intended 2026-07-16), as is the driver name
+    // already embedded in trip records.
+    viewUsers: false, manageAgentsDrivers: false, manageAdmins: false,
+    manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: false,
+  },
+};
+
+// user is the app-shape user object (from userRowToApp) — anything that
+// isn't role=ADMIN is never granted admin permissions, and an admin with a
+// missing/unrecognized adminLevel is treated as VIEWER (fail-closed, not
+// fail-open) rather than silently getting full access.
+function hasAdminPermission(user, permission) {
+  if (!user || user.role !== ROLE.ADMIN) return false;
+  const level = ADMIN_PERMISSIONS[user.admin_level] ? user.admin_level : ADMIN_LEVEL.VIEWER;
+  return !!ADMIN_PERMISSIONS[level][permission];
+}
+
+// True only for a VIEWER-tier admin who has actually been assigned at
+// least one company to scope to — FLEET_OPS/STANDARD are never scoped
+// regardless of what's stored on scoped_company_ids (a level change back
+// up should restore full visibility without needing the field cleared
+// separately), and a Viewer with no companies assigned yet sees
+// everything, same as before this feature existed, rather than being
+// scoped to "nothing."
+function isCompanyScoped(user) {
+  return !!user && user.role === ROLE.ADMIN && user.admin_level === ADMIN_LEVEL.VIEWER && Array.isArray(user.scoped_company_ids) && user.scoped_company_ids.length > 0;
+}
+
+// Filters a user list down to: agents on any of the scoped companies,
+// PLUS every driver who has ever appeared on a trip with one of those
+// agents (a driver isn't "owned" by one company, so excluding drivers
+// entirely would hide the very people ferrying these companies' agents
+// around) — admins of any level are always included so the Users list
+// doesn't start hiding other admin accounts. Pass trips so driver
+// membership can be computed from real trip history rather than guessed.
+function scopeUsersToCompany(users, trips, companyIds) {
+  if (!companyIds?.length) return users;
+  const idSet = new Set(companyIds);
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  const relevantDriverIds = new Set(
+    trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+  );
+  return users.filter(u =>
+    u.role === ROLE.ADMIN ||
+    (u.role === ROLE.AGENT && scopedAgentIds.has(u.id)) ||
+    (u.role === ROLE.DRIVER && relevantDriverIds.has(u.id))
+  );
+}
+
+// Filters a trip list down to those involving at least one agent from
+// any of the scoped companies — checks agent_ids (covers multi-passenger
+// trips where the scoped agent is a passenger added later, not just the
+// original booker).
+function scopeTripsToCompany(trips, users, companyIds) {
+  if (!companyIds?.length) return trips;
+  const idSet = new Set(companyIds);
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  return trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id)));
+}
+
+// Tickets carry agent_id directly (filed by that agent, whether about
+// themselves or a trip), so this doesn't need the trip cross-reference
+// scopeTripsToCompany does — a simple membership check against the same
+// scoped-agent set.
+function scopeTicketsToCompany(tickets, users, companyIds) {
+  if (!companyIds?.length) return tickets;
+  const idSet = new Set(companyIds);
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  return tickets.filter(t => scopedAgentIds.has(t.agent_id));
+}
+
+// Admin notifications are broadcast-style (no for_user_ids), so scoping
+// means: does this notification's trip_id resolve to a trip that
+// involves a scoped agent? A handful of notification types (e.g. a
+// branch/company reassignment) carry no trip_id at all — those are left
+// visible rather than guessed at via message-text matching, which would
+// be fragile. This trades a small, non-sensitive amount of over-sharing
+// for not silently hiding a notification a Viewer genuinely should see.
+function scopeNotificationsToCompany(notifications, trips, users, companyIds) {
+  if (!companyIds?.length) return notifications;
+  const idSet = new Set(companyIds);
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  const scopedTripIds = new Set(trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.trip_id));
+  return notifications.filter(n => !n.trip_id || scopedTripIds.has(n.trip_id));
+}
+
+const TRIP_STATE = Object.freeze({
+  UNASSIGNED_BOOKING: "UNASSIGNED_BOOKING",
+  ASSIGNED:           "ASSIGNED",
+  DRIVER_CONFIRMED:   "DRIVER_CONFIRMED",
+  IN_TRANSIT:         "IN_TRANSIT",
+  ARCHIVED_COMPLETED: "ARCHIVED_COMPLETED",
+});
+
+const DRIVER_STATE = Object.freeze({ AVAILABLE: "AVAILABLE", BUSY: "BUSY" });
+
+const DRIVER_CAPACITY = 4;
+const CAPACITY_WARN_PCT = 0.75;
+
+// ── State machine ──
+const TRIP_TRANSITIONS = {
+  // NOTE: ASSIGNED is a reserved intermediate state — the current reducer
+  // (TRIP/ASSIGN_DRIVER) auto-confirms and jumps straight to DRIVER_CONFIRMED,
+  // so ASSIGNED is never actually produced today. Kept in the state machine
+  // and UI checks (StateBadge, active-trip filters) for forward compatibility
+  // if a manual "awaiting driver confirmation" step is reintroduced later.
+  [TRIP_STATE.UNASSIGNED_BOOKING]: [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED],
+  [TRIP_STATE.ASSIGNED]:           [TRIP_STATE.DRIVER_CONFIRMED],
+  [TRIP_STATE.DRIVER_CONFIRMED]:   [TRIP_STATE.IN_TRANSIT],
+  [TRIP_STATE.IN_TRANSIT]:         [TRIP_STATE.ARCHIVED_COMPLETED],
+  [TRIP_STATE.ARCHIVED_COMPLETED]: [],
+};
+
+function assertTripTransition(from, to) {
+  if (!TRIP_TRANSITIONS[from] || !TRIP_TRANSITIONS[from].includes(to)) {
+    throw new Error(`[SM] Trip: ${from} → ${to} ILLEGAL`);
+  }
+}
+
+// ── Company drop-off locations ──
+// NARROW ROLE NOW: this static array is used in exactly one place — as
+// the one-time seed data for INITIAL_STATE.companies below — and nowhere
+// else. Companies are now a dynamic, admin-managed list (see
+// ADMIN/CREATE_COMPANY etc.) stored in state.companies / the "companies"
+// Supabase table, each with a single address. Every other place that
+// used to read COMPANY_LOCATIONS directly now reads state.companies
+// instead — see companyById() and defaultCompanyAnchor() just below.
+const COMPANY_LOCATIONS = [
+  // Real street addresses confirmed 2026-07-12. lat/lng below are still the
+  // OLD suburb-center placeholders (Maitland/Woodstock general area) and
+  // have NOT yet been re-geocoded against these exact addresses — this
+  // sandbox has no network access to a geocoding service to verify precise
+  // coordinates. Waze navigation uses these lat/lng values directly, so
+  // they should be corrected before drivers rely on them for turn-by-turn
+  // navigation. See instructions below for the safest way to fix this.
+  // lat/lng verified 2026-07-12 directly via the app's own address search
+  // (Google Places/Nominatim) against the real street addresses below —
+  // replaces the earlier suburb-center placeholders that were sending
+  // Waze to Ndabeni instead of the actual buildings.
+  // lat/lng re-verified 2026-07-12 via a direct Google Maps pin right-click
+  // (the previous value landed in Pinelands, not Maitland — confirmed wrong
+  // by the user testing actual Waze navigation).
+  { id: "TELUS_MAITLAND",  label: "Telus Maitland",  address: "65 Voortrekker Road, Maitland, Cape Town, 7405",           lat: -33.924044419785275, lng: 18.477786638756267, area: "Maitland",  isCompany: true },
+  // Re-verified 2026-07-12 via direct Google Maps pin right-click — this
+  // one matched the prior value closely (~25m difference), confirming it
+  // was already correct; updated to the more precise figure regardless.
+  { id: "TELUS_WOODSTOCK", label: "Telus Woodstock", address: "108 Albert Road, Woodstock, Cape Town, 7925",              lat: -33.92669882560984, lng: 18.448095367592494, area: "Woodstock", isCompany: true },
+];
+
+// Looks up a company by id from the dynamic state.companies list and
+// returns it with convenience .address/.lat/.lng/.label fields flattened
+// onto the object.
+function companyById(state, id) {
+  const co = (state?.companies || []).find(c => c.id === id);
+  if (!co) return null;
+  const addr = co.address;
+  return { id: co.id, label: co.name, address: addr?.label, area: addr?.area, lat: addr?.lat, lng: addr?.lng, active: co.active };
+}
+
+// Generic starting-point anchor for route-sequencing math (buildPickupSequence's
+// driverStartCoord fallback, RECORD_ROUTE's default driver position, etc.) —
+// this was never about a specific agent's assigned company, just "some
+// sensible default depot" for when no better coordinate is known. Uses the
+// first active company's address, with a hardcoded Cape Town CBD fallback
+// so route math never breaks on an empty company list (e.g. right after
+// a fresh install, before any company has been added yet).
+function defaultCompanyAnchor(state) {
+  const co = (state?.companies || []).find(c => c.active !== false);
+  if (co?.address?.lat != null) return co.address;
+  return { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
+}
+
+// ── Cape Town address database ──
+const CPT_ADDRESS_DB = [
+  // ── CBD / City Bowl ──
+  { label: "Adderley Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9258, lng: 18.4232 },
+  { label: "Buitenkant Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9310, lng: 18.4255 },
+  { label: "Bree Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9235, lng: 18.4195 },
+  { label: "Loop Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9225, lng: 18.4188 },
+  { label: "Long Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9228, lng: 18.4192 },
+  { label: "Wale Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9218, lng: 18.4168 },
+  { label: "Strand Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9200, lng: 18.4215 },
+  { label: "Thibault Square, Cape Town CBD", area: "Cape Town CBD", lat: -33.9255, lng: 18.4250 },
+  { label: "Longmarket Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9245, lng: 18.4210 },
+  { label: "Shortmarket Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9240, lng: 18.4200 },
+  { label: "St Georges Mall, Cape Town CBD", area: "Cape Town CBD", lat: -33.9248, lng: 18.4228 },
+  { label: "Parliament Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9265, lng: 18.4238 },
+  { label: "Hout Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9230, lng: 18.4178 },
+  { label: "Burg Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9242, lng: 18.4222 },
+  { label: "Riebeeck Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9170, lng: 18.4225 },
+  { label: "Castle Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9265, lng: 18.4255 },
+  { label: "Darling Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9270, lng: 18.4245 },
+  { label: "Plein Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9275, lng: 18.4225 },
+  { label: "Roeland Street, Cape Town CBD", area: "Cape Town CBD", lat: -33.9300, lng: 18.4215 },
+  // ── Gardens / Tamboerskloof / Sea Point ──
+  { label: "Kloof Street, Gardens", area: "Gardens", lat: -33.9275, lng: 18.4182 },
+  { label: "Orange Street, Gardens", area: "Gardens", lat: -33.9295, lng: 18.4145 },
+  { label: "Government Avenue, Gardens", area: "Gardens", lat: -33.9285, lng: 18.4170 },
+  { label: "Hatfield Street, Gardens", area: "Gardens", lat: -33.9300, lng: 18.4150 },
+  { label: "Mill Street, Gardens", area: "Gardens", lat: -33.9320, lng: 18.4135 },
+  { label: "Annandale Road, Gardens", area: "Gardens", lat: -33.9340, lng: 18.4090 },
+  { label: "Upper Kloof Street, Tamboerskloof", area: "Tamboerskloof", lat: -33.9260, lng: 18.4170 },
+  { label: "Park Road, Tamboerskloof", area: "Tamboerskloof", lat: -33.9290, lng: 18.4090 },
+  { label: "Belvedere Avenue, Tamboerskloof", area: "Tamboerskloof", lat: -33.9320, lng: 18.4070 },
+  { label: "De Lorentz Street, Tamboerskloof", area: "Tamboerskloof", lat: -33.9300, lng: 18.4110 },
+  { label: "Camp Street, Tamboerskloof", area: "Tamboerskloof", lat: -33.9285, lng: 18.4145 },
+  { label: "Regent Road, Sea Point", area: "Sea Point", lat: -33.9102, lng: 18.3888 },
+  { label: "Main Road, Sea Point", area: "Sea Point", lat: -33.9115, lng: 18.3895 },
+  { label: "High Level Road, Sea Point", area: "Sea Point", lat: -33.9085, lng: 18.3860 },
+  { label: "Arthurs Road, Sea Point", area: "Sea Point", lat: -33.9145, lng: 18.3920 },
+  { label: "Queens Road, Sea Point", area: "Sea Point", lat: -33.9180, lng: 18.3870 },
+  { label: "Glengariff Road, Sea Point", area: "Sea Point", lat: -33.9120, lng: 18.3900 },
+  { label: "Church Street, Sea Point", area: "Sea Point", lat: -33.9160, lng: 18.3930 },
+  { label: "Springbok Road, Three Anchor Bay", area: "Three Anchor Bay", lat: -33.9080, lng: 18.3960 },
+  // ── Green Point / De Waterkant / Mouille Point ──
+  { label: "Somerset Road, Green Point", area: "Green Point", lat: -33.9055, lng: 18.4065 },
+  { label: "Main Road, Green Point", area: "Green Point", lat: -33.9075, lng: 18.4020 },
+  { label: "Three Anchor Bay Road, Green Point", area: "Green Point", lat: -33.9090, lng: 18.3990 },
+  { label: "Fritz Sonnenberg Road, Green Point", area: "Green Point", lat: -33.9060, lng: 18.4045 },
+  { label: "Hudson Street, De Waterkant", area: "De Waterkant", lat: -33.9190, lng: 18.4185 },
+  { label: "Waterkant Street, De Waterkant", area: "De Waterkant", lat: -33.9195, lng: 18.4192 },
+  { label: "Beach Road, Mouille Point", area: "Mouille Point", lat: -33.9020, lng: 18.4020 },
+  // ── Bo-Kaap ──
+  { label: "Wale Street, Bo-Kaap", area: "Bo-Kaap", lat: -33.9215, lng: 18.4128 },
+  { label: "Chiappini Street, Bo-Kaap", area: "Bo-Kaap", lat: -33.9210, lng: 18.4118 },
+  // ── Woodstock ──
+  { label: "Victoria Road, Woodstock", area: "Woodstock", lat: -33.9238, lng: 18.4435 },
+  { label: "Albert Road, Woodstock", area: "Woodstock", lat: -33.9242, lng: 18.4468 },
+  { label: "Sir Lowry Road, Woodstock", area: "Woodstock", lat: -33.9255, lng: 18.4390 },
+  { label: "Prince George Drive, Woodstock", area: "Woodstock", lat: -33.9260, lng: 18.4420 },
+  { label: "Broadway, Woodstock", area: "Woodstock", lat: -33.9245, lng: 18.4455 },
+  { label: "Roger Street, Woodstock", area: "Woodstock", lat: -33.9250, lng: 18.4480 },
+  { label: "Tennant Street, Woodstock", area: "Woodstock", lat: -33.9220, lng: 18.4460 },
+  { label: "Chapel Street, Woodstock", area: "Woodstock", lat: -33.9265, lng: 18.4445 },
+  { label: "Aberdeen Street, Woodstock", area: "Woodstock", lat: -33.9255, lng: 18.4470 },
+  // ── Salt River ──
+  { label: "Lower Main Road, Salt River", area: "Salt River", lat: -33.9302, lng: 18.4793 },
+  { label: "Upper Durban Road, Salt River", area: "Salt River", lat: -33.9295, lng: 18.4810 },
+  { label: "Malta Road, Salt River", area: "Salt River", lat: -33.9315, lng: 18.4800 },
+  { label: "Durham Avenue, Salt River", area: "Salt River", lat: -33.9310, lng: 18.4815 },
+  { label: "Voortrekker Road, Salt River", area: "Salt River", lat: -33.9280, lng: 18.4830 },
+  { label: "Foundry Road, Salt River", area: "Salt River", lat: -33.9320, lng: 18.4790 },
+  { label: "Imam Haron Road, Salt River", area: "Salt River", lat: -33.9290, lng: 18.4805 },
+  // ── Observatory ──
+  { label: "Lower Main Road, Observatory", area: "Observatory", lat: -33.9380, lng: 18.4718 },
+  { label: "Main Road, Observatory", area: "Observatory", lat: -33.9400, lng: 18.4710 },
+  { label: "Station Road, Observatory", area: "Observatory", lat: -33.9392, lng: 18.4725 },
+  { label: "Trill Road, Observatory", area: "Observatory", lat: -33.9405, lng: 18.4735 },
+  { label: "Nuttall Road, Observatory", area: "Observatory", lat: -33.9385, lng: 18.4700 },
+  { label: "Chapel Street, Observatory", area: "Observatory", lat: -33.9410, lng: 18.4715 },
+  { label: "Anson Street, Observatory", area: "Observatory", lat: -33.9395, lng: 18.4730 },
+  { label: "Milner Road, Observatory", area: "Observatory", lat: -33.9420, lng: 18.4690 },
+  // ── Mowbray / Rosebank ──
+  { label: "Main Road, Mowbray", area: "Mowbray", lat: -33.9510, lng: 18.4740 },
+  { label: "Durban Road, Mowbray", area: "Mowbray", lat: -33.9498, lng: 18.4750 },
+  { label: "Forest Road, Mowbray", area: "Mowbray", lat: -33.9490, lng: 18.4760 },
+  { label: "St Andrews Road, Mowbray", area: "Mowbray", lat: -33.9520, lng: 18.4720 },
+  { label: "Liesbeek Parkway, Rosebank", area: "Rosebank", lat: -33.9540, lng: 18.4690 },
+  // ── Rondebosch ──
+  { label: "Main Road, Rondebosch", area: "Rondebosch", lat: -33.9600, lng: 18.4730 },
+  { label: "High Street, Rondebosch", area: "Rondebosch", lat: -33.9590, lng: 18.4718 },
+  { label: "Campground Road, Rondebosch", area: "Rondebosch", lat: -33.9605, lng: 18.4745 },
+  { label: "Belmont Road, Rondebosch", area: "Rondebosch", lat: -33.9620, lng: 18.4700 },
+  { label: "Lower Campground Road, Rondebosch", area: "Rondebosch", lat: -33.9610, lng: 18.4750 },
+  { label: "Klipfontein Road, Rondebosch", area: "Rondebosch", lat: -33.9580, lng: 18.4830 },
+  // ── Newlands ──
+  { label: "Newlands Avenue, Newlands", area: "Newlands", lat: -33.9700, lng: 18.4640 },
+  { label: "Dean Street, Newlands", area: "Newlands", lat: -33.9715, lng: 18.4658 },
+  { label: "Sandown Road, Newlands", area: "Newlands", lat: -33.9730, lng: 18.4620 },
+  { label: "Kildare Road, Newlands", area: "Newlands", lat: -33.9690, lng: 18.4670 },
+  // ── Claremont ──
+  { label: "Main Road, Claremont", area: "Claremont", lat: -33.9858, lng: 18.4651 },
+  { label: "Grove Avenue, Claremont", area: "Claremont", lat: -33.9845, lng: 18.4635 },
+  { label: "Protea Road, Claremont", area: "Claremont", lat: -33.9862, lng: 18.4665 },
+  { label: "Rosmead Avenue, Claremont", area: "Claremont", lat: -33.9848, lng: 18.4648 },
+  { label: "Lansdowne Road, Claremont", area: "Claremont", lat: -33.9870, lng: 18.4690 },
+  { label: "Dreyer Street, Claremont", area: "Claremont", lat: -33.9830, lng: 18.4640 },
+  { label: "Aurora Street, Claremont", area: "Claremont", lat: -33.9855, lng: 18.4670 },
+  { label: "Wilton Road, Claremont", area: "Claremont", lat: -33.9840, lng: 18.4655 },
+  // ── Kenilworth ──
+  { label: "Main Road, Kenilworth", area: "Kenilworth", lat: -33.9820, lng: 18.4750 },
+  { label: "Rosmead Avenue, Kenilworth", area: "Kenilworth", lat: -33.9830, lng: 18.4762 },
+  { label: "Heath Road, Kenilworth", area: "Kenilworth", lat: -33.9850, lng: 18.4775 },
+  { label: "Royal Road, Kenilworth", area: "Kenilworth", lat: -33.9805, lng: 18.4730 },
+  // ── Wynberg ──
+  { label: "Main Road, Wynberg", area: "Wynberg", lat: -33.9958, lng: 18.4673 },
+  { label: "Church Street, Wynberg", area: "Wynberg", lat: -33.9952, lng: 18.4665 },
+  { label: "Wetton Road, Wynberg", area: "Wynberg", lat: -33.9942, lng: 18.4680 },
+  { label: "Wolfe Street, Wynberg", area: "Wynberg", lat: -33.9975, lng: 18.4690 },
+  { label: "Brodie Road, Wynberg", area: "Wynberg", lat: -33.9930, lng: 18.4650 },
+  // ── Plumstead / Southfield / Diep River ──
+  { label: "Wetton Road, Plumstead", area: "Plumstead", lat: -34.0000, lng: 18.4780 },
+  { label: "Main Road, Plumstead", area: "Plumstead", lat: -34.0030, lng: 18.4760 },
+  { label: "Victoria Road, Plumstead", area: "Plumstead", lat: -34.0050, lng: 18.4790 },
+  { label: "Southfield Road, Southfield", area: "Southfield", lat: -33.9950, lng: 18.5000 },
+  { label: "Main Road, Diep River", area: "Diep River", lat: -34.0220, lng: 18.4640 },
+  { label: "Belvedere Road, Diep River", area: "Diep River", lat: -34.0250, lng: 18.4660 },
+  // ── Pinelands ──
+  { label: "Howard Drive, Pinelands", area: "Pinelands", lat: -33.9302, lng: 18.5050 },
+  { label: "Jan Smuts Drive, Pinelands", area: "Pinelands", lat: -33.9310, lng: 18.5065 },
+  { label: "Wilfred Street, Pinelands", area: "Pinelands", lat: -33.9318, lng: 18.5042 },
+  { label: "Forest Drive, Pinelands", area: "Pinelands", lat: -33.9340, lng: 18.5080 },
+  { label: "Central Square, Pinelands", area: "Pinelands", lat: -33.9355, lng: 18.5025 },
+  // ── Maitland ──
+  { label: "Voortrekker Road, Maitland", area: "Maitland", lat: -33.9320, lng: 18.5000 },
+  { label: "Howard Drive, Maitland", area: "Maitland", lat: -33.9315, lng: 18.5018 },
+  { label: "Albert Road, Maitland", area: "Maitland", lat: -33.9290, lng: 18.4990 },
+  // ── Goodwood / Parow ──
+  { label: "Voortrekker Road, Goodwood", area: "Goodwood", lat: -33.9050, lng: 18.5500 },
+  { label: "Vasco Boulevard, Goodwood", area: "Goodwood", lat: -33.9080, lng: 18.5480 },
+  { label: "Uitsig Road, Goodwood", area: "Goodwood", lat: -33.9020, lng: 18.5540 },
+  { label: "Voortrekker Road, Parow", area: "Parow", lat: -33.9020, lng: 18.5850 },
+  { label: "Station Road, Parow", area: "Parow", lat: -33.9015, lng: 18.5840 },
+  { label: "Tallent Street, Parow", area: "Parow", lat: -33.9070, lng: 18.5890 },
+  { label: "Hugo Street, Parow", area: "Parow", lat: -33.9000, lng: 18.5870 },
+  // ── Bellville ──
+  { label: "Voortrekker Road, Bellville", area: "Bellville", lat: -33.9000, lng: 18.6300 },
+  { label: "Jip de Jager Drive, Bellville", area: "Bellville", lat: -33.8980, lng: 18.6288 },
+  { label: "Dr Hertzog Boulevard, Bellville", area: "Bellville", lat: -33.9010, lng: 18.6315 },
+  { label: "Kasselsvlei Road, Bellville", area: "Bellville", lat: -33.8988, lng: 18.6275 },
+  { label: "Main Road, Bellville", area: "Bellville", lat: -33.9008, lng: 18.6298 },
+  { label: "Edward Street, Bellville", area: "Bellville", lat: -33.8995, lng: 18.6320 },
+  { label: "Carl Cronje Drive, Bellville", area: "Bellville", lat: -33.8920, lng: 18.6260 },
+  { label: "Tyger Valley Road, Bellville", area: "Bellville", lat: -33.8730, lng: 18.6260 },
+  { label: "Old Oak Road, Bellville", area: "Bellville", lat: -33.8960, lng: 18.6180 },
+  // ── Athlone / Belgravia / Crawford ──
+  { label: "Klipfontein Road, Athlone", area: "Athlone", lat: -33.9620, lng: 18.5150 },
+  { label: "Belgravia Road, Athlone", area: "Athlone", lat: -33.9605, lng: 18.5138 },
+  { label: "Repulse Road, Athlone", area: "Athlone", lat: -33.9590, lng: 18.5100 },
+  { label: "Belgravia Road, Crawford", area: "Crawford", lat: -33.9700, lng: 18.4995 },
+  { label: "Klipfontein Road, Crawford", area: "Crawford", lat: -33.9690, lng: 18.4960 },
+  // ── Mitchells Plain ──
+  { label: "Spine Road, Mitchells Plain", area: "Mitchells Plain", lat: -34.0306, lng: 18.6244 },
+  { label: "Freedom Way, Mitchells Plain", area: "Mitchells Plain", lat: -34.0295, lng: 18.6230 },
+  { label: "Tafelsig Road, Mitchells Plain", area: "Mitchells Plain", lat: -34.0315, lng: 18.6258 },
+  { label: "Robert Sobukwe Road, Mitchells Plain", area: "Mitchells Plain", lat: -34.0302, lng: 18.6210 },
+  { label: "Highlands Drive, Mitchells Plain", area: "Mitchells Plain", lat: -34.0380, lng: 18.6280 },
+  { label: "Vanguard Drive, Mitchells Plain", area: "Mitchells Plain", lat: -34.0210, lng: 18.6090 },
+  { label: "Eisleben Road, Mitchells Plain", area: "Mitchells Plain", lat: -34.0290, lng: 18.6220 },
+  { label: "Merrydale Avenue, Mitchells Plain", area: "Mitchells Plain", lat: -34.0330, lng: 18.6160 },
+  { label: "AZ Berman Drive, Mitchells Plain", area: "Mitchells Plain", lat: -34.0260, lng: 18.6190 },
+  { label: "Weltevreden Road, Mitchells Plain", area: "Mitchells Plain", lat: -34.0340, lng: 18.6330 },
+  // ── Khayelitsha ──
+  { label: "Spine Road, Khayelitsha", area: "Khayelitsha", lat: -34.0414, lng: 18.6619 },
+  { label: "Mew Way, Khayelitsha", area: "Khayelitsha", lat: -34.0420, lng: 18.6628 },
+  { label: "Lansdowne Road, Khayelitsha", area: "Khayelitsha", lat: -34.0380, lng: 18.6720 },
+  { label: "Steve Biko Road, Khayelitsha", area: "Khayelitsha", lat: -34.0460, lng: 18.6700 },
+  { label: "Walter Sisulu Road, Khayelitsha", area: "Khayelitsha", lat: -34.0500, lng: 18.6750 },
+  { label: "Ntlazane Street, Khayelitsha", area: "Khayelitsha", lat: -34.0440, lng: 18.6690 },
+  { label: "Japhta Masemola Road, Khayelitsha", area: "Khayelitsha", lat: -34.0470, lng: 18.6730 },
+  // ── Milnerton / Table View / Blouberg ──
+  { label: "Otto Du Plessis Drive, Blouberg", area: "Blouberg", lat: -33.8070, lng: 18.4870 },
+  { label: "Blaauwberg Road, Table View", area: "Table View", lat: -33.8270, lng: 18.4910 },
+  { label: "Table View Main Road, Table View", area: "Table View", lat: -33.8260, lng: 18.4900 },
+  { label: "Milnerton Road, Milnerton", area: "Milnerton", lat: -33.8680, lng: 18.4970 },
+  { label: "Morningstar Drive, Milnerton", area: "Milnerton", lat: -33.8692, lng: 18.4985 },
+  { label: "Bosmansdam Road, Milnerton", area: "Milnerton", lat: -33.8730, lng: 18.5040 },
+  { label: "Royal Ascot Boulevard, Milnerton", area: "Milnerton", lat: -33.8650, lng: 18.5070 },
+  { label: "Link Road, Table View", area: "Table View", lat: -33.8240, lng: 18.4870 },
+  { label: "Marine Circle, Table View", area: "Table View", lat: -33.8210, lng: 18.4920 },
+  // ── Stellenbosch ──
+  { label: "Church Street, Stellenbosch", area: "Stellenbosch", lat: -33.9325, lng: 18.8651 },
+  { label: "Main Road, Stellenbosch", area: "Stellenbosch", lat: -33.9318, lng: 18.8640 },
+  { label: "Dorp Street, Stellenbosch", area: "Stellenbosch", lat: -33.9355, lng: 18.8605 },
+  { label: "Bird Street, Stellenbosch", area: "Stellenbosch", lat: -33.9340, lng: 18.8625 },
+  { label: "Andringa Street, Stellenbosch", area: "Stellenbosch", lat: -33.9365, lng: 18.8615 },
+  { label: "Merriman Avenue, Stellenbosch", area: "Stellenbosch", lat: -33.9395, lng: 18.8580 },
+  // ── Airport / Industria ──
+  { label: "Modderdam Road, Airport Industria", area: "Airport Industria", lat: -33.9681, lng: 18.5942 },
+  { label: "Airport Approach Road, Cape Town", area: "Airport Industria", lat: -33.9700, lng: 18.5958 },
+  { label: "Bofors Circle, Epping Industria", area: "Epping Industria", lat: -33.9290, lng: 18.5290 },
+  { label: "Epping Avenue, Epping", area: "Epping", lat: -33.9320, lng: 18.5320 },
+  { label: "Ndabeni Road, Ndabeni", area: "Ndabeni", lat: -33.9210, lng: 18.5180 },
+  { label: "Koeberg Road, Brooklyn", area: "Brooklyn", lat: -33.8980, lng: 18.4880 },
+  // ── Muizenberg / Kalk Bay / Fish Hoek / Simon's Town ──
+  { label: "Main Road, Muizenberg", area: "Muizenberg", lat: -34.1060, lng: 18.4720 },
+  { label: "Main Road, Kalk Bay", area: "Kalk Bay", lat: -34.1300, lng: 18.4500 },
+  { label: "Church Street, Kalk Bay", area: "Kalk Bay", lat: -34.1292, lng: 18.4490 },
+  { label: "Main Road, Fish Hoek", area: "Fish Hoek", lat: -34.1370, lng: 18.4310 },
+  { label: "St Georges Street, Simon's Town", area: "Simon's Town", lat: -34.1930, lng: 18.4380 },
+  { label: "Main Road, Simon's Town", area: "Simon's Town", lat: -34.1925, lng: 18.4360 },
+  // ── Hout Bay / Constantia ──
+  { label: "Main Road, Hout Bay", area: "Hout Bay", lat: -34.0420, lng: 18.3530 },
+  { label: "Disa River Road, Hout Bay", area: "Hout Bay", lat: -34.0398, lng: 18.3548 },
+  { label: "Constantia Main Road, Constantia", area: "Constantia", lat: -34.0250, lng: 18.4280 },
+  { label: "Spaanschemat River Road, Constantia", area: "Constantia", lat: -34.0210, lng: 18.4220 },
+  // ── Camps Bay / Bantry Bay / Clifton ──
+  { label: "Victoria Road, Camps Bay", area: "Camps Bay", lat: -33.9525, lng: 18.3775 },
+  { label: "Camps Bay Drive, Camps Bay", area: "Camps Bay", lat: -33.9520, lng: 18.3790 },
+  { label: "The Glen, Camps Bay", area: "Camps Bay", lat: -33.9510, lng: 18.3805 },
+  { label: "Theresa Avenue, Camps Bay", area: "Camps Bay", lat: -33.9540, lng: 18.3815 },
+  { label: "Kloof Road, Bantry Bay", area: "Bantry Bay", lat: -33.9210, lng: 18.3815 },
+  { label: "Victoria Road, Clifton", area: "Clifton", lat: -33.9390, lng: 18.3760 },
+  // ── Lansdowne / Hanover Park / Crawford ──
+  { label: "Lansdowne Road, Lansdowne", area: "Lansdowne", lat: -33.9760, lng: 18.4980 },
+  { label: "Wetton Road, Lansdowne", area: "Lansdowne", lat: -33.9790, lng: 18.4940 },
+  { label: "Ferndale Road, Lansdowne", area: "Lansdowne", lat: -33.9740, lng: 18.4920 },
+  { label: "Hanover Park Avenue, Hanover Park", area: "Hanover Park", lat: -34.0010, lng: 18.5320 },
+  // ── Lavender Hill / Retreat / Steenberg / Tokai / Bergvliet ──
+  { label: "Steenberg Road, Steenberg", area: "Steenberg", lat: -34.0610, lng: 18.4500 },
+  { label: "Main Road, Retreat", area: "Retreat", lat: -34.0440, lng: 18.4730 },
+  { label: "Prince George Drive, Lavender Hill", area: "Lavender Hill", lat: -34.0680, lng: 18.4670 },
+  { label: "Ladies Mile Road, Bergvliet", area: "Bergvliet", lat: -34.0330, lng: 18.4570 },
+  { label: "Tokai Road, Tokai", area: "Tokai", lat: -34.0480, lng: 18.4290 },
+  // ── Philippi / Lentegeur / Strandfontein ──
+  { label: "Lansdowne Road, Philippi", area: "Philippi", lat: -34.0080, lng: 18.5800 },
+  { label: "AZ Berman Drive, Philippi", area: "Philippi", lat: -34.0120, lng: 18.5760 },
+  { label: "Cape Flats Road, Strandfontein", area: "Strandfontein", lat: -34.0820, lng: 18.5790 },
+  { label: "Spine Road, Lentegeur", area: "Lentegeur", lat: -34.0250, lng: 18.6390 },
+  // ── Gugulethu / Nyanga ──
+  { label: "NY1 Road, Gugulethu", area: "Gugulethu", lat: -33.9750, lng: 18.5780 },
+  { label: "Lansdowne Road, Nyanga", area: "Nyanga", lat: -33.9990, lng: 18.5860 },
+  { label: "Vanguard Drive, Nyanga", area: "Nyanga", lat: -33.9920, lng: 18.5800 },
+  // ── Delft / Blue Downs / Eerste River ──
+  { label: "Symphony Way, Delft", area: "Delft", lat: -33.9700, lng: 18.6400 },
+  { label: "Stellenbosch Arterial, Blue Downs", area: "Blue Downs", lat: -33.9590, lng: 18.7080 },
+  { label: "Old Faure Road, Eerste River", area: "Eerste River", lat: -33.8550, lng: 18.7280 },
+  // ── Brackenfell / Kraaifontein / Kuils River ──
+  { label: "Old Paarl Road, Brackenfell", area: "Brackenfell", lat: -33.8770, lng: 18.6750 },
+  { label: "De Bron Road, Brackenfell", area: "Brackenfell", lat: -33.8800, lng: 18.6790 },
+  { label: "Brighton Road, Kraaifontein", area: "Kraaifontein", lat: -33.8420, lng: 18.6700 },
+  { label: "Protea Road, Kraaifontein", area: "Kraaifontein", lat: -33.8460, lng: 18.6660 },
+  { label: "Van Riebeeck Road, Kuils River", area: "Kuils River", lat: -33.9420, lng: 18.6850 },
+  // ── Durbanville ──
+  { label: "Wellington Road, Durbanville", area: "Durbanville", lat: -33.8290, lng: 18.6500 },
+  { label: "Durban Road, Durbanville", area: "Durbanville", lat: -33.8310, lng: 18.6480 },
+  { label: "Florida Road, Durbanville", area: "Durbanville", lat: -33.8320, lng: 18.6540 },
+  { label: "School Street, Durbanville", area: "Durbanville", lat: -33.8295, lng: 18.6510 },
+  // ── Edgemead / Bothasig / Panorama / Plattekloof ──
+  { label: "Edgemead Drive, Edgemead", area: "Edgemead", lat: -33.8770, lng: 18.5640 },
+  { label: "Frans Conradie Drive, Bothasig", area: "Bothasig", lat: -33.8650, lng: 18.5560 },
+  { label: "Connaught Road, Bothasig", area: "Bothasig", lat: -33.8680, lng: 18.5590 },
+  { label: "Panorama Drive, Panorama", area: "Panorama", lat: -33.8650, lng: 18.5780 },
+  { label: "Plattekloof Road, Plattekloof", area: "Plattekloof", lat: -33.8820, lng: 18.5840 },
+  // ── Century City / Montague Gardens ──
+  { label: "Century Boulevard, Century City", area: "Century City", lat: -33.8920, lng: 18.5180 },
+  { label: "Marine Drive, Montague Gardens", area: "Montague Gardens", lat: -33.8730, lng: 18.5320 },
+  // ── Vredehoek / Walmer Estate ──
+  { label: "Upper Buitenkant Street, Vredehoek", area: "Vredehoek", lat: -33.9420, lng: 18.4180 },
+  { label: "Springbok Road, Walmer Estate", area: "Walmer Estate", lat: -33.9350, lng: 18.4420 },
+  // ── Rondebosch East / Heideveld / Manenberg ──
+  { label: "Jan Smuts Drive, Rondebosch East", area: "Rondebosch East", lat: -33.9650, lng: 18.5050 },
+  { label: "Duinefontein Road, Heideveld", area: "Heideveld", lat: -33.9740, lng: 18.5430 },
+  { label: "Manenberg Avenue, Manenberg", area: "Manenberg", lat: -33.9780, lng: 18.5570 },
+  // ── Elsies River / Bishop Lavis / Valhalla Park ──
+  { label: "Halt Road, Elsies River", area: "Elsies River", lat: -33.9290, lng: 18.5780 },
+  { label: "Symphony Way, Bishop Lavis", area: "Bishop Lavis", lat: -33.9430, lng: 18.5870 },
+  { label: "Valhalla Drive, Valhalla Park", area: "Valhalla Park", lat: -33.9460, lng: 18.5950 },
+  // ── Ottery / Grassy Park ──
+  { label: "Ottery Road, Ottery", area: "Ottery", lat: -34.0000, lng: 18.5040 },
+  { label: "Prince George Drive, Grassy Park", area: "Grassy Park", lat: -34.0440, lng: 18.5050 },
+  // ── Vrygrond / Capricorn / Marina Da Gama ──
+  { label: "Baden Powell Drive, Vrygrond", area: "Vrygrond", lat: -34.0820, lng: 18.4570 },
+  { label: "Military Road, Capricorn", area: "Capricorn", lat: -34.0900, lng: 18.4550 },
+  { label: "Marina Da Gama Boulevard, Marina Da Gama", area: "Marina Da Gama", lat: -34.1010, lng: 18.4660 },
+  // ── Joe Slovo / Dunoon / Atlantis ──
+  { label: "Phola Park Road, Joe Slovo", area: "Joe Slovo", lat: -33.8950, lng: 18.5160 },
+  { label: "Sandown Road, Dunoon", area: "Dunoon", lat: -33.8120, lng: 18.5160 },
+  { label: "Beach Road, Atlantis", area: "Atlantis", lat: -33.5700, lng: 18.4920 },
+  // ── Melkbosstrand / Sunningdale / Big Bay ──
+  { label: "Otto Du Plessis Drive, Melkbosstrand", area: "Melkbosstrand", lat: -33.7250, lng: 18.4380 },
+  { label: "Sunningdale Drive, Sunningdale", area: "Sunningdale", lat: -33.8030, lng: 18.4940 },
+  { label: "Doncaster Road, Big Bay", area: "Big Bay", lat: -33.7700, lng: 18.4500 },
+  // ── Belhar / Bonteheuwel / Langa ──
+  { label: "Robert Sobukwe Road, Belhar", area: "Belhar", lat: -33.9320, lng: 18.6310 },
+  { label: "Bonteheuwel Avenue, Bonteheuwel", area: "Bonteheuwel", lat: -33.9540, lng: 18.5500 },
+  { label: "Washington Street, Langa", area: "Langa", lat: -33.9430, lng: 18.5300 },
+  // ── Parklands / Sunset Beach ──
+  { label: "Sandown Road, Parklands", area: "Parklands", lat: -33.8170, lng: 18.4940 },
+  { label: "Marine Drive, Sunset Beach", area: "Sunset Beach", lat: -33.7980, lng: 18.4790 },
+  // ── Woodbridge Island / Royal Cape ──
+  { label: "Woodbridge Island Road, Woodbridge Island", area: "Woodbridge Island", lat: -33.8870, lng: 18.4800 },
+  { label: "Klipfontein Road, Royal Cape", area: "Royal Cape", lat: -33.9710, lng: 18.4880 },
+  // ── Welgemoed / Loevenstein ──
+  { label: "De Tyger Drive, Welgemoed", area: "Welgemoed", lat: -33.8900, lng: 18.6100 },
+  { label: "Loevenstein Road, Loevenstein", area: "Loevenstein", lat: -33.8840, lng: 18.6020 },
+  // ── Strand / Somerset West / Paarl ──
+  { label: "Beach Road, Strand", area: "Strand", lat: -34.1175, lng: 18.8340 },
+  { label: "Main Road, Somerset West", area: "Somerset West", lat: -34.0790, lng: 18.8420 },
+  { label: "Lourensford Road, Somerset West", area: "Somerset West", lat: -34.0850, lng: 18.8500 },
+  { label: "Main Street, Paarl", area: "Paarl", lat: -33.7290, lng: 18.9620 },
+  { label: "Lady Grey Street, Paarl", area: "Paarl", lat: -33.7320, lng: 18.9650 },
+];
+
+function coordForArea(areaName) {
+  const entry = CPT_ADDRESS_DB.find(a => a.area === areaName);
+  if (entry) return { lat: entry.lat, lng: entry.lng };
+  return { lat: -33.9249, lng: 18.4241 };
+}
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Turns a stored "YYYY/MM/DD" scheduled_date into a clear, scannable
+// label for a driver's trip card — "TODAY", "TOMORROW", or "Wed, Jul 22"
+// for anything further out. Built for exactly this: a driver assigned to
+// several days of one agent's week booking (see TRIP/BULK_ASSIGN_DRIVER)
+// previously had no way to tell which trip CARD corresponded to which
+// DAY, since nothing on the card showed a date at all. Parses the
+// slash-format date using explicit year/month/day components (not
+// new Date(dateStr) on the raw string) so there's no ambiguity about
+// which timezone the string gets interpreted in — the components are
+// used directly, local calendar date to local calendar date.
+// A person's booking only becomes a "trip" once a driver is actually
+// assigned to it — before that (UNASSIGNED_BOOKING) it's still just a
+// booking, per explicit product decision. Used everywhere user-facing
+// text names a SPECIFIC trip object whose state is known, so the label
+// always matches reality instead of calling every booking a "trip"
+// regardless of whether a driver has ever touched it.
+function tripNoun(trip) {
+  return trip?.state === TRIP_STATE.UNASSIGNED_BOOKING ? "booking" : "trip";
+}
+function tripNounCap(trip) {
+  const n = tripNoun(trip);
+  return n.charAt(0).toUpperCase() + n.slice(1);
+}
+
+function formatTripDateForDriver(dateStr) {
+  if (!dateStr) return "—";
+  const [y, m, d] = dateStr.split("/").map(Number);
+  if (!y || !m || !d) return dateStr;
+  const tripDate = new Date(y, m - 1, d);
+  const today = new Date();
+  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const diffDays = Math.round((tripDate - todayMidnight) / 86400000);
+  if (diffDays === 0) return "TODAY";
+  if (diffDays === 1) return "TOMORROW";
+  return tripDate.toLocaleDateString("en-ZA", { weekday: "short", month: "short", day: "numeric" });
+}
+
+// Counts DISTINCT CALENDAR DATES across a set of trips, not trip rows.
+// A week booking WITH a return leg creates TWO trip rows per day
+// (outbound + return, sharing the same scheduled_date and week_day_num
+// — see AgentBookTab's week-booking loop) — a return trip is still the
+// same day's commute, not a second day. Anywhere the admin sees "N days"
+// for a week-booking selection should count this, not selectedTrips.length,
+// or a 6-day week with return trips every day would show as "12 days."
+function distinctWeekDays(trips) {
+  return new Set(trips.map(t => t.scheduled_date)).size;
+}
+
+// Builds the FULL optimized route for a driver with one or more active
+// trips: starting from wherever the driver currently is, greedily visits
+// the nearest remaining pickup each step until all pickups are done, then
+// does the same for drop-offs. This is what "quickest route from the
+// driver's position, through the pickups, to the drop-offs" means in
+// practice — a classic nearest-neighbour heuristic, not a full TSP solve
+// (which would be overkill for a handful of stops and isn't guaranteed to
+// be meaningfully better for this use case).
+//
+// Returns { pickupOrder, dropoffOrder, legs, totalRoadKm } where legs is
+// the ordered list of individual point-to-point distances (each already
+// road-factored via ROAD_FACTOR) that sum to totalRoadKm — this is the
+// real "start to finish" route distance, distinct from est_distance_km on
+// each trip (which is just that one trip's own pickup-to-dropoff line).
+const ROAD_FACTOR = 1.35; // same straight-line-to-road approximation used elsewhere in the app
+
+function computeOptimalRoute(trips, driverCurrentCoord) {
+  // Last-resort fallback only — the caller (TRIP/RECORD_ROUTE) always
+  // resolves and passes a real coordinate first. No `state` available
+  // here (this runs inside the Supabase action handler on an
+  // already-extracted coord), so this uses the same hardcoded Cape Town
+  // CBD point defaultCompanyAnchor() falls back to, rather than adding a
+  // state dependency to an otherwise-pure route-math function.
+  const start = driverCurrentCoord || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
+  const legs = [];
+  let cur = start;
+  let totalKm = 0;
+
+  // Every individual pickup point across every trip (a multi-passenger
+  // trip contributes one entry per agent, not one per trip) — matches
+  // the same [...first, ...extra] pattern used elsewhere in the app for
+  // multi-passenger pickup sequencing.
+  let remainingPickups = [];
+  trips.forEach(t => {
+    (t.pickup_sequence_coords || []).forEach(p => {
+      remainingPickups.push({ trip_id: t.trip_id, agent_id: p.agent_id, coord: p, kind: "pickup" });
+    });
+  });
+
+  const pickupOrder = [];
+  while (remainingPickups.length) {
+    let best = null, bestIdx = -1, bestDist = Infinity;
+    remainingPickups.forEach((p, i) => {
+      const d = haversineKm(cur.lat, cur.lng, p.coord.lat, p.coord.lng);
+      if (d < bestDist) { bestDist = d; best = p; bestIdx = i; }
+    });
+    const roadKm = bestDist * ROAD_FACTOR;
+    legs.push({ from: cur, to: best.coord, km: roadKm, kind: "pickup", trip_id: best.trip_id, agent_id: best.agent_id });
+    totalKm += roadKm;
+    cur = best.coord;
+    pickupOrder.push(best);
+    remainingPickups.splice(bestIdx, 1);
+  }
+
+  // Same nearest-neighbour approach for drop-offs, continuing from
+  // wherever the last pickup left off — this is what actually answers
+  // "then to the drop-offs" as one continuous route rather than treating
+  // drop-off ordering as a separate, disconnected problem.
+  let remainingDropoffs = [];
+  trips.forEach(t => {
+    (t.dropoff_sequence_coords || []).forEach(d => {
+      remainingDropoffs.push({ trip_id: t.trip_id, coord: d, kind: "dropoff" });
+    });
+  });
+
+  const dropoffOrder = [];
+  while (remainingDropoffs.length) {
+    let best = null, bestIdx = -1, bestDist = Infinity;
+    remainingDropoffs.forEach((d, i) => {
+      const dist = haversineKm(cur.lat, cur.lng, d.coord.lat, d.coord.lng);
+      if (dist < bestDist) { bestDist = dist; best = d; bestIdx = i; }
+    });
+    const roadKm = bestDist * ROAD_FACTOR;
+    legs.push({ from: cur, to: best.coord, km: roadKm, kind: "dropoff", trip_id: best.trip_id });
+    totalKm += roadKm;
+    cur = best.coord;
+    dropoffOrder.push(best);
+    remainingDropoffs.splice(bestIdx, 1);
+  }
+
+  return { pickupOrder, dropoffOrder, legs, totalRoadKm: totalKm };
+}
+
+function buildPickupSequence(trips, driverStartCoord) {
+  // Last-resort fallback only — every real call site passes a resolved
+  // anchor (see defaultCompanyAnchor(state) at the call sites). No
+  // `state` available in this pure route-math function.
+  const start = driverStartCoord || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
+  let remaining = trips.map(t => ({
+    trip: t,
+    coord: (t.pickup_sequence_coords && t.pickup_sequence_coords[0]) || start,
+  }));
+  const ordered = [];
+  let cur = start;
+  while (remaining.length) {
+    let best = null, bestDist = Infinity;
+    for (const r of remaining) {
+      const d = haversineKm(cur.lat, cur.lng, r.coord.lat, r.coord.lng);
+      if (d < bestDist) { bestDist = d; best = r; }
+    }
+    ordered.push(best);
+    cur = best.coord;
+    remaining = remaining.filter(r => r !== best);
+  }
+  return ordered;
+}
+
+// Nearest-neighbour route through all drop-offs, continuing the chain
+// from wherever the pickup route left off (the LAST pickup stop) — the
+// same continuation point live navigation uses (see the DriverNavTab
+// dropoff ordering). Previously sorted by scheduled_time first with
+// distance-from-a-fixed-branch-point only as a tie-break, which could
+// disagree with the driver's actual (distance-minimizing) live route.
+// Per explicit decision, dispatch-time sequencing now matches live
+// navigation exactly — this is the number a route actually costs in
+// petrol, not a scheduling label that happens to usually agree with it.
+function buildDropoffSequence(trips, lastPickupCoord) {
+  let remaining = [...trips];
+  if (!lastPickupCoord || remaining.length <= 1) return remaining;
+  const ordered = [];
+  let cur = lastPickupCoord;
+  while (remaining.length) {
+    let best = null, bestDist = Infinity;
+    for (const t of remaining) {
+      const c = t.dropoff_sequence_coords?.[0];
+      const d = c ? haversineKm(cur.lat, cur.lng, c.lat, c.lng) : Infinity;
+      if (d < bestDist) { bestDist = d; best = t; }
+    }
+    ordered.push(best);
+    const bestCoord = best.dropoff_sequence_coords?.[0];
+    if (bestCoord) cur = { lat: bestCoord.lat, lng: bestCoord.lng };
+    remaining = remaining.filter(t => t !== best);
+  }
+  return ordered;
+}
+
+// Nearest-neighbour route through all not-yet-done dropoffs, continuing
+// the chain from wherever the driver currently is (last completed pickup,
+// or the last completed dropoff once some are done) — NOT a single sort
+// against one fixed anchor point. A single-anchor sort only gets the
+// FIRST stop right: with 3+ dropoffs scattered around a city, "closest
+// to where I just was" for every stop independently can route the driver
+// right past stop B to reach stop C, then backtrack to B, then on to D —
+// exactly the kind of extra petrol this function exists to avoid.
+// Already-completed dropoffs are left in their current position (never
+// reordered) since the driver has already been there; only the remaining
+// ones are chained.
+function sortDropoffsByProximity(dropStops, lastPickupCoord) {
+  if (!lastPickupCoord || dropStops.length <= 1) return dropStops;
+  const done = dropStops.filter(s => s.done);
+  let remaining = dropStops.filter(s => !s.done);
+  if (remaining.length <= 1) return [...done, ...remaining];
+  const ordered = [];
+  let cur = lastPickupCoord;
+  while (remaining.length) {
+    let best = null, bestDist = Infinity;
+    for (const s of remaining) {
+      const d = haversineKm(cur.lat, cur.lng, s.lat || 0, s.lng || 0);
+      if (d < bestDist) { bestDist = d; best = s; }
+    }
+    ordered.push(best);
+    cur = { lat: best.lat, lng: best.lng };
+    remaining = remaining.filter(s => s !== best);
+  }
+  return [...done, ...ordered];
+}
+
+// Sums the full route a driver will actually drive across ALL their
+// currently-assigned active trips: start anchor -> every pickup in
+// sequence -> every dropoff in sequence. Deliberately built from the
+// SAME ordered/dropOrdered arrays buildPickupSequence/buildDropoffSequence
+// already produce at assignment time, rather than recomputing a separate
+// estimate — so this number always matches the route the driver will
+// actually navigate, not a second, possibly-diverging guess. Includes
+// the road-distance correction factor (ROAD_FACTOR) since straight-line
+// haversine distance understates real driving distance.
+function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropoffs) {
+  let total = 0;
+  let cur = startAnchor;
+  for (const p of orderedPickups) {
+    if (!p.coord) continue;
+    total += haversineKm(cur.lat, cur.lng, p.coord.lat, p.coord.lng);
+    cur = p.coord;
+  }
+  for (const t of orderedDropoffs) {
+    const c = t.dropoff_sequence_coords?.[0];
+    if (!c) continue;
+    total += haversineKm(cur.lat, cur.lng, c.lat, c.lng);
+    cur = { lat: c.lat, lng: c.lng };
+  }
+  return total * ROAD_FACTOR;
+}
+
+// Company policy: a driver's total route (first pickup to last drop-off)
+// should not exceed 40 km for every agent riding in the vehicle at once
+// — more passengers means more legitimate detour distance is expected,
+// so the cap scales with how many people are actually being driven
+// rather than being one fixed number regardless of vehicle load.
+// Deliberately a SEPARATE number from the existing 40km single-leg
+// threshold (which flags one agent's individual pickup->dropoff
+// distance for a surcharge) — this caps the driver's WHOLE multi-stop
+// route instead.
+function companyPolicyDistanceCapKm(totalAgentCount) {
+  return 40 * Math.max(1, totalAgentCount);
+}
+
+const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
+const now = () => new Date().toLocaleString("en-ZA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
+// now() returns a formatted display string, which is what the in-memory
+// reducer's mock UI expects everywhere it renders a timestamp directly.
+// The real Supabase schema's timestamp columns (ts, timestamp, acceptedat,
+// confirmedat, completedat, bookedat, updatedat, etc.) are bigint epoch-ms
+// values, not strings — inserting now()'s output into those columns fails
+// with Postgres error 22P02. nowEpoch() is for exactly those DB writes.
+const nowEpoch = () => Date.now();
+
+/* ---------- MONTHLY ARCHIVE WINDOWS ----------
+   Agents and drivers see completed trips in calendar-month buckets:
+   the CURRENT month live, plus exactly ONE month of archive (the
+   previous calendar month). On the 1st of each month the buckets roll
+   over automatically — last month becomes the archive, and the month
+   before that EXPIRES from the app's display. Expired trips are NEVER
+   deleted: they stay in the backend and remain reachable through the
+   admin Trip History range queries and the Help tab's full-history
+   trip picker. scheduled_date is "YYYY/MM/DD" (en-ZA), so a 7-char
+   prefix compare is an exact calendar-month match. Non-completed
+   trips (booked/assigned/in-transit) never expire regardless of
+   date — an old stuck booking should stay visible, not vanish. */
+const monthPrefixOf = (d) => `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}`;
+const currentMonthPrefix = () => monthPrefixOf(new Date());
+const previousMonthPrefix = () => {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() - 1);
+  return monthPrefixOf(d);
+};
+const archiveMonthLabel = () => {
+  const d = new Date();
+  d.setDate(1);
+  d.setMonth(d.getMonth() - 1);
+  return d.toLocaleString("en-ZA", { month: "long", year: "numeric" }).toUpperCase();
+};
+function tripArchiveBucket(trip) {
+  if (trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) return "CURRENT";
+  const mp = String(trip.scheduled_date || "").slice(0, 7);
+  if (mp === currentMonthPrefix()) return "CURRENT";
+  if (mp === previousMonthPrefix()) return "ARCHIVE";
+  return "EXPIRED";
+}
+// Converts an epoch-ms value (as read back from Supabase) into the same
+// display format now() produces, so the UI shows "11/07/2026, 19:34"
+// instead of a raw number like 1752262440000.
+const epochToDisplay = (ms) => (ms == null ? null : new Date(ms).toLocaleString("en-ZA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }));
+
+// Parses the app's booking-form date/time strings into a real Date object.
+// scheduled_date is typically "DD/MM/YYYY" (en-ZA locale, what the booking
+// form's date default produces) but the field is free-text — admins/agents
+// can type other formats, so this tries DD/MM/YYYY first (the expected case)
+// and falls back to whatever the JS Date constructor can natively parse
+// (handles ISO "YYYY-MM-DD" and a few other common shapes). Returns null
+// rather than throwing if nothing works, so callers can skip time-sensitive
+// checks gracefully instead of crashing on a malformed date string.
+function parseScheduledDateTime(dateStr, timeStr) {
+  if (!dateStr || !timeStr) return null;
+  const [h, m] = String(timeStr).split(":").map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+
+  const ddmmyyyy = String(dateStr).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (ddmmyyyy) {
+    const [, dd, mm, yyyy] = ddmmyyyy;
+    const d = new Date(Number(yyyy), Number(mm) - 1, Number(dd), h, m, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // YYYY/MM/DD — what the booking form's free-text Date field actually
+  // defaults to (confirmed from the running app), distinct from the
+  // DD/MM/YYYY case above. Checked explicitly since 2026/07/11 is
+  // ambiguous against the DD/MM/YYYY regex and was silently failing,
+  // leaving scheduledtime null against a NOT NULL column.
+  const yyyymmddSlash = String(dateStr).match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (yyyymmddSlash) {
+    const [, yyyy, mm, dd] = yyyymmddSlash;
+    const d = new Date(Number(yyyy), Number(mm) - 1, Number(dd), h, m, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  // YYYY-MM-DD (ISO, e.g. from a native <input type="date">)
+  const yyyymmddDash = String(dateStr).match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (yyyymmddDash) {
+    const [, yyyy, mm, dd] = yyyymmddDash;
+    const d = new Date(Number(yyyy), Number(mm) - 1, Number(dd), h, m, 0, 0);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  const fallback = new Date(`${dateStr}T${String(timeStr).padStart(5, "0")}:00`);
+  return Number.isNaN(fallback.getTime()) ? null : fallback;
+}
+
+function getDriverLoad(state, driver_id, scheduledDate) {
+  // Counts PASSENGERS (summed across the driver's active trips ON THE
+  // GIVEN DATE), not trips, and not across all dates. A driver's trips
+  // on the SAME day all run on one vehicle at once — DriverNavTab
+  // flattens a day's active trips into a single combined route — so the
+  // real capacity constraint is "how many people are aboard this one
+  // day," and DRIVER_CAPACITY is a seat count (the UI says "X/4 seats"
+  // everywhere). Trips on DIFFERENT days never share a vehicle at the
+  // same time, so they must never compete for the same 4 seats — a
+  // driver already assigned to 4 different days of one agent's week
+  // booking is NOT "full" for a 5th, unrelated day. scheduledDate is
+  // required (not optional) so a caller can't accidentally omit it and
+  // silently fall back to the old, wrong all-dates behavior; pass the
+  // trip's own scheduled_date when checking whether it can be assigned.
+  return state.trips
+    .filter(t => t.driver_id === driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED && t.scheduled_date === scheduledDate)
+    .reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
+}
+
+/* ---------- WAZE NAVIGATION (web: window.open instead of RN Linking) ----------
+   Per Waze's own developer docs (developers.google.com/waze/deeplinks), the
+   single https://waze.com/ul URL is the correct link for every platform —
+   it already branches internally based on the user's device:
+     - Desktop: opens the Waze web page (there is no Waze desktop app)
+     - Mobile with the Waze app installed: opens the app directly
+     - Mobile without the app: opens the Waze web page
+   The alternative waze:// scheme is documented as unreliable outside cases
+   where the app is guaranteed to be installed — "if users tap the link,
+   nothing happens" otherwise. Using only the https:// link avoids the
+   silent-failure risk that approach carries on desktop. */
+function buildWazeLink(lat, lng, label = "") {
+  const params = new URLSearchParams({ ll: `${lat},${lng}`, navigate: "yes" });
+  if (label) params.set("q", label);
+  return `https://www.waze.com/ul?${params}`;
+}
+function openWaze(lat, lng, label = "") {
+  window.open(buildWazeLink(lat, lng, label), "_blank", "noopener,noreferrer");
+}
+
+// Text-only fallback for when a manually-typed address couldn't be
+// geocoded (TomTom unavailable or the address wasn't found) — no lat/lng
+// at all, just the address string. Waze's own app/website resolves the
+// search itself once it opens, exactly like typing the address directly
+// into Waze. Manual addresses that DO geocode successfully use the
+// regular coordinate-based buildWazeLink instead (see AgentBookTab's
+// submit — pickupIsManual/dropoffIsManual only stay true on failure).
+function buildWazeAddressLink(address) {
+  const params = new URLSearchParams({ q: address, navigate: "yes" });
+  return `https://www.waze.com/ul?${params}`;
+}
+function openWazeByAddress(address) {
+  window.open(buildWazeAddressLink(address), "_blank", "noopener,noreferrer");
+}
+
+// Single entry point for every Waze button in the app — checks isManual
+// first and routes to the text-only search link when true, since a
+// manually-typed address's lat/lng is a meaningless placeholder (see
+// AgentBookTab's submit for why) and must never be sent to Waze as if it
+// were a real coordinate.
+function smartOpenWaze(lat, lng, label, isManual) {
+  if (isManual && label) { openWazeByAddress(label); return; }
+  if (lat != null && lng != null) openWaze(lat, lng, label);
+}
+
+// Single source of truth for whether in-app chat/calling should be
+// available for a given trip — only once the driver has confirmed
+// (accepted the assignment) or the trip is already in transit. Before
+// that (still just ASSIGNED, not yet confirmed) or after completion,
+// messaging/calling is disabled — used consistently everywhere a chat
+// or call button appears, so there's one place to change this rule
+// rather than a scattered per-button check that's easy to miss updating.
+function isTripActiveForComms(trip) {
+  return trip && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state);
+}
+
+// Single source of truth for "does this notification pertain to this
+// specific person" — matches the two real targeting models already used
+// throughout the app: agent/driver notifications are addressed to a
+// specific user via for_user_ids; admin notifications are broadcast to
+// the whole admin queue via for_roles (not to one specific admin, since
+// admins share a queue). Used for both the toast popup and the alert
+// sound, so a person only ever hears/sees a notification meant for them
+// — not literally every notification in the system, which is what the
+// toast was doing before this existed.
+function isNotificationForUser(n, user) {
+  if (!user) return false;
+  if (n.for_user_ids?.length) return n.for_user_ids.includes(user.id);
+  if (user.role === ROLE.ADMIN) return !n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN);
+  return false;
+}
+
+/* ---------- ADDRESS SEARCH (offline DB + OpenStreetMap Nominatim) ---------- */
+// Nominatim is OpenStreetMap's free, public geocoding search — no API key,
+// no billing account, no script tag, and it sends proper CORS headers so a
+// plain fetch() from the browser works out of the box. This replaced Google
+// Places because that requires a correctly billed + API-enabled Cloud
+// Console project, which isn't something that can be diagnosed or fixed
+// from here — Nominatim needs zero setup and just works.
+const CPT_BOUNDS = { north: -33.55, south: -34.25, east: 19.05, west: 18.25 };
+const GENERIC_ROAD_WORDS = new Set([
+  "street", "road", "avenue", "drive", "way", "lane", "close", "crescent",
+  "boulevard", "square", "place", "walk", "terrace", "rise", "view", "park",
+  "circle", "loop", "court", "heights", "hill", "bay", "cape", "town",
+]);
+
+function staticSearch(query) {
+  if (!query || query.trim().length < 2) return [];
+  const q = query.toLowerCase().trim();
+  const qNoNum = q.replace(/^\d+\s*/, "");
+  const words = qNoNum.split(/\s+/).filter(w => w.length >= 2 && !GENERIC_ROAD_WORDS.has(w) && !/^\d+$/.test(w));
+  if (words.length === 0) return [];
+  return CPT_ADDRESS_DB
+    .map(addr => {
+      const lbl = addr.label.toLowerCase();
+      const street = lbl.split(",")[0];
+      let score = 0;
+      let streetMatched = false;
+      if (street.includes(qNoNum) && qNoNum.length >= 3) { score += 100; streetMatched = true; }
+      words.forEach(w => {
+        if (street.startsWith(w)) { score += 25; streetMatched = true; }
+        if (street.includes(w)) { score += 15; streetMatched = true; }
+        if (addr.area.toLowerCase().includes(w)) score += 5;
+      });
+      return (streetMatched && score > 0) ? { ...addr, score, source: "local" } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6);
+}
+
+// Nominatim's usage policy asks for a descriptive User-Agent/Referer, but
+// browsers set Referer automatically and block scripts from overriding it —
+// there's nothing extra to configure here. Requests are capped to Cape
+// Town's bounding box via viewbox+bounded so results don't drift to other
+// cities that happen to share a street name.
+/* ---------- TOMTOM SEARCH & GEOCODING (optional — falls back to Nominatim if absent) ----------
+   Replaces the earlier Google Places/Geocoding integration entirely — one
+   vendor now covers address search (this block), driving routes/ETA, and
+   GPS map-matching (see the driver-tracking code further down), instead
+   of juggling separate Google + TomTom billing.
+
+   Called via plain fetch() against TomTom's REST endpoints (Search API
+   for autocomplete, Geocoding API for complete addresses) — both accept
+   the API key as a query parameter and are CORS-friendly for GET
+   requests, the same pattern already used for Nominatim in this file.
+   No SDK script tag or session-token dance needed, which is simpler than
+   the Google integration this replaces.
+
+   Requires VITE_TOMTOM_API_KEY in your .env file (see .env.example). If
+   it's missing, TomTom is silently skipped and the app runs on Nominatim
+   alone, exactly as it did before either paid integration existed. */
+const TOMTOM_API_KEY = import.meta.env?.VITE_TOMTOM_API_KEY || null;
+console.log(
+  TOMTOM_API_KEY
+    ? `[TomTom] API key loaded (starts with: ${TOMTOM_API_KEY.slice(0, 8)}...)`
+    : "[TomTom] No VITE_TOMTOM_API_KEY found in env — falling back to Nominatim. Check your .env file and restart 'npm run dev'."
+);
+
+async function tomtomAutocompleteSearch(query) {
+  if (!TOMTOM_API_KEY || !query || query.trim().length < 2) return [];
+  try {
+    const url = `https://api.tomtom.com/search/2/search/${encodeURIComponent(query)}.json` +
+      `?key=${TOMTOM_API_KEY}&countrySet=ZA&limit=6` +
+      `&topLeft=${CPT_BOUNDS.north},${CPT_BOUNDS.west}&btmRight=${CPT_BOUNDS.south},${CPT_BOUNDS.east}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TomTom search returned ${res.status}`);
+    const data = await res.json();
+    return (data.results || []).map(r => ({
+      label: r.address?.freeformAddress || r.poi?.name || query,
+      area: r.address?.municipalitySubdivision || r.address?.municipality || "Cape Town",
+      lat: r.position?.lat, lng: r.position?.lon,
+      source: "tomtom",
+    })).filter(r => r.lat != null && r.lng != null);
+  } catch (e) {
+    console.warn("[TomTom] autocomplete failed, falling back to Nominatim:", e.message);
+    return [];
+  }
+}
+
+// TomTom's Geocoding endpoint is the right tool for a complete, typed-out
+// address (as opposed to the Search/autocomplete endpoint above, built for
+// real-time partial typing) — used by the manual "Type Address" entry
+// path to resolve real coordinates for the app's internal route/distance
+// math, the same role Google's Geocoding API played before this rebuild.
+async function tomtomGeocodeAddress(address) {
+  if (!TOMTOM_API_KEY || !address?.trim()) return null;
+  try {
+    const url = `https://api.tomtom.com/search/2/geocode/${encodeURIComponent(address)}.json` +
+      `?key=${TOMTOM_API_KEY}&countrySet=ZA&limit=1`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TomTom geocode returned ${res.status}`);
+    const data = await res.json();
+    const r = data.results?.[0];
+    if (!r) return null;
+    return {
+      label: r.address?.freeformAddress || address,
+      area: r.address?.municipalitySubdivision || r.address?.municipality || "Cape Town",
+      lat: r.position?.lat, lng: r.position?.lon,
+      source: "tomtom-geocoding",
+    };
+  } catch (e) {
+    console.warn("[TomTom] geocoding failed:", e.message);
+    return null;
+  }
+}
+
+async function nominatimSearch(query) {
+  if (!query || query.trim().length < 2) return [];
+  try {
+    const params = new URLSearchParams({
+      q: query,
+      format: "jsonv2",
+      addressdetails: "1",
+      limit: "6",
+      countrycodes: "za",
+      viewbox: `${CPT_BOUNDS.west},${CPT_BOUNDS.north},${CPT_BOUNDS.east},${CPT_BOUNDS.south}`,
+      bounded: "1",
+      // Nominatim's usage policy asks for a way to identify the calling
+      // app. Browsers block JS from setting a custom User-Agent header for
+      // security reasons, so their documented workaround is to identify
+      // via this query param instead. Swap in a real contact address if
+      // you have one — it's optional but keeps you in good standing under
+      // their usage policy at higher request volumes.
+      // email: "your-real-contact@yourdomain.com",
+    });
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+      headers: { "Accept-Language": "en" },
+    });
+    if (!res.ok) {
+      console.warn("[Nominatim] HTTP error:", res.status);
+      return [];
+    }
+    const data = await res.json();
+    if (!Array.isArray(data) || data.length === 0) return [];
+    return data.map(r => {
+      const addr = r.address || {};
+      const houseNum = addr.house_number || "";
+      const road = addr.road || addr.pedestrian || addr.footway || "";
+      const suburb = addr.suburb || addr.neighbourhood || addr.city_district || addr.town || "";
+      const streetLine = road ? `${houseNum ? houseNum + " " : ""}${road}` : "";
+      const label = streetLine
+        ? `${streetLine}${suburb ? `, ${suburb}` : ""}, Cape Town`
+        : (r.display_name || query);
+      return {
+        label,
+        area: suburb || "Cape Town",
+        lat: parseFloat(r.lat),
+        lng: parseFloat(r.lon),
+        source: "osm",
+      };
+    }).filter(r => !isNaN(r.lat) && !isNaN(r.lng));
+  } catch (e) {
+    console.warn("[Nominatim] search failed, falling back to offline DB:", e.message);
+    return [];
+  }
+}
+
+async function unifiedAddressSearch(query) {
+  const offline = staticSearch(query);
+  if (TOMTOM_API_KEY) {
+    const tomtom = await tomtomAutocompleteSearch(query);
+    if (tomtom.length > 0) return { results: tomtom, liveOk: true, source: "tomtom" };
+  }
+  const live = await nominatimSearch(query);
+  if (live.length > 0) return { results: live, liveOk: true, source: "nominatim" };
+  return { results: offline, liveOk: false, source: "offline" };
+}
+
+/* ---------- SUPABASE CLIENT (web) ----------
+   Note: this file assumes @supabase/supabase-js is available as an ES
+   import in your build (Vite/CRA/Next). If you're pasting this into a
+   sandboxed preview tool without npm access, comment out the import below
+   and the app will fall back to the in-memory reducer automatically. */
+import { createClient } from "@supabase/supabase-js";
+
+const SUPABASE_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_Kyne7Q6PJ2uKmcfslI-qNQ_CX-m7mxF";
+
+const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
+      realtime: { params: { eventsPerSecond: 10 } },
+    })
+  : null;
+
+// Instant street-name suggestions from the bulk-loaded City of Cape Town
+// street name reference table (18k+ names, no house numbers/coordinates).
+// This is meant to be near-instant feedback while typing — picking a
+// suggestion re-runs the live Nominatim search scoped to that exact name,
+// which is what actually resolves a coordinate.
+async function streetNameSearch(query) {
+  if (!supabase || !query || query.trim().length < 2) return [];
+  const q = query.trim().toUpperCase();
+  try {
+    const { data, error } = await supabase
+      .from("cape_town_street_names")
+      .select("street_name")
+      .like("street_name_upper", `${q}%`)
+      .order("street_name")
+      .limit(8);
+    if (error) {
+      console.warn("[StreetNames] query failed:", error.message);
+      return [];
+    }
+    return (data || []).map(r => r.street_name);
+  } catch (e) {
+    console.warn("[StreetNames] query failed:", e.message);
+    return [];
+  }
+}
+
+/* ---------- SEED DATA (used for local fallback / first-run reference) ---------- */
+const SEED_USERS = [
+  { id: "USR_ADMIN", role: ROLE.ADMIN, name: "Control Admin", staff_number: "ADM001", auth: { login: "Control Admin", pass: "ADM001" } },
+  { id: "USR_A1", role: ROLE.AGENT, name: "Nomsa Dlamini", staff_number: "AG1001", auth: { login: "Nomsa Dlamini", pass: "AG1001" },
+    home_address: { label: "Spine Road, Mitchells Plain, Cape Town", area: "Mitchells Plain", lat: -34.0306, lng: 18.6244 },
+    branch_id: "TELUS_MAITLAND", branch_history: [] },
+  { id: "USR_A2", role: ROLE.AGENT, name: "Thabo Mokoena", staff_number: "AG1002", auth: { login: "Thabo Mokoena", pass: "AG1002" },
+    home_address: { label: "Voortrekker Road, Bellville, Cape Town", area: "Bellville", lat: -33.9000, lng: 18.6300 },
+    branch_id: "TELUS_MAITLAND", branch_history: [] },
+  { id: "USR_A3", role: ROLE.AGENT, name: "Ayesha Dollie", staff_number: "AG1003", auth: { login: "Ayesha Dollie", pass: "AG1003" },
+    home_address: { label: "Lansdowne Road, Lansdowne, Cape Town", area: "Lansdowne", lat: -33.9760, lng: 18.4980 },
+    branch_id: "TELUS_MAITLAND", branch_history: [] },
+  { id: "USR_D1", role: ROLE.DRIVER, name: "Sipho Nkosi", staff_number: "DR2001", auth: { login: "Sipho Nkosi", pass: "DR2001" } },
+  { id: "USR_D2", role: ROLE.DRIVER, name: "Fatima Adams", staff_number: "DR2002", auth: { login: "Fatima Adams", pass: "DR2002" } },
+];
+const SEED_DRIVER_STATUS = [
+  { driver_id: "USR_D1", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "Toyota Hiace - CA 123-456", phone: "071 234 5678", capacity: DRIVER_CAPACITY },
+  { driver_id: "USR_D2", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "VW Transporter - CA 789-012", phone: "082 345 6789", capacity: DRIVER_CAPACITY },
+];
+const INITIAL_STATE = {
+  // tickets/campaigns/companies live in reducer state so demo mode is
+  // fully functional — in Supabase mode these are ignored (the store
+  // overlays the fetched versions; see the state assembly in useAppStore).
+  tickets: [],
+  campaigns: [],
+  // Seeded from the two hardcoded COMPANY_LOCATIONS entries this replaces
+  // — each becomes an editable Company with a single address (the
+  // address that was already there). Company ids match the old branch
+  // ids exactly so every existing agent's branch_id keeps resolving
+  // without touching SEED_USERS.
+  companies: COMPANY_LOCATIONS.map(loc => ({
+    id: loc.id, name: loc.label, active: true,
+    address: { label: loc.address, area: loc.area, lat: loc.lat, lng: loc.lng },
+  })),
+  users: SEED_USERS, driver_status: SEED_DRIVER_STATUS, trips: [], notifications: [], active_user_id: null,
+};
+
+/* ---------- IN-MEMORY REDUCER (fallback when Supabase isn't configured / reachable) ---------- */
+function appReducer(state, action) {
+  switch (action.type) {
+
+    case "AUTH/LOGIN": {
+      const user = state.users.find(u => u.auth.login === action.login && u.auth.pass === action.pass);
+      if (!user) return { ...state, _error: "Invalid credentials" };
+      return { ...state, active_user_id: user.id, _error: null };
+    }
+    case "AUTH/LOGOUT":
+      return { ...state, active_user_id: null };
+
+    case "ADMIN/DELETE_USERS": {
+      // Batch delete, processed per-user rather than all-or-nothing —
+      // mirrors the bulk-import pattern: one blocked user (has active
+      // trips, is the acting admin themselves) shouldn't stop deletion
+      // of the others in the same selection. Deliberately conservative:
+      // a user with ANY non-completed trip (as agent OR driver) is
+      // refused rather than force-deleted, since cascading that would
+      // either orphan a live booking or silently cancel it without the
+      // explicit confirmation TRIP/ADMIN_CANCEL requires.
+      const results = [];
+      let workingState = state;
+      for (const targetId of action.user_ids || []) {
+        const target = workingState.users.find(u => u.id === targetId);
+        if (!target) { results.push({ id: targetId, ok: false, reason: "User not found" }); continue; }
+        if (targetId === action.acting_admin_id) { results.push({ id: targetId, ok: false, name: target.name, reason: "You can't delete your own account" }); continue; }
+        // Matches the real DB foreign-key behavior (confirmed via
+        // pg_constraint): trips.agentid/driverid, messages.senderid, and
+        // notifications.userid are all RESTRICT, not cascade — Postgres
+        // itself refuses to delete a user with ANY row in those tables,
+        // not just active trips. Checking trip involvement at all
+        // (including completed) here means the block surfaces as a
+        // clear app message instead of a raw FK-violation error the
+        // admin would have no context for. driver_status/driver_positions/
+        // tickets/direct_messages all cascade automatically and need no
+        // guard.
+        const hasAnyTrip = workingState.trips.some(t => t.agent_ids.includes(targetId) || t.driver_id === targetId);
+        if (hasAnyTrip) { results.push({ id: targetId, ok: false, name: target.name, reason: "Has trip history on file — the database keeps trip records tied to their account and won't allow deletion while any exist" }); continue; }
+        workingState = {
+          ...workingState,
+          users: workingState.users.filter(u => u.id !== targetId),
+          driver_status: workingState.driver_status.filter(d => d.driver_id !== targetId),
+        };
+        results.push({ id: targetId, ok: true, name: target.name });
+      }
+      return { ...workingState, _error: null, _lastDeleteResults: results };
+    }
+
+    case "ADMIN/UPDATE_USER": {
+      const target = state.users.find(u => u.id === action.user_id);
+      if (!target) return { ...state, _error: "User not found" };
+
+      // ── Company assignment ──
+      // Plain field for either AGENT or DRIVER — this was the actual bug:
+      // simpleBranchId only ever got applied for AGENT below (it was
+      // folded into agent-only branchUpdate), so a driver's company
+      // selection was silently discarded on every save regardless of
+      // what the UI sent.
+      const simpleBranchId = action.branch_id !== undefined ? action.branch_id : target.branch_id;
+
+      // ── Branch reassignment distance tracking (AGENTS ONLY, per
+      // explicit decision — drivers get a plain assignment with none of
+      // this) ── If this update changes an agent's branch_id, and the
+      // NEW branch is more than 40 km (road-distance estimate) from the
+      // agent's pickup/home address, archive the branch they're leaving
+      // into branch_history before switching — a record of "moved from
+      // X because it was too far" rather than silently overwriting it.
+      let branchUpdate = {};
+      let branchNotif = null;
+      if (target.role === ROLE.AGENT && action.branch_id !== undefined && action.branch_id !== target.branch_id) {
+        const newBranch = companyById(state, action.branch_id);
+        const home = target.home_address;
+        let distKm = null;
+        if (newBranch && home?.lat != null) {
+          distKm = haversineKm(home.lat, home.lng, newBranch.lat, newBranch.lng) * ROAD_FACTOR;
+        }
+        const farReassignment = distKm != null && distKm > 40;
+        branchUpdate = {
+          branch_id: action.branch_id,
+          branch_history: farReassignment && target.branch_id
+            ? [...(target.branch_history || []), { branch_id: target.branch_id, changed_at: now(), reason: `Reassigned to ${newBranch?.label || action.branch_id} (${distKm.toFixed(1)} km from home) — previous branch kept on file.` }]
+            : (target.branch_history || []),
+        };
+        if (farReassignment) {
+          branchNotif = {
+            id: mkId(), type: "BRANCH_REASSIGNED_FAR", for_roles: [ROLE.ADMIN],
+            message: `📍 ${target.name} reassigned to ${newBranch?.label || action.branch_id}, which is ${distKm.toFixed(1)} km from their home address. Previous company retained on file.`,
+            ts: now(), read: false,
+          };
+        }
+      }
+
+      const newUsers = state.users.map(u => u.id === action.user_id ? {
+        ...u,
+        name: action.name ?? u.name,
+        staff_number: action.staff_number ?? u.staff_number,
+        auth: { login: action.login ?? u.auth.login, pass: action.pass || u.auth.pass },
+        ...(u.role === ROLE.AGENT
+          ? { home_address: action.home_address !== undefined ? action.home_address : u.home_address, ...branchUpdate }
+          : {}),
+        // Drivers get home_address too (their "which area do they live
+        // in" field, used for assignment purposes — see the comment on
+        // userRowToApp) plus the plain company assignment — no distance
+        // warning, no branch_history archiving, that stays agent-only.
+        ...(u.role === ROLE.DRIVER
+          ? { home_address: action.home_address !== undefined ? action.home_address : u.home_address, branch_id: simpleBranchId }
+          : {}),
+        // Local reducer previously had no ADMIN branch at all here — only
+        // AGENT fields were ever updated, so changing an existing admin's
+        // level (or, now, their scoped company) silently did nothing in
+        // demo mode despite the edit form dispatching it correctly.
+        ...(u.role === ROLE.ADMIN
+          ? {
+              admin_level: action.admin_level !== undefined ? action.admin_level : u.admin_level,
+              scoped_company_ids: action.scoped_company_ids !== undefined ? action.scoped_company_ids : u.scoped_company_ids,
+            }
+          : {}),
+      } : u);
+      let newDriverStatus = state.driver_status;
+      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.phone !== undefined)) {
+        newDriverStatus = state.driver_status.map(d => d.driver_id === action.user_id ? {
+          ...d,
+          vehicle: action.vehicle !== undefined ? action.vehicle : d.vehicle,
+          phone: action.phone !== undefined ? action.phone : d.phone,
+        } : d);
+      }
+      const newTrips = state.trips.map(t =>
+        t.agent_ids.includes(action.user_id) && action.name
+          ? { ...t, agent_name: t.agent_ids[0] === action.user_id ? action.name : t.agent_name }
+          : t
+      );
+      const newNotifications = branchNotif ? [branchNotif, ...state.notifications] : state.notifications;
+      return { ...state, users: newUsers, driver_status: newDriverStatus, trips: newTrips, notifications: newNotifications, _error: null };
+    }
+
+    case "TRIP/ADD_AGENT": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is already on this trip" };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot add a passenger to a completed trip" };
+      if (trip.agent_ids.length >= DRIVER_CAPACITY) {
+        return { ...state, _error: `This trip is full (${trip.agent_ids.length}/${DRIVER_CAPACITY} seats) — remove a passenger before adding another.` };
+      }
+
+      const newAgentIds = [...trip.agent_ids, action.agent_id];
+      const newPickupCoords = [...trip.pickup_sequence_coords, { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id }];
+
+      let newTrips;
+      if (trip.driver_id) {
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords };
+        const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
+        const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
+        // Adding a passenger's pickup point can shift the whole pickup
+        // route, which shifts the LAST pickup — the anchor drop-off
+        // sequencing chains from. Re-running it here keeps the displayed
+        // drop_sequence_num honest instead of going stale the moment a
+        // passenger is added mid-route.
+        const dropOrderedAdd = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMapAdd = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrderedAdd.forEach((t, i) => { dropMapAdd[t.trip_id] = i + 1; });
+        // Adding a passenger also changes the total agent count the
+        // policy cap is based on, and the route itself — both need
+        // recomputing here or an agent added mid-route would see a
+        // stale distance/cap left over from before they were added.
+        const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+        const routeDistanceKmAdd = computeDriverRouteDistanceKm(defaultCompanyAnchor(state), ordered, dropOrderedAdd);
+        const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
+        const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
+        newTrips = state.trips.map(t => {
+          if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapAdd[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAdd, driver_route_cap_km: policyCapKmAdd, driver_route_exceeds_policy: exceedsPolicyAdd };
+          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapAdd[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAdd, driver_route_cap_km: policyCapKmAdd, driver_route_exceeds_policy: exceedsPolicyAdd };
+          return t;
+        });
+      } else {
+        newTrips = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords } : t);
+      }
+
+      const notif = {
+        id: mkId(), type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `You've been added to trip ${trip.trip_id} (pickup: ${action.pickup_label}).`,
+        trip_id: trip.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/REMOVE_AGENT": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is not on this trip" };
+      if (trip.agent_ids.length <= 1) return { ...state, _error: "Cannot remove the last passenger — cancel or reassign the trip instead" };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot remove a passenger from a completed trip" };
+
+      const newAgentIds = trip.agent_ids.filter(id => id !== action.agent_id);
+      // Same index-0 fallback RELOCATE_AGENT uses: on trips created before
+      // the primary coord carried agent_id, position 0 belongs to the
+      // primary agent — without this, removing the primary agent left
+      // their pickup point in the sequence (a stop for nobody).
+      const newPickupCoords = trip.pickup_sequence_coords.filter((c, i) => {
+        const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        return !belongsToRemoved;
+      });
+      const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
+      const newAgentName = newAgentIds[0] ? (state.users.find(u => u.id === newAgentIds[0])?.name || trip.agent_name) : trip.agent_name;
+
+      let newTripsRemove;
+      if (trip.driver_id) {
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
+        const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
+        const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
+        // Same reasoning as ADD_AGENT — removing a passenger's pickup
+        // point can shift the pickup route, which shifts the anchor the
+        // drop-off chain continues from.
+        const dropOrderedRem = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMapRem = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrderedRem.forEach((t, i) => { dropMapRem[t.trip_id] = i + 1; });
+        const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+        const routeDistanceKmRem = computeDriverRouteDistanceKm(defaultCompanyAnchor(state), ordered, dropOrderedRem);
+        const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
+        const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
+        newTripsRemove = state.trips.map(t => {
+          if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapRem[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmRem, driver_route_cap_km: policyCapKmRem, driver_route_exceeds_policy: exceedsPolicyRem };
+          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapRem[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmRem, driver_route_cap_km: policyCapKmRem, driver_route_exceeds_policy: exceedsPolicyRem };
+          return t;
+        });
+      } else {
+        newTripsRemove = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
+      }
+
+      const removeNotif = {
+        id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `You've been removed from trip ${trip.trip_id}.`,
+        trip_id: trip.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTripsRemove, notifications: [removeNotif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/RELOCATE_AGENT": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is not on this trip" };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot relocate a passenger on a completed trip" };
+
+      const newCoord = { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id };
+      const newPickupCoords = trip.pickup_sequence_coords.map((c, i) => {
+        const belongsToThisAgent = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        return belongsToThisAgent ? { ...newCoord, agent_id: c.agent_id } : c;
+      });
+
+      let newTripsRelocate;
+      if (trip.driver_id) {
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const updatedTrip = { ...trip, pickup_sequence_coords: newPickupCoords };
+        const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
+        const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
+        // Same reasoning — moving a pickup point can shift the pickup
+        // route's last stop, which is the anchor drop-off sequencing
+        // continues from.
+        const dropOrderedReloc = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMapReloc = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrderedReloc.forEach((t, i) => { dropMapReloc[t.trip_id] = i + 1; });
+        const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+        const routeDistanceKmReloc = computeDriverRouteDistanceKm(defaultCompanyAnchor(state), ordered, dropOrderedReloc);
+        const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
+        const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
+        newTripsRelocate = state.trips.map(t => {
+          if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapReloc[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmReloc, driver_route_cap_km: policyCapKmReloc, driver_route_exceeds_policy: exceedsPolicyReloc };
+          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapReloc[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmReloc, driver_route_cap_km: policyCapKmReloc, driver_route_exceeds_policy: exceedsPolicyReloc };
+          return t;
+        });
+      } else {
+        newTripsRelocate = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, pickup_sequence_coords: newPickupCoords } : t);
+      }
+
+      const relocateNotif = {
+        id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `Your pickup for trip ${trip.trip_id} was moved to ${action.pickup_label}.`,
+        trip_id: trip.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTripsRelocate, notifications: [relocateNotif, ...state.notifications], _error: null };
+    }
+
+    case "ADMIN/CREATE_USER": {
+      const newUser = {
+        id: "USR_" + mkId(), role: action.role, name: action.name, staff_number: action.staff_number || action.auth?.pass || null, auth: action.auth,
+        ...((action.role === ROLE.AGENT || action.role === ROLE.DRIVER) && action.home_address ? { home_address: action.home_address } : {}),
+        // No fallback to "the first company" — once companies are an
+        // admin-managed, addable/removable list, there's no meaningful
+        // "first" one to default to. The create-user form requires
+        // picking a company for agent accounts, so this null fallback is
+        // a safety net for callers that skip that requirement (e.g. a
+        // malformed bulk-import row), not the normal path.
+        ...(action.role === ROLE.AGENT ? { branch_id: action.branch_id || null, branch_history: [] } : {}),
+        ...(action.role === ROLE.DRIVER ? { branch_id: action.branch_id || null } : {}),
+        // Local reducer previously never stored admin_level for new admin
+        // accounts at all (only the AGENT branch above set fields) — the
+        // UI form always dispatched it correctly, this branch just never
+        // existed. scoped_company_ids restricts a VIEWER-tier admin to one
+        // or more companies; empty/null means unrestricted, which is the
+        // only sensible value for FLEET_OPS/STANDARD anyway.
+        ...(action.role === ROLE.ADMIN ? { admin_level: action.admin_level || ADMIN_LEVEL.VIEWER, scoped_company_ids: action.scoped_company_ids || [] } : {}),
+      };
+      const newUsers = [...state.users, newUser];
+      let newDriverStatus = state.driver_status;
+      if (action.role === ROLE.DRIVER) {
+        newDriverStatus = [...state.driver_status, {
+          driver_id: newUser.id, state: DRIVER_STATE.AVAILABLE, current_trip_id: null,
+          vehicle: action.vehicle || "—", phone: action.phone || "—",
+          capacity: DRIVER_CAPACITY,
+        }];
+      }
+      return { ...state, users: newUsers, driver_status: newDriverStatus };
+    }
+
+    case "TRIP/BOOK": {
+      const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
+      const dropCoord = action.dropoff_coord || defaultCompanyAnchor(state);
+      const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
+      const estCostZar = parseFloat((8 + (estDistKm * ROAD_FACTOR) * 3.5).toFixed(2));
+      // Road-distance estimate (same 1.35 correction factor used everywhere
+      // else in the UI to turn straight-line Haversine km into an approximate
+      // driving distance) — thresholds below are checked against THIS value
+      // so they line up with the km figure admins actually see on screen.
+      const roadDistKm = estDistKm * ROAD_FACTOR;
+
+      // The id can be pre-generated by dispatch (see the fallback branch
+      // in useAppStore): dispatch runs this reducer once itself to detect
+      // errors AND React runs it again internally — with a random id
+      // generated here, those two runs would each mint a DIFFERENT id,
+      // and the id dispatch returns to the booking form (for rollback)
+      // wouldn't exist in React's authoritative state.
+      const tripId = action._client_trip_id || ("TRP_" + mkId());
+      const nowTs = now();
+
+      // Exception flag: booked on the SAME calendar day as the trip,
+      // after 15:00 local time — a fixed clock-time cutoff, not a rolling
+      // "hours before departure" window. A trip booked today for tomorrow
+      // at any time is never an exception under this rule, even if it's
+      // booked at 11pm tonight; only same-day-after-3pm counts. Mirrors
+      // the Supabase handler's isException exactly — this was previously
+      // ONLY computed there, so the "E" badge / CSV column / Search
+      // Profiles exception count never worked in demo/fallback mode.
+      // nowTs (above) is a formatted display string, not an epoch — this
+      // needs a real Date object to read the current hour/minute/date.
+      const nowDateForException = new Date();
+      const bookingDateStr = `${nowDateForException.getFullYear()}/${String(nowDateForException.getMonth() + 1).padStart(2, "0")}/${String(nowDateForException.getDate()).padStart(2, "0")}`;
+      const isSameDay = action.scheduled_date === bookingDateStr;
+      const isException = isSameDay && (nowDateForException.getHours() > 15 || (nowDateForException.getHours() === 15 && nowDateForException.getMinutes() > 0));
+
+      const trip = {
+        trip_id: tripId,
+        agent_ids: [action.agent_id],
+        driver_id: null,
+        state: TRIP_STATE.UNASSIGNED_BOOKING,
+        // agent_id stamped to match the Supabase shape (tripRowToApp puts
+        // row.agentid on the primary coord) — TRIP/REMOVE_AGENT filters
+        // and the driver nav's per-passenger stop list both key on it.
+        pickup_sequence_coords: [{ ...pickupCoord, label: action.pickup_label, agent_id: action.agent_id }],
+        dropoff_sequence_coords: [{ ...dropCoord, label: action.dropoff_label }],
+        completed_pickups: [],
+        current_gps_coordinates: pickupCoord,
+        current_nav_idx: 0,
+        pickup_location_label: action.pickup_label,
+        dropoff_location_label: action.dropoff_label,
+        custom_pickup: action.pickup_label,
+        custom_dropoff: action.dropoff_label,
+        dropoff_company_id: action.dropoff_company_id || null,
+        trip_type: action.trip_type,
+        scheduled_date: action.scheduled_date,
+        scheduled_time: action.scheduled_time,
+        // Previously missing entirely from the local reducer — the
+        // Supabase side has always stored these (see tripRowToApp /
+        // handleSupabaseAction's TRIP/BOOK), but this branch never did,
+        // silently breaking week-booking grouping in demo mode.
+        week_group_id: action.week_group_id || null,
+        week_day_num: action.week_day_num || null,
+        booked_at: nowTs,
+        confirmed_at: null,
+        tripStartedAt: null,
+        in_transit_at: null,
+        completed_at: null,
+        agent_name: action.agent_name,
+        phone: action.phone,
+        drop_sequence_num: null,
+        pickup_order_num: null,
+        est_distance_km: estDistKm,
+        est_cost_zar: estCostZar,
+        actual_distance_km: null,
+        driverAccepted: false,
+        acceptedAt: null,
+        declinedBy: [],
+        chat_messages: [],
+        reminder_sent: false,
+        long_distance_flag: roadDistKm > 40,
+        admin_note: roadDistKm > 42 ? `Booking distance ${roadDistKm.toFixed(1)} km exceeds 42 km threshold.` : null,
+        is_exception: isException,
+      };
+
+      const notifs = [{
+        id: mkId(), type: "TRIP_BOOKED", for_roles: [ROLE.ADMIN],
+        message: `New booking from ${action.agent_name}: ${action.pickup_label} → ${action.dropoff_label}`,
+        trip_id: tripId, ts: nowTs, read: false,
+      }];
+
+      // ── Long-distance notification (>40 km) ──
+      if (roadDistKm > 40) {
+        notifs.unshift({
+          id: mkId(), type: "LONG_DISTANCE_TRIP", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${tripId} for ${action.agent_name} is ${roadDistKm.toFixed(1)} km — exceeds the 40 km threshold.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      // ── Surcharge notification (>42 km): R20 for every km over 40, uncapped ──
+      if (roadDistKm > 42) {
+        const billableKm = roadDistKm - 40;
+        const surcharge = Math.round(billableKm * 20);
+        notifs.unshift({
+          id: mkId(), type: "DISTANCE_SURCHARGE", for_roles: [ROLE.ADMIN],
+          message: `💰 Trip ${tripId} (${roadDistKm.toFixed(1)} km) qualifies for a distance surcharge: R${surcharge} (${billableKm.toFixed(1)} km over 40 km @ R20/km) — for invoicing.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      // ── Booking-exception notification (same-day booking after 15:00) ──
+      if (isException) {
+        notifs.unshift({
+          id: mkId(), type: "BOOKING_EXCEPTION", for_roles: [ROLE.ADMIN],
+          message: `⚠ EXCEPTION: ${action.agent_name} booked trip ${tripId} for today after the 15:00 cutoff.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      // ── Late-booking notification (<2 hours before scheduled time) ──
+      // Parses scheduled_date + scheduled_time against "now" — if either is
+      // missing/unparseable this check is silently skipped rather than
+      // throwing, since a malformed date shouldn't block the booking itself.
+      try {
+        const scheduledDt = parseScheduledDateTime(action.scheduled_date, action.scheduled_time);
+        if (scheduledDt) {
+          const hoursUntil = (scheduledDt.getTime() - Date.now()) / 3600000;
+          if (hoursUntil < 2) {
+            notifs.unshift({
+              id: mkId(), type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
+              message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
+              trip_id: tripId, ts: nowTs, read: false,
+            });
+          }
+        }
+      } catch (e) { /* malformed date/time — skip late-booking check, don't block booking */ }
+
+      return { ...state, trips: [trip, ...state.trips], notifications: [...notifs, ...state.notifications] };
+    }
+
+    case "TRIP/DISPATCH_MULTI": {
+      // Merges several separately-booked UNASSIGNED trips (one per agent)
+      // into a single multi-passenger trip and assigns one driver to all
+      // of them in one step — for when several agents happen to be going
+      // the same way and an admin wants one driver to do a milk-run
+      // instead of dispatching each booking separately. action.trip_ids
+      // is [primary, ...secondaries]; the primary trip absorbs every
+      // secondary's agent + pickup point (same shape TRIP/ADD_AGENT
+      // builds), the secondary trip RECORDS are then removed (their
+      // booking data now lives inside the primary, not lost — just
+      // consolidated), and the merged trip goes through the exact same
+      // seat-capacity check, sequencing, and notification logic
+      // TRIP/ASSIGN_DRIVER uses for a single trip, so a merged dispatch
+      // behaves identically to any other assignment from that point on.
+      const [primaryId, ...secondaryIds] = action.trip_ids || [];
+      const primary = state.trips.find(t => t.trip_id === primaryId);
+      if (!primary) return { ...state, _error: "Trip not found" };
+      if (primary.state !== TRIP_STATE.UNASSIGNED_BOOKING) return { ...state, _error: "The primary trip is no longer unassigned." };
+      const secondaries = secondaryIds.map(id => state.trips.find(t => t.trip_id === id)).filter(Boolean);
+      if (secondaries.length !== secondaryIds.length) return { ...state, _error: "One of the selected trips no longer exists." };
+      if (secondaries.some(t => t.state !== TRIP_STATE.UNASSIGNED_BOOKING)) return { ...state, _error: "One of the selected trips is no longer unassigned." };
+      // Reject if the same agent appears on more than one selected
+      // booking — e.g. an admin accidentally selects both of one
+      // agent's own legs for a merge meant for several DIFFERENT
+      // agents. Left unchecked, that agent's name/pickup point would
+      // end up duplicated on the resulting trip (confirmed in
+      // production: same passenger listed twice with identical pickup
+      // details). Named error rather than a silent dedup, so the admin
+      // knows exactly what to fix in their selection.
+      const allSelectedAgentIds = [...primary.agent_ids, ...secondaries.flatMap(t => t.agent_ids)];
+      const seenAgentIds = new Set();
+      for (const aid of allSelectedAgentIds) {
+        if (seenAgentIds.has(aid)) {
+          const dupName = state.users.find(u => u.id === aid)?.name || aid;
+          return { ...state, _error: `${dupName} is on more than one of the selected bookings — remove the duplicate before combining.` };
+        }
+        seenAgentIds.add(aid);
+      }
+      const totalSeats = primary.agent_ids.length + secondaries.reduce((n, t) => n + t.agent_ids.length, 0);
+      if (totalSeats > DRIVER_CAPACITY) {
+        return { ...state, _error: `Selected trips need ${totalSeats} seats — only ${DRIVER_CAPACITY} fit on one vehicle.` };
+      }
+      // Also account for the driver's EXISTING load before mutating
+      // anything — the delegated ASSIGN_DRIVER below would catch an
+      // overflow, but only AFTER the merge has already deleted the
+      // secondary trips, leaving them merged-but-unassigned on a
+      // rejection. Checking here keeps the whole operation atomic: an
+      // over-capacity dispatch is refused with zero mutation.
+      const driverExistingSeats = getDriverLoad(state, action.driver_id, primary.scheduled_date);
+      if (driverExistingSeats + totalSeats > DRIVER_CAPACITY) {
+        return { ...state, _error: `Driver doesn't have room — ${driverExistingSeats}/${DRIVER_CAPACITY} seats taken, these trips need ${totalSeats}.` };
+      }
+      const mergedAgentIds = [...primary.agent_ids, ...secondaries.flatMap(t => t.agent_ids)];
+      const mergedPickupCoords = [...primary.pickup_sequence_coords, ...secondaries.flatMap(t => t.pickup_sequence_coords)];
+      const mergedTrip = { ...primary, agent_ids: mergedAgentIds, pickup_sequence_coords: mergedPickupCoords };
+      const secondaryIdSet = new Set(secondaryIds);
+      const stateAfterMerge = {
+        ...state,
+        trips: state.trips.filter(t => !secondaryIdSet.has(t.trip_id)).map(t => t.trip_id === primaryId ? mergedTrip : t),
+        notifications: [
+          ...secondaries.flatMap(t => t.agent_ids.map(aid => ({
+            id: mkId(), type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+            message: `Your trip has been combined with ${primary.agent_name}'s trip (${primaryId}) for shared transport.`,
+            trip_id: primaryId, ts: now(), read: false,
+          }))),
+          ...state.notifications,
+        ],
+      };
+      // From here, hand off to the exact same assignment logic
+      // TRIP/ASSIGN_DRIVER uses — capacity check, pickup/dropoff
+      // sequencing across the driver's other active trips, the
+      // DRIVER_ASSIGNED / DRIVER_FULLY_BOOKED notifications, all of it,
+      // so a merged dispatch is indistinguishable from a normal one
+      // once assigned.
+      return appReducer(stateAfterMerge, { type: "TRIP/ASSIGN_DRIVER", trip_id: primaryId, driver_id: action.driver_id });
+    }
+
+    case "TRIP/BULK_ASSIGN_DRIVER": {
+      // Assigns the SAME driver to multiple SEPARATE trips, one per day
+      // — for a week booking, where each day is genuinely its own trip
+      // with its own route (unlike TRIP/DISPATCH_MULTI, which merges
+      // several trips into ONE physical trip for several DIFFERENT
+      // agents riding together at the same time; merging across
+      // different days makes no sense, since each day needs its own
+      // driver assignment and route). Each trip_id gets its own real
+      // TRIP/ASSIGN_DRIVER call, so per-day capacity, sequencing, and
+      // notifications all work exactly as they would for one normal
+      // single-trip assignment — processed independently so one day's
+      // conflict (driver already booked that specific day, trip no
+      // longer unassigned, etc.) doesn't block the rest of the week.
+      const results = [];
+      let workingState = state;
+      for (const tripId of action.trip_ids || []) {
+        const before = workingState;
+        const after = appReducer(workingState, { type: "TRIP/ASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id });
+        if (after._error) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error });
+          // Don't adopt the errored attempt's state — keep going from
+          // the last known-good state so one bad day doesn't poison the
+          // rest of the batch.
+          workingState = { ...before, _error: null };
+        } else {
+          results.push({ trip_id: tripId, ok: true });
+          workingState = { ...after, _error: null };
+        }
+      }
+      return { ...workingState, _error: null, _lastBulkAssignResults: results };
+    }
+
+    case "TRIP/ASSIGN_DRIVER": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      const drvStatus = state.driver_status.find(d => d.driver_id === action.driver_id);
+      if (!trip || !drvStatus) return state;
+
+      const currentLoad = getDriverLoad(state, action.driver_id, trip.scheduled_date);
+      const incomingSeats = Math.max(1, trip.agent_ids?.length || 0);
+      if (currentLoad + incomingSeats > DRIVER_CAPACITY) {
+        return { ...state, _error: `Driver doesn't have room — ${currentLoad}/${DRIVER_CAPACITY} seats taken, this trip needs ${incomingSeats}.` };
+      }
+
+      try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
+      catch (e) { return { ...state, _error: e.message }; }
+
+      const existingAssigned = state.trips.filter(
+        t => t.driver_id === action.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED && t.trip_id !== action.trip_id
+      );
+      const allForDriver = [...existingAssigned, { ...trip, driver_id: action.driver_id }];
+      const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
+      const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+      const seqMap = {};
+      const dropMap = {};
+      ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+      dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+
+      // Total route distance across ALL the driver's active trips —
+      // computed from the exact ordered sequences above, so this always
+      // matches the route the driver will actually navigate. Stamped on
+      // every trip the driver has (not just the one just assigned) since
+      // it's a property of the driver's whole route, shared by everyone
+      // riding in that vehicle right now — an agent added in trip #1
+      // needs to see the same total as one added in trip #3.
+      const totalAgentCount = allForDriver.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+      const routeDistanceKm = computeDriverRouteDistanceKm(defaultCompanyAnchor(state), ordered, dropOrdered);
+      const policyCapKm = companyPolicyDistanceCapKm(totalAgentCount);
+      const exceedsPolicy = routeDistanceKm > policyCapKm;
+
+      const newTrips = state.trips.map(t => {
+        if (t.trip_id === action.trip_id) {
+          return {
+            ...t, state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: action.driver_id,
+            pickup_order_num: seqMap[action.trip_id],
+            drop_sequence_num: dropMap[action.trip_id],
+            driverAccepted: true, acceptedAt: now(), confirmed_at: now(), tripStartedAt: now(),
+            driver_route_km: routeDistanceKm, driver_route_cap_km: policyCapKm, driver_route_exceeds_policy: exceedsPolicy,
+          };
+        }
+        if (t.driver_id === action.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+          return {
+            ...t,
+            pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num,
+            drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num,
+            driver_route_km: routeDistanceKm, driver_route_cap_km: policyCapKm, driver_route_exceeds_policy: exceedsPolicy,
+          };
+        }
+        return t;
+      });
+
+      const newDriverStatus = state.driver_status.map(d =>
+        d.driver_id === action.driver_id
+          ? { ...d, state: DRIVER_STATE.BUSY, current_trip_id: action.trip_id } : d
+      );
+
+      const driverUser = state.users.find(u => u.id === action.driver_id);
+      const driverRec = state.driver_status.find(d => d.driver_id === action.driver_id);
+      const newLoad = currentLoad + incomingSeats;
+      const isFullyBooked = newLoad >= DRIVER_CAPACITY;
+
+      const notif = {
+        id: mkId(), type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT],
+        for_user_ids: [...trip.agent_ids],
+        message: `Driver ${driverUser?.name} (${driverRec?.vehicle}) assigned. You are pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+
+      const notifications = [notif, ...state.notifications];
+      if (isFullyBooked) {
+        notifications.unshift({
+          id: mkId(), type: "DRIVER_FULLY_BOOKED", for_roles: [ROLE.ADMIN],
+          message: `⚠ Driver ${driverUser?.name} is now FULLY BOOKED (${DRIVER_CAPACITY}/${DRIVER_CAPACITY} seats).`,
+          ts: now(), read: false,
+        });
+      }
+      if (exceedsPolicy) {
+        notifications.unshift({
+          id: mkId(), type: "ROUTE_EXCEEDS_POLICY", for_roles: [ROLE.ADMIN],
+          message: `⚠ Driver ${driverUser?.name}'s total route is ${routeDistanceKm.toFixed(1)} km — exceeds the ${policyCapKm} km policy cap for ${totalAgentCount} agent${totalAgentCount !== 1 ? "s" : ""} (40 km × ${totalAgentCount}).`,
+          trip_id: action.trip_id, ts: now(), read: false,
+        });
+      }
+
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications, _error: null };
+    }
+
+    case "TRIP/DRIVER_CONFIRM": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
+      catch (e) { return { ...state, _error: e.message }; }
+      const nowTs = now();
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? { ...t, state: TRIP_STATE.DRIVER_CONFIRMED, confirmed_at: nowTs, tripStartedAt: nowTs } : t
+      );
+      const notif = {
+        id: mkId(), type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT],
+        for_user_ids: [...trip.agent_ids],
+        message: "Your driver has confirmed the trip. They are on the way.",
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      };
+      return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/ACCEPT": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      const driverUser = state.users.find(u => u.id === trip.driver_id);
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id ? { ...t, driverAccepted: true, acceptedAt: now() } : t
+      );
+      const notif = {
+        id: mkId(), type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN],
+        for_user_ids: [...trip.agent_ids],
+        message: `Driver ${driverUser?.name} accepted your trip.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/REMOVE_DRIVER": {
+      // Admin-initiated un-assignment (demo-mode parity with the Supabase
+      // handler) — reverts the trip to UNASSIGNED_BOOKING and frees the
+      // driver if they have no other active trips. Unlike TRIP/DECLINE
+      // this does NOT touch declinedBy (it's an admin correcting an
+      // assignment, not the driver refusing it).
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (!trip.driver_id) return { ...state, _error: "This trip has no driver assigned." };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot remove the driver from a completed trip." };
+      const removedDriverId = trip.driver_id;
+      const newTrips = state.trips.map(t => t.trip_id === action.trip_id
+        ? { ...t, state: TRIP_STATE.UNASSIGNED_BOOKING, driver_id: null, pickup_order_num: null, drop_sequence_num: null, driverAccepted: false }
+        : t);
+      const stillActive = newTrips.filter(t => t.driver_id === removedDriverId && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
+      const newDriverStatus = stillActive.length === 0
+        ? state.driver_status.map(d => d.driver_id === removedDriverId ? { ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null } : d)
+        : state.driver_status;
+      const removedDriverUser = state.users.find(u => u.id === removedDriverId);
+      const notif = {
+        id: mkId(), type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: [...trip.agent_ids],
+        message: `Driver ${removedDriverUser?.name || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/REPORT_DELAY": {
+      // Driver-facing delay report (demo-mode parity). No trip_delays
+      // table in the in-memory model, so this just raises the admin +
+      // agent notifications the Supabase handler also raises.
+      const validReasons = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
+      if (!validReasons.includes(action.reason)) return { ...state, _error: "Please choose a valid delay reason." };
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (trip.driver_id !== action.driver_id) return { ...state, _error: "You're not the driver on this trip." };
+      if (![TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state)) {
+        return { ...state, _error: "Delays can only be reported on an active trip." };
+      }
+      const reportingDriver = state.users.find(u => u.id === action.driver_id);
+      const nowTs = now();
+      const adminNotif = {
+        id: mkId(), type: "TRIP_DELAY", for_roles: [ROLE.ADMIN],
+        message: `⏱ ${reportingDriver?.name || "Driver"} reported a delay on trip ${action.trip_id}: ${action.reason}${action.note ? ` — "${action.note.trim()}"` : ""}`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      };
+      const agentNotif = trip.agent_ids.length ? [{
+        id: mkId(), type: "TRIP_DELAY", for_roles: [ROLE.AGENT], for_user_ids: [...trip.agent_ids],
+        message: `Heads up: your driver reported a delay on trip ${action.trip_id} (${action.reason}).`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      }] : [];
+      return { ...state, notifications: [adminNotif, ...agentNotif, ...state.notifications], _error: null };
+    }
+
+    case "DM/SEND": {
+      // Direct message (demo-mode parity). No direct_messages table in
+      // the in-memory model — the live UI fetches those separately — so
+      // in demo mode this is accepted as a clean no-op success rather
+      // than falling through to the default case as an unknown action
+      // (which left the send button looking broken). Returning cleanly
+      // lets the caller's optimistic UI proceed.
+      return { ...state, _error: null };
+    }
+
+    case "TRIP/DECLINE": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? {
+              ...t, state: TRIP_STATE.UNASSIGNED_BOOKING, driver_id: null,
+              pickup_order_num: null, drop_sequence_num: null,
+              driverAccepted: false, declinedBy: [...(t.declinedBy || []), action.driver_id],
+            }
+          : t
+      );
+      const remaining = newTrips.filter(t =>
+        t.driver_id === action.driver_id &&
+        [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+      );
+      const newDriverStatus = remaining.length === 0
+        ? state.driver_status.map(d =>
+            d.driver_id === action.driver_id
+              ? { ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null } : d)
+        : state.driver_status;
+      const driverUser = state.users.find(u => u.id === action.driver_id);
+      const notif = {
+        id: mkId(), type: "TRIP_DECLINED", for_roles: [ROLE.ADMIN],
+        message: `Driver ${driverUser?.name} declined trip ${action.trip_id}. Needs reassignment.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/CONFIRM_AGENT_PICKUP": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      const newCompleted = [...trip.completed_pickups, action.agent_id];
+      const allPickedUp = trip.agent_ids.every(id => newCompleted.includes(id));
+      const nextNavIdx = (trip.current_nav_idx || 0) + 1;
+      const nowTs = now();
+      let newState = trip.state;
+      let inTransitAt = trip.in_transit_at;
+      if (allPickedUp && trip.state !== TRIP_STATE.IN_TRANSIT) {
+        try { assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT); }
+        catch (e) { return { ...state, _error: e.message }; }
+        newState = TRIP_STATE.IN_TRANSIT;
+        inTransitAt = nowTs;
+      }
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx }
+          : t
+      );
+      const notifs = allPickedUp ? [{
+        id: mkId(), type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
+        message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      }] : [];
+      return { ...state, trips: newTrips, notifications: [...notifs, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/COMPLETE": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      try { assertTripTransition(trip.state, TRIP_STATE.ARCHIVED_COMPLETED); }
+      catch (e) { return { ...state, _error: e.message }; }
+      const drvStatus = state.driver_status.find(d => d.driver_id === trip.driver_id);
+      if (!drvStatus) return { ...state, _error: `Driver status not found for ${action.trip_id}` };
+
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: now(), actual_distance_km: t.est_distance_km }
+          : t
+      );
+
+      const remaining = newTrips.filter(t =>
+        t.driver_id === trip.driver_id &&
+        [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+      );
+      const newDriverStatus = state.driver_status.map(d =>
+        d.driver_id === trip.driver_id
+          ? { ...d, state: remaining.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remaining[0]?.trip_id || null }
+          : d
+      );
+
+      const agentNotifs = trip.agent_ids.map(aid => ({
+        id: mkId(), type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+        message: "Your trip has been completed and archived.",
+        trip_id: action.trip_id, ts: now(), read: false,
+      }));
+      const adminNotif = {
+        id: mkId(), type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
+        message: `Trip ${action.trip_id} archived. Driver ${state.users.find(u => u.id === trip.driver_id)?.name || trip.driver_id} has ${remaining.length} trips remaining.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...agentNotifs, adminNotif, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/SEND_CHAT":
+    case "CHAT/SEND": {
+      const msg = {
+        id: mkId(), sender_id: action.sender_id, sender_name: action.sender_name,
+        sender_role: action.sender_role, text: action.text, ts: now(),
+      };
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id
+          ? { ...t, chat_messages: [...(t.chat_messages || []), msg] } : t
+      );
+      return { ...state, trips: newTrips };
+    }
+
+    case "NOTIF/MARK_READ":
+      return { ...state, notifications: state.notifications.map(n => n.id === action.id ? { ...n, read: true } : n) };
+    case "NOTIF/MARK_ALL_READ": {
+      // Scoped to the caller — previously this marked EVERY user's
+      // notifications read (fine when only admins triggered it, but wrong
+      // once agents and drivers do: one person's "clear" would silently
+      // clear everyone's). user_id = mark that user's; admin = mark the
+      // admin-role broadcast notifications.
+      const matches = (n) => action.user_id != null
+        ? n.for_user_ids?.includes(action.user_id)
+        : (action.admin ? (!n.for_user_ids?.length && (!n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN))) : true);
+      return { ...state, notifications: state.notifications.map(n => matches(n) ? { ...n, read: true } : n) };
+    }
+
+    case "TRIP/SEND_REMINDER": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip || trip.reminder_sent) return state;
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id ? { ...t, reminder_sent: true } : t
+      );
+      const notif = {
+        id: mkId(), type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT],
+        for_user_ids: [...trip.agent_ids],
+        message: `Reminder: your trip from ${trip.custom_pickup} departs at ${trip.scheduled_time}.`,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, notifications: [notif, ...state.notifications] };
+    }
+
+    case "TRIP/CANCEL": {
+      // Rollback primitive for multi-leg bookings (week series / with-
+      // return): removes a just-created booking and its notifications.
+      // Deliberately narrow — only UNASSIGNED_BOOKING can be cancelled
+      // (nothing dispatched, no driver involved yet), and when agent_id
+      // is provided the trip must belong to that agent, so this can't be
+      // repurposed to delete someone else's or an in-flight trip.
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (trip.state !== TRIP_STATE.UNASSIGNED_BOOKING) return { ...state, _error: "Only unassigned bookings can be cancelled." };
+      if (action.agent_id != null && !trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "You can only cancel your own bookings." };
+      return {
+        ...state,
+        trips: state.trips.filter(t => t.trip_id !== action.trip_id),
+        notifications: state.notifications.filter(n => n.trip_id !== action.trip_id),
+        _error: null,
+      };
+    }
+
+    case "TICKET/CREATE": {
+      // Mirrors the Supabase handler so filing a ticket works in demo
+      // mode too — previously this action had no local case at all, so
+      // the Help form's submit "succeeded" while nothing ever appeared.
+      if (!action.category?.trim()) return { ...state, _error: "Please choose a category." };
+      if (!action.message?.trim()) return { ...state, _error: "Please describe the issue." };
+      const ticketNowTs = nowEpoch();
+      const ticket = {
+        id: "TKT_" + mkId(), agent_id: action.user_id, trip_id: action.trip_id || null,
+        role: action.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT,
+        category: action.category.trim(), message: action.message.trim(),
+        status: "OPEN", admin_id: null, admin_reply: null,
+        created_at: ticketNowTs, updated_at: ticketNowTs, resolved_at: null,
+      };
+      const filingUser = state.users.find(u => u.id === action.user_id);
+      const ticketNotif = {
+        id: mkId(), type: "TICKET_OPENED", for_roles: [ROLE.ADMIN],
+        message: `🎫 New ticket from ${filingUser?.name || (ticket.role === ROLE.DRIVER ? "a driver" : "an agent")}: ${ticket.category}${ticket.trip_id ? ` (Trip ${ticket.trip_id})` : ""}`,
+        trip_id: ticket.trip_id, ts: now(), read: false,
+      };
+      return { ...state, tickets: [ticket, ...(state.tickets || [])], notifications: [ticketNotif, ...state.notifications], _error: null };
+    }
+
+    case "TICKET/UPDATE": {
+      const ticket = (state.tickets || []).find(t => t.id === action.ticket_id);
+      if (!ticket) return { ...state, _error: "Ticket not found" };
+      const updNowTs = nowEpoch();
+      const newTickets = state.tickets.map(t => t.id === action.ticket_id ? {
+        ...t,
+        status: action.status !== undefined ? action.status : t.status,
+        admin_reply: action.admin_reply !== undefined ? action.admin_reply : t.admin_reply,
+        admin_id: action.admin_id !== undefined ? action.admin_id : t.admin_id,
+        updated_at: updNowTs,
+        resolved_at: action.status === "RESOLVED" ? updNowTs : t.resolved_at,
+      } : t);
+      const updateNotif = (action.status !== undefined || action.admin_reply !== undefined) ? [{
+        id: mkId(), type: "TICKET_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [ticket.agent_id],
+        message: action.status === "RESOLVED"
+          ? `Your ticket (${ticket.category}) has been resolved.`
+          : `Your ticket (${ticket.category}) has an update from admin.`,
+        trip_id: ticket.trip_id, ts: now(), read: false,
+      }] : [];
+      return { ...state, tickets: newTickets, notifications: [...updateNotif, ...state.notifications], _error: null };
+    }
+
+    case "ADMIN/CREATE_COMPANY": {
+      if (!action.name?.trim()) return { ...state, _error: "Company name is required." };
+      if (!action.address?.lat) {
+        return { ...state, _error: "An address is required." };
+      }
+      const company = {
+        id: "CO_" + mkId(), name: action.name.trim(), active: true,
+        address: action.address,
+      };
+      return { ...state, companies: [...(state.companies || []), company].sort((a, b) => a.name.localeCompare(b.name)), _error: null };
+    }
+
+    case "ADMIN/DELETE_COMPANY": {
+      const co = (state.companies || []).find(c => c.id === action.company_id);
+      if (!co) return { ...state, _error: "Company not found" };
+      // Same reasoning as campaign delete — refuse rather than silently
+      // orphan agents whose branch_id points at a company that no
+      // longer exists.
+      const assignedCount = state.users.filter(u => u.branch_id === action.company_id).length;
+      if (assignedCount > 0) {
+        return { ...state, _error: `${assignedCount} agent${assignedCount !== 1 ? "s are" : " is"} still assigned to this company — reassign them first.` };
+      }
+      return { ...state, companies: state.companies.filter(c => c.id !== action.company_id), _error: null };
+    }
+
+    case "ADMIN/UPDATE_COMPANY": {
+      const co = (state.companies || []).find(c => c.id === action.company_id);
+      if (!co) return { ...state, _error: "Company not found" };
+      const newCompanies = state.companies.map(c => c.id === action.company_id ? {
+        ...c,
+        name: action.name !== undefined ? action.name.trim() : c.name,
+        active: action.active !== undefined ? action.active : c.active,
+        address: action.address !== undefined ? action.address : c.address,
+      } : c);
+      return { ...state, companies: newCompanies, _error: null };
+    }
+
+    case "ADMIN/CREATE_CAMPAIGN": {
+      if (!action.name?.trim()) return { ...state, _error: "Campaign name is required." };
+      const campaign = { id: "CMP_" + mkId(), name: action.name.trim(), active: true };
+      return { ...state, campaigns: [...(state.campaigns || []), campaign].sort((a, b) => a.name.localeCompare(b.name)), _error: null };
+    }
+
+    case "ADMIN/DELETE_CAMPAIGN": {
+      const camp = (state.campaigns || []).find(c => c.id === action.campaign_id);
+      if (!camp) return { ...state, _error: "Campaign not found" };
+      // Refuse if any agent is still assigned — matches how the users
+      // table's own foreign keys behave elsewhere in this app (deleting
+      // a referenced row is blocked, not silently cascaded): an agent's
+      // campaignid pointing at a deleted campaign would be a dangling
+      // reference nothing in the app expects. Reassign or clear those
+      // agents' campaign first, same pattern as resolving trip history
+      // before a user can be deleted.
+      const assignedCount = state.users.filter(u => u.campaign_id === action.campaign_id).length;
+      if (assignedCount > 0) {
+        return { ...state, _error: `${assignedCount} agent${assignedCount !== 1 ? "s are" : " is"} still assigned to this campaign — reassign them first.` };
+      }
+      return { ...state, campaigns: state.campaigns.filter(c => c.id !== action.campaign_id), _error: null };
+    }
+
+    case "ADMIN/UPDATE_CAMPAIGN": {
+      const camp = (state.campaigns || []).find(c => c.id === action.campaign_id);
+      if (!camp) return { ...state, _error: "Campaign not found" };
+      const newCampaigns = state.campaigns.map(c => c.id === action.campaign_id ? {
+        ...c,
+        name: action.name !== undefined ? action.name.trim() : c.name,
+        active: action.active !== undefined ? action.active : c.active,
+      } : c);
+      return { ...state, campaigns: newCampaigns, _error: null };
+    }
+
+    case "TRIP/ADMIN_CANCEL": {
+      // Admin-initiated cancellation of any not-yet-completed trip —
+      // distinct from TRIP/CANCEL (the agent-facing rollback primitive,
+      // which is deliberately limited to UNASSIGNED_BOOKING). This one
+      // also frees the assigned driver and NOTIFIES everyone affected
+      // instead of scrubbing the notification history.
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Completed trips can't be cancelled — they're already archived." };
+      const newTrips = state.trips.filter(t => t.trip_id !== action.trip_id);
+      let newDriverStatus = state.driver_status;
+      if (trip.driver_id) {
+        const remaining = newTrips.filter(t =>
+          t.driver_id === trip.driver_id &&
+          [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+        );
+        newDriverStatus = state.driver_status.map(d =>
+          d.driver_id === trip.driver_id
+            ? { ...d, state: remaining.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remaining[0]?.trip_id || null }
+            : d
+        );
+      }
+      const nowTs = now();
+      const cancelNotifs = [
+        ...trip.agent_ids.map(aid => ({
+          id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+          message: `Your trip ${trip.trip_id} (${trip.scheduled_date} ${trip.scheduled_time}) was cancelled by an admin.`,
+          trip_id: trip.trip_id, ts: nowTs, read: false,
+        })),
+        ...(trip.driver_id ? [{
+          id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [trip.driver_id],
+          message: `Trip ${trip.trip_id} was cancelled by an admin and removed from your route.`,
+          trip_id: trip.trip_id, ts: nowTs, read: false,
+        }] : []),
+      ];
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...cancelNotifs, ...state.notifications], _error: null };
+    }
+
+    case "_CLEAR_ERROR":
+      return { ...state, _error: null };
+
+    default:
+      return state;
+  }
+}
+
+/* ---------- SUPABASE-BACKED STORE HOOK ----------
+   Same action-type contract as the in-memory reducer above, so every
+   screen calls dispatch({ type: "...", ... }) identically regardless of
+   which backend is active. Falls back to the in-memory reducer if
+   Supabase isn't configured or a connection can't be established, so the
+   app is fully demoable even without a working database connection. */
+
+// ── Mapping layer ──────────────────────────────────────────────────
+// The real Supabase schema stores every migrated column in unquoted
+// lowercase (e.g. staffnumber, driverid, extraagentids) since Postgres
+// folds unquoted identifiers to lowercase. The functions below are the
+// ONLY place that talks to those real column names — everything else
+// in the app (reducer, UI) keeps using the clean snake_case shape.
+// id columns are bigint (DB-generated), not app-generated USR_/TRP_
+// strings — see ADMIN/CREATE_USER and TRIP/BOOK for insert+readback.
+function userRowToApp(row) {
+  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username, pass: row.passwordhash } };
+  // Home address is meaningful for both agents (pickup point) and drivers
+  // (which area they live in, for assignment purposes) — not agent-only.
+  if ((row.role === ROLE.AGENT || row.role === ROLE.DRIVER) && row.homelat != null) {
+    user.home_address = { label: row.homeaddress, area: row.homearea, lat: row.homelat, lng: row.homelng };
+  }
+  if (row.role === ROLE.AGENT || row.role === ROLE.DRIVER) {
+    user.branch_id = row.branchid || null;
+  }
+  if (row.role === ROLE.AGENT) {
+    user.branch_history = Array.isArray(row.branchhistory) ? row.branchhistory : [];
+    user.campaign_id = row.campaignid || null;
+  }
+  if (row.role === ROLE.ADMIN) {
+    user.admin_level = row.adminlevel || ADMIN_LEVEL.VIEWER;
+    // The single company a Viewer-tier admin is restricted to seeing —
+    // null means unrestricted (the historical default, and the only
+    // sensible value for FLEET_OPS/STANDARD who see everything
+    // regardless). Read for any admin role so a level change back to
+    // FLEET_OPS doesn't need this field cleared separately.
+    user.scoped_company_ids = row.scopedcompanyids || [];
+  }
+  return user;
+}
+function driverStatusRowToApp(row) {
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity };
+}
+function tripRowToApp(row, chatByTrip) {
+  const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
+  const extraPickups = Array.isArray(row.extrapickups) ? row.extrapickups : [];
+  return {
+    trip_id: row.id, agent_ids: [row.agentid, ...(row.extraagentids || [])].filter(Boolean), driver_id: row.driverid, state: row.status,
+    pickup_sequence_coords: [...firstPickup, ...extraPickups],
+    dropoff_sequence_coords: row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel }] : [],
+    completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
+    pickup_company_id: row.pickupcompanyid, dropoff_company_id: row.dropoffcompanyid,
+    pickup_is_manual: row.pickupismanual || false, dropoff_is_manual: row.dropoffismanual || false,
+    direction: row.direction, is_exception: row.isexception || false, completed_dropoffs: row.completeddropoffs || [],
+    pickup_timestamps: row.pickuptimestamps || {}, dropoff_timestamps: row.dropofftimestamps || {},
+    route_total_km: row.routetotalkm,
+    week_group_id: row.weekgroupid || null, week_day_num: row.weekdaynum || null,
+    trip_type: row.triptype, scheduled_date: row.scheduleddate,
+    scheduled_time: row.scheduledtimestr || row.scheduledtime, scheduled_time_epoch: row.scheduledtime,
+    booked_at: epochToDisplay(row.bookedat), confirmed_at: epochToDisplay(row.confirmedat),
+    in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat),
+    agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
+    est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
+    driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), declinedBy: row.declinedby || [], reminder_sent: row.remindersent,
+    long_distance_flag: row.longdistanceflag || false, admin_note: row.adminnote || null,
+    driver_route_km: row.driverroutekm != null ? Number(row.driverroutekm) : null,
+    driver_route_cap_km: row.driverroutecapkm != null ? Number(row.driverroutecapkm) : null,
+    driver_route_exceeds_policy: row.driverrouteexceedspolicy || false,
+    chat_messages: chatByTrip[row.id] || [],
+  };
+}
+function notifRowToApp(row) {
+  return { id: row.id, type: row.type, for_roles: row.forroles || [], for_user_ids: row.userid != null ? [row.userid] : [], message: row.message, trip_id: row.tripid, ts: epochToDisplay(row.timestamp), ts_epoch: row.timestamp, read: row.isread };
+}
+
+async function fetchAllFromSupabase() {
+  // Trips: always include every trip that isn't finished yet (regardless of
+  // age — an unassigned booking from last week still needs to show up), but
+  // only pull ARCHIVED_COMPLETED trips from the last 30 days. Without this,
+  // every client re-downloads the ENTIRE historical trips table on every one
+  // of the 18 actions that refetch — fine with a handful of test trips, but
+  // at real scale (2000 staff, ~1-2 trips/day) that table grows by tens of
+  // thousands of rows a month and this fetch becomes the bottleneck well
+  // before Supabase's own row/storage limits do. Older completed trips are
+  // still in the database and reachable via a dedicated history/report
+  // query later — they're just not part of the app's everyday live state.
+  // Window starts at the FIRST of the PREVIOUS calendar month (not a
+  // rolling 30 days) so the one-month archive agents/drivers see is
+  // always the complete month — a rolling window would truncate the
+  // start of the archive month for most of the current one. Worst case
+  // this loads ~62 days of completed trips, same order of magnitude as
+  // the old 30-day window.
+  const prevMonthStart = (() => {
+    const d = new Date();
+    return new Date(d.getFullYear(), d.getMonth() - 1, 1).getTime();
+  })();
+  const tripsQuery = supabase.from("trips").select("*")
+    .or(`status.neq.${TRIP_STATE.ARCHIVED_COMPLETED},completedat.gte.${prevMonthStart}`)
+    .order("id", { ascending: false });
+
+  const [usersRes, driversRes, tripsRes] = await Promise.all([
+    supabase.from("users").select("*").order("id"),
+    supabase.from("driver_status").select("*"),
+    tripsQuery,
+  ]);
+  const firstError = usersRes.error || driversRes.error || tripsRes.error;
+  if (firstError) throw firstError;
+
+  // Chat and notifications are scoped to the same trip set loaded above —
+  // no point pulling messages/alerts for a trip that was just filtered out
+  // as old-and-completed. Falls back to unfiltered if there happen to be
+  // zero trips in scope (e.g. a brand-new empty database).
+  const tripIdsInScope = tripsRes.data.map(t => t.id);
+  const [chatRes, notifsRes] = await Promise.all([
+    tripIdsInScope.length > 0
+      ? supabase.from("messages").select("*").in("tripid", tripIdsInScope).order("timestamp")
+      : supabase.from("messages").select("*").order("timestamp"),
+    supabase.from("notifications").select("*").order("timestamp", { ascending: false }).limit(500),
+  ]);
+  const secondError = chatRes.error || notifsRes.error;
+  if (secondError) throw secondError;
+
+  const chatByTrip = {};
+  for (const m of chatRes.data) {
+    (chatByTrip[m.tripid] ||= []).push({ id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole, text: m.content, ts: epochToDisplay(m.timestamp) });
+  }
+  // The real notifications table is one row per (notification, user) —
+  // for_roles-only broadcasts are written as a single row with userid=null
+  // (see insertNotification). Those broadcast rows are merged back into one
+  // entry with a for_user_ids array purely for display purposes. Per-user
+  // rows (userid present) are NEVER merged, even if several share the same
+  // type/trip/timestamp/message (e.g. TRIP/COMPLETE fanning out one row per
+  // agent) — each keeps its own id and read-state, since NOTIF/MARK_READ
+  // updates by that specific row's id. Merging those would let one agent's
+  // "mark as read" silently mark a different agent's row instead.
+  const notifRows = notifsRes.data.map(notifRowToApp);
+  const merged = [];
+  const seen = new Map();
+  for (const n of notifRows) {
+    const isBroadcastRow = n.for_user_ids.length === 0;
+    if (!isBroadcastRow) { merged.push(n); continue; }
+    const key = `${n.type}|${n.trip_id}|${n.ts}|${n.message}`;
+    if (seen.has(key)) {
+      seen.get(key).for_user_ids.push(...n.for_user_ids);
+    } else {
+      const copy = { ...n, for_user_ids: [...n.for_user_ids] };
+      seen.set(key, copy);
+      merged.push(copy);
+    }
+  }
+  return {
+    users: usersRes.data.map(userRowToApp),
+    driver_status: driversRes.data.map(driverStatusRowToApp),
+    trips: tripsRes.data.map(r => tripRowToApp(r, chatByTrip)),
+    notifications: merged,
+  };
+}
+
+// On-demand fetch for one direct-message conversation (both directions
+// between the two given user ids) — not part of the general refetch
+// cycle, since DMs are only needed when an admin actually opens a
+// specific conversation, not loaded for everyone all the time.
+// On-demand fetch of delay/detour reports for one trip — not part of the
+// general refetch cycle, since this is only needed when someone actually
+// opens a trip's detail view, not loaded for every trip all the time.
+// Batched version of fetchTripDelays, for CSV export — one query for every
+// trip being exported rather than one query per trip, which would be slow
+// and wasteful for a large date-range export.
+// Batched fetch of audit_logs entries for a set of trips — same pattern
+// as fetchDelaysForTrips, used to show "which admin edited this trip" on
+// the CSV export without a per-trip query for every row.
+async function fetchAuditLogsForTrips(tripIds) {
+  if (!tripIds.length) return {};
+  const { data, error } = await supabase.from("audit_logs").select("*").in("tripid", tripIds).order("timestamp", { ascending: true });
+  if (error) return {};
+  const byTrip = {};
+  (data || []).forEach(a => {
+    (byTrip[a.tripid] ||= []).push({ actionType: a.actiontype, username: a.username, details: a.details, timestamp: a.timestamp });
+  });
+  return byTrip;
+}
+
+async function fetchDelaysForTrips(tripIds) {
+  if (!tripIds.length) return {};
+  const { data, error } = await supabase.from("trip_delays").select("*").in("tripid", tripIds).order("reportedat", { ascending: true });
+  if (error) return {};
+  const byTrip = {};
+  (data || []).forEach(d => {
+    (byTrip[d.tripid] ||= []).push({ reason: d.reason, note: d.note, reported_at: d.reportedat });
+  });
+  return byTrip;
+}
+
+async function fetchTripDelays(tripId) {
+  const { data, error } = await supabase.from("trip_delays").select("*").eq("tripid", tripId).order("reportedat", { ascending: true });
+  if (error) throw error;
+  return (data || []).map(d => ({ id: d.id, trip_id: d.tripid, driver_id: d.driverid, reason: d.reason, note: d.note, reported_at: d.reportedat }));
+}
+
+async function fetchDirectMessages(userIdA, userIdB) {
+  const { data, error } = await supabase.from("direct_messages").select("*")
+    .or(`and(senderid.eq.${userIdA},recipientid.eq.${userIdB}),and(senderid.eq.${userIdB},recipientid.eq.${userIdA})`)
+    .order("timestamp", { ascending: true });
+  if (error) throw error;
+  return (data || []).map(m => ({
+    id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole,
+    recipient_id: m.recipientid, text: m.content, ts: epochToDisplay(m.timestamp), ts_epoch: m.timestamp,
+  }));
+}
+
+// The real notifications table has a single nullable `userid` column, not
+// an array — this fans a { for_roles, for_user_ids, ... } notification out
+// into one row per target user (or a single role-only broadcast row when
+// for_user_ids is empty), matching what fetchAllFromSupabase re-merges.
+async function insertNotification(n) {
+  // notifications.title is NOT NULL with no default, but the app's
+  // notification model never tracked a separate title — only type and
+  // message. Derive one from type the same way the UI already formats it
+  // for display (e.g. "DRIVER_ASSIGNED" -> "DRIVER ASSIGNED") rather than
+  // updating every call site to pass an explicit title.
+  const title = n.title || (n.type ? n.type.replace(/_/g, " ") : "Notification");
+  const base = { title, type: n.type, forroles: n.for_roles || [], message: n.message, tripid: n.trip_id ?? null, timestamp: n.ts, isread: n.read ?? false };
+  const userIds = n.for_user_ids && n.for_user_ids.length ? n.for_user_ids : [null];
+  const rows = userIds.map(uid => ({ ...base, userid: uid }));
+  return supabase.from("notifications").insert(rows);
+}
+
+// Writes to the real production audit_logs table (actiontype, username,
+// actordetails, issuccess, details, timestamp — the original columns —
+// plus tripid/targetuserid added specifically so the trip sheet CSV can
+// show which admin edited a given trip). Called at the end of every
+// admin action that actually changes a trip or user record, right before
+// the final refetch() — never allowed to throw and break the action it's
+// logging, since an audit trail failing to write shouldn't block the
+// actual operation from succeeding.
+async function logAuditAction({ actorId, actorName, actionType, tripId, targetUserId, details }) {
+  try {
+    await supabase.from("audit_logs").insert({
+      actiontype: actionType, username: actorName || String(actorId), actordetails: actorId != null ? String(actorId) : null,
+      issuccess: true, details: details || null, timestamp: nowEpoch(),
+      tripid: tripId ?? null, targetuserid: targetUserId ?? null,
+    });
+  } catch (e) {
+    console.warn("[AuditLog] failed to record action (action itself still succeeded):", e.message);
+  }
+}
+
+// On-demand query for completed trips OLDER than the live window (current
+// + previous month) that fetchAllFromSupabase normally loads. Deliberately
+// separate from the live
+// app state — this is called only when an admin opens the History tab and
+// picks a date range, not on every refetch, so it doesn't reintroduce the
+// bandwidth problem the live-window filter was added to solve.
+async function fetchTripHistory({ fromMs, toMs, agentId, driverId } = {}) {
+  let q = supabase.from("trips").select("*").eq("status", TRIP_STATE.ARCHIVED_COMPLETED).order("completedat", { ascending: false }).limit(500);
+  if (fromMs != null) q = q.gte("completedat", fromMs);
+  if (toMs != null) q = q.lte("completedat", toMs);
+  if (agentId != null) q = q.eq("agentid", agentId);
+  if (driverId != null) q = q.eq("driverid", driverId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return (data || []).map(r => tripRowToApp(r, {}));
+}
+
+// Re-checks the ACTING user's real, current admin_level directly from the
+// database before allowing a gated action — never trusts client-side state,
+// since that could be stale (permissions changed after login) or bypassed
+// entirely by someone calling dispatch directly from devtools. Throws with
+// a clear message rather than silently no-op'ing, so the UI can surface it.
+async function assertAdminPermission(activeUserRef, permission) {
+  const actingId = activeUserRef.current;
+  if (actingId == null) throw new Error("Not logged in.");
+  const { data: actingUser, error } = await supabase.from("users").select("role, adminlevel, fullname").eq("id", actingId).single();
+  if (error || !actingUser) throw new Error("Could not verify permissions.");
+  if (actingUser.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
+  const level = ADMIN_PERMISSIONS[actingUser.adminlevel] ? actingUser.adminlevel : ADMIN_LEVEL.VIEWER;
+  if (!ADMIN_PERMISSIONS[level][permission]) {
+    throw new Error(`Your admin level (${level.replace("_", " ")}) doesn't have permission to do this.`);
+  }
+  // Returned so call sites that need to log WHO made this edit (audit
+  // trail) don't need a second lookup — existing call sites that just
+  // `await` this without using the result are unaffected.
+  return { id: actingId, name: actingUser.fullname };
+}
+
+/* ---------- SESSION PERSISTENCE ----------
+   The active user id survives page refreshes via localStorage — without
+   this, every reload logged everyone out, which for a driver mid-route
+   on a phone meant re-typing credentials while driving. This persists
+   ONLY the user id (no password, no token): rehydration still goes
+   through the normal data fetch, and an id that no longer matches a
+   real user simply falls through to the login screen. */
+const ACTIVE_USER_STORAGE_KEY = "transitos_active_user_id";
+function readStoredActiveUserId() {
+  try {
+    const raw = localStorage.getItem(ACTIVE_USER_STORAGE_KEY);
+    if (!raw) return null;
+    // Supabase user ids are numeric (bigint); demo-mode ids are strings
+    // ("USR_…"). Restore the same type that was stored so strict-equality
+    // lookups (u.id === active_user_id) keep working in both modes.
+    return /^\d+$/.test(raw) ? Number(raw) : raw;
+  } catch (e) { return null; }
+}
+function persistActiveUserId(id) {
+  try {
+    if (id == null) localStorage.removeItem(ACTIVE_USER_STORAGE_KEY);
+    else localStorage.setItem(ACTIVE_USER_STORAGE_KEY, String(id));
+  } catch (e) { /* private browsing / storage blocked — session just won't persist */ }
+}
+
+/* ---------- PASSWORD HASHING ----------
+   SHA-256(salt + password) via the built-in Web Crypto API — no new
+   dependency. This replaces plaintext storage in the users table:
+   passwordhash now holds the hex digest and the salt lives in a new
+   passwordsalt column (see transitos_security_hardening.sql for the
+   one-line ALTER TABLE). Migration is LAZY: accounts created before
+   hashing still log in via the legacy plaintext comparison and are
+   upgraded to salted-hash in place on their first successful login —
+   no bulk migration or forced resets needed. Honest scope note: with
+   the anon key + a custom users table, verification necessarily runs
+   client-side, so hashing protects against DATA exposure (dumps, CSVs,
+   shoulder-surfed rows), not against a malicious client. The full fix
+   is Supabase Auth — see the hardening SQL's header for that plan. */
+function makeSalt() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+async function hashPassword(password, salt) {
+  const data = new TextEncoder().encode(`${salt}${password}`);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Supabase JS never throws on a failed query — it returns { error }.
+// Every state-critical write below must go through this, otherwise a
+// failed update/insert silently "succeeds" and the action reports
+// success to the user while the database was never changed (the same
+// silent-failure class the dispatch-throws fix was made to eliminate).
+// Best-effort writes (audit log, GPS ticks, re-sequencing touch-ups)
+// intentionally do NOT use it.
+function must(res) {
+  if (res?.error) throw res.error;
+  return res;
+}
+
+async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
+  switch (action.type) {
+    case "AUTH/LOGIN": {
+      // Fetch by username only, verify the password client-side — the old
+      // version matched passwordhash in the query itself, which only works
+      // for plaintext. Salted accounts (passwordsalt set) compare SHA-256
+      // digests; legacy plaintext accounts still match directly and are
+      // upgraded to salted-hash in place on this first successful login.
+      const { data, error } = await supabase.from("users").select("*").eq("username", action.login).maybeSingle();
+      if (error) throw error;
+      if (!data) throw new Error("Invalid credentials");
+      let valid = false;
+      if (data.passwordsalt) {
+        valid = (await hashPassword(action.pass, data.passwordsalt)) === data.passwordhash;
+      } else {
+        valid = data.passwordhash === action.pass;
+        if (valid) {
+          // Lazy upgrade — best-effort: a failed upgrade never blocks the
+          // login itself, the account just stays plaintext until next time.
+          try {
+            const upSalt = makeSalt();
+            const upHash = await hashPassword(action.pass, upSalt);
+            await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
+          } catch (e) {
+            console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
+          }
+        }
+      }
+      if (!valid) throw new Error("Invalid credentials");
+      activeUserRef.current = data.id;
+      persistActiveUserId(data.id);
+      await refetch();
+      return;
+    }
+    case "AUTH/LOGOUT":
+      activeUserRef.current = null;
+      persistActiveUserId(null);
+      await refetch();
+      return;
+    case "ADMIN/DELETE_USERS": {
+      // Batch delete processed per-user (see the in-memory reducer's
+      // case for the full rationale). Permission is checked per TARGET's
+      // role, not once up front — a STANDARD admin selecting a mix of
+      // agents and admins should have the agents actually deleted and
+      // the admin rows refused, not the whole batch rejected.
+      //
+      // The trip-involvement check queries the database directly rather
+      // than trusting already-loaded client state: fetchAllFromSupabase
+      // only loads a ~60-day live window, so a user's OLDER trip history
+      // (outside that window but still a real row in the trips table)
+      // would not be visible in `state` yet would still trip the
+      // database's RESTRICT foreign key and fail the delete anyway —
+      // checking live means the block reason shown to the admin is
+      // always accurate, not just "looked clear from stale client data."
+      const results = [];
+      // Acting admin's own identity, fetched once — used for the audit
+      // log on each successful delete. The per-target permission check
+      // inside the loop below is the real gate (it can refuse a specific
+      // target even when the actor is a valid admin); this is purely
+      // for attribution, not authorization.
+      const { data: actorRow } = await supabase.from("users").select("id, fullname").eq("id", activeUserRef.current).maybeSingle();
+      for (const targetId of action.user_ids || []) {
+        const { data: target } = await supabase.from("users").select("id, role, fullname").eq("id", targetId).maybeSingle();
+        if (!target) { results.push({ id: targetId, ok: false, reason: "User not found" }); continue; }
+        if (targetId === activeUserRef.current) { results.push({ id: targetId, ok: false, name: target.fullname, reason: "You can't delete your own account" }); continue; }
+        try {
+          await assertAdminPermission(activeUserRef, target.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
+        } catch (e) {
+          results.push({ id: targetId, ok: false, name: target.fullname, reason: e.message });
+          continue;
+        }
+        const { count: tripCount } = await supabase.from("trips")
+          .select("id", { count: "exact", head: true })
+          .or(`agentid.eq.${targetId},driverid.eq.${targetId}`);
+        // extraagentids is an array column — a passenger-only role on a
+        // trip (added via TRIP/ADD_AGENT) doesn't set agentid/driverid,
+        // so the .or() above alone would miss it and let the delete
+        // proceed straight into an FK violation on trips_agentid_fkey's
+        // sibling constraint. Checked separately since PostgREST's .or()
+        // doesn't support an "array contains" clause inline.
+        const { count: extraCount } = await supabase.from("trips")
+          .select("id", { count: "exact", head: true })
+          .contains("extraagentids", [targetId]);
+        if ((tripCount || 0) > 0 || (extraCount || 0) > 0) {
+          results.push({ id: targetId, ok: false, name: target.fullname, reason: "Has trip history on file — the database keeps trip records tied to their account and won't allow deletion while any exist" });
+          continue;
+        }
+        // Logged BEFORE the delete, not after — audit_logs.targetuserid
+        // is a foreign key to users, so writing the log entry once the
+        // row is already gone always fails its own FK constraint. That
+        // failure was silent (logAuditAction swallows its own errors so
+        // a broken audit write never blocks the real action), which
+        // meant successful user deletions were quietly leaving NO audit
+        // trail at all — the one action where that matters most.
+        if (actorRow) {
+          await logAuditAction({
+            actorId: actorRow.id, actorName: actorRow.fullname, actionType: "ADMIN/DELETE_USERS",
+            targetUserId: targetId, details: `Deleted ${target.role.toLowerCase()} account: ${target.fullname}`,
+          });
+        }
+        const { error: delError } = await supabase.from("users").delete().eq("id", targetId);
+        if (delError) { results.push({ id: targetId, ok: false, name: target.fullname, reason: delError.message }); continue; }
+        results.push({ id: targetId, ok: true, name: target.fullname });
+      }
+      await refetch();
+      return results;
+    }
+    case "ADMIN/UPDATE_USER": {
+      const { data: target } = await supabase.from("users").select("*").eq("id", action.user_id).single();
+      if (!target) throw new Error("User not found");
+      // Editing an admin account needs manageAdmins; editing an agent/driver
+      // only needs manageAgentsDrivers — checked against the target's role,
+      // not the acting user's, since a STANDARD admin can edit agents but
+      // must never be able to edit another admin's account this way.
+      const actingAdmin = await assertAdminPermission(activeUserRef, target.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
+      const update = {
+        fullname: action.name ?? target.fullname,
+        staffnumber: action.staff_number ?? target.staffnumber,
+        username: action.login ?? target.username,
+      };
+      // A provided password is stored salted-hashed; absent means keep
+      // whatever is there (hashed or legacy plaintext awaiting its
+      // lazy upgrade at next login).
+      if (action.pass) {
+        const updSalt = makeSalt();
+        update.passwordsalt = updSalt;
+        update.passwordhash = await hashPassword(action.pass, updSalt);
+      }
+      if ((target.role === ROLE.AGENT || target.role === ROLE.DRIVER) && action.home_address !== undefined) {
+        update.homeaddress = action.home_address?.label ?? null;
+        update.homearea = action.home_address?.area ?? null;
+        update.homelat = action.home_address?.lat ?? null;
+        update.homelng = action.home_address?.lng ?? null;
+      }
+      if (target.role === ROLE.AGENT && action.campaign_id !== undefined) {
+        update.campaignid = action.campaign_id;
+      }
+      if (target.role === ROLE.ADMIN) {
+        if (action.admin_level !== undefined) update.adminlevel = action.admin_level;
+        if (action.scoped_company_ids !== undefined) update.scopedcompanyids = action.scoped_company_ids;
+      }
+
+      // ── Company assignment ──
+      // Plain write for either AGENT or DRIVER — this was the actual bug:
+      // update.branchid used to only get set inside the AGENT-only
+      // distance-check block below, so a driver's company selection was
+      // silently discarded on every save regardless of what the UI sent.
+      // Per explicit decision, drivers get a plain assignment with none
+      // of the 40km-from-home warning / branch_history archiving that
+      // stays specific to agents (their home-to-company commute distance
+      // is what that check is actually about).
+      let branchNotifRow = null;
+      if ((target.role === ROLE.AGENT || target.role === ROLE.DRIVER) && action.branch_id !== undefined && action.branch_id !== target.branchid) {
+        update.branchid = action.branch_id;
+      }
+      // ── Branch reassignment distance tracking (agents only — same
+      // >40 km rule as the in-memory reducer, see that case for the full
+      // explanation). Runs in addition to the plain write above, only
+      // for agents, only layering on the history/notification side
+      // effects when the new company is genuinely far from home. ──
+      if (target.role === ROLE.AGENT && action.branch_id !== undefined && action.branch_id !== target.branchid) {
+        // Query the companies table directly — handleSupabaseAction has no
+        // in-memory state object to read (unlike the local reducer), it
+        // queries Supabase for whatever it needs at each step.
+        const { data: newBranchRow } = await supabase.from("companies").select("*").eq("id", action.branch_id).maybeSingle();
+        const newBranch = newBranchRow ? { id: newBranchRow.id, label: newBranchRow.name, lat: newBranchRow.addresslat, lng: newBranchRow.addresslng } : null;
+        const homeLat = action.home_address !== undefined ? action.home_address?.lat : target.homelat;
+        const homeLng = action.home_address !== undefined ? action.home_address?.lng : target.homelng;
+        let distKm = null;
+        if (newBranch && homeLat != null) distKm = haversineKm(homeLat, homeLng, newBranch.lat, newBranch.lng) * ROAD_FACTOR;
+        const farReassignment = distKm != null && distKm > 40;
+
+        if (farReassignment && target.branchid) {
+          const prevHistory = Array.isArray(target.branchhistory) ? target.branchhistory : [];
+          update.branchhistory = [...prevHistory, { branch_id: target.branchid, changed_at: nowEpoch(), reason: `Reassigned to ${newBranch?.label || action.branch_id} (${distKm.toFixed(1)} km from home) — previous branch kept on file.` }];
+        }
+        if (farReassignment) {
+          branchNotifRow = {
+            type: "BRANCH_REASSIGNED_FAR", for_roles: [ROLE.ADMIN],
+            message: `📍 ${target.fullname} reassigned to ${newBranch?.label || action.branch_id}, which is ${distKm.toFixed(1)} km from their home address. Previous company retained on file.`,
+            ts: nowEpoch(), read: false,
+          };
+        }
+      }
+
+      const { error } = await supabase.from("users").update(update).eq("id", action.user_id);
+      if (error) throw error;
+      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.phone !== undefined)) {
+        const dsUpdate = { updatedat: new Date().toISOString() };
+        if (action.vehicle !== undefined) dsUpdate.vehicle = action.vehicle;
+        if (action.phone !== undefined) dsUpdate.phone = action.phone;
+        const { error: dErr } = await supabase.from("driver_status").update(dsUpdate).eq("driverid", action.user_id);
+        if (dErr) throw dErr;
+      }
+      if (action.name) {
+        // Keep the denormalized agentname in sync on that agent's own trips
+        // (mirrors the in-memory reducer's behaviour) — only the primary
+        // agent slot, since extrapickups entries carry their own agent_id.
+        const { data: theirTrips } = await supabase.from("trips").select("id, agentid").eq("agentid", action.user_id);
+        for (const t of theirTrips || []) {
+          await supabase.from("trips").update({ agentname: action.name }).eq("id", t.id);
+        }
+      }
+      if (branchNotifRow) await insertNotification(branchNotifRow);
+      await logAuditAction({
+        actorId: actingAdmin.id, actorName: actingAdmin.name, actionType: "ADMIN/UPDATE_USER",
+        targetUserId: action.user_id, details: `Updated ${target.role.toLowerCase()} account: ${target.fullname}`,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/ADD_AGENT": {
+      const actingAdminAdd = await assertAdminPermission(activeUserRef, "manageTrips");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const currentAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (currentAgentIds.includes(action.agent_id)) throw new Error("Agent is already on this trip");
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot add a passenger to a completed trip");
+      // Vehicle capacity is per-trip: this trip alone can't exceed
+      // DRIVER_CAPACITY passengers, independent of whatever else the
+      // driver has on their plate across other trips.
+      if (currentAgentIds.length >= DRIVER_CAPACITY) {
+        throw new Error(`This trip is full (${currentAgentIds.length}/${DRIVER_CAPACITY} seats) — remove a passenger before adding another.`);
+      }
+
+      const newExtraAgentIds = [...(tripRow.extraagentids || []), action.agent_id];
+      const newExtraPickups = [...(tripRow.extrapickups || []), { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id }];
+
+      const { error: upErr } = await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups }).eq("id", action.trip_id);
+      if (upErr) throw upErr;
+
+      // Re-sequence this driver's active trips the same way ASSIGN_DRIVER does,
+      // since the new pickup point may now be geographically first for someone
+      // — and since the pickup route's last stop is the anchor drop-off
+      // sequencing continues from, re-sequence drop-offs too rather than
+      // leaving dropsequencenum stale after a mid-route passenger add.
+      if (tripRow.driverid) {
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const allForDriver = (driverTripsRaw || []).map(r => {
+          const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
+          const extra = (r.id === action.trip_id ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          return {
+            trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
+            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          };
+        });
+        const ordered = buildPickupSequence(allForDriver, null);
+        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMap = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+        const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+        const routeDistanceKmAdd = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
+        const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
+        for (const t of driverTripsRaw || []) {
+          const patch = {};
+          if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
+          if (dropMap[t.id] != null && dropMap[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMap[t.id];
+          patch.driverroutekm = routeDistanceKmAdd; patch.driverroutecapkm = policyCapKmAdd; patch.driverrouteexceedspolicy = exceedsPolicyAdd;
+          if (Object.keys(patch).length) await supabase.from("trips").update(patch).eq("id", t.id);
+        }
+      }
+
+      await insertNotification({
+        type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `You've been added to trip ${action.trip_id} (pickup: ${action.pickup_label}).`,
+        trip_id: action.trip_id, ts: nowEpoch(), read: false,
+      });
+      await logAuditAction({
+        actorId: actingAdminAdd.id, actorName: actingAdminAdd.name, actionType: "TRIP/ADD_AGENT",
+        tripId: action.trip_id, targetUserId: action.agent_id, details: `Added passenger (pickup: ${action.pickup_label})`,
+      });
+      await refetch();
+      return;
+    }
+
+    case "TRIP/REMOVE_AGENT": {
+      const actingAdminRemove = await assertAdminPermission(activeUserRef, "manageTrips");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const agentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (!agentIds.includes(action.agent_id)) throw new Error("Agent is not on this trip");
+      if (agentIds.length <= 1) throw new Error("Cannot remove the last passenger — cancel or reassign the trip instead");
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot remove a passenger from a completed trip");
+
+      const newCompletedPickups = (tripRow.completedpickups || []).filter(id => id !== action.agent_id);
+      const wasPrimary = tripRow.agentid === action.agent_id;
+      const newExtraPickups = (tripRow.extrapickups || []).filter(p => p.agent_id !== action.agent_id);
+      const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => id !== action.agent_id);
+
+      const update = { completedpickups: newCompletedPickups, extrapickups: newExtraPickups, extraagentids: newExtraAgentIds };
+      if (wasPrimary) {
+        // The removed agent held the primary agentid/pickuplat/lng/label slot —
+        // promote the next remaining pickup (first extrapickups entry, if
+        // any) into that slot so pickuplat/lng/label stays populated for
+        // any code that still reads it directly instead of the merged array.
+        const promoted = newExtraPickups[0];
+        update.agentid = promoted?.agent_id ?? newExtraAgentIds[0] ?? null;
+        if (promoted) {
+          update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label;
+          update.extrapickups = newExtraPickups.slice(1);
+          update.extraagentids = newExtraAgentIds.filter(id => id !== promoted.agent_id);
+        }
+        const { data: newPrimaryUser } = await supabase.from("users").select("fullname").eq("id", update.agentid).maybeSingle();
+        if (newPrimaryUser) update.agentname = newPrimaryUser.fullname;
+      }
+
+      const { error: rmErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
+      if (rmErr) throw rmErr;
+
+      if (tripRow.driverid) {
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const allForDriver = (driverTripsRaw || []).map(r => {
+          const isThisTrip = r.id === action.trip_id;
+          const first = (isThisTrip ? update.pickuplat ?? r.pickuplat : r.pickuplat) != null
+            ? [{ lat: isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (update.pickuplng ?? r.pickuplng) : r.pickuplng }]
+            : [];
+          const extra = (isThisTrip ? (update.extrapickups ?? newExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          return {
+            trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
+            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          };
+        });
+        const ordered = buildPickupSequence(allForDriver, null);
+        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMap = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+        const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+        const routeDistanceKmRem = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
+        const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
+        for (const t of driverTripsRaw || []) {
+          const patch = {};
+          if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
+          if (dropMap[t.id] != null && dropMap[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMap[t.id];
+          patch.driverroutekm = routeDistanceKmRem; patch.driverroutecapkm = policyCapKmRem; patch.driverrouteexceedspolicy = exceedsPolicyRem;
+          if (Object.keys(patch).length) await supabase.from("trips").update(patch).eq("id", t.id);
+        }
+      }
+
+      await insertNotification({
+        type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `You've been removed from trip ${action.trip_id}.`,
+        trip_id: action.trip_id, ts: nowEpoch(), read: false,
+      });
+      await logAuditAction({
+        actorId: actingAdminRemove.id, actorName: actingAdminRemove.name, actionType: "TRIP/REMOVE_AGENT",
+        tripId: action.trip_id, targetUserId: action.agent_id, details: "Removed passenger from trip",
+      });
+      await refetch();
+      return;
+    }
+
+    case "TRIP/RELOCATE_AGENT": {
+      const actingAdminReloc = await assertAdminPermission(activeUserRef, "manageTrips");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const agentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (!agentIds.includes(action.agent_id)) throw new Error("Agent is not on this trip");
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot relocate a passenger on a completed trip");
+
+      const isPrimary = tripRow.agentid === action.agent_id;
+      const update = {};
+      if (isPrimary) {
+        update.pickuplat = action.pickup_coord.lat; update.pickuplng = action.pickup_coord.lng; update.pickuplabel = action.pickup_label;
+      } else {
+        update.extrapickups = (tripRow.extrapickups || []).map(p =>
+          p.agent_id === action.agent_id ? { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id } : p
+        );
+      }
+
+      const { error: relErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
+      if (relErr) throw relErr;
+
+      if (tripRow.driverid) {
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const allForDriver = (driverTripsRaw || []).map(r => {
+          const isThisTrip = r.id === action.trip_id;
+          const lat = isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat;
+          const lng = isThisTrip ? (update.pickuplng ?? r.pickuplng) : r.pickuplng;
+          const first = lat != null ? [{ lat, lng }] : [];
+          const extra = (isThisTrip ? (update.extrapickups ?? r.extrapickups ?? []) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          return {
+            trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
+            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          };
+        });
+        const ordered = buildPickupSequence(allForDriver, null);
+        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const seqMap = {}, dropMap = {};
+        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+        const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+        const routeDistanceKmReloc = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
+        const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
+        for (const t of driverTripsRaw || []) {
+          const patch = {};
+          if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
+          if (dropMap[t.id] != null && dropMap[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMap[t.id];
+          patch.driverroutekm = routeDistanceKmReloc; patch.driverroutecapkm = policyCapKmReloc; patch.driverrouteexceedspolicy = exceedsPolicyReloc;
+          if (Object.keys(patch).length) await supabase.from("trips").update(patch).eq("id", t.id);
+        }
+      }
+
+      await insertNotification({
+        type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+        message: `Your pickup for trip ${action.trip_id} was moved to ${action.pickup_label}.`,
+        trip_id: action.trip_id, ts: nowEpoch(), read: false,
+      });
+      await logAuditAction({
+        actorId: actingAdminReloc.id, actorName: actingAdminReloc.name, actionType: "TRIP/RELOCATE_AGENT",
+        tripId: action.trip_id, targetUserId: action.agent_id, details: `Relocated pickup to ${action.pickup_label}`,
+      });
+      await refetch();
+      return;
+    }
+    case "ADMIN/CREATE_USER": {
+      // Creating an admin account (any level) is Fleet Ops only; creating
+      // an agent or driver just needs manageAgentsDrivers.
+      const actingAdminCreate = await assertAdminPermission(activeUserRef, action.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
+      // New accounts are salted-hashed from the start — only lazy-upgraded
+      // legacy accounts ever hold plaintext, and only until first login.
+      const newUserSalt = makeSalt();
+      const newUserHash = await hashPassword(action.auth.pass, newUserSalt);
+      const row = {
+        role: action.role, fullname: action.name, username: action.auth.login, passwordhash: newUserHash, passwordsalt: newUserSalt,
+        // The production schema has a NOT NULL email column the app has
+        // no real use for — username/staff-number is the actual login
+        // credential everywhere else in the app, and email is never read
+        // anywhere. Synthesized deterministically from the username so
+        // it's stable and traceable rather than random; matches the
+        // placeholder pattern already used in the Supabase Auth migration
+        // plan (transitos_security_hardening.sql) for when a real email
+        // becomes meaningful. Without this, EVERY user creation — single
+        // AND bulk CSV import — failed with a not-null violation.
+        // users.phone is ALSO a NOT NULL column the app never asks for on
+        // this form — the only phone field in the UI is the driver's
+        // live contact number, which is a different, separate column on
+        // driver_status (used for the in-app calling feature), not this
+        // one. Placeholder here, same reasoning as email above: nothing
+        // in the app reads users.phone, so a stable non-empty default
+        // satisfies the constraint without inventing UI nobody would use.
+        phone: action.phone || "N/A",
+        email: `${action.auth.login.toLowerCase().replace(/[^a-z0-9]+/g, ".")}@transitos.internal`,
+        staffnumber: action.staff_number || action.auth.pass || null,
+        homeaddress: action.home_address?.label ?? null, homearea: action.home_address?.area ?? null,
+        homelat: action.home_address?.lat ?? null, homelng: action.home_address?.lng ?? null,
+        ...(action.role === ROLE.AGENT ? { branchid: action.branch_id || null, branchhistory: [], campaignid: action.campaign_id || null } : {}),
+        ...(action.role === ROLE.DRIVER ? { branchid: action.branch_id || null } : {}),
+        ...(action.role === ROLE.ADMIN ? { adminlevel: action.admin_level || ADMIN_LEVEL.VIEWER, scopedcompanyids: action.scoped_company_ids || [] } : {}),
+      };
+      // Real users.id is a DB-generated bigint, not an app-generated string —
+      // insert and read the id back so driver_status can reference it.
+      const { data: inserted, error } = await supabase.from("users").insert(row).select("id").single();
+      if (error) throw error;
+      if (action.role === ROLE.DRIVER) {
+        const { error: dErr } = await supabase.from("driver_status").insert({
+          driverid: inserted.id, state: DRIVER_STATE.AVAILABLE, currenttripid: null,
+          vehicle: action.vehicle || "—", phone: action.phone || "—", capacity: DRIVER_CAPACITY,
+        });
+        if (dErr) throw dErr;
+      }
+      await logAuditAction({
+        actorId: actingAdminCreate.id, actorName: actingAdminCreate.name, actionType: "ADMIN/CREATE_USER",
+        targetUserId: inserted.id, details: `Created ${action.role.toLowerCase()} account: ${action.name}`,
+      });
+      await refetch();
+      return;
+    }
+    case "ADMIN/CREATE_COMPANY": {
+      const actingAdminCoC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      if (!action.name?.trim()) throw new Error("Company name is required.");
+      if (!action.address?.lat) {
+        throw new Error("An address is required.");
+      }
+      const { data: coInserted, error } = await supabase.from("companies").insert({
+        name: action.name.trim(), active: true,
+        addresslabel: action.address.label, addressarea: action.address.area,
+        addresslat: action.address.lat, addresslng: action.address.lng,
+      }).select("id").single();
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminCoC.id, actorName: actingAdminCoC.name, actionType: "ADMIN/CREATE_COMPANY",
+        details: `Created company: ${action.name.trim()} (id ${coInserted?.id})`,
+      });
+      // Same reasoning as campaigns — companies lives in its own fetch
+      // cycle, refetch() alone never reloads it.
+      if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/UPDATE_COMPANY": {
+      const actingAdminCoU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const update = {};
+      if (action.name !== undefined) update.name = action.name.trim();
+      if (action.active !== undefined) update.active = action.active;
+      if (action.address !== undefined) {
+        update.addresslabel = action.address.label; update.addressarea = action.address.area;
+        update.addresslat = action.address.lat; update.addresslng = action.address.lng;
+      }
+      const { error } = await supabase.from("companies").update(update).eq("id", action.company_id);
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminCoU.id, actorName: actingAdminCoU.name, actionType: "ADMIN/UPDATE_COMPANY",
+        details: `Updated company id ${action.company_id}${action.name !== undefined ? ` — renamed to "${action.name.trim()}"` : ""}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
+      });
+      if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/DELETE_COMPANY": {
+      const actingAdminCoD = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const { data: coRow } = await supabase.from("companies").select("id, name").eq("id", action.company_id).maybeSingle();
+      if (!coRow) throw new Error("Company not found");
+      const { count: assignedCount } = await supabase.from("users")
+        .select("id", { count: "exact", head: true })
+        .eq("branchid", action.company_id);
+      if ((assignedCount || 0) > 0) {
+        throw new Error(`${assignedCount} agent${assignedCount !== 1 ? "s are" : " is"} still assigned to this company — reassign them first.`);
+      }
+      await logAuditAction({
+        actorId: actingAdminCoD.id, actorName: actingAdminCoD.name, actionType: "ADMIN/DELETE_COMPANY",
+        details: `Deleted company: ${coRow.name} (id ${action.company_id})`,
+      });
+      const { error: delCoErr } = await supabase.from("companies").delete().eq("id", action.company_id);
+      if (delCoErr) throw delCoErr;
+      if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/CREATE_CAMPAIGN": {
+      const actingAdminCampC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      if (!action.name?.trim()) throw new Error("Campaign name is required.");
+      const { data: campInserted, error } = await supabase.from("campaigns").insert({ name: action.name.trim(), active: true }).select("id").single();
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminCampC.id, actorName: actingAdminCampC.name, actionType: "ADMIN/CREATE_CAMPAIGN",
+        details: `Created campaign: ${action.name.trim()} (id ${campInserted?.id})`,
+      });
+      // campaigns lives in its own fetch cycle (see the comment on
+      // fetchCampaigns in useAppStore) — refetch() alone never reloads
+      // it, so without this the insert succeeded in the database but the
+      // admin's own screen kept showing the old list until the realtime
+      // subscription happened to fire (or never, in some configurations).
+      if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/UPDATE_CAMPAIGN": {
+      const actingAdminCampU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const update = {};
+      if (action.name !== undefined) update.name = action.name.trim();
+      if (action.active !== undefined) update.active = action.active;
+      const { error } = await supabase.from("campaigns").update(update).eq("id", action.campaign_id);
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminCampU.id, actorName: actingAdminCampU.name, actionType: "ADMIN/UPDATE_CAMPAIGN",
+        details: `Updated campaign id ${action.campaign_id}${action.name !== undefined ? ` — renamed to "${action.name.trim()}"` : ""}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
+      });
+      if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/DELETE_CAMPAIGN": {
+      const actingAdminCampD = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const { data: campRow } = await supabase.from("campaigns").select("id, name").eq("id", action.campaign_id).maybeSingle();
+      if (!campRow) throw new Error("Campaign not found");
+      // Checked against live DB state, not client state — same reasoning
+      // as the user-delete trip check: the campaign list in `state` may
+      // not reflect every agent currently assigned to it.
+      const { count: assignedCount } = await supabase.from("users")
+        .select("id", { count: "exact", head: true })
+        .eq("campaignid", action.campaign_id);
+      if ((assignedCount || 0) > 0) {
+        throw new Error(`${assignedCount} agent${assignedCount !== 1 ? "s are" : " is"} still assigned to this campaign — reassign them first.`);
+      }
+      // Logged BEFORE the delete — audit_logs has no FK on campaign id
+      // (it's not a users row), so ordering isn't strictly required here
+      // the way it was for ADMIN/DELETE_USERS, but keeping delete-audit
+      // actions in a consistent "log intent, then act" order avoids
+      // having to remember which one matters case by case.
+      await logAuditAction({
+        actorId: actingAdminCampD.id, actorName: actingAdminCampD.name, actionType: "ADMIN/DELETE_CAMPAIGN",
+        details: `Deleted campaign: ${campRow.name} (id ${action.campaign_id})`,
+      });
+      const { error: delCampErr } = await supabase.from("campaigns").delete().eq("id", action.campaign_id);
+      if (delCampErr) throw delCampErr;
+      if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
+      else await refetch();
+      return;
+    }
+    case "TICKET/CREATE": {
+      // Agent- or driver-facing — no admin permission gate, any logged-in
+      // agent/driver can file a ticket. trip_id is optional (a ticket
+      // doesn't have to be about a specific trip). The underlying
+      // agentid column is a plain user reference despite its name —
+      // reused for drivers too rather than adding a second column.
+      if (!action.category?.trim()) throw new Error("Please choose a category.");
+      if (!action.message?.trim()) throw new Error("Please describe the issue.");
+      const role = action.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT;
+      const nowTs = nowEpoch();
+      const { error } = await supabase.from("tickets").insert({
+        agentid: action.user_id, tripid: action.trip_id || null, role,
+        category: action.category.trim(), message: action.message.trim(),
+        status: "OPEN", createdat: nowTs, updatedat: nowTs,
+      });
+      if (error) throw error;
+      const { data: filingUser } = await supabase.from("users").select("fullname").eq("id", action.user_id).maybeSingle();
+      await insertNotification({
+        type: "TICKET_OPENED", for_roles: [ROLE.ADMIN],
+        message: `🎫 New ticket from ${filingUser?.fullname || (role === ROLE.DRIVER ? "a driver" : "an agent")}: ${action.category}${action.trip_id ? ` (Trip ${action.trip_id})` : ""}`,
+        trip_id: action.trip_id || null, ts: nowTs, read: false,
+      });
+      // tickets lives in its own fetch cycle (see fetchTickets in
+      // useAppStore) — refetch() alone never reloads it, so without this
+      // an agent's filed ticket wouldn't appear on the admin's Tickets
+      // screen until the realtime subscription happened to fire.
+      if (extraRefetchers.fetchTickets) await extraRefetchers.fetchTickets();
+      else await refetch();
+      return;
+    }
+    case "TICKET/UPDATE": {
+      // Admin-facing — responding to / resolving a ticket is operational
+      // work, same tier as trip management (Fleet Ops + Standard, not
+      // Viewer, who can see tickets but shouldn't be able to action them
+      // — matches the read-only pattern used everywhere else for Viewer).
+      const actingAdminTicket = await assertAdminPermission(activeUserRef, "manageTrips");
+      const nowTs = nowEpoch();
+      const update = { updatedat: nowTs };
+      if (action.status !== undefined) update.status = action.status;
+      if (action.admin_reply !== undefined) update.adminreply = action.admin_reply;
+      if (action.admin_id !== undefined) update.adminid = action.admin_id;
+      if (action.status === "RESOLVED") update.resolvedat = nowTs;
+      const { error } = await supabase.from("tickets").update(update).eq("id", action.ticket_id);
+      if (error) throw error;
+      if (action.status !== undefined || action.admin_reply !== undefined) {
+        const { data: ticketRow } = await supabase.from("tickets").select("agentid, tripid, category").eq("id", action.ticket_id).maybeSingle();
+        if (ticketRow) {
+          await insertNotification({
+            type: "TICKET_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [ticketRow.agentid],
+            message: action.status === "RESOLVED"
+              ? `Your ticket (${ticketRow.category}) has been resolved.`
+              : `Your ticket (${ticketRow.category}) has an update from admin.`,
+            trip_id: ticketRow.tripid, ts: nowTs, read: false,
+          });
+          await logAuditAction({
+            actorId: actingAdminTicket.id, actorName: actingAdminTicket.name, actionType: "TICKET/UPDATE",
+            tripId: ticketRow.tripid, targetUserId: ticketRow.agentid,
+            details: `Ticket #${action.ticket_id} (${ticketRow.category})${action.status !== undefined ? ` — status set to ${action.status}` : ""}${action.admin_reply !== undefined ? " — replied" : ""}`,
+          });
+        }
+      }
+      if (extraRefetchers.fetchTickets) await extraRefetchers.fetchTickets();
+      else await refetch();
+      return;
+    }
+    case "DM/SEND": {
+      // Fleet Ops + Standard only — Viewer can't initiate contact with
+      // anyone, matching the read-only pattern applied everywhere else.
+      // Completely separate from the trip-scoped chat system: no trip_id
+      // involved, works for any agent/driver at any time, including
+      // outside any active trip.
+      const actingAdminDm = await assertAdminPermission(activeUserRef, "manageTrips");
+      if (!action.message?.trim()) throw new Error("Message can't be empty.");
+      const dmNowTs = nowEpoch();
+      const { error: dmError } = await supabase.from("direct_messages").insert({
+        senderid: action.sender_id, sendername: action.sender_name, senderrole: action.sender_role,
+        recipientid: action.recipient_id, content: action.message.trim(), timestamp: dmNowTs,
+      });
+      if (dmError) throw dmError;
+      await insertNotification({
+        type: "DIRECT_MESSAGE", for_roles: [], for_user_ids: [action.recipient_id],
+        message: `💬 Message from ${action.sender_name}: ${action.message.trim().slice(0, 80)}`,
+        ts: dmNowTs, read: false,
+      });
+      await logAuditAction({
+        actorId: actingAdminDm.id, actorName: actingAdminDm.name, actionType: "DM/SEND",
+        targetUserId: action.recipient_id, details: `Sent direct message: "${action.message.trim().slice(0, 100)}"`,
+      });
+      return;
+    }
+    case "TRIP/BOOK": {
+      const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
+      // Fallback only used if the booking form somehow omitted
+      // dropoff_coord (the real UI always supplies it) — queries the
+      // companies table directly since handleSupabaseAction has no
+      // in-memory state to read a cached default from.
+      let dropCoord = action.dropoff_coord;
+      if (!dropCoord) {
+        const { data: fallbackCo } = await supabase.from("companies").select("*").eq("active", true).limit(1).maybeSingle();
+        const fallbackAddr = fallbackCo?.addresslat != null ? { label: fallbackCo.addresslabel, area: fallbackCo.addressarea, lat: fallbackCo.addresslat, lng: fallbackCo.addresslng } : null;
+        dropCoord = fallbackAddr || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
+      }
+      const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
+      const estCostZar = parseFloat((8 + estDistKm * ROAD_FACTOR * 3.5).toFixed(2));
+      const roadDistKm = estDistKm * ROAD_FACTOR;
+      const nowTs = nowEpoch();
+
+      // scheduledtime is a bigint (epoch ms) column, but the booking form
+      // sends separate date/time strings — convert here rather than pass
+      // the raw string through, which Postgres rejects with 22P02.
+      const scheduledDtForInsert = parseScheduledDateTime(action.scheduled_date, action.scheduled_time);
+      const scheduledTimeEpoch = scheduledDtForInsert ? scheduledDtForInsert.getTime() : null;
+      if (scheduledTimeEpoch == null) {
+        throw new Error(`Couldn't understand the scheduled date/time ("${action.scheduled_date}" "${action.scheduled_time}"). Please use YYYY/MM/DD for the date and HH:MM for the time.`);
+      }
+
+      // Exception flag: booked on the SAME calendar day as the trip,
+      // after 15:00 local time — a fixed clock-time cutoff, not a rolling
+      // "hours before departure" window. A trip booked today for tomorrow
+      // at any time is never an exception under this rule, even if it's
+      // booked at 11pm tonight; only same-day-after-3pm counts.
+      const nowDate = new Date(nowTs);
+      const bookingDateStr = `${nowDate.getFullYear()}/${String(nowDate.getMonth() + 1).padStart(2, "0")}/${String(nowDate.getDate()).padStart(2, "0")}`;
+      const isSameDay = action.scheduled_date === bookingDateStr;
+      const isException = isSameDay && (nowDate.getHours() > 15 || (nowDate.getHours() === 15 && nowDate.getMinutes() > 0));
+
+      // Real trips.id is a DB-generated bigint — insert and read it back
+      // before building notifications that reference trip_id.
+      const { data: inserted, error } = await supabase.from("trips").insert({
+        agentid: action.agent_id, driverid: null, status: TRIP_STATE.UNASSIGNED_BOOKING,
+        pickuplat: pickupCoord.lat, pickuplng: pickupCoord.lng, pickuplabel: action.pickup_label,
+        dropofflat: dropCoord.lat, dropofflng: dropCoord.lng, dropofflabel: action.dropoff_label,
+        completedpickups: [], completeddropoffs: [], pickuplocation: action.pickup_label, dropofflocation: action.dropoff_label,
+        pickupcompanyid: action.pickup_company_id || null, dropoffcompanyid: action.dropoff_company_id || null,
+        direction: action.direction || null, isexception: isException,
+        pickupismanual: action.pickup_is_manual || false, dropoffismanual: action.dropoff_is_manual || false,
+        triptype: action.trip_type, weekgroupid: action.week_group_id || null, weekdaynum: action.week_day_num || null,
+        scheduleddate: action.scheduled_date, scheduledtime: scheduledTimeEpoch, scheduledtimestr: action.scheduled_time,
+        bookedat: nowTs, agentname: action.agent_name, phone: action.phone,
+        estdistancekm: estDistKm, estcostzar: estCostZar, driveraccepted: false, declinedby: [], remindersent: false,
+        longdistanceflag: roadDistKm > 40,
+        adminnote: roadDistKm > 42 ? `Booking distance ${roadDistKm.toFixed(1)} km exceeds 42 km threshold.` : null,
+      }).select("id").single();
+      if (error) throw error;
+      const tripId = inserted.id;
+
+      const notifRows = [{
+        type: "TRIP_BOOKED", for_roles: [ROLE.ADMIN],
+        message: `New booking from ${action.agent_name}: ${action.pickup_label} → ${action.dropoff_label}`,
+        trip_id: tripId, ts: nowTs, read: false,
+      }];
+
+      if (isException) {
+        notifRows.push({
+          type: "BOOKING_EXCEPTION", for_roles: [ROLE.ADMIN],
+          message: `⚠ EXCEPTION: ${action.agent_name} booked trip ${tripId} for today after the 15:00 cutoff.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      if (roadDistKm > 40) {
+        notifRows.push({
+          type: "LONG_DISTANCE_TRIP", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${tripId} for ${action.agent_name} is ${roadDistKm.toFixed(1)} km — exceeds the 40 km threshold.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      // Surcharge: R20 for every km over 40, uncapped.
+      if (roadDistKm > 42) {
+        const billableKm = roadDistKm - 40;
+        const surcharge = Math.round(billableKm * 20);
+        notifRows.push({
+          type: "DISTANCE_SURCHARGE", for_roles: [ROLE.ADMIN],
+          message: `💰 Trip ${tripId} (${roadDistKm.toFixed(1)} km) qualifies for a distance surcharge: R${surcharge} (${billableKm.toFixed(1)} km over 40 km @ R20/km) — for invoicing.`,
+          trip_id: tripId, ts: nowTs, read: false,
+        });
+      }
+
+      try {
+        const scheduledDt = parseScheduledDateTime(action.scheduled_date, action.scheduled_time);
+        if (scheduledDt) {
+          const hoursUntil = (scheduledDt.getTime() - Date.now()) / 3600000;
+          if (hoursUntil < 2) {
+            notifRows.push({
+              type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
+              message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
+              trip_id: tripId, ts: nowTs, read: false,
+            });
+          }
+        }
+      } catch (e) { /* malformed date/time — skip late-booking check */ }
+
+      for (const row of notifRows) await insertNotification(row);
+      await refetch();
+      // Hand the new id back to the caller — the booking form uses this to
+      // cancel already-created legs if a later leg of a multi-leg (week /
+      // with-return) booking fails, making the whole booking atomic.
+      return tripId;
+    }
+    case "TRIP/CANCEL": {
+      // Rollback primitive for multi-leg bookings — same guards as the
+      // in-memory reducer's version: UNASSIGNED_BOOKING only (no driver
+      // involved yet), and when agent_id is provided the trip must belong
+      // to that agent. Notifications about the cancelled booking are
+      // cleaned up too (best-effort) so admins aren't chasing ghosts.
+      const { data: cancelRow } = await supabase.from("trips").select("status, agentid, extraagentids").eq("id", action.trip_id).single();
+      if (!cancelRow) throw new Error("Trip not found");
+      if (cancelRow.status !== TRIP_STATE.UNASSIGNED_BOOKING) throw new Error("Only unassigned bookings can be cancelled.");
+      if (action.agent_id != null) {
+        const ownerIds = [cancelRow.agentid, ...(cancelRow.extraagentids || [])].filter(Boolean);
+        if (!ownerIds.includes(action.agent_id)) throw new Error("You can only cancel your own bookings.");
+      }
+      must(await supabase.from("trips").delete().eq("id", action.trip_id));
+      await supabase.from("notifications").delete().eq("tripid", action.trip_id);
+      await refetch();
+      return;
+    }
+    case "TRIP/ADMIN_CANCEL": {
+      // Admin-initiated cancellation of any not-yet-completed trip — see
+      // the in-memory reducer's case for the TRIP/CANCEL distinction.
+      // Notifications are inserted BEFORE the delete and reference the
+      // trip id as plain data, so they survive as the record of what was
+      // cancelled and when (plus the audit log entry below).
+      const actingAdminCancel = await assertAdminPermission(activeUserRef, "manageTrips");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Completed trips can't be cancelled — they're already archived.");
+      const nowTs = nowEpoch();
+      const cancelAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (cancelAgentIds.length) {
+        await insertNotification({
+          type: "TRIP_CANCELLED", for_roles: [ROLE.AGENT], for_user_ids: cancelAgentIds,
+          message: `Your trip ${action.trip_id} (${tripRow.scheduleddate || ""} ${tripRow.scheduledtimestr || ""}) was cancelled by an admin.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      if (tripRow.driverid) {
+        await insertNotification({
+          type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [tripRow.driverid],
+          message: `Trip ${action.trip_id} was cancelled by an admin and removed from your route.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      await logAuditAction({
+        actorId: actingAdminCancel.id, actorName: actingAdminCancel.name, actionType: "TRIP/ADMIN_CANCEL",
+        tripId: action.trip_id, details: `Cancelled trip (was ${tripRow.status})`,
+      });
+      must(await supabase.from("trips").delete().eq("id", action.trip_id));
+      if (tripRow.driverid) {
+        const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+        if (!remaining || remaining.length === 0) {
+          await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", tripRow.driverid);
+        }
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/DISPATCH_MULTI": {
+      // Merges several separately-booked UNASSIGNED trips into one
+      // multi-passenger trip and assigns a driver to all of them in one
+      // step — see the in-memory reducer's case for the full rationale.
+      // manageDispatch (not manageTrips) since this IS a dispatch action;
+      // the merge step is just how it gets there.
+      const actingAdminMulti = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const [primaryId, ...secondaryIds] = action.trip_ids || [];
+      const { data: primaryRow } = await supabase.from("trips").select("*").eq("id", primaryId).single();
+      if (!primaryRow) throw new Error("Trip not found");
+      if (primaryRow.status !== TRIP_STATE.UNASSIGNED_BOOKING) throw new Error("The primary trip is no longer unassigned.");
+      const { data: secondaryRows } = secondaryIds.length
+        ? await supabase.from("trips").select("*").in("id", secondaryIds)
+        : { data: [] };
+      if ((secondaryRows || []).length !== secondaryIds.length) throw new Error("One of the selected trips no longer exists.");
+      if ((secondaryRows || []).some(t => t.status !== TRIP_STATE.UNASSIGNED_BOOKING)) throw new Error("One of the selected trips is no longer unassigned.");
+      const primaryAgentIds = [primaryRow.agentid, ...(primaryRow.extraagentids || [])].filter(Boolean);
+      // Reject if the same agent appears on more than one selected
+      // booking (see the in-memory reducer's case for the full
+      // rationale — this is the actual bug confirmed in production:
+      // a passenger listed twice with identical pickup details on a
+      // merged trip). Checked before any writes below, so a rejection
+      // here leaves the database completely untouched.
+      const allSelectedAgentIdsSupa = [...primaryAgentIds, ...(secondaryRows || []).flatMap(t => [t.agentid, ...(t.extraagentids || [])].filter(Boolean))];
+      const seenAgentIdsSupa = new Set();
+      for (const aid of allSelectedAgentIdsSupa) {
+        if (seenAgentIdsSupa.has(aid)) {
+          const { data: dupUserRow } = await supabase.from("users").select("fullname").eq("id", aid).maybeSingle();
+          throw new Error(`${dupUserRow?.fullname || aid} is on more than one of the selected bookings — remove the duplicate before combining.`);
+        }
+        seenAgentIdsSupa.add(aid);
+      }
+      const secondaryAgentCounts = (secondaryRows || []).map(t => 1 + (t.extraagentids || []).length);
+      const totalSeats = primaryAgentIds.length + secondaryAgentCounts.reduce((a, b) => a + b, 0);
+      if (totalSeats > DRIVER_CAPACITY) {
+        throw new Error(`Selected trips need ${totalSeats} seats — only ${DRIVER_CAPACITY} fit on one vehicle.`);
+      }
+      // Account for the driver's EXISTING passenger load before mutating
+      // anything — critical here because the merge below WRITES to the DB
+      // (deletes secondary rows, updates the primary). Without this, an
+      // over-capacity dispatch onto an already-loaded driver would persist
+      // the merge and only then hit the delegated ASSIGN_DRIVER rejection,
+      // leaving orphaned DB state. Checking first keeps it atomic.
+      const { data: driverExistingTrips } = await supabase.from("trips").select("extraagentids").eq("driverid", action.driver_id).eq("scheduleddate", primaryRow.scheduleddate).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+      const driverExistingSeats = (driverExistingTrips || []).reduce((s, r) => s + Math.max(1, 1 + (r.extraagentids?.length || 0)), 0);
+      if (driverExistingSeats + totalSeats > DRIVER_CAPACITY) {
+        throw new Error(`Driver doesn't have room — ${driverExistingSeats}/${DRIVER_CAPACITY} seats taken, these trips need ${totalSeats}.`);
+      }
+      // Fold every secondary trip's agent(s) + pickup point(s) into the
+      // primary's extraagentids/extrapickups — same shape TRIP/ADD_AGENT
+      // writes, so the merged trip is indistinguishable from one built up
+      // via repeated single ADD_AGENT calls.
+      const newExtraAgentIds = [...(primaryRow.extraagentids || [])];
+      const newExtraPickups = [...(primaryRow.extrapickups || [])];
+      for (const sec of secondaryRows || []) {
+        if (sec.agentid) {
+          newExtraAgentIds.push(sec.agentid);
+          newExtraPickups.push({ lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.agentid });
+        }
+        for (let i = 0; i < (sec.extraagentids || []).length; i++) {
+          newExtraAgentIds.push(sec.extraagentids[i]);
+          newExtraPickups.push(sec.extrapickups?.[i] || { lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.extraagentids[i] });
+        }
+      }
+      must(await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups }).eq("id", primaryId));
+      if (secondaryIds.length) {
+        must(await supabase.from("trips").delete().in("id", secondaryIds));
+        await supabase.from("notifications").delete().in("tripid", secondaryIds);
+      }
+      const combinedAgentIds = (secondaryRows || []).flatMap(t => [t.agentid, ...(t.extraagentids || [])].filter(Boolean));
+      for (const aid of combinedAgentIds) {
+        await insertNotification({
+          type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+          message: `Your trip has been combined with ${primaryRow.agentname}'s trip (${primaryId}) for shared transport.`,
+          trip_id: primaryId, ts: nowEpoch(), read: false,
+        });
+      }
+      await logAuditAction({
+        actorId: actingAdminMulti.id, actorName: actingAdminMulti.name, actionType: "TRIP/DISPATCH_MULTI",
+        tripId: primaryId, details: `Merged ${secondaryIds.length} trip(s) [${secondaryIds.join(", ")}] into ${primaryId} and dispatched`,
+      });
+      // From here, the exact same code path as a normal single-trip
+      // assignment — capacity check, sequencing, DRIVER_ASSIGNED /
+      // DRIVER_FULLY_BOOKED notifications, all of it.
+      return handleSupabaseAction({ type: "TRIP/ASSIGN_DRIVER", trip_id: primaryId, driver_id: action.driver_id }, activeUserRef, refetch);
+    }
+    case "TRIP/BULK_ASSIGN_DRIVER": {
+      // Assigns the SAME driver to multiple SEPARATE trips individually
+      // — see the local reducer's case for the full rationale (week
+      // bookings: each day is its own trip/route, unlike DISPATCH_MULTI
+      // which merges several agents into one shared trip). Each trip_id
+      // gets a real, independent TRIP/ASSIGN_DRIVER call so a conflict
+      // on one day (already booked, no longer unassigned, etc.) doesn't
+      // block the rest. refetch() is skipped per-iteration (passed a
+      // no-op) and done ONCE at the end, since refetching after every
+      // single day in a 7-day week would be wasteful and each
+      // assignment's own DB write already persists correctly regardless
+      // of when the client re-syncs.
+      const results = [];
+      for (const tripId of action.trip_ids || []) {
+        try {
+          await handleSupabaseAction({ type: "TRIP/ASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id }, activeUserRef, async () => {});
+          results.push({ trip_id: tripId, ok: true });
+        } catch (e) {
+          results.push({ trip_id: tripId, ok: false, reason: e.message || "Assignment failed" });
+        }
+      }
+      await refetch();
+      return results;
+    }
+    case "TRIP/ASSIGN_DRIVER": {
+      const actingAdminAssign = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", action.driver_id).single();
+      if (!tripRow || !driverRow) throw new Error("Trip or driver not found");
+      const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+      // Seat-based load: sum passengers (primary + extra agents) across the
+      // driver's active trips ON THE SAME DATE as the trip being assigned
+      // — not across all dates. Trips on different days never share a
+      // vehicle at the same time, so a driver already assigned to 4
+      // different days of one agent's week booking must NOT be treated
+      // as "full" for an unrelated 5th day. (Matches getDriverLoad in
+      // the local reducer.)
+      const driverTripsRawSameDay = (driverTripsRaw || []).filter(t => t.scheduleddate === tripRow.scheduleddate);
+      const seatsOf = (r) => Math.max(1, 1 + (r.extraagentids?.length || 0));
+      const currentLoad = driverTripsRawSameDay.filter(t => t.id !== action.trip_id).reduce((s, r) => s + seatsOf(r), 0);
+      const incomingSeats = Math.max(1, 1 + (tripRow.extraagentids?.length || 0));
+      if (currentLoad + incomingSeats > DRIVER_CAPACITY) throw new Error(`Driver doesn't have room — ${currentLoad}/${DRIVER_CAPACITY} seats taken, this trip needs ${incomingSeats}.`);
+      assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
+      const existingAssigned = (driverTripsRaw || []).filter(t => t.id !== action.trip_id);
+      const allForDriver = [...existingAssigned, { ...tripRow, driverid: action.driver_id }].map(r => {
+        const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
+        const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng }));
+        return {
+          trip_id: r.id,
+          // Multi-passenger trips need every pickup point represented here,
+          // not just the primary agent's — otherwise a driver's first
+          // assignment to an already-multi-agent trip ignores the extra
+          // passengers entirely when computing nearest-neighbour order.
+          pickup_sequence_coords: [...first, ...extra],
+          dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          scheduled_time: r.scheduledtimestr,
+        };
+      });
+      const ordered = buildPickupSequence(allForDriver, null);
+      const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+      const seqMap = {}, dropMap = {};
+      ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+      dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+      // Total route distance across ALL the driver's active trips, from
+      // the SAME ordered sequences just built above — matches the local
+      // reducer's approach (see its comment for the full rationale).
+      const startAnchor = { lat: -33.9249, lng: 18.4241 }; // same fallback buildPickupSequence(..., null) uses internally
+      const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+      const routeDistanceKm = computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
+      const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
+      const exceedsPolicy = routeDistanceKm > policyCapKm;
+      const nowTs = nowEpoch();
+      const { error: upErr } = await supabase.from("trips").update({
+        status: TRIP_STATE.DRIVER_CONFIRMED, driverid: action.driver_id,
+        pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
+        driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
+        driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
+      }).eq("id", action.trip_id);
+      if (upErr) throw upErr;
+      for (const t of existingAssigned) {
+        await supabase.from("trips").update({
+          pickupordernum: seqMap[t.id] ?? t.pickupordernum,
+          dropsequencenum: dropMap[t.id] ?? t.dropsequencenum,
+          driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
+        }).eq("id", t.id);
+      }
+      const newLoad = currentLoad + incomingSeats;
+      // driver_status.updatedat is timestamptz, not bigint like trips.*at
+      // columns — sending the raw epoch number (nowTs) fails with a 22008
+      // "date/time field value out of range" error. Postgres's DEFAULT
+      // now() only applies on INSERT, not UPDATE, so omitting the column
+      // here would leave it stale rather than refreshed — send a proper
+      // ISO timestamp string instead.
+      must(await supabase.from("driver_status").update({ state: DRIVER_STATE.BUSY, currenttripid: action.trip_id, updatedat: new Date(nowTs).toISOString() }).eq("driverid", action.driver_id));
+      const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+        message: `Driver ${driverUser?.fullname} (${driverRow.vehicle}) assigned. You are pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      if (newLoad >= DRIVER_CAPACITY) {
+        await insertNotification({
+          type: "DRIVER_FULLY_BOOKED", for_roles: [ROLE.ADMIN],
+          message: `⚠ Driver ${driverUser?.fullname} is now FULLY BOOKED (${DRIVER_CAPACITY}/${DRIVER_CAPACITY} seats).`,
+          ts: nowTs, read: false,
+        });
+      }
+      if (exceedsPolicy) {
+        await insertNotification({
+          type: "ROUTE_EXCEEDS_POLICY", for_roles: [ROLE.ADMIN],
+          message: `⚠ Driver ${driverUser?.fullname}'s total route is ${routeDistanceKm.toFixed(1)} km — exceeds the ${policyCapKm} km policy cap for ${totalAgentCountAssign} agent${totalAgentCountAssign !== 1 ? "s" : ""} (40 km × ${totalAgentCountAssign}).`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      await logAuditAction({
+        actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
+        tripId: action.trip_id, targetUserId: action.driver_id, details: `Assigned driver ${driverUser?.fullname || action.driver_id}`,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/DRIVER_CONFIRM": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
+      const nowTs = nowEpoch();
+      must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+        message: "Your driver has confirmed the trip. They are on the way.", trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/ACCEPT": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
+      const nowTs = nowEpoch();
+      must(await supabase.from("trips").update({ driveraccepted: true, acceptedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: tripAgentIds,
+        message: `Driver ${driverUser?.fullname} accepted your trip.`, trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/REMOVE_DRIVER": {
+      // Admin-initiated — Fleet Ops + Standard, works on any trip that
+      // currently has a driver assigned, regardless of status (ASSIGNED,
+      // DRIVER_CONFIRMED, or IN_TRANSIT). Distinct from TRIP/DECLINE
+      // (driver-initiated, adds to declinedby so that driver won't be
+      // re-suggested) — this is purely an admin correcting an assignment,
+      // so it does NOT touch declinedby.
+      const actingAdminRemoveDriver = await assertAdminPermission(activeUserRef, "manageTrips");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      if (!tripRow.driverid) throw new Error("This trip has no driver assigned.");
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot remove the driver from a completed trip.");
+      const removedDriverId = tripRow.driverid;
+      const nowTs = nowEpoch();
+      must(await supabase.from("trips").update({
+        status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
+        driveraccepted: false, updatedat: nowTs,
+      }).eq("id", action.trip_id));
+      const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", removedDriverId)
+        .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      if (!remaining || remaining.length === 0) {
+        await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", removedDriverId);
+      }
+      const { data: removedDriverUser } = await supabase.from("users").select("fullname").eq("id", removedDriverId).maybeSingle();
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: tripAgentIds,
+        message: `Driver ${removedDriverUser?.fullname || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await logAuditAction({
+        actorId: actingAdminRemoveDriver.id, actorName: actingAdminRemoveDriver.name, actionType: "TRIP/REMOVE_DRIVER",
+        tripId: action.trip_id, targetUserId: removedDriverId, details: `Removed driver ${removedDriverUser?.fullname || removedDriverId} from trip`,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/REPORT_DELAY": {
+      // Driver-facing — no admin permission gate. Only makes sense on a
+      // trip the reporting driver actually owns and that's genuinely
+      // active (matches the same DRIVER_CONFIRMED/IN_TRANSIT window used
+      // for chat/calling elsewhere) — a delay report on an unassigned or
+      // already-completed trip doesn't mean anything.
+      const validReasons = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
+      if (!validReasons.includes(action.reason)) throw new Error("Please choose a valid delay reason.");
+      const { data: tripRow } = await supabase.from("trips").select("driverid, status, agentid, extraagentids").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      if (tripRow.driverid !== action.driver_id) throw new Error("You're not the driver on this trip.");
+      if (![TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(tripRow.status)) {
+        throw new Error("Delays can only be reported on an active trip.");
+      }
+      const nowTs = nowEpoch();
+      const { error } = await supabase.from("trip_delays").insert({
+        tripid: action.trip_id, driverid: action.driver_id, reason: action.reason,
+        note: action.note?.trim() || null, reportedat: nowTs,
+      });
+      if (error) throw error;
+      const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle();
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "TRIP_DELAY", for_roles: [ROLE.ADMIN], for_user_ids: [],
+        message: `⏱ ${reportingDriver?.fullname || "Driver"} reported a delay on trip ${action.trip_id}: ${action.reason}${action.note ? ` — "${action.note.trim()}"` : ""}`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      // Agents on the trip get a lighter-weight heads-up too, without the
+      // internal note detail (which might be operationally sensitive,
+      // e.g. "driver seems lost") — just the fact there's a delay.
+      if (tripAgentIds.length) {
+        await insertNotification({
+          type: "TRIP_DELAY", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+          message: `⏱ Your driver reported a delay: ${action.reason}. Your trip may take longer than expected.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      return;
+    }
+    case "TRIP/DECLINE": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const nowTs = nowEpoch();
+      must(await supabase.from("trips").update({
+        status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
+        driveraccepted: false, declinedby: [...(tripRow.declinedby || []), action.driver_id], updatedat: nowTs,
+      }).eq("id", action.trip_id));
+      const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", action.driver_id)
+        .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      if (!remaining || remaining.length === 0) {
+        await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", action.driver_id);
+      }
+      const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
+      await insertNotification({
+        type: "TRIP_DECLINED", for_roles: [ROLE.ADMIN],
+        message: `Driver ${driverUser?.fullname} declined trip ${action.trip_id}. Needs reassignment.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await refetch();
+      return;
+    }
+    case "TRIP/CONFIRM_AGENT_PICKUP": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      const newCompleted = [...(tripRow.completedpickups || []), action.agent_id];
+      const allPickedUp = tripAgentIds.every(id => newCompleted.includes(id));
+      const nowTs = nowEpoch();
+      let newState = tripRow.status, inTransitAt = tripRow.intransitat;
+      if (allPickedUp && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
+        assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
+        newState = TRIP_STATE.IN_TRANSIT;
+        inTransitAt = nowTs;
+      }
+      // Real per-agent pickup time — this specific agent, this specific
+      // moment, distinct from intransitat (which only marks when the
+      // LAST passenger on the trip was picked up).
+      const newPickupTimestamps = { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: nowTs };
+      must(await supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, updatedat: nowTs }).eq("id", action.trip_id));
+      if (allPickedUp) {
+        await insertNotification({
+          type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`, trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/COMPLETE": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
+      const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", tripRow.driverid).maybeSingle();
+      if (!driverRow) throw new Error(`Driver status not found for ${action.trip_id}`);
+      const nowTs = nowEpoch();
+      // completeddropoffs records every agent on THIS trip as dropped —
+      // this is what lets the trip sheet show which driver actually
+      // dropped which agent, since driverid is already on the trip row
+      // and this confirms the drop event happened, not just the booking.
+      const tripAgentIdsForDrop = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}) };
+      tripAgentIdsForDrop.forEach(id => { newDropoffTimestamps[id] = nowTs; });
+      must(await supabase.from("trips").update({
+        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: tripRow.estdistancekm,
+        completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, updatedat: nowTs,
+      }).eq("id", action.trip_id));
+      const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+        .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      const stillBusy = (remaining || []).filter(r => r.id !== action.trip_id);
+      must(await supabase.from("driver_status").update({
+        state: stillBusy.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY,
+        currenttripid: stillBusy[0]?.id || null,
+        updatedat: new Date(nowTs).toISOString(),
+      }).eq("driverid", tripRow.driverid));
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      const agentNotifs = tripAgentIds.map(aid => ({
+        type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+        message: "Your trip has been completed and archived.", trip_id: action.trip_id, ts: nowTs, read: false,
+      }));
+      for (const row of agentNotifs) await insertNotification(row);
+      const { data: completedDriverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+      await insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN], message: `Trip ${action.trip_id} archived. Driver ${completedDriverUser?.fullname || tripRow.driverid} has ${stillBusy.length} trips remaining.`, ts: nowTs, read: false });
+      await refetch();
+      return;
+    }
+    case "TRIP/RECORD_ROUTE": {
+      // Computes the full optimized route (driver's current position ->
+      // every pickup -> every drop-off, nearest-neighbour ordered) across
+      // ALL of a driver's currently active trips, and writes the same
+      // total distance onto every one of those trips — the total belongs
+      // to the whole run, not any single trip's own pickup-to-dropoff leg.
+      const { trips: routeTrips, driver_coord } = action;
+      const { totalRoadKm } = computeOptimalRoute(routeTrips, driver_coord);
+      for (const t of routeTrips) {
+        await supabase.from("trips").update({ routetotalkm: totalRoadKm }).eq("id", t.trip_id);
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/SEND_CHAT":
+    case "CHAT/SEND": {
+      must(await supabase.from("messages").insert({
+        tripid: action.trip_id, senderid: action.sender_id, sendername: action.sender_name,
+        senderrole: action.sender_role, content: action.text, timestamp: nowEpoch(),
+      }));
+      await refetch();
+      return;
+    }
+    case "NOTIF/MARK_READ":
+      must(await supabase.from("notifications").update({ isread: true }).eq("id", action.id));
+      await refetch();
+      return;
+    case "NOTIF/MARK_ALL_READ": {
+      // Scoped to the caller (see the in-memory reducer's case) — the old
+      // .neq("id", -1) matched every row, so any user clearing their
+      // alerts marked the whole table read.
+      let q = supabase.from("notifications").update({ isread: true });
+      if (action.user_id != null) {
+        q = q.eq("userid", action.user_id);
+      } else if (action.admin) {
+        // Admin-role broadcasts are stored with userid null.
+        q = q.is("userid", null);
+      } else {
+        q = q.neq("id", -1);
+      }
+      must(await q);
+      await refetch();
+      return;
+    }
+    case "TRIP/SEND_REMINDER": {
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow || tripRow.remindersent) return;
+      const nowTs = nowEpoch();
+      must(await supabase.from("trips").update({ remindersent: true }).eq("id", action.trip_id));
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+        message: `Reminder: your trip from ${tripRow.pickuplocation} departs at ${tripRow.scheduledtimestr || tripRow.scheduledtime}.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await refetch();
+      return;
+    }
+    default:
+      return;
+  }
+}
+
+function useAppStore() {
+  const [supaState, setSupaState] = useState(null);
+  const [supaError, setSupaError] = useState(null);
+  const [useFallback, setUseFallback] = useState(!supabase);
+  // Rehydrated from localStorage so a page refresh doesn't log everyone
+  // out — the initial refetch below then loads data for this user. An id
+  // that doesn't match any real user just lands on the login screen.
+  const activeUserRef = useRef(readStoredActiveUserId());
+  const [localState, localDispatch] = useReducer(appReducer, INITIAL_STATE, (init) => {
+    const stored = readStoredActiveUserId();
+    return stored != null && init.users.some(u => u.id === stored)
+      ? { ...init, active_user_id: stored }
+      : init;
+  });
+  // Mirrors localState synchronously (useReducer's own state lags a render
+  // behind). dispatch() needs this to run appReducer itself and inspect
+  // _error BEFORE deciding whether to throw — see dispatch below.
+  const localStateRef = useRef(localState);
+  useEffect(() => { localStateRef.current = localState; }, [localState]);
+  const [driverPositions, setDriverPositions] = useState({}); // { [driverid]: {lat,lng,heading,speed_kmh,accuracy_m,tripid,updatedat} }
+  const [campaigns, setCampaigns] = useState([]); // [{ id, name, active }]
+  const [companies, setCompanies] = useState([]); // [{ id, name, active, address }]
+  const [tickets, setTickets] = useState([]);
+
+  const refetch = useCallback(async () => {
+    if (!supabase) return;
+    try {
+      const fresh = await fetchAllFromSupabase();
+      setSupaState({ ...fresh, active_user_id: activeUserRef.current });
+      setSupaError(null);
+    } catch (e) {
+      // Supabase configured but unreachable (bad credentials, network, RLS
+      // misconfigured, schema not migrated yet) — fall back to the in-memory
+      // reducer so the app is still usable/demoable.
+      console.warn("[Supabase] falling back to in-memory store:", e.message);
+      setUseFallback(true);
+      setSupaError(e.message);
+    }
+  }, []);
+
+  const fetchDriverPositions = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("driver_positions").select("*");
+    if (error) return; // non-fatal — live map just stays empty/stale, doesn't break the app
+    const byDriver = {};
+    for (const row of data) {
+      byDriver[row.driverid] = {
+        lat: row.lat, lng: row.lng, heading: row.heading, speed_kmh: row.speed_kmh,
+        accuracy_m: row.accuracy_m, trip_id: row.tripid, updated_at: row.updatedat,
+      };
+    }
+    setDriverPositions(byDriver);
+  }, []);
+
+  // Campaigns is a small, rarely-changing admin-managed lookup list (same
+  // role COMPANY_LOCATIONS plays, just editable from the app instead of
+  // hardcoded) — fetched separately from the main refetch cycle since it
+  // has nothing to do with trips/users and shouldn't trigger a full
+  // re-download of those on every campaign edit.
+  const fetchCampaigns = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("campaigns").select("*").order("name");
+    if (error) return;
+    setCampaigns((data || []).map(c => ({ id: c.id, name: c.name, active: c.active })));
+  }, []);
+
+  // Companies — replaces the old hardcoded COMPANY_LOCATIONS constant.
+  // Own fetch cycle (not part of the main refetch), same reasoning as
+  // campaigns: an admin-workflow table that doesn't need to reload on
+  // every trip/user action. address-prefixed flat columns (see the
+  // migration SQL) are reassembled into the nested { label, area, lat,
+  // lng } shape the rest of the app already expects for an address,
+  // matching how home_address etc. are shaped.
+  const fetchCompanies = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("companies").select("*").order("name");
+    if (error) return;
+    setCompanies((data || []).map(c => ({
+      // Cast to string: users.branchid is a text column holding a
+      // company id AS TEXT, but this id comes back from Supabase as a
+      // real bigint (JS number). Without this cast, every comparison
+      // between a company id and a user's branch_id (Set membership in
+      // the scope*ToCompany helpers, the History tab's company filter,
+      // dropdown selections) silently fails — 42 !== "42" — so company
+      // filtering/scoping looked broken even though the underlying
+      // logic was otherwise correct.
+      id: String(c.id), name: c.name, active: c.active,
+      address: { label: c.addresslabel, area: c.addressarea, lat: c.addresslat, lng: c.addresslng },
+    })));
+  }, []);
+
+  // Tickets — agent-to-admin messages/complaints, optionally referencing
+  // a trip. Own subscription (not part of the main refetch cycle) since
+  // it's a distinct, admin-workflow-driven table unrelated to trip/user
+  // sync cadence.
+  const fetchTickets = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("tickets").select("*").order("createdat", { ascending: false });
+    if (error) return;
+    setTickets((data || []).map(t => ({
+      id: t.id, agent_id: t.agentid, trip_id: t.tripid, category: t.category, message: t.message,
+      status: t.status, admin_id: t.adminid, admin_reply: t.adminreply, role: t.role || ROLE.AGENT,
+      created_at: t.createdat, updated_at: t.updatedat, resolved_at: t.resolvedat,
+    })));
+  }, []);
+
+  useEffect(() => {
+    if (!supabase) return;
+    refetch();
+    const channel = supabase
+      .channel("transitos-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "driver_status" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "users" }, refetch)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [refetch]);
+
+  // Separate, lightweight subscription for live driver positions — these
+  // update every ~8s per active driver, far more often than trip/user
+  // data changes, so they're deliberately NOT part of the general
+  // refetch() cycle above (which re-downloads users/trips/messages/
+  // notifications — wasteful to do that on every GPS tick).
+  useEffect(() => {
+    if (!supabase) return;
+    fetchDriverPositions();
+    const channel = supabase
+      .channel("transitos-driver-positions")
+      .on("postgres_changes", { event: "*", schema: "public", table: "driver_positions" }, fetchDriverPositions)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchDriverPositions]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    fetchCampaigns();
+    const channel = supabase
+      .channel("transitos-campaigns")
+      .on("postgres_changes", { event: "*", schema: "public", table: "campaigns" }, fetchCampaigns)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchCampaigns]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    fetchCompanies();
+    const channel = supabase
+      .channel("transitos-companies")
+      .on("postgres_changes", { event: "*", schema: "public", table: "companies" }, fetchCompanies)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchCompanies]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    fetchTickets();
+    const channel = supabase
+      .channel("transitos-tickets")
+      .on("postgres_changes", { event: "*", schema: "public", table: "tickets" }, fetchTickets)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchTickets]);
+
+  const dispatch = useCallback(async (action) => {
+    if (useFallback || !supabase) {
+      // appReducer never throws — a failed action just comes back with
+      // _error set on the returned state. Running it here (in addition to
+      // the real localDispatch call below) lets us inspect that _error
+      // synchronously and throw, instead of only letting it sit in state
+      // where every "await dispatch(...)" call site would sail past a
+      // failure as if it had succeeded. This mirrors the Supabase branch's
+      // throw-on-failure behavior for the fallback/demo store too.
+      // _error is pre-cleared on the input state because several reducer
+      // cases (TRIP/BOOK, TRIP/SEND_CHAT, NOTIF/*) don't reset it on
+      // success — without clearing, a stale error from an earlier failed
+      // action would make a perfectly successful later action throw.
+      // TRIP/BOOK's id must be generated HERE, not inside the reducer:
+      // this reducer runs twice per action (once below for error
+      // detection, once inside React via localDispatch), and a reducer-
+      // generated random id would differ between the two runs — the id
+      // returned to the booking form would then not exist in React's
+      // authoritative state, breaking rollback (TRIP/CANCEL).
+      const effectiveAction = action.type === "TRIP/BOOK" && !action._client_trip_id
+        ? { ...action, _client_trip_id: "TRP_" + mkId() }
+        : action.type === "ADMIN/DELETE_USERS"
+        // The reducer's self-deletion guard needs to know who's acting —
+        // a pure reducer has no access to activeUserRef itself, so it's
+        // injected here the same way _client_trip_id is for TRIP/BOOK.
+        ? { ...action, acting_admin_id: activeUserRef.current }
+        : action;
+      const result = appReducer({ ...localStateRef.current, _error: null }, effectiveAction);
+      localStateRef.current = result;
+      localDispatch(effectiveAction);
+      if (result._error) throw new Error(result._error);
+      // Keep the persisted session in sync in demo mode too — the
+      // Supabase path does the equivalent inside handleSupabaseAction.
+      if (action.type === "AUTH/LOGIN") persistActiveUserId(result.active_user_id);
+      if (action.type === "AUTH/LOGOUT") persistActiveUserId(null);
+      // Match the Supabase handler's return contract: TRIP/BOOK hands back
+      // the new trip's id (the reducer prepends it) so the booking form
+      // can roll a multi-leg booking back if a later leg fails.
+      if (action.type === "TRIP/BOOK") return effectiveAction._client_trip_id ?? result.trips[0]?.trip_id;
+      // Same return contract as the Supabase handler: per-user
+      // success/failure results, so the UI can show exactly which
+      // selected accounts were deleted and why any others were refused.
+      if (action.type === "ADMIN/DELETE_USERS") return result._lastDeleteResults;
+      // Same idea: per-day success/failure results, so the UI can show
+      // which days of a week booking got assigned and why any didn't.
+      if (action.type === "TRIP/BULK_ASSIGN_DRIVER") return result._lastBulkAssignResults;
+      return;
+    }
+    try {
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets });
+    } catch (e) {
+      // Still recorded for the global _error banner (unchanged), but now
+      // ALSO re-thrown — previously this only set state, meaning every
+      // "await dispatch(...)" call site across the app would silently
+      // continue past a failed action as if it had succeeded. Callers
+      // that specifically want to ignore failures should catch this
+      // themselves; that's an explicit choice at the call site now,
+      // not an accidental one baked into dispatch itself.
+      setSupaError(e.message);
+      throw e;
+    }
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets]);
+
+  const loading = !useFallback && !!supabase && supaState === null;
+  const state = useFallback || !supabase
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], _error: null, _loading: false }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, _error: supaError, _loading: loading };
+
+  return [state, dispatch];
+}
+
+/* ============================================================
+   SHARED UI COMPONENTS
+   ============================================================ */
+
+function StateBadge({ state }) {
+  const cfg = STATE_BADGE_MAP[state] || STATE_BADGE_MAP.UNASSIGNED_BOOKING;
+  return (
+    <span className="state-badge" style={{ background: cfg.bg, borderColor: cfg.border, color: cfg.fg }}>
+      <span className="state-dot" style={{ background: cfg.fg }} />
+      {cfg.label}
+    </span>
+  );
+}
+
+function RoleBadge({ role }) {
+  const cfg = ROLE_BADGE_MAP[role] || ROLE_BADGE_MAP.AGENT;
+  return <span className="role-badge" style={{ background: cfg.bg, borderColor: cfg.border, color: cfg.fg }}>{role}</span>;
+}
+
+function SectionHeader({ label }) {
+  return (
+    <div className="sec-hdr">
+      <span className="sec-hdr-txt">{label}</span>
+      <div className="sec-hdr-line" />
+    </div>
+  );
+}
+
+function Empty({ icon = "◈", text = "No data" }) {
+  return (
+    <div className="empty">
+      <div className="empty-ico">{icon}</div>
+      <div className="empty-txt">{text}</div>
+    </div>
+  );
+}
+
+function GpsBlock({ coord }) {
+  if (!coord) return null;
+  return (
+    <div className="gps-block">
+      <div className="gps-row"><span className="gps-key">LAT</span><span className="gps-val">{coord.lat?.toFixed(6)}</span></div>
+      <div className="gps-row"><span className="gps-key">LNG</span><span className="gps-val">{coord.lng?.toFixed(6)}</span></div>
+      <div className="gps-row"><span className="gps-key">LOC</span><span className="gps-val">{coord.label || coord.area || "—"}</span></div>
+    </div>
+  );
+}
+
+function DriverAvatar({ name, size = 42 }) {
+  const init = (name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+  return (
+    <div className="driver-av" style={{ width: size, height: size, fontSize: size * 0.38, borderRadius: size * 0.07 }}>
+      {init}
+    </div>
+  );
+}
+
+function CapacityBar({ load, capacity = DRIVER_CAPACITY }) {
+  const pct = Math.min(load / capacity, 1);
+  const full = load >= capacity;
+  const warn = pct >= CAPACITY_WARN_PCT;
+  const color = full ? COLORS.red : warn ? COLORS.amber : COLORS.green;
+  return (
+    <div className="cap-wrap">
+      <div className="cap-label-row">
+        <span style={{ color: COLORS.ghost }}>CAPACITY</span>
+        <span style={{ color, fontWeight: 700 }}>{load}/{capacity} {full ? "— FULLY BOOKED" : warn ? "— 75%+ BOOKED" : ""}</span>
+      </div>
+      <div className="cap-track"><div className="cap-fill" style={{ width: `${pct * 100}%`, background: color }} /></div>
+    </div>
+  );
+}
+
+function Button({ title, onClick, variant = "amber", size = "md", full = false, disabled = false, loading = false, style, children }) {
+  const cls = `btn btn-${variant}${size === "sm" ? " btn-sm" : ""}${full ? " btn-full" : ""}`;
+  return (
+    <button className={cls} onClick={onClick} disabled={disabled || loading} style={style}>
+      {loading ? <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} /> : (children || title)}
+    </button>
+  );
+}
+
+function Card({ children, style, body = true }) {
+  return <div className={`card${body ? " card-body" : ""}`} style={style}>{children}</div>;
+}
+
+function TextField({ label, error, style, ...inputProps }) {
+  return (
+    <div className="field" style={style}>
+      {label ? <label className="field-label">{label}</label> : null}
+      <input className={`inp${error ? " err" : ""}`} {...inputProps} />
+      {error ? <span style={{ fontSize: 10, color: COLORS.red, marginTop: 2 }}>{error}</span> : null}
+    </div>
+  );
+}
+
+/* ---------- STREET INPUT (GPS-style address autocomplete) ---------- */
+function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
+  const [query, setQuery] = useState(value || "");
+  const [results, setResults] = useState([]);
+  const [showDrop, setShowDrop] = useState(false);
+  const [selected, setSelected] = useState(preConfirmed && value ? preConfirmed : null);
+  const [isLive, setIsLive] = useState(false);
+  const [resultSource, setResultSource] = useState("offline"); // "tomtom" | "nominatim" | "offline"
+  const [streetSuggestions, setStreetSuggestions] = useState([]);
+  const inputRef = useRef(null);
+  const wrapRef = useRef(null);
+
+  useEffect(() => {
+    if (selected) return;
+    // Reset the live badge the instant the query changes, so it never shows
+    // the previous keystroke's live/offline result while a new lookup is
+    // still in flight (was: only reset on clear, causing stale flicker).
+    setIsLive(false);
+    if (query.trim().length < 2) { setResults([]); setShowDrop(false); setStreetSuggestions([]); return; }
+    const instant = staticSearch(query);
+    setResults(instant);
+    setShowDrop(instant.length > 0);
+    setResultSource("offline");
+
+    // Instant street-name suggestions from the bulk street-name table —
+    // runs in parallel with the debounced live search below, not blocked
+    // by it, since it's meant to show up before the debounce even fires.
+    let nameCancelled = false;
+    streetNameSearch(query).then(names => {
+      if (!nameCancelled) setStreetSuggestions(names);
+    });
+
+    // Debounce the live search call — without this, every keystroke fired
+    // its own network request with no cancellation of the in-flight ones,
+    // which both wastes quota and can trigger rate limiting on fast typing.
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      unifiedAddressSearch(query).then(({ results: hits, liveOk, source }) => {
+        if (cancelled) return;
+        setResults(hits);
+        setShowDrop(hits.length > 0);
+        setIsLive(liveOk);
+        setResultSource(source);
+      });
+    }, 300);
+    return () => { cancelled = true; nameCancelled = true; clearTimeout(timer); };
+  }, [query]);
+
+  // Tapping a street-name suggestion re-runs the search scoped to that
+  // exact name, so Nominatim gets a clean, unambiguous query instead of
+  // whatever partial text the person had typed — much more likely to
+  // resolve to a real coordinate.
+  const pickStreetSuggestion = (name) => {
+    setStreetSuggestions([]);
+    setQuery(name);
+  };
+
+  useEffect(() => {
+    function onDocClick(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setShowDrop(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
+  }, []);
+
+  const handleInput = (v) => {
+    setQuery(v);
+    setSelected(null);
+    setIsLive(false);
+    onChange({ street: v, area: "", coord: null, label: v, confirmed: false });
+    if (v.trim().length < 2) { setResults([]); setShowDrop(false); }
+  };
+
+  const selectResult = (r) => {
+    setQuery(r.label);
+    setSelected(r);
+    setShowDrop(false);
+    setResults([]);
+    setStreetSuggestions([]);
+    onChange({ street: r.label, area: r.area, coord: { lat: r.lat, lng: r.lng, label: r.label }, label: r.label, confirmed: true });
+    inputRef.current?.blur();
+  };
+
+  const clearInput = () => {
+    setQuery(""); setSelected(null); setResults([]); setShowDrop(false); setIsLive(false); setStreetSuggestions([]);
+    onChange({ street: "", area: "", coord: null, label: "", confirmed: false });
+    setTimeout(() => inputRef.current?.focus(), 50);
+  };
+
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <div style={{ position: "relative" }}>
+        <span style={{ position: "absolute", left: 12, top: 11, fontSize: 15, color: selected ? COLORS.green : COLORS.ghost, pointerEvents: "none" }}>
+          {selected ? "✅" : "📍"}
+        </span>
+        <input
+          ref={inputRef}
+          className={`inp${error ? " err" : ""}`}
+          style={{ paddingLeft: 38, paddingRight: query ? 34 : 12, width: "100%" }}
+          value={query}
+          onChange={e => handleInput(e.target.value)}
+          onFocus={() => { if (results.length > 0 && !selected) setShowDrop(true); }}
+          placeholder={placeholder || "Start typing a street or suburb…"}
+          autoComplete="off"
+        />
+        {query ? (
+          <button onClick={clearInput} style={{ position: "absolute", right: 9, top: 9, background: "none", border: "none", color: COLORS.ghost, fontSize: 14, cursor: "pointer" }}>✕</button>
+        ) : null}
+      </div>
+
+      {!selected && streetSuggestions.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginTop: 5 }}>
+          {streetSuggestions.map(name => (
+            <button
+              key={name}
+              onMouseDown={() => pickStreetSuggestion(name)}
+              style={{ fontSize: 10, padding: "4px 9px", borderRadius: 12, border: `1px solid ${COLORS.wire}`, background: COLORS.surface, color: COLORS.chalk, cursor: "pointer" }}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {query.length >= 2 && !selected && results.length === 0 && (
+        <div style={{ fontSize: 10, color: COLORS.ghost, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 10, marginTop: 4 }}>
+          No address matched "<span style={{ color: COLORS.chalk }}>{query}</span>". Check the spelling, try just the street name, or try the suburb.
+        </div>
+      )}
+
+      {showDrop && results.length > 0 && (
+        <div style={{ position: "absolute", top: 46, left: 0, right: 0, zIndex: 100, background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, boxShadow: "0 8px 32px rgba(0,0,0,.45)", maxHeight: 280, overflowY: "auto" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 12px", borderBottom: `1px solid ${COLORS.wire}`, background: COLORS.surface }}>
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>
+              {`${results.length} address${results.length !== 1 ? "es" : ""} found`}
+            </span>
+            <span style={{ fontSize: 8, fontWeight: 700, color: isLive ? COLORS.green : COLORS.dim }}>
+              {isLive ? (resultSource === "tomtom" ? "● TOMTOM" : "● LIVE") : "○ OFFLINE DB"}
+            </span>
+          </div>
+          {results.map((r, i) => {
+            const comma = r.label.indexOf(",");
+            const street = comma > 0 ? r.label.slice(0, comma) : r.label;
+            const suburb = comma > 0 ? r.label.slice(comma + 1).trim() : r.area;
+            return (
+              <div key={`${r.lat?.toFixed(4)}-${r.lng?.toFixed(4)}-${i}`}
+                onMouseDown={() => selectResult(r)}
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 12px", borderBottom: "1px solid rgba(255,255,255,.04)", cursor: "pointer" }}
+                onMouseEnter={e => e.currentTarget.style.background = "rgba(245,166,35,.08)"}
+                onMouseLeave={e => e.currentTarget.style.background = "transparent"}
+              >
+                <span style={{ fontSize: 13 }}>📍</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>{street}</div>
+                  <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{suburb}</div>
+                </div>
+                <span style={{ color: COLORS.ghost }}>›</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {selected && (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, background: "rgba(29,185,84,.08)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 6, padding: 10, marginTop: 6 }}>
+          <div style={{ width: 8, height: 8, borderRadius: 4, background: COLORS.green }} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.green }}>{selected.label}</div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>{selected.lat?.toFixed(5)}, {selected.lng?.toFixed(5)}</div>
+          </div>
+          <button onClick={clearInput} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 13, cursor: "pointer" }}>✕</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LocationSelector({ mode, setMode, companyId, setCompanyId, state, streetValue, streetCoord, onStreetChange, manualAddress, onManualAddressChange, error, errMsg }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 6 }}>
+        <Button title="🏠 Home / Street" variant={mode === "street" ? "amber" : "ghost"} size="sm" full onClick={() => setMode("street")} style={{ flex: 1 }} />
+        <Button title="🏢 Company" variant={mode === "company" ? "amber" : "ghost"} size="sm" full onClick={() => setMode("company")} style={{ flex: 1 }} />
+        <Button title="✏️ Type Address" variant={mode === "manual" ? "amber" : "ghost"} size="sm" full onClick={() => setMode("manual")} style={{ flex: 1 }} />
+      </div>
+      {mode === "street" && (
+        <>
+          <StreetInput
+            value={streetValue} error={!!error} placeholder="e.g. 14 Main Road" onChange={onStreetChange}
+            preConfirmed={streetCoord ? { label: streetValue, area: streetCoord.area, lat: streetCoord.lat, lng: streetCoord.lng } : null}
+          />
+          {errMsg ? <span style={{ fontSize: 10, color: COLORS.red }}>{errMsg}</span> : null}
+        </>
+      )}
+      {mode === "company" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {(state?.companies || []).length === 0 ? (
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>No companies have been added yet — add one from Users → Manage Companies.</span>
+          ) : state.companies.map(loc => {
+            const sel = companyId === loc.id;
+            const co = companyById(state, loc.id);
+            return (
+              <div key={loc.id} onClick={() => setCompanyId(loc.id)}
+                style={{ display: "flex", alignItems: "center", gap: 12, border: `1px solid ${sel ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, padding: "12px 14px", background: sel ? COLORS.amber : "transparent", cursor: "pointer" }}>
+                <span style={{ fontSize: 18 }}>🏢</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: sel ? COLORS.ink : COLORS.chalk }}>{loc.name}{!loc.active ? " (inactive)" : ""}</div>
+                  <div style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost, marginTop: 2 }}>{co?.address || "—"}</div>
+                </div>
+                {sel ? <span style={{ color: COLORS.ink }}>✓</span> : null}
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {mode === "manual" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <TextField
+            label="Full address (typed exactly as it should appear in Waze)"
+            value={manualAddress} onChange={e => onManualAddressChange(e.target.value)}
+            placeholder="e.g. 14 Bokmakierie Street, Rocklands, Cape Town, 7100"
+          />
+          <span style={{ fontSize: 9, color: COLORS.ghost }}>
+            No dropdown search — type the exact address and it'll be looked up in the background to give your driver a precise pin in Waze. If it can't be found, Waze will fall back to searching this text directly when navigation opens. Include the suburb and postal code for the best match.
+          </span>
+          {errMsg ? <span style={{ fontSize: 10, color: COLORS.red }}>{errMsg}</span> : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   LOGIN SCREEN
+   ============================================================ */
+function LoginScreen({ users, onLogin, error }) {
+  const [login, setLogin] = useState("");
+  const [pass, setPass] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async () => {
+    if (!login || !pass || submitting) return;
+    // Guards against double-click / double-Enter firing two parallel
+    // login attempts (harmless but sloppy — and with hashed accounts
+    // each attempt is a fetch + digest, so don't do it twice).
+    setSubmitting(true);
+    try {
+      await onLogin(login, pass);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="screen" style={{ alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div style={{ maxWidth: 380, width: "100%", display: "flex", flexDirection: "column", gap: 24 }}>
+        <div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 26, fontWeight: 800, letterSpacing: 2, color: COLORS.amber, textAlign: "center" }}>PEARCE AND SONS</div>
+          <div style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", letterSpacing: 1.5, marginTop: 6, textTransform: "uppercase" }}>Staff Transport</div>
+        </div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <TextField label="Username" value={login} onChange={e => setLogin(e.target.value)} autoCapitalize="off"
+            onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+          <TextField label="Password" type="password" value={pass} onChange={e => setPass(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && handleSubmit()} />
+          {error ? (
+            <div style={{ background: "rgba(232,58,58,.08)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 10 }}>
+              <span style={{ fontSize: 10, color: COLORS.red }}>⚠ {error}</span>
+            </div>
+          ) : null}
+          <Button title={submitting ? "LOGGING IN…" : "LOGIN →"} variant="amber" full onClick={handleSubmit} disabled={submitting} loading={submitting} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   AGENT APP
+   ============================================================ */
+function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
+  const active = myTrips.find(t => [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
+  return (
+    <div className="pad">
+      <div>
+        <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>GOOD DAY, AGENT</div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, letterSpacing: 1.5, textTransform: "uppercase", marginTop: 2 }}>Transport Operations Portal</div>
+      </div>
+
+      {active && (
+        <div onClick={() => goToTrip(active)} style={{ cursor: "pointer", background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 14, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontWeight: 700, fontSize: 11 }}>▶ ACTIVE TRIP</div>
+          <StateBadge state={active.state} />
+          <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 4 }}>{active.custom_pickup} → {active.custom_dropoff}</div>
+          {active.pickup_order_num && <div style={{ fontSize: 11, color: COLORS.amber, fontWeight: 700 }}>You are pickup #{active.pickup_order_num}</div>}
+          <div style={{ fontSize: 10, color: COLORS.dim }}>Tap to view details →</div>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10 }}>
+        {[["⊕", "BOOK", "New booking", "book", COLORS.amber], ["⊟", "TRIPS", `${myTrips.length} bookings`, "trips", COLORS.blue], ["◬", "ALERTS", "Updates", "alerts", COLORS.green]].map(([icon, label, sub, tab, color]) => (
+          <div key={tab} onClick={() => setTab(tab)} style={{ flex: 1, height: 80, border: `1px solid ${COLORS.wire}`, borderRadius: 4, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, cursor: "pointer" }}>
+            <span style={{ fontSize: 20, color }}>{icon}</span>
+            <span style={{ fontSize: 10, fontWeight: 700 }}>{label}</span>
+            <span style={{ fontSize: 9, color: COLORS.ghost }}>{sub}</span>
+          </div>
+        ))}
+      </div>
+
+      <SectionHeader label="Recent Activity" />
+      {myTrips.length === 0 ? <Empty icon="⊟" text="No bookings yet" /> : myTrips.slice(0, 4).map(t => (
+        <div key={t.trip_id} onClick={() => goToTrip(t)} style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
+            <StateBadge state={t.state} />
+          </div>
+          <div style={{ fontSize: 11 }}>{t.custom_pickup}</div>
+          <div style={{ fontSize: 10, color: COLORS.ghost }}>→ {t.custom_dropoff}</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 9, color: COLORS.dim }}>{t.scheduled_date} · {t.scheduled_time}</span>
+            {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
+            {["ASSIGNED", "DRIVER_CONFIRMED"].includes(t.state) && !t.reminder_sent && (
+              <Button title="⏰ REMIND" variant="ghost" size="sm" onClick={e => { e.stopPropagation(); dispatch({ type: "TRIP/SEND_REMINDER", trip_id: t.trip_id }).catch(() => {}); /* failure already toasted by the wrapper */ }} />
+            )}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Given a start/end date (YYYY-MM-DD, from a native date input) returns
+// one DD/MM/YYYY-formatted (en-ZA, matching the rest of the app) string
+// per calendar day inclusive. Ranges longer than 14 days return [] so the
+// booking form's "14 days max" validation fires — a "week trip" spanning
+// months would create an unreasonable number of trips in one submission,
+// and silently truncating to the first 14 (the old behavior) booked
+// something different from what the agent selected without any error.
+function expandDateRange(startStr, endStr) {
+  const start = new Date(`${startStr}T00:00:00`);
+  const end = new Date(`${endStr}T00:00:00`);
+  if (isNaN(start) || isNaN(end) || end < start) return [];
+  const days = [];
+  const cur = new Date(start);
+  while (cur <= end) {
+    days.push(cur.toLocaleDateString("en-ZA"));
+    cur.setDate(cur.getDate() + 1);
+    // Ranges longer than 14 days are REJECTED (empty result -> the
+    // booking form's "14 days max" validation error fires), not silently
+    // truncated to the first 14 like before — an agent who picked a
+    // 20-day range was getting 14 days booked with no error at all.
+    if (days.length > 14) return [];
+  }
+  return days;
+}
+
+function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
+  const homeAddr = user.home_address;
+  const workLocation = companyById(state, user.branch_id);
+  const hasHomeAddress = !!homeAddr;
+  const hasWorkLocation = !!workLocation;
+  const canBook = hasHomeAddress && hasWorkLocation;
+  // Local calendar date, NOT toISOString() (which is UTC): in SAST
+  // (UTC+2) between midnight and 02:00 local, the UTC date is still
+  // yesterday — the week-booking date inputs were defaulting to (and
+  // allowing, via min=) a day that had already passed.
+  const todayStr = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+
+  const [form, setForm] = useState({
+    direction: "INBOUND", // INBOUND = home -> work, OUTBOUND = work -> home
+    trip_type: "DAY",
+    date: new Date().toLocaleDateString("en-ZA"), // used for DAY bookings
+    weekStart: todayStr, weekEnd: todayStr, // used for WEEK bookings (native date inputs, YYYY-MM-DD)
+    time: "08:00", phone: "",
+    wantsReturn: false, returnTime: "17:00",
+  });
+  const [errs, setErrs] = useState({});
+  const [loading, setLoading] = useState(false);
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  // Agents commute the same route daily — one tap copies the recurring
+  // parts of their most recent booking (direction, time, phone; and
+  // whether a same-day return leg existed, reconstructed from the trips
+  // themselves since "wantsReturn" isn't stored) onto today's form. The
+  // date is deliberately NOT copied: "my usual trip" means "again today",
+  // not "again on the day I last booked".
+  const lastTrip = (myTrips || [])
+    .filter(t => t.trip_type !== "WEEK" || t.week_day_num === 1)
+    .slice()
+    // en-ZA dates are YYYY/MM/DD, so date+time sorts lexically — trip ids
+    // don't work for recency ("9" > "10" as strings, and demo ids are
+    // random). "Most recent" here means latest-scheduled, which is what
+    // an agent thinks of as their usual trip anyway.
+    .sort((a, b) => `${b.scheduled_date} ${b.scheduled_time}`.localeCompare(`${a.scheduled_date} ${a.scheduled_time}`))[0] || null;
+  const lastHadReturn = lastTrip
+    ? (myTrips || []).some(t =>
+        t !== lastTrip &&
+        t.scheduled_date === lastTrip.scheduled_date &&
+        t.direction !== lastTrip.direction)
+    : false;
+  const lastReturnLeg = lastHadReturn
+    ? (myTrips || []).find(t => t !== lastTrip && t.scheduled_date === lastTrip.scheduled_date && t.direction !== lastTrip.direction)
+    : null;
+  const prefillFromLast = () => {
+    if (!lastTrip) return;
+    // The "outbound" of the pair is whichever leg is earlier in the day.
+    const legs = [lastTrip, ...(lastReturnLeg ? [lastReturnLeg] : [])]
+      .sort((a, b) => String(a.scheduled_time).localeCompare(String(b.scheduled_time)));
+    const first = legs[0];
+    const second = legs[1] || null;
+    setForm(f => ({
+      ...f,
+      trip_type: "DAY",
+      direction: first.direction,
+      time: first.scheduled_time || f.time,
+      phone: first.phone || f.phone,
+      wantsReturn: !!second,
+      returnTime: second?.scheduled_time || f.returnTime,
+    }));
+    setErrs({});
+  };
+
+  const returnDirection = form.direction === "INBOUND" ? "OUTBOUND" : "INBOUND";
+  const weekDates = form.trip_type === "WEEK" ? expandDateRange(form.weekStart, form.weekEnd) : [];
+
+  const validate = () => {
+    const e = {};
+    if (!canBook) e.setup = "Missing home address or work location — contact your admin to have these set up before booking.";
+    if (!form.phone) e.phone = "Contact number is required";
+    if (form.trip_type === "WEEK" && weekDates.length === 0) e.week = "Please choose a valid date range (end date on or after start date, 14 days max).";
+    setErrs(e);
+    return Object.keys(e).length === 0;
+  };
+
+  // Builds the pickup/dropoff pair for a single leg (one direction, one
+  // date) — both ends fully determined by the agent's own profile
+  // (home_address, branch_id), nothing typed or searched.
+  const buildLeg = (direction, dateStr, timeStr, weekGroupId, dayNum) => {
+    const homeCoord = { lat: homeAddr.lat, lng: homeAddr.lng, label: homeAddr.label };
+    const workCoord = { lat: workLocation.lat, lng: workLocation.lng, label: workLocation.address };
+    const pickupLabel = direction === "INBOUND" ? homeAddr.label : workLocation.address;
+    const pickupCoord = direction === "INBOUND" ? homeCoord : workCoord;
+    const dropoffLabel = direction === "INBOUND" ? workLocation.address : homeAddr.label;
+    const dropoffCoord = direction === "INBOUND" ? workCoord : homeCoord;
+    return {
+      type: "TRIP/BOOK", agent_id: user.id, agent_name: user.name,
+      pickup_label: pickupLabel, pickup_coord: pickupCoord, dropoff_label: dropoffLabel, dropoff_coord: dropoffCoord,
+      pickup_company_id: direction === "OUTBOUND" ? workLocation.id : null,
+      dropoff_company_id: direction === "INBOUND" ? workLocation.id : null,
+      direction, pickup_is_manual: false, dropoff_is_manual: false,
+      trip_type: form.trip_type, scheduled_date: dateStr, scheduled_time: timeStr, phone: form.phone,
+      week_group_id: weekGroupId || undefined, week_day_num: dayNum || undefined,
+    };
+  };
+
+  const submit = async () => {
+    if (!validate()) return;
+    setLoading(true);
+    // All-or-nothing: every leg's new trip id is collected as it's
+    // created, and if ANY later leg fails, everything created so far is
+    // cancelled again. Before this, a week booking failing on day 3 of 7
+    // silently left days 1–2 booked with no indication which days
+    // actually existed.
+    const createdTripIds = [];
+    const bookLeg = async (leg) => {
+      const id = await dispatch(leg);
+      if (id != null) createdTripIds.push(id);
+    };
+    try {
+      if (form.trip_type === "WEEK") {
+        // One shared group id links every trip created by this single
+        // booking — lets the driver/admin see them as one series, and is
+        // what makes "reveal next day's trip once today's is done" work
+        // (see the week-group filter in DriverApp).
+        const weekGroupId = crypto.randomUUID();
+        for (let i = 0; i < weekDates.length; i++) {
+          await bookLeg(buildLeg(form.direction, weekDates[i], form.time, weekGroupId, i + 1));
+          if (form.wantsReturn) {
+            await bookLeg(buildLeg(returnDirection, weekDates[i], form.returnTime, weekGroupId, i + 1));
+          }
+        }
+      } else {
+        await bookLeg(buildLeg(form.direction, form.date, form.time));
+        if (form.wantsReturn) {
+          await bookLeg(buildLeg(returnDirection, form.date, form.returnTime));
+        }
+      }
+      setTab("trips");
+    } catch (e) {
+      let rollbackFailures = 0;
+      for (const id of createdTripIds) {
+        try {
+          await dispatch({ type: "TRIP/CANCEL", trip_id: id, agent_id: user.id });
+        } catch {
+          rollbackFailures++;
+        }
+      }
+      const reason = e.message || "Booking failed";
+      if (createdTripIds.length === 0) {
+        setErrs({ submit: `${reason} — nothing was booked. Please try again.` });
+      } else if (rollbackFailures === 0) {
+        setErrs({ submit: `${reason} — the ${createdTripIds.length} leg${createdTripIds.length !== 1 ? "s" : ""} created before the failure ${createdTripIds.length !== 1 ? "were" : "was"} cancelled, so nothing was booked. Please try again.` });
+      } else {
+        setErrs({ submit: `${reason} — and ${rollbackFailures} already-created leg${rollbackFailures !== 1 ? "s" : ""} couldn't be automatically cancelled. Please check My Trips and contact your admin before rebooking.` });
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, letterSpacing: 1 }}>NEW BOOKING</div>
+      <Card>
+        {!canBook && (
+          <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 12 }}>
+            <span style={{ fontSize: 11, color: COLORS.red }}>
+              {!hasHomeAddress && !hasWorkLocation
+                ? "Your home address and work location haven't been set up yet."
+                : !hasHomeAddress
+                ? "Your home address hasn't been set up yet."
+                : "Your work location (company) hasn't been set up yet."}
+              {" "}Contact your admin to have this added to your profile before you can submit a booking.
+            </span>
+          </div>
+        )}
+        <SectionHeader label="Booking Type" />
+        <div style={{ display: "flex", gap: 8 }}>
+          {["DAY", "WEEK"].map(t => <Button key={t} title={`${t} TRIP`} variant={form.trip_type === t ? "amber" : "ghost"} size="sm" onClick={() => set("trip_type", t)} style={{ flex: 1 }} />)}
+        </div>
+
+        {lastTrip && (
+          <div style={{ background: "rgba(56,178,172,.06)", border: "1px solid rgba(56,178,172,.3)", borderRadius: 4, padding: 10, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: 160 }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.teal }}>⟳ BOOK MY USUAL</div>
+              <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>
+                {lastTrip.direction === "INBOUND" ? "Home → Work" : "Work → Home"} at {lastTrip.scheduled_time}{lastHadReturn ? ` + return at ${lastReturnLeg?.scheduled_time}` : ""} — copied onto today's date.
+              </div>
+            </div>
+            <Button title="USE IT" size="sm" variant="ghost" onClick={prefillFromLast} />
+          </div>
+        )}
+
+        <SectionHeader label="Direction" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {[
+            { id: "INBOUND", label: "Inbound", desc: "Home → Work", from: homeAddr?.label, to: workLocation?.label },
+            { id: "OUTBOUND", label: "Outbound", desc: "Work → Home", from: workLocation?.label, to: homeAddr?.label },
+          ].map(opt => {
+            const sel = form.direction === opt.id;
+            return (
+              <div key={opt.id} onClick={() => canBook && set("direction", opt.id)}
+                style={{ display: "flex", alignItems: "center", gap: 12, border: `1px solid ${sel ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, padding: "12px 14px", background: sel ? COLORS.amber : "transparent", cursor: canBook ? "pointer" : "not-allowed", opacity: canBook ? 1 : .5 }}>
+                <span style={{ fontSize: 18 }}>{opt.id === "INBOUND" ? "🏠→🏢" : "🏢→🏠"}</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: sel ? COLORS.ink : COLORS.chalk }}>{opt.label}</div>
+                  <div style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost, marginTop: 2 }}>{opt.desc}</div>
+                  {canBook && <div style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost, marginTop: 4 }}>{opt.from} → {opt.to}</div>}
+                </div>
+                {sel && <span style={{ color: COLORS.ink }}>✓</span>}
+              </div>
+            );
+          })}
+        </div>
+
+        <SectionHeader label="Schedule" />
+        {form.trip_type === "WEEK" ? (
+          <>
+            <div className="grid2">
+              <div>
+                <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FROM</label>
+                <input type="date" className="inp" value={form.weekStart} min={todayStr} onChange={e => set("weekStart", e.target.value)} style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>TILL</label>
+                <input type="date" className="inp" value={form.weekEnd} min={form.weekStart} onChange={e => set("weekEnd", e.target.value)} style={{ width: "100%" }} />
+              </div>
+            </div>
+            {errs.week && <span style={{ fontSize: 10, color: COLORS.red }}>{errs.week}</span>}
+            {weekDates.length > 0 && (
+              <span style={{ fontSize: 9, color: COLORS.teal }}>
+                {weekDates.length} day{weekDates.length !== 1 ? "s" : ""}: {weekDates.join(", ")}
+              </span>
+            )}
+          </>
+        ) : (
+          <TextField label="Date" value={form.date} onChange={e => set("date", e.target.value)} />
+        )}
+        <TextField label={form.trip_type === "WEEK" ? "Time (every day)" : "Time"} type="time" value={form.time} onChange={e => set("time", e.target.value)} />
+
+        <SectionHeader label="Return Trip?" />
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 10, color: COLORS.ghost }}>
+            Do you also need a return {returnDirection === "OUTBOUND" ? "trip home from work" : "trip to work"}{form.trip_type === "WEEK" ? " on each of these days" : ""}?
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Button title="NO, ONE-WAY ONLY" size="sm" variant={!form.wantsReturn ? "amber" : "ghost"} onClick={() => set("wantsReturn", false)} style={{ flex: 1 }} />
+            <Button title="YES, BOOK RETURN" size="sm" variant={form.wantsReturn ? "amber" : "ghost"} onClick={() => set("wantsReturn", true)} style={{ flex: 1 }} />
+          </div>
+          {form.wantsReturn && (
+            <TextField label={`Return time (${returnDirection === "OUTBOUND" ? "Work → Home" : "Home → Work"})`} type="time" value={form.returnTime} onChange={e => set("returnTime", e.target.value)} />
+          )}
+        </div>
+
+        <TextField label="Contact Phone" value={form.phone} onChange={e => set("phone", e.target.value)} placeholder="07x xxx xxxx" error={errs.phone} />
+        {errs.submit && <span style={{ fontSize: 10, color: COLORS.red }}>{errs.submit}</span>}
+        <Button title={loading ? "SUBMITTING…" : "SUBMIT BOOKING →"} variant="amber" full onClick={submit} disabled={loading || !canBook} loading={loading} />
+      </Card>
+    </div>
+  );
+}
+
+function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
+  const [text, setText] = useState("");
+  // Agent-facing cancel — only while the trip is still UNASSIGNED (no
+  // driver involved yet), matching TRIP/CANCEL's own guard. Anything
+  // already dispatched needs an admin (who can free the driver and
+  // notify everyone properly).
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState(null);
+  const cancelTrip = async () => {
+    setCancelling(true);
+    setCancelError(null);
+    try {
+      await dispatch({ type: "TRIP/CANCEL", trip_id: trip.trip_id, agent_id: user.id });
+      onBack();
+    } catch (e) {
+      setCancelError(e.message || "Couldn't cancel the booking — please try again.");
+    } finally {
+      setCancelling(false);
+    }
+  };
+  const isActiveTripForTracking = trip && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state);
+  // Reference point for the distance/ETA calculation is wherever the
+  // driver is currently headed — the pickup if they haven't collected
+  // this agent yet, otherwise the drop-off. Called unconditionally
+  // (before the early return below) per React's Rules of Hooks; the hook
+  // itself no-ops when driverId/referencePoint aren't available yet.
+  // On a multi-passenger trip, "the pickup" must be THIS agent's own
+  // pickup point — [0] is the PRIMARY agent's, so a secondary passenger
+  // was being shown distance/ETA to someone else's address. Falls back
+  // to [0] for the primary agent / legacy coords without agent_id.
+  const myPickupCoord = trip
+    ? (trip.pickup_sequence_coords?.find(c => c.agent_id === user.id) ?? trip.pickup_sequence_coords?.[0]) ?? null
+    : null;
+  const trackingReferencePoint = trip
+    ? (trip.completed_pickups?.includes(user.id) ? trip.dropoff_sequence_coords?.[0] : myPickupCoord) ?? null
+    : null;
+  const shuttleStatus = useAgentShuttleStatus(isActiveTripForTracking ? trip?.driver_id : null, trackingReferencePoint);
+  if (!trip) return <div className="pad"><span style={{ color: COLORS.ghost }}>Trip not found.</span></div>;
+
+  const driverUser = state.users.find(u => u.id === trip.driver_id);
+  const driverStatus = state.driver_status.find(d => d.driver_id === trip.driver_id);
+  const pickupCoord = trip.pickup_sequence_coords?.[0] ?? null;
+  const dropCoord = trip.dropoff_sequence_coords?.[0] ?? null;
+  // Was previously always the trip's PRIMARY agent (agent_ids[0]), which
+  // misattributed every message sent by a secondary agent on a
+  // multi-passenger trip to the primary agent's identity instead of
+  // their own. Use the actual logged-in user now.
+  const chatUser = user;
+  const msgs = trip.chat_messages || [];
+
+  const send = async () => {
+    if (!text.trim()) return;
+    try {
+      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: chatUser.id, sender_name: chatUser.name, sender_role: chatUser.role, text: text.trim() });
+      setText("");
+    } catch (e) {
+      // Text deliberately stays in the input on failure so it's easy to
+      // just hit send again — no error banner for a single dropped
+      // message in a low-stakes, frequently-retried action like chat.
+      console.warn("[Chat] send failed:", e.message);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <Button title="‹ BACK" variant="ghost" size="sm" onClick={onBack} style={{ alignSelf: "flex-start" }} />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>{trip.trip_type} TRIP</div>
+        </div>
+        <StateBadge state={trip.state} />
+      </div>
+
+      {trip.pickup_order_num && (
+        <div style={{ background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 12 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>◈ YOU ARE PICKUP #{trip.pickup_order_num}</div>
+          <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>Drop-off sequence: #{trip.drop_sequence_num}</div>
+        </div>
+      )}
+
+      {trip.state === TRIP_STATE.UNASSIGNED_BOOKING && (
+        !confirmingCancel ? (
+          <Button title="✕ CANCEL THIS TRIP" variant="ghost" size="sm" onClick={() => setConfirmingCancel(true)} style={{ alignSelf: "flex-start" }} />
+        ) : (
+          <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <span style={{ fontSize: 10, color: COLORS.chalk }}>Cancel this booking? It hasn't been assigned to a driver yet, so it will just be removed.</span>
+            {cancelError && <span style={{ fontSize: 10, color: COLORS.red }}>{cancelError}</span>}
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title="KEEP TRIP" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setConfirmingCancel(false); setCancelError(null); }} />
+              <Button title={cancelling ? "CANCELLING…" : "YES, CANCEL IT"} variant="danger" size="sm" style={{ flex: 1 }} onClick={cancelTrip} disabled={cancelling} loading={cancelling} />
+            </div>
+          </div>
+        )
+      )}
+      {trip.state !== TRIP_STATE.UNASSIGNED_BOOKING && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
+        <span style={{ fontSize: 9, color: COLORS.ghost }}>Need to cancel? A driver is already assigned — contact your admin to cancel this trip.</span>
+      )}
+
+      <Card>
+        <SectionHeader label="Route" />
+        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ PICKUP: </span>{trip.custom_pickup}</div>
+        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
+        {trip.est_distance_km && <div style={{ fontSize: 10, color: COLORS.teal }}>Est. distance: {(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
+        {trip.driver_route_km != null && (
+          <div style={{ fontSize: 10, color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, marginTop: 2 }}>
+            {trip.driver_route_exceeds_policy ? "⚠ " : ""}Driver's total route (first pickup → last drop-off): {trip.driver_route_km.toFixed(1)} km
+            {trip.driver_route_cap_km != null && ` (company policy cap: ${trip.driver_route_cap_km.toFixed(0)} km)`}
+          </div>
+        )}
+        <SectionHeader label="Pickup Location" />
+        {pickupCoord ? <GpsBlock coord={pickupCoord} /> : <span style={{ fontSize: 10, color: COLORS.ghost }}>Coordinates pending</span>}
+        {pickupCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
+        <SectionHeader label="Drop-off Location" />
+        {dropCoord ? <GpsBlock coord={dropCoord} /> : <span style={{ fontSize: 10, color: COLORS.ghost }}>Coordinates pending</span>}
+        {dropCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+      </Card>
+
+      {driverUser && (
+        <Card>
+          <SectionHeader label="Assigned Driver" />
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <DriverAvatar name={driverUser.name} />
+            <div>
+              <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{driverUser.name}</div>
+              <div style={{ fontSize: 10, color: COLORS.ghost }}>{driverStatus?.vehicle}</div>
+              <div style={{ marginTop: 6 }}><StateBadge state={driverStatus?.state} /></div>
+            </div>
+          </div>
+          {(() => {
+            // Text-only, deliberately — no map, no coordinates rendered
+            // here at all. The heading comment on useAgentShuttleStatus
+            // explains why: agents get a plain-language summary computed
+            // from the driver's lightweight broadcast, never the raw
+            // position data itself.
+            if (!isActiveTripForTracking) {
+              return <span style={{ fontSize: 9, color: COLORS.ghost }}>Live driver tracking becomes available once your driver confirms the trip.</span>;
+            }
+            if (!shuttleStatus.summary) {
+              return <span style={{ fontSize: 9, color: COLORS.ghost }}>Waiting for your driver's shuttle status…</span>;
+            }
+            const { distanceKm, etaMin } = shuttleStatus.summary;
+            const headingToward = trip.completed_pickups?.includes(user.id) ? "your drop-off" : "you";
+            return (
+              <div style={{ background: "rgba(29,185,84,.08)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 4, padding: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: shuttleStatus.stale ? COLORS.ghost : COLORS.green }}>
+                  {shuttleStatus.stale
+                    ? "Shuttle status unavailable — reconnecting…"
+                    : etaMin != null
+                    ? `Your shuttle is about ${etaMin} min${etaMin !== 1 ? "s" : ""} away`
+                    : "Tracking your shuttle…"}
+                </div>
+                {!shuttleStatus.stale && distanceKm != null && (
+                  <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 3 }}>
+                    ~{distanceKm.toFixed(1)} km from {headingToward}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+          {call && isTripActiveForComms(trip) && (
+            <Button
+              title="📞 CALL DRIVER" variant="green" size="sm"
+              onClick={() => call.startCall({ id: driverUser.id, name: driverUser.name }, trip.trip_id)}
+              disabled={call.callState !== CALL_STATE.IDLE}
+            />
+          )}
+          {isTripActiveForComms(trip)
+            ? <div style={{ fontSize: 9, color: COLORS.ghost }}>Or message your driver using Trip Chat below.</div>
+            : <div style={{ fontSize: 9, color: COLORS.ghost }}>Messaging and calling become available once your driver confirms the trip.</div>}
+        </Card>
+      )}
+
+      <Card>
+        <SectionHeader label="Trip Log" />
+        {[["BOOKED", trip.booked_at], ["CONFIRMED", trip.confirmed_at], ["IN TRANSIT", trip.in_transit_at], ["COMPLETED", trip.completed_at]].map(([l, v]) => v ? (
+          <div key={l} style={{ display: "flex", gap: 6, fontSize: 10 }}>
+            <span style={{ color: COLORS.green }}>✓</span><span style={{ color: COLORS.ghost }}>{l}:</span><span>{v}</span>
+          </div>
+        ) : null)}
+      </Card>
+
+      {isTripActiveForComms(trip) && (
+        <Card>
+          <SectionHeader label="Trip Chat" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 220, overflowY: "auto" }}>
+            {msgs.length === 0 && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 12 }}>No messages yet.</span>}
+            {msgs.map(m => {
+              const mine = m.sender_id === chatUser.id;
+              return (
+                <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "82%", borderRadius: 6, padding: 9, background: mine ? "rgba(45,140,240,.15)" : COLORS.surface, border: `1px solid ${mine ? "rgba(45,140,240,.3)" : COLORS.wire}` }}>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, marginBottom: 3 }}>{m.sender_name} · {m.ts}</div>
+                  <div style={{ fontSize: 11 }}>{m.text}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 7 }}>
+            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" />
+            <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim()} />
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJumpConsumed }) {
+  const [filter, setFilter] = useState("ALL");
+  // Seeded from a home-screen card tap (jumpTripId), then consumed so the
+  // deep-link is one-shot — the TRIPS tab itself still opens on the list.
+  const [detailId, setDetailId] = useState(jumpTripId ?? null);
+  useEffect(() => { if (jumpTripId) onJumpConsumed?.(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Monthly archive window: trips completed BEFORE the previous calendar
+  // month are expired from the app's display entirely (they remain in
+  // the backend — see tripArchiveBucket). What's left is split into the
+  // live list and the one-month archive shown under its own header.
+  const visible = myTrips.filter(t => tripArchiveBucket(t) !== "EXPIRED");
+  const filtered = filter === "ALL" ? visible : visible.filter(t => t.state === filter);
+  const liveList = filtered.filter(t => tripArchiveBucket(t) === "CURRENT");
+  const archiveList = filtered.filter(t => tripArchiveBucket(t) === "ARCHIVE");
+  const detailTrip = detailId ? state.trips.find(t => t.trip_id === detailId) : null;
+
+  if (detailTrip) return <AgentTripDetail trip={detailTrip} state={state} dispatch={dispatch} user={user} call={call} onBack={() => setDetailId(null)} />;
+
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>MY TRIPS</div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {["ALL", ...Object.values(TRIP_STATE)].map(f => (
+          <Button key={f} size="sm" variant={filter === f ? "amber" : "ghost"} title={f === "ALL" ? "ALL" : f.replace("_BOOKING", "").replace("ARCHIVED_", "")} onClick={() => setFilter(f)} />
+        ))}
+      </div>
+      {(() => {
+        const TripRow = ({ t }) => (
+          <div onClick={() => setDetailId(t.trip_id)} style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 9 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>{t.trip_id}</div>
+                <div style={{ fontSize: 12, fontWeight: 600 }}>{t.trip_type} TRIP</div>
+              </div>
+              <StateBadge state={t.state} />
+            </div>
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
+              {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
+            </div>
+          </div>
+        );
+        if (filtered.length === 0) return <Empty icon="⊟" text="No trips" />;
+        return (
+          <>
+            {liveList.map(t => <TripRow key={t.trip_id} t={t} />)}
+            {archiveList.length > 0 && (
+              <>
+                <SectionHeader label={`◈ Archive — ${archiveMonthLabel()}`} />
+                {archiveList.map(t => <TripRow key={t.trip_id} t={t} />)}
+                <span style={{ fontSize: 8, color: COLORS.ghost }}>The app keeps one month of archive. Older trips are retained in the system — ask an admin for records beyond {archiveMonthLabel().toLowerCase()}.</span>
+              </>
+            )}
+          </>
+        );
+      })()}
+    </div>
+  );
+}
+
+// Role-agnostic: filters purely by for_user_ids, so agents AND drivers
+// use the same component (a driver's ticket replies and trip-cancellation
+// alerts are targeted by user id, so they land here too).
+function AlertsTab({ state, user, dispatch }) {
+  const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ALERTS</div>
+        <Button title="CLEAR" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", user_id: user.id }).catch(() => {})} />
+      </div>
+      {myNotifs.length === 0 ? <Empty icon="◬" text="No alerts" /> : myNotifs.map(n => (
+        <div key={n.id} onClick={() => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {})}
+          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.08)", border: n.read ? "none" : "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 13 }}>
+          <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1, marginBottom: 5 }}>{ICONS[n.type] || "◈"} {n.type.replace(/_/g, " ")}</div>
+          <div style={{ fontSize: 11 }}>{n.message}</div>
+          <div style={{ fontSize: 9, color: COLORS.dim, marginTop: 5 }}>{n.ts}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Agent-filed tickets are about THEIR OWN commute experience — a lost
+// item, a driver's conduct, being late, etc. Driver-filed tickets are
+// about THEIR OWN operational concerns while running trips — genuinely
+// different complaint patterns, not just the same list relabeled.
+const AGENT_TICKET_CATEGORIES = ["Lost Item", "Driver Complaint", "Vehicle Issue", "Late Pickup/Drop-off", "Route Concern", "Other"];
+const DRIVER_TICKET_CATEGORIES = ["Agent No-Show", "Agent Conduct Complaint", "Wrong/Incomplete Address", "Vehicle Issue", "Route/Traffic Concern", "Safety Concern", "Other"];
+
+function HelpTab({ state, user, dispatch }) {
+  const [showForm, setShowForm] = useState(false);
+  const [category, setCategory] = useState("");
+  const [tripId, setTripId] = useState("");
+  const [message, setMessage] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState(null);
+  const [historyTrips, setHistoryTrips] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Combine live trips already in state with a full history fetch, same
+  // pattern as AdminProfileSearch — a lost-item ticket might reference a
+  // trip well outside the live window (current + previous month). Filtered by whichever
+  // role is using this screen: an agent's own trips (agent_ids includes
+  // them) vs a driver's own trips (driver_id === them).
+  const liveMyTrips = state.trips.filter(t => user.role === ROLE.DRIVER ? t.driver_id === user.id : t.agent_ids?.includes(user.id));
+  useEffect(() => {
+    setLoadingHistory(true);
+    const historyQuery = user.role === ROLE.DRIVER ? { driverId: user.id } : { agentId: user.id };
+    fetchTripHistory(historyQuery).then(hits => { setHistoryTrips(hits); setLoadingHistory(false); }).catch(() => { setHistoryTrips([]); setLoadingHistory(false); });
+  }, [user.id, user.role]);
+  const liveTripIds = new Set(liveMyTrips.map(t => t.trip_id));
+  const allMyTrips = [...liveMyTrips, ...(historyTrips || []).filter(t => !liveTripIds.has(t.trip_id))]
+    .sort((a, b) => (b.scheduled_time_epoch || 0) - (a.scheduled_time_epoch || 0));
+
+  const myTickets = state.tickets.filter(t => t.agent_id === user.id);
+
+  // Reference material for whoever's filing a new ticket — their OWN past
+  // tickets in the same category, so a pattern (e.g. "this address is
+  // wrong" reported three times before) is visible before they even
+  // finish writing the new one. Scoped to the filer's own history only,
+  // not fleet-wide, per the explicit decision this was built against.
+  const similarPastTickets = category
+    ? myTickets.filter(t => t.category === category && t.id !== null).slice(0, 5)
+    : [];
+
+  const submit = async () => {
+    if (!category) { setErr("Please choose a category."); return; }
+    if (!tripId) { setErr("Please select which trip this is about."); return; }
+    if (!message.trim()) { setErr("Please describe the issue."); return; }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      // Supabase trip ids are numeric strings from the <select> and need
+      // Number(); demo-mode ids are "TRP_…" strings and must pass through
+      // as-is — Number() turned those into NaN.
+      await dispatch({ type: "TICKET/CREATE", user_id: user.id, role: user.role, trip_id: /^\d+$/.test(tripId) ? Number(tripId) : tripId, category, message: message.trim() });
+      setCategory(""); setTripId(""); setMessage(""); setShowForm(false);
+    } catch (e) {
+      setErr(e.message || "Failed to submit ticket.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const STATUS_COLOR = { OPEN: COLORS.amber, IN_PROGRESS: COLORS.blue2, RESOLVED: COLORS.green };
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>HELP & TICKETS</div>
+        <Button title={showForm ? "CANCEL" : "+ NEW TICKET"} variant={showForm ? "ghost" : "amber"} size="sm" onClick={() => { setShowForm(s => !s); setErr(null); }} />
+      </div>
+
+      {showForm && (
+        <Card>
+          <SectionHeader label="Category" />
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {(user.role === ROLE.DRIVER ? DRIVER_TICKET_CATEGORIES : AGENT_TICKET_CATEGORIES).map(c => (
+              <Button key={c} title={c} size="sm" variant={category === c ? "amber" : "ghost"} onClick={() => setCategory(c)} />
+            ))}
+          </div>
+
+          {similarPastTickets.length > 0 && (
+            <div style={{ background: COLORS.surface, borderRadius: 4, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+              <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.teal, letterSpacing: 1, marginBottom: 6 }}>
+                YOU'VE REPORTED THIS BEFORE ({similarPastTickets.length})
+              </div>
+              {similarPastTickets.map(t => (
+                <div key={t.id} style={{ fontSize: 10, color: COLORS.chalk, padding: "4px 0", borderTop: `1px solid ${COLORS.wire}` }}>
+                  <span style={{ color: COLORS.ghost }}>{epochToDisplay(t.created_at)}: </span>{t.message}
+                  {t.trip_id && <span style={{ color: COLORS.ghost }}> (Trip {t.trip_id})</span>}
+                </div>
+              ))}
+              <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 6 }}>Shown for reference — submitting again still creates a new ticket.</div>
+            </div>
+          )}
+
+          <SectionHeader label="Which trip is this about?" />
+          {loadingHistory && allMyTrips.length === 0 ? (
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>Loading your trips…</span>
+          ) : allMyTrips.length === 0 ? (
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>You don't have any trips yet.</span>
+          ) : (
+            <select className="inp" value={tripId} onChange={e => setTripId(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— Select a trip —</option>
+              {allMyTrips.map(t => (
+                <option key={t.trip_id} value={t.trip_id}>
+                  {t.trip_id} · {t.scheduled_date} {t.scheduled_time} · {t.custom_pickup} → {t.custom_dropoff}
+                </option>
+              ))}
+            </select>
+          )}
+          <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Selecting the trip lets admins narrow down which driver/vehicle was involved.</span>
+
+          <SectionHeader label="Describe the issue" />
+          <textarea
+            className="inp" rows={4} value={message} onChange={e => setMessage(e.target.value)}
+            placeholder="e.g. I left my water bottle in the vehicle after my trip this morning."
+            style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+          />
+
+          {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+          <Button title={submitting ? "SUBMITTING…" : "SUBMIT TICKET →"} variant="amber" full onClick={submit} disabled={submitting} loading={submitting} />
+        </Card>
+      )}
+
+      <SectionHeader label={`My Tickets (${myTickets.length})`} />
+      {myTickets.length === 0 ? (
+        <Empty icon="🎫" text="No tickets submitted yet" />
+      ) : myTickets.map(t => (
+        <Card key={t.id}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 11, fontWeight: 700 }}>{t.category}</span>
+            <span style={{ fontSize: 8, fontWeight: 700, color: STATUS_COLOR[t.status], border: `1px solid ${STATUS_COLOR[t.status]}`, borderRadius: 2, padding: "2px 6px" }}>{t.status.replace("_", " ")}</span>
+          </div>
+          {t.trip_id && <div style={{ fontSize: 9, color: COLORS.ghost }}>Re: Trip {t.trip_id}</div>}
+          <div style={{ fontSize: 11, lineHeight: 1.5 }}>{t.message}</div>
+          {t.admin_reply && (
+            <div style={{ background: COLORS.surface, borderRadius: 4, padding: 10, marginTop: 4 }}>
+              <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>ADMIN REPLY</div>
+              <div style={{ fontSize: 11 }}>{t.admin_reply}</div>
+            </div>
+          )}
+          <div style={{ fontSize: 9, color: COLORS.dim }}>{epochToDisplay(t.created_at)}</div>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+
+function AgentProfileTab({ user, myTrips, dispatch }) {
+  const initials = user.name.split(" ").map(w => w[0]).join("").slice(0, 2);
+  return (
+    <div className="pad">
+      <Card style={{ alignItems: "center", padding: 24, textAlign: "center" }}>
+        <div style={{ width: 64, height: 64, borderRadius: 4, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONTS.head, fontSize: 24, fontWeight: 800, color: COLORS.amber, margin: "0 auto" }}>{initials}</div>
+        <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, marginTop: 10 }}>{user.name}</div>
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 6 }}><RoleBadge role={user.role} /></div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 4 }}>{user.id}</div>
+      </Card>
+      {user.home_address && (
+        <Card>
+          <SectionHeader label="Home Address" />
+          <div style={{ fontSize: 11, fontWeight: 600 }}>🏠 {user.home_address.label}</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{user.home_address.lat?.toFixed(5)}, {user.home_address.lng?.toFixed(5)}</div>
+        </Card>
+      )}
+      <Card body={false}>
+        {[["Total Trips", myTrips.length], ["Completed", myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length], ["Active", myTrips.filter(t => [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)).length]].map(([l, v]) => (
+          <div key={l} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${COLORS.wire}` }}>
+            <span style={{ fontSize: 11 }}>{l}</span>
+            <span style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.amber }}>{v}</span>
+          </div>
+        ))}
+      </Card>
+      <AlertSoundToggle />
+      <Button title="LOGOUT" variant="ghost" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
+    </div>
+  );
+}
+
+const AGENT_TABS = [["home", "◈", "Home"], ["book", "⊕", "Book"], ["trips", "⊟", "Trips"], ["help", "🎫", "Help"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
+
+/* ============================================================
+   IN-APP VOICE CALLING (WebRTC)
+   ============================================================
+   Signaling: a per-call Supabase Realtime broadcast channel carries the
+   offer/answer/ICE-candidate exchange — nothing here touches the database,
+   since none of this needs to persist once the call ends.
+
+   NAT traversal: Google's public STUN server handles the common case
+   (both parties on normal home/mobile networks). Calls between parties on
+   restrictive networks (some corporate firewalls, some mobile carriers'
+   CGNAT setups) will fail to connect audio without a TURN server — that
+   requires either a paid TURN provider or self-hosting coturn, which is
+   an infrastructure/cost decision, not something addable from within the
+   app code. If real-world call failures turn out to be common, that's the
+   next thing to add.
+
+   Scope: one call at a time, audio only, initiated from within a specific
+   trip context (so both parties know who they're calling and why).
+   ============================================================ */
+
+const ICE_SERVERS = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+const CALL_STATE = Object.freeze({
+  IDLE: "IDLE", RINGING_OUTGOING: "RINGING_OUTGOING", RINGING_INCOMING: "RINGING_INCOMING",
+  CONNECTING: "CONNECTING", ACTIVE: "ACTIVE", ENDED: "ENDED", FAILED: "FAILED",
+});
+
+// One call channel per user (not per trip) — a driver or agent might be
+// mid-conversation on one trip and receive a call about a different one;
+// keying by the recipient's own user id means exactly one channel to
+// listen on regardless of how many trips they're juggling.
+function callChannelName(userId) {
+  return `call-signal-${userId}`;
+}
+
+/* ============================================================
+   LIVE GPS TRACKING (drivers)
+   ============================================================
+   Uses the browser Geolocation API's watchPosition — this only works
+   while the driver's tab/PWA is open in the foreground; a closed tab or
+   backgrounded browser on most mobile OSes will stop updates. True
+   background tracking needs a native app with background location
+   permission, which a PWA cannot provide.
+
+   Persists the latest position (upsert) to driver_positions for the live
+   map, and appends every update to driver_position_log for later route
+   review. Only runs while the driver has at least one non-completed trip
+   — no reason to track location (or drain battery) when idle.
+   ============================================================ */
+
+
+// One driver-position broadcast channel per driver — separate from the
+// call-signaling channel above, but the same naming pattern and the same
+// underlying Supabase Realtime WebSocket connection (no new
+// infrastructure, no separate server to run).
+function driverPositionChannelName(driverId) {
+  return `driver-pos-${driverId}`;
+}
+
+// Two very different cadences on purpose:
+//   - BROADCAST_INTERVAL_MS: fast, cheap — a WebSocket message with a
+//     handful of numbers, no HTTP round-trip, no RLS check, no database
+//     write at all. This is what makes the admin map and the agent's
+//     "your shuttle is Xkm away" text feel live.
+//   - DB_PERSIST_INTERVAL_MS: much slower — this is the expensive path
+//     (a real REST call, two of them actually: driver_positions upsert +
+//     driver_position_log insert), kept only for durability (map still
+//     shows a recent position after a page reload) and the historical
+//     breadcrumb trail used for the CSV/trip sheet. Persisting every 4s
+//     like before was needless database load for data that's now mostly
+//     served live via broadcast anyway.
+const BROADCAST_INTERVAL_MS = 4000;
+const DB_PERSIST_INTERVAL_MS = 25000;
+
+function useDriverLocationTracking(user, hasActiveTrip, currentTripId) {
+  const [tracking, setTracking] = useState(false);
+  const [lastError, setLastError] = useState(null);
+  const watchIdRef = useRef(null);
+  const lastBroadcastRef = useRef(0);
+  const lastPersistRef = useRef(0);
+  const channelRef = useRef(null);
+
+  useEffect(() => {
+    if (!hasActiveTrip || !user?.id || !navigator.geolocation || !supabase) {
+      if (watchIdRef.current != null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+        setTracking(false);
+      }
+      if (channelRef.current) {
+        supabase?.removeChannel(channelRef.current);
+        channelRef.current = null;
+      }
+      return;
+    }
+
+    const channel = supabase.channel(driverPositionChannelName(user.id));
+    channel.subscribe();
+    channelRef.current = channel;
+
+    const onPosition = async (pos) => {
+      const now = Date.now();
+      const { latitude, longitude, heading, speed, accuracy } = pos.coords;
+      const speedKmh = speed != null ? speed * 3.6 : null;
+
+      // Fast path: broadcast every ~4s. Deliberately minimal payload —
+      // short keys, only the fields anything actually needs, no wrapper
+      // object — this is the "text-only, kilobytes per trip" piece.
+      if (now - lastBroadcastRef.current >= BROADCAST_INTERVAL_MS) {
+        lastBroadcastRef.current = now;
+        channel.send({
+          type: "broadcast", event: "pos",
+          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, ts: now },
+        });
+      }
+
+      // Slow path: persist to the database roughly every 25s — far less
+      // frequent than before, since the database write is the expensive
+      // part (two REST calls) and live updates no longer depend on it.
+      if (now - lastPersistRef.current >= DB_PERSIST_INTERVAL_MS) {
+        lastPersistRef.current = now;
+        try {
+          // Supabase returns { error } instead of throwing — the old
+          // catch-only version here could never actually fire on a failed
+          // write, so the driver's "tracking health" indicator always
+          // showed healthy even when positions were silently not saving.
+          const posRes = await supabase.from("driver_positions").upsert({
+            driverid: user.id, lat: latitude, lng: longitude,
+            heading: heading ?? null, speed_kmh: speedKmh, accuracy_m: accuracy ?? null,
+            tripid: currentTripId ?? null, updatedat: new Date(now).toISOString(),
+          }, { onConflict: "driverid" });
+          if (posRes?.error) throw posRes.error;
+          const logRes = await supabase.from("driver_position_log").insert({
+            driverid: user.id, tripid: currentTripId ?? null, lat: latitude, lng: longitude,
+            heading: heading ?? null, speed_kmh: speedKmh, recordedat: now,
+          });
+          if (logRes?.error) throw logRes.error;
+          setLastError(null);
+        } catch (e) {
+          setLastError(e.message || "Failed to update location");
+        }
+      }
+    };
+
+    const onError = (err) => {
+      setLastError(
+        err.code === err.PERMISSION_DENIED ? "Location permission denied — live tracking is off."
+        : err.code === err.POSITION_UNAVAILABLE ? "Location unavailable."
+        : "Location error."
+      );
+    };
+
+    watchIdRef.current = navigator.geolocation.watchPosition(onPosition, onError, {
+      enableHighAccuracy: true, maximumAge: 5000, timeout: 15000,
+    });
+    setTracking(true);
+
+    return () => {
+      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+      if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
+    };
+  }, [hasActiveTrip, user?.id, currentTripId]);
+
+  return { tracking, lastError };
+}
+
+// Agent-side consumer of the driver's lightweight broadcast — this is
+// deliberately NOT a map. It subscribes to the same driver-position
+// broadcast channel the admin map uses, but computes a plain-language
+// distance/ETA summary client-side and throws the raw coordinates away
+// immediately after — the hook's return value never includes lat/lng at
+// all, so there's no raw position data sitting in agent-side state that
+// could accidentally end up rendered as a map later. Map rendering stays
+// exclusively on the admin/driver side, per the requirement that agents
+// only ever see "your shuttle is 3 mins away," never a position.
+function useAgentShuttleStatus(driverId, referencePoint) {
+  const [summary, setSummary] = useState(null); // { distanceKm, etaMin, updatedAt } — never lat/lng
+  const [stale, setStale] = useState(false);
+
+  useEffect(() => {
+    if (!supabase || !driverId) { setSummary(null); return; }
+    const channel = supabase.channel(driverPositionChannelName(driverId));
+    channel.on("broadcast", { event: "pos" }, ({ payload }) => {
+      const { la, lo, s } = payload; // la/lo used only for this immediate calculation, never stored
+      let distanceKm = null, etaMin = null;
+      if (referencePoint) {
+        distanceKm = haversineKm(la, lo, referencePoint.lat, referencePoint.lng) * ROAD_FACTOR;
+        // Rough ETA from current speed if moving fast enough for it to be
+        // meaningful, otherwise fall back to a flat ~25km/h city-average
+        // assumption — a stationary/slow reading would otherwise imply an
+        // absurdly long or short ETA.
+        const effectiveSpeedKmh = s != null && s > 5 ? s : 25;
+        etaMin = Math.max(1, Math.round((distanceKm / effectiveSpeedKmh) * 60));
+      }
+      setSummary({ distanceKm, etaMin, updatedAt: Date.now() });
+      setStale(false);
+    });
+    channel.subscribe();
+
+    // If no broadcast has arrived in a while (driver's tab closed,
+    // connection dropped), mark stale rather than keep showing an old
+    // "3 mins away" indefinitely.
+    const staleCheck = setInterval(() => {
+      setSummary(s => {
+        if (s && Date.now() - s.updatedAt > BROADCAST_INTERVAL_MS * 3) setStale(true);
+        return s;
+      });
+    }, BROADCAST_INTERVAL_MS);
+
+    return () => { supabase.removeChannel(channel); clearInterval(staleCheck); };
+  }, [driverId, referencePoint?.lat, referencePoint?.lng]);
+
+  return { summary, stale };
+}
+
+
+function useWebRTCCall(currentUser) {
+  const [callState, setCallState] = useState(CALL_STATE.IDLE);
+  const [remoteUser, setRemoteUser] = useState(null); // { id, name }
+  const [callTripId, setCallTripId] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const pcRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const remoteAudioRef = useRef(null);
+  const channelRef = useRef(null); // MY OWN inbox channel — always listening
+  const callChannelRef = useRef(null); // the active call's shared channel, if any
+  const pendingIceRef = useRef([]); // ICE candidates that arrive before remoteDescription is set
+  // Mirrors callState for the inbox effect below to read without needing
+  // callState itself in that effect's dependency array — that dependency
+  // was causing the inbox WebSocket channel to be torn down and recreated
+  // on EVERY call state transition (many times per call: IDLE -> RINGING
+  // -> ACTIVE -> IDLE), which is what was producing the repeated
+  // "WebSocket is closed before the connection is established" errors.
+  const callStateRef = useRef(CALL_STATE.IDLE);
+  useEffect(() => { callStateRef.current = callState; }, [callState]);
+
+  const cleanup = useCallback(() => {
+    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+    if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
+    if (callChannelRef.current && callChannelRef.current !== channelRef.current) {
+      supabase.removeChannel(callChannelRef.current);
+    }
+    callChannelRef.current = null;
+    pendingIceRef.current = [];
+    setRemoteUser(null);
+    setCallTripId(null);
+  }, []);
+
+  const hangUp = useCallback((notifyPeer = true) => {
+    if (notifyPeer && callChannelRef.current) {
+      callChannelRef.current.send({ type: "broadcast", event: "hangup", payload: {} });
+    }
+    cleanup();
+    setCallState(CALL_STATE.IDLE);
+  }, [cleanup]);
+
+  // Always-on inbox: listens for incoming call offers addressed to me,
+  // regardless of what else the app is doing. Separate from the ephemeral
+  // per-call channel used once a call is actually in progress.
+  useEffect(() => {
+    if (!supabase || !currentUser?.id) return;
+    const inbox = supabase.channel(callChannelName(currentUser.id));
+    channelRef.current = inbox;
+
+    inbox.on("broadcast", { event: "offer" }, async ({ payload }) => {
+      // Reject a second incoming call while one is already ringing/active —
+      // no call-waiting support, keep this simple and predictable. Reads
+      // the ref, not the callState closure variable, since this effect no
+      // longer re-runs on every state change (see comment above).
+      if (callStateRef.current !== CALL_STATE.IDLE) {
+        supabase.channel(payload.callChannelName).subscribe((status) => {
+          if (status === "SUBSCRIBED") {
+            supabase.channel(payload.callChannelName).send({ type: "broadcast", event: "busy", payload: {} });
+          }
+        });
+        return;
+      }
+      setRemoteUser({ id: payload.fromId, name: payload.fromName });
+      setCallTripId(payload.tripId || null);
+      setCallState(CALL_STATE.RINGING_INCOMING);
+      pcRef.current = { pendingOffer: payload.offer, callChannelName: payload.callChannelName };
+    });
+
+    inbox.subscribe();
+    return () => { supabase.removeChannel(inbox); channelRef.current = null; };
+  }, [currentUser?.id]);
+
+  const buildPeerConnection = useCallback((channel) => {
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+    pc.onicecandidate = (e) => {
+      if (e.candidate) channel.send({ type: "broadcast", event: "ice-candidate", payload: { candidate: e.candidate } });
+    };
+    pc.ontrack = (e) => {
+      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = e.streams[0];
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "connected") setCallState(CALL_STATE.ACTIVE);
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        setErrorMsg(pc.connectionState === "failed" ? "Call connection failed — this can happen on restrictive networks." : null);
+        if (pc.connectionState === "failed") setCallState(CALL_STATE.FAILED);
+      }
+    };
+    return pc;
+  }, []);
+
+  const startCall = useCallback(async (targetUser, tripId) => {
+    if (!supabase || callState !== CALL_STATE.IDLE) return;
+    setErrorMsg(null);
+    if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
+      setErrorMsg("Voice calling isn't supported in this browser.");
+      setCallState(CALL_STATE.FAILED);
+      return;
+    }
+    try {
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = localStream;
+
+      const chanName = `call-${currentUser.id}-${targetUser.id}-${Date.now()}`;
+      const channel = supabase.channel(chanName);
+      callChannelRef.current = channel;
+
+      const pc = buildPeerConnection(channel);
+      pcRef.current = pc;
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      channel.on("broadcast", { event: "answer" }, async ({ payload }) => {
+        await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
+        for (const c of pendingIceRef.current) await pc.addIceCandidate(new RTCIceCandidate(c));
+        pendingIceRef.current = [];
+        setCallState(CALL_STATE.CONNECTING);
+      });
+      channel.on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
+        if (pc.remoteDescription) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+        else pendingIceRef.current.push(payload.candidate);
+      });
+      channel.on("broadcast", { event: "hangup" }, () => hangUp(false));
+      channel.on("broadcast", { event: "busy" }, () => { setErrorMsg(`${targetUser.name} is on another call.`); hangUp(false); });
+      channel.on("broadcast", { event: "declined" }, () => { setErrorMsg(`${targetUser.name} declined the call.`); hangUp(false); });
+
+      await new Promise((resolve) => channel.subscribe((status) => { if (status === "SUBSCRIBED") resolve(); }));
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      const inbox = supabase.channel(callChannelName(targetUser.id));
+      await new Promise((resolve) => inbox.subscribe((status) => { if (status === "SUBSCRIBED") resolve(); }));
+      inbox.send({ type: "broadcast", event: "offer", payload: { offer, fromId: currentUser.id, fromName: currentUser.name, tripId, callChannelName: chanName } });
+      supabase.removeChannel(inbox);
+
+      setRemoteUser(targetUser);
+      setCallTripId(tripId || null);
+      setCallState(CALL_STATE.RINGING_OUTGOING);
+    } catch (e) {
+      setErrorMsg(e.name === "NotAllowedError" ? "Microphone access denied." : (e.message || "Could not start call."));
+      cleanup();
+      setCallState(CALL_STATE.FAILED);
+    }
+  }, [currentUser, callState, buildPeerConnection, hangUp, cleanup]);
+
+  const acceptCall = useCallback(async () => {
+    if (!pcRef.current?.pendingOffer) return;
+    setErrorMsg(null);
+    if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
+      setErrorMsg("Voice calling isn't supported in this browser.");
+      setCallState(CALL_STATE.FAILED);
+      return;
+    }
+    try {
+      const { pendingOffer, callChannelName: chanName } = pcRef.current;
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStreamRef.current = localStream;
+
+      const channel = supabase.channel(chanName);
+      callChannelRef.current = channel;
+      const pc = buildPeerConnection(channel);
+      pcRef.current = pc;
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+
+      channel.on("broadcast", { event: "ice-candidate" }, async ({ payload }) => {
+        if (pc.remoteDescription) await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+        else pendingIceRef.current.push(payload.candidate);
+      });
+      channel.on("broadcast", { event: "hangup" }, () => hangUp(false));
+
+      await new Promise((resolve) => channel.subscribe((status) => { if (status === "SUBSCRIBED") resolve(); }));
+
+      await pc.setRemoteDescription(new RTCSessionDescription(pendingOffer));
+      for (const c of pendingIceRef.current) await pc.addIceCandidate(new RTCIceCandidate(c));
+      pendingIceRef.current = [];
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      channel.send({ type: "broadcast", event: "answer", payload: { answer } });
+
+      setCallState(CALL_STATE.CONNECTING);
+    } catch (e) {
+      setErrorMsg(e.name === "NotAllowedError" ? "Microphone access denied." : (e.message || "Could not accept call."));
+      cleanup();
+      setCallState(CALL_STATE.FAILED);
+    }
+  }, [buildPeerConnection, hangUp, cleanup]);
+
+  const declineCall = useCallback(() => {
+    if (pcRef.current?.callChannelName) {
+      const chan = supabase.channel(pcRef.current.callChannelName);
+      chan.subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          chan.send({ type: "broadcast", event: "declined", payload: {} });
+          setTimeout(() => supabase.removeChannel(chan), 500);
+        }
+      });
+    }
+    pcRef.current = null;
+    cleanup();
+    setCallState(CALL_STATE.IDLE);
+  }, [cleanup]);
+
+  const resetAfterEnd = useCallback(() => setCallState(CALL_STATE.IDLE), []);
+
+  const toggleMute = useCallback(() => {
+    if (!localStreamRef.current) return false;
+    const track = localStreamRef.current.getAudioTracks()[0];
+    if (!track) return false;
+    track.enabled = !track.enabled;
+    return !track.enabled; // returns true if now muted
+  }, []);
+
+  return { callState, remoteUser, callTripId, errorMsg, remoteAudioRef, startCall, acceptCall, declineCall, hangUp, resetAfterEnd, toggleMute };
+}
+
+/* ---------- ALERT SOUND ----------
+   A short two-tone chime, synthesized directly via the Web Audio API —
+   no external audio file to bundle/host. Browsers block audio from
+   playing before the user has interacted with the page at all (autoplay
+   policy), so the very first alert after page load may be silent; every
+   alert after any click/tap/keypress plays normally. This is a browser
+   platform restriction, not something fixable from app code — it's the
+   same reason video sites show a "tap to unmute" prompt on first load. */
+// Sound preference is a per-device/browser setting (like ringer volume),
+// not something tied to the person's account — stored in localStorage,
+// not the database, so it doesn't need a schema change or sync across
+// devices. Defaults to enabled (opt-out, not opt-in) since that's what
+// "add a sound to notify" implies as the baseline behavior.
+const ALERT_SOUND_PREF_KEY = "transitos_alert_sound_muted";
+function isAlertSoundMuted() {
+  try { return localStorage.getItem(ALERT_SOUND_PREF_KEY) === "true"; } catch (e) { return false; }
+}
+function setAlertSoundMuted(muted) {
+  try { localStorage.setItem(ALERT_SOUND_PREF_KEY, muted ? "true" : "false"); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+}
+
+let sharedAudioCtx = null;
+function playAlertSound() {
+  if (isAlertSoundMuted()) return;
+  try {
+    if (!sharedAudioCtx) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return; // unsupported browser — silently skip, never crash the app over this
+      sharedAudioCtx = new AudioContextClass();
+    }
+    const ctx = sharedAudioCtx;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    // Two quick notes (a rising interval) rather than a single flat beep —
+    // more recognizable as "an alert happened" without being harsh.
+    [[880, now, 0.12], [1175, now + 0.12, 0.16]].forEach(([freq, start, dur]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.25, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+    });
+  } catch (e) {
+    // Never let a sound failure break the actual notification/toast —
+    // audio is enhancement, not core functionality.
+    console.warn("[AlertSound] playback failed:", e.message);
+  }
+}
+
+function AlertSoundToggle() {
+  const [muted, setMuted] = useState(isAlertSoundMuted());
+  const toggle = () => {
+    const next = !muted;
+    setMuted(next);
+    setAlertSoundMuted(next);
+    if (!next) playAlertSound(); // quick confirmation beep when re-enabling
+  };
+  return (
+    <Button title={muted ? "🔇 ALERT SOUND: OFF" : "🔔 ALERT SOUND: ON"} variant="ghost" size="sm" full onClick={toggle} />
+  );
+}
+
+// Floating call UI — renders ringing/active/failed states as an overlay.
+// Mounted once near the root of each role's app shell so a call can be
+// received no matter which tab the person currently has open.
+function CallOverlay({ call }) {
+  const { callState, remoteUser, errorMsg, remoteAudioRef, acceptCall, declineCall, hangUp, resetAfterEnd, toggleMute } = call;
+  const [muted, setMuted] = useState(false);
+
+  const handleToggleMute = () => setMuted(toggleMute());
+
+  if (callState === CALL_STATE.IDLE) return null;
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.85)", zIndex: 999, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 20 }}>
+      <audio ref={remoteAudioRef} autoPlay />
+      <div style={{ width: 88, height: 88, borderRadius: 44, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 32, fontWeight: 800, color: "#000" }}>
+        {(remoteUser?.name || "?").split(" ").map(w => w[0]).slice(0, 2).join("")}
+      </div>
+      <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: "#fff" }}>{remoteUser?.name || "Unknown"}</div>
+      <div style={{ fontSize: 11, color: COLORS.ghost, letterSpacing: 1 }}>
+        {callState === CALL_STATE.RINGING_OUTGOING && "Calling…"}
+        {callState === CALL_STATE.RINGING_INCOMING && "Incoming call…"}
+        {callState === CALL_STATE.CONNECTING && "Connecting…"}
+        {callState === CALL_STATE.ACTIVE && "On call"}
+        {callState === CALL_STATE.FAILED && (errorMsg || "Call failed")}
+      </div>
+
+      {callState === CALL_STATE.RINGING_INCOMING && (
+        <div style={{ display: "flex", gap: 20, marginTop: 10 }}>
+          <button onClick={declineCall} style={{ width: 60, height: 60, borderRadius: 30, background: COLORS.red, border: "none", fontSize: 22, cursor: "pointer" }}>✕</button>
+          <button onClick={acceptCall} style={{ width: 60, height: 60, borderRadius: 30, background: COLORS.green, border: "none", fontSize: 22, cursor: "pointer" }}>✓</button>
+        </div>
+      )}
+
+      {[CALL_STATE.RINGING_OUTGOING, CALL_STATE.CONNECTING, CALL_STATE.ACTIVE].includes(callState) && (
+        <div style={{ display: "flex", gap: 16, marginTop: 10 }}>
+          {callState === CALL_STATE.ACTIVE && (
+            <button onClick={handleToggleMute} style={{ width: 60, height: 60, borderRadius: 30, background: muted ? COLORS.amber : COLORS.surface, border: `1px solid ${COLORS.wire}`, fontSize: 20, cursor: "pointer" }}>
+              {muted ? "🔇" : "🎙"}
+            </button>
+          )}
+          <button onClick={() => hangUp(true)} style={{ width: 60, height: 60, borderRadius: 30, background: COLORS.red, border: "none", fontSize: 22, cursor: "pointer" }}>✕</button>
+        </div>
+      )}
+
+      {callState === CALL_STATE.FAILED && (
+        <Button title="CLOSE" variant="ghost" onClick={resetAfterEnd} />
+      )}
+    </div>
+  );
+}
+
+
+function AgentApp({ state, dispatch, user }) {
+  const [tab, setTab] = useState("home");
+  const myTrips = state.trips.filter(t => t.agent_ids.includes(user.id));
+  const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read);
+  // Home-screen cards say "Tap to view details" — so land on THAT trip's
+  // detail view, not just the trips list (which is what happened before:
+  // goToTrip ignored its argument entirely). The id is consumed by
+  // AgentTripsTab on mount and cleared, so tapping the TRIPS tab later
+  // opens the normal list.
+  const [jumpTripId, setJumpTripId] = useState(null);
+  const goToTrip = (trip) => { setJumpTripId(trip?.trip_id ?? null); setTab("trips"); };
+  const call = useWebRTCCall(user);
+
+  return (
+    <div className="screen">
+      <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>TRANSIT/OS</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {myNotifs.length > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 6px", fontSize: 9, fontWeight: 800, color: "#000" }}>{myNotifs.length}</span>}
+          <RoleBadge role={ROLE.AGENT} />
+        </div>
+      </div>
+
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {tab === "home" && <AgentHomeTab myTrips={myTrips} dispatch={dispatch} goToTrip={goToTrip} setTab={setTab} />}
+        {tab === "book" && <AgentBookTab user={user} state={state} dispatch={dispatch} setTab={setTab} myTrips={myTrips} />}
+        {tab === "trips" && <AgentTripsTab myTrips={myTrips} state={state} dispatch={dispatch} user={user} call={call} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
+        {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
+        {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
+        {tab === "me" && <AgentProfileTab user={user} myTrips={myTrips} dispatch={dispatch} />}
+      </div>
+
+      <div style={{ display: "flex", background: COLORS.panel, borderTop: `1px solid ${COLORS.wire}`, position: "sticky", bottom: 0 }}>
+        {AGENT_TABS.map(([id, icon, label]) => (
+          <div key={id} onClick={() => setTab(id)} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "10px 0", cursor: "pointer", color: tab === id ? COLORS.amber : COLORS.ghost }}>
+            <span style={{ fontSize: 17 }}>{icon}</span>
+            <span style={{ fontSize: 9, fontWeight: 700 }}>{label}</span>
+          </div>
+        ))}
+      </div>
+      <CallOverlay call={call} />
+    </div>
+  );
+}
+
+/* ============================================================
+   DRIVER APP
+   ============================================================ */
+// Shared per-trip chat, usable by both agent and driver screens. Filters
+// the trip's message thread to whichever counterpart the current viewer
+// is messaging (driver messaging one specific agent on a multi-passenger
+// trip, or an agent messaging their driver) rather than showing one
+// merged thread with everyone on a multi-passenger trip mixed together.
+function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
+  const [text, setText] = useState("");
+  const allMsgs = trip.chat_messages || [];
+  // A message belongs to this specific conversation if it was sent by
+  // either party in this pair — keeps a driver's separate conversations
+  // with two different agents on the same trip from bleeding together.
+  const msgs = allMsgs.filter(m => m.sender_id === currentUser.id || m.sender_id === otherUser.id);
+
+  const send = async () => {
+    if (!text.trim()) return;
+    try {
+      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: currentUser.id, sender_name: currentUser.name, sender_role: currentUser.role, text: text.trim() });
+      setText("");
+    } catch (e) {
+      console.warn("[Chat] send failed:", e.message);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", display: "flex", flexDirection: "column", maxHeight: "80vh" }}>
+        <div style={{ padding: 14, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1 }}>MESSAGING</div>
+            <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{otherUser.name}</div>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ flex: 1, overflowY: "auto", padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+          {msgs.length === 0 && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 20 }}>No messages yet — say hello.</span>}
+          {msgs.map(m => {
+            const mine = m.sender_id === currentUser.id;
+            return (
+              <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "82%", borderRadius: 6, padding: 9, background: mine ? "rgba(45,140,240,.15)" : COLORS.surface, border: `1px solid ${mine ? "rgba(45,140,240,.3)" : COLORS.wire}` }}>
+                <div style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, marginBottom: 3 }}>{m.sender_name} · {m.ts}</div>
+                <div style={{ fontSize: 11 }}>{m.text}</div>
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", gap: 7, padding: 14, borderTop: `1px solid ${COLORS.wire}` }}>
+          <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" autoFocus />
+          <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim()} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
+  const myStatus = state.driver_status.find(d => d.driver_id === user.id);
+  const active = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+  const load = active.length;
+  const full = load >= DRIVER_CAPACITY;
+  const [chatWith, setChatWith] = useState(null); // { trip, otherUser } | null
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>{user.name}</div>
+          <div style={{ fontSize: 10, color: COLORS.ghost, letterSpacing: 1 }}>DRIVER CONSOLE</div>
+        </div>
+        <StateBadge state={full ? "FULLY_BOOKED" : (myStatus?.state || DRIVER_STATE.AVAILABLE)} />
+      </div>
+
+      <Card>
+        <span style={{ fontSize: 9, letterSpacing: 1.5, color: COLORS.ghost, textTransform: "uppercase" }}>VEHICLE</span>
+        <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{myStatus?.vehicle || "—"}</div>
+        <CapacityBar load={load} capacity={DRIVER_CAPACITY} />
+      </Card>
+
+      <SectionHeader label={`Assigned Passengers (${active.length})`} />
+      {active.length === 0 ? <Empty icon="⊟" text="No assigned trips" /> : active.map(trip => {
+        const pickupCoord = trip.pickup_sequence_coords?.[0];
+        // A trip can carry multiple agents (extraagentids) — resolve every
+        // one of them to a real user record and their own pickup point,
+        // rather than only ever showing the primary agent_name/phone. Falls
+        // back to the trip-level agent_name/phone if a user record can't
+        // be found (shouldn't normally happen, but keeps the card from
+        // rendering blank instead of degrading gracefully).
+        const passengers = (trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null]).map(aid => {
+          const u = state.users.find(x => x.id === aid);
+          const coord = trip.pickup_sequence_coords?.find(c => c.agent_id === aid) || pickupCoord;
+          const pickedUp = trip.completed_pickups?.includes(aid);
+          return {
+            id: aid, name: u?.name || trip.agent_name, phone: u?.phone || trip.phone,
+            pickupLabel: coord?.label || trip.custom_pickup, coord, pickedUp,
+          };
+        });
+        return (
+          <Card key={trip.trip_id}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</span>
+              <StateBadge state={trip.state} />
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "8px 10px" }}>
+              <span style={{ fontSize: 15 }}>📅</span>
+              <div>
+                <div style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: COLORS.amber }}>
+                  {formatTripDateForDriver(trip.scheduled_date)} — {trip.scheduled_time}
+                </div>
+                {trip.trip_type === "WEEK" && trip.week_day_num && (
+                  <div style={{ fontSize: 9, color: COLORS.ghost }}>Day {trip.week_day_num} of this week's series</div>
+                )}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              {trip.pickup_order_num && <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.green, background: "rgba(29,185,84,.15)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 2, padding: "2px 7px" }}>PICKUP #{trip.pickup_order_num}</span>}
+              {trip.drop_sequence_num && <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.red, background: "rgba(232,58,58,.15)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 2, padding: "2px 7px" }}>DROP #{trip.drop_sequence_num}</span>}
+            </div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>
+              {passengers.length > 1 ? `PASSENGERS (${passengers.length})` : "PASSENGER"}
+            </div>
+            {passengers.map((p, i) => (
+              <div key={p.id ?? i} style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${p.pickedUp ? "rgba(29,185,84,.35)" : COLORS.wire}` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 700 }}>{p.name}</div>
+                  {p.pickedUp && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, border: "1px solid rgba(29,185,84,.4)", borderRadius: 2, padding: "1px 6px" }}>✓ PICKED UP</span>}
+                </div>
+                <div style={{ fontSize: 10, color: COLORS.green, marginTop: 3 }}>◉ {p.pickupLabel}</div>
+                {p.id != null && isTripActiveForComms(trip) && (
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <Button title="💬 MESSAGE" variant="ghost" size="sm" onClick={() => setChatWith({ trip, otherUser: { id: p.id, name: p.name, role: ROLE.AGENT } })} style={{ flex: 1 }} />
+                    {call && (
+                      <Button
+                        title="📞" variant="green" size="sm"
+                        onClick={() => call.startCall({ id: p.id, name: p.name }, trip.trip_id)}
+                        disabled={call.callState !== CALL_STATE.IDLE}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
+            {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
+            {trip.driver_route_km != null && (
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>
+                Driver's total route: <span style={{ color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, fontWeight: 700 }}>
+                  {trip.driver_route_km.toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
+                </span>
+              </div>
+            )}
+            {pickupCoord && <GpsBlock coord={pickupCoord} />}
+            {trip.state === TRIP_STATE.ASSIGNED && !trip.driverAccepted && (
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="✓ ACCEPT" variant="green" style={{ flex: 1 }} onClick={async () => {
+                  try {
+                    await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
+                    await dispatch({ type: "TRIP/DRIVER_CONFIRM", trip_id: trip.trip_id });
+                  } catch (e) {
+                    // The trip card's own state-driven UI (this button only
+                    // shows while trip.state === ASSIGNED) will naturally
+                    // reflect whatever actually happened once the next
+                    // realtime refetch lands — no separate error banner
+                    // wired up at this render depth, but the failure is at
+                    // least visible in the console rather than silent.
+                    console.warn("[DriverTripsTab] accept/confirm failed:", e.message);
+                  }
+                }} />
+                <Button title="✗ DECLINE" variant="danger" style={{ flex: 1 }} onClick={() => dispatch({ type: "TRIP/DECLINE", trip_id: trip.trip_id, driver_id: user.id }).catch(() => {}) /* failure already toasted by the wrapper */} />
+              </div>
+            )}
+            {trip.driverAccepted && <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ ACCEPTED — {trip.acceptedAt}</span>}
+            <div style={{ display: "flex", gap: 8 }}>
+              {pickupCoord && <Button title="WAZE ↗" variant="waze" style={{ flex: 1 }} onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
+              {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state) && <Button title="NAV →" variant="amber" onClick={() => setTab("navigate")} />}
+            </div>
+          </Card>
+        );
+      })}
+
+      {chatWith && (
+        <TripChatModal
+          trip={chatWith.trip}
+          currentUser={user}
+          otherUser={chatWith.otherUser}
+          dispatch={dispatch}
+          onClose={() => setChatWith(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+const DELAY_REASONS = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
+
+function DelayReportModal({ trip, user, dispatch, onClose }) {
+  const [reason, setReason] = useState("");
+  const [note, setNote] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState(null);
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    if (!reason) { setErr("Please choose a reason."); return; }
+    if (!trip) { setErr("No active trip found."); return; }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      await dispatch({ type: "TRIP/REPORT_DELAY", trip_id: trip.trip_id, driver_id: user.id, reason, note: note.trim() || undefined });
+      setDone(true);
+    } catch (e) {
+      setErr(e.message || "Failed to report delay.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>REPORT DELAY / DETOUR</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+        </div>
+
+        {done ? (
+          <>
+            <div style={{ fontSize: 12, color: COLORS.green, textAlign: "center", padding: 16 }}>✓ Reported. Admins and your passengers have been notified.</div>
+            <Button title="CLOSE" variant="amber" full onClick={onClose} />
+          </>
+        ) : (
+          <>
+            <SectionHeader label="Reason" />
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {DELAY_REASONS.map(r => (
+                <Button key={r} title={r} size="sm" variant={reason === r ? "amber" : "ghost"} onClick={() => setReason(r)} />
+              ))}
+            </div>
+            <SectionHeader label="Additional details (optional)" />
+            <textarea
+              className="inp" rows={3} value={note} onChange={e => setNote(e.target.value)}
+              placeholder="e.g. Taking a detour via Main Road due to closed intersection."
+              style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+            />
+            {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+            <Button title={submitting ? "REPORTING…" : "REPORT →"} variant="amber" full onClick={submit} disabled={submitting} loading={submitting} />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DriverNavTab({ state, dispatch, user, call, myTrips }) {
+  const [tripStarted, setTripStarted] = useState(false);
+  const [chatWith, setChatWith] = useState(null);
+  const [showDelayForm, setShowDelayForm] = useState(false);
+  // myTrips comes from DriverApp already filtered through the week-series
+  // progressive reveal (day N hidden until day N-1 completes). Deriving
+  // from raw state.trips here bypassed that: ASSIGN_DRIVER auto-confirms,
+  // so bulk-assigning a week series made every future day's pickup appear
+  // in TODAY's navigation route at once. Falls back to state.trips only
+  // if the prop is missing (defensive, e.g. older call sites).
+  const navSourceTrips = myTrips ?? state.trips.filter(t => t.driver_id === user.id);
+  const myActiveTrips = navSourceTrips.filter(t => t.driver_id === user.id && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state))
+    .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+
+  // One stop per PASSENGER, not per trip — a multi-passenger trip
+  // contributes one entry per agent in pickup_sequence_coords. The old
+  // per-trip version only ever showed the primary agent's pickup, so the
+  // extra passengers were invisible to the driver, allPickedUp went true
+  // with people still waiting, and TRIP/COMPLETE then failed with an
+  // illegal-transition error (the backend requires ALL agents in
+  // completed_pickups before the trip moves to IN_TRANSIT).
+  const pickupStops = myActiveTrips.flatMap(trip =>
+    (trip.pickup_sequence_coords || []).map((p, idx) => {
+      const agentId = p.agent_id ?? trip.agent_ids?.[idx];
+      const agentUser = state.users.find(u => u.id === agentId);
+      return {
+        lat: p.lat, lng: p.lng,
+        label: p.label || trip.custom_pickup,
+        trip_id: trip.trip_id, agent_id: agentId,
+        agent_name: agentUser?.name || trip.agent_name, phone: trip.phone,
+        done: !!(agentId != null && trip.completed_pickups?.includes(agentId)),
+        isManual: trip.pickup_is_manual || false,
+        // Booked pickup time — previously absent from this list entirely,
+        // so a driver actively navigating had no way to check whether
+        // they were running early or late against what the agent was
+        // told to expect. Pulled from the trip level since that's the
+        // single source of truth for when this stop was booked for.
+        scheduled_time: trip.scheduled_time, scheduled_date: trip.scheduled_date,
+      };
+    })
+  );
+  const allPickedUp = pickupStops.length > 0 && pickupStops.every(s => s.done);
+  const curPickup = pickupStops.find(s => !s.done);
+  const curPickupIdx = pickupStops.findIndex(s => !s.done);
+  const donePickups = pickupStops.filter(s => s.done).length;
+  const lastPickupDone = [...pickupStops].reverse().find(s => s.done) || pickupStops[0];
+  const lastPickupCoord = lastPickupDone ? { lat: lastPickupDone.lat, lng: lastPickupDone.lng } : null;
+
+  const dropoffGroups = {};
+  myActiveTrips.forEach(trip => {
+    const coord = trip.dropoff_sequence_coords?.[0];
+    if (!coord) return;
+    const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
+    if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, trip_ids: [], passengers: [], done: false, isManual: trip.dropoff_is_manual || false };
+    dropoffGroups[key].trip_ids.push(trip.trip_id);
+    // Include every agent on this trip, not just the primary — a
+    // multi-passenger trip drops off more than one person at this stop.
+    const tripAgentIds = trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null];
+    tripAgentIds.forEach(aid => {
+      const u = state.users.find(x => x.id === aid);
+      dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+    });
+  });
+  Object.values(dropoffGroups).forEach(group => { group.done = group.trip_ids.every(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.ARCHIVED_COMPLETED); });
+  const dropStops = sortDropoffsByProximity(Object.values(dropoffGroups), lastPickupCoord);
+  const curDrop = allPickedUp ? dropStops.find(s => !s.done) : null;
+  const curDropIdx = allPickedUp ? dropStops.findIndex(s => !s.done) : -1;
+  const doneDrops = dropStops.filter(s => s.done).length;
+  const allComplete = allPickedUp && dropStops.length > 0 && dropStops.every(s => s.done);
+
+  const [startTripError, setStartTripError] = useState(null);
+  const handleStartTrip = async () => {
+    setStartTripError(null);
+    try {
+      for (const trip of myActiveTrips) {
+        if (trip.state === TRIP_STATE.ASSIGNED) {
+          await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
+          await dispatch({ type: "TRIP/DRIVER_CONFIRM", trip_id: trip.trip_id });
+        }
+      }
+      // Use the driver's live GPS position if tracking has picked one up
+      // already; otherwise fall back to a sensible default company
+      // location, same default used elsewhere in the app when no better
+      // start point is known.
+      const livePos = state.driver_positions?.[user.id];
+      const driverCoord = livePos ? { lat: livePos.lat, lng: livePos.lng } : defaultCompanyAnchor(state);
+      await dispatch({ type: "TRIP/RECORD_ROUTE", trips: myActiveTrips, driver_coord: driverCoord });
+      // tripStarted only flips once every step above has actually
+      // succeeded — previously this was set unconditionally at the very
+      // top of the function, so a mid-loop failure left the driver on a
+      // screen that already looked "started" with no Waze prompt and no
+      // way to tell what had gone wrong.
+      setTripStarted(true);
+      const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
+      if (firstPickup?.lat && firstPickup?.lng) smartOpenWaze(firstPickup.lat, firstPickup.lng, firstPickup.label, firstPickup.isManual);
+    } catch (e) {
+      setStartTripError(e.message || "Couldn't start the trip — please try again.");
+    }
+  };
+  const confirmPickup = async (trip_id, agent_id) => {
+    try {
+      await dispatch({ type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id });
+    } catch (e) {
+      setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
+      return;
+    }
+    // Immediately navigate to whichever pickup becomes current next —
+    // pickupStops is derived from state.trips, so after the dispatch
+    // above resolves and state updates, the next un-done stop (if any)
+    // is the new "current" one. Read it fresh here rather than from the
+    // stale closure captured when this render happened.
+    const remaining = pickupStops.filter(s => s.trip_id !== trip_id || s.agent_id !== agent_id).filter(s => !s.done);
+    const next = remaining[0];
+    if (next?.lat && next?.lng) {
+      smartOpenWaze(next.lat, next.lng, next.label, next.isManual);
+      return;
+    }
+    // No pickups left — this was the last one, so go straight into
+    // drop-off navigation instead of leaving the driver stranded with no
+    // active Waze prompt until they notice and tap a separate button.
+    const firstDrop = dropStops.find(s => !s.done);
+    if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+  };
+  const confirmDropoff = async (group) => {
+    try {
+      for (const tid of group.trip_ids) {
+        const t = state.trips.find(x => x.trip_id === tid);
+        if (t && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) await dispatch({ type: "TRIP/COMPLETE", trip_id: tid });
+      }
+    } catch (e) {
+      setStartTripError(e.message || "Couldn't complete drop-off — please try again.");
+      return;
+    }
+    const remaining = dropStops.filter(s => s !== group).filter(s => !s.done);
+    const next = remaining[0];
+    if (next?.lat && next?.lng) smartOpenWaze(next.lat, next.lng, next.label, next.isManual);
+  };
+
+  if (myActiveTrips.length === 0) return <div className="pad"><div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div><Empty icon="◉" text="No active trips. Accept trips from the Trips tab first." /></div>;
+
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1.5, textTransform: "uppercase", marginTop: -8 }}>
+        {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
+        {myActiveTrips[0]?.route_total_km != null && ` · ${myActiveTrips[0].route_total_km.toFixed(1)} km TOTAL ROUTE`}
+      </div>
+      {startTripError && (
+        <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
+          <span style={{ fontSize: 11, color: COLORS.red }}>{startTripError}</span>
+        </div>
+      )}
+
+      {!tripStarted && (
+        <Card style={{ alignItems: "center", padding: 28, textAlign: "center", borderColor: COLORS.amber }}>
+          <div style={{ fontSize: 40 }}>🚐</div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800 }}>Ready to go?</div>
+          <div style={{ fontSize: 10, color: COLORS.mist }}>{pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} · {dropStops.length} drop-off location{dropStops.length !== 1 ? "s" : ""}</div>
+          {pickupStops.map((s, i) => (
+            <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}`, width: "100%", textAlign: "left" }}>
+              <span style={{ color: COLORS.green, fontWeight: 800, minWidth: 22 }}>#{i + 1}</span>
+              <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 11 }}>{s.agent_name}</div><div style={{ color: COLORS.ghost, fontSize: 10 }}>{s.label}</div></div>
+              {s.scheduled_time && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, whiteSpace: "nowrap" }}>🕐 {s.scheduled_time}</div>}
+            </div>
+          ))}
+          <Button title="▶ START TRIP — OPEN WAZE" variant="amber" full onClick={handleStartTrip} style={{ padding: 18, fontSize: 15, letterSpacing: 2 }} />
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>🧭 Opens Waze immediately, navigating to your first pickup</div>
+        </Card>
+      )}
+
+      {tripStarted && myActiveTrips.length > 0 && (
+        <Button title="⏱ REPORT DELAY / DETOUR" variant="ghost" full onClick={() => setShowDelayForm(true)} />
+      )}
+      {showDelayForm && (
+        <DelayReportModal
+          trip={myActiveTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || myActiveTrips[0]}
+          user={user} dispatch={dispatch}
+          onClose={() => setShowDelayForm(false)}
+        />
+      )}
+
+      {tripStarted && !allPickedUp && curPickup && (
+        <>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {pickupStops.map((s, i) => (
+              <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ padding: "4px 10px", borderRadius: 2, fontSize: 9, fontWeight: 700, background: s.done ? "rgba(29,185,84,.15)" : i === curPickupIdx ? "rgba(245,166,35,.2)" : COLORS.surface, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : i === curPickupIdx ? COLORS.amber : COLORS.wire}`, color: s.done ? COLORS.green : i === curPickupIdx ? COLORS.amber : COLORS.ghost }}>
+                {s.done ? "✓ " : i === curPickupIdx ? "▶ " : "○ "}P{i + 1}: {s.agent_name?.split(" ")[0]}
+              </div>
+            ))}
+          </div>
+          <Card style={{ gap: 12, borderColor: COLORS.amber, background: "rgba(245,166,35,.04)" }}>
+            <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.amber, fontWeight: 800, textTransform: "uppercase" }}>▶ PICKUP {curPickupIdx + 1} OF {pickupStops.length}</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+              <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.green }}>◉ {curPickup.agent_name}</div>
+              {curPickup.scheduled_time && (
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 1 }}>BOOKED FOR</div>
+                  <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800, color: COLORS.amber }}>{curPickup.scheduled_time}</div>
+                </div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <Button title="💬 MESSAGE" variant="ghost" size="sm" onClick={() => setChatWith({ trip: myActiveTrips.find(t => t.trip_id === curPickup.trip_id), otherUser: { id: curPickup.agent_id, name: curPickup.agent_name, role: ROLE.AGENT } })} style={{ flex: 1 }} />
+              {call && (
+                <Button
+                  title="📞 CALL" variant="green" size="sm"
+                  onClick={() => call.startCall({ id: curPickup.agent_id, name: curPickup.agent_name }, curPickup.trip_id)}
+                  disabled={call.callState !== CALL_STATE.IDLE}
+                  style={{ flex: 1 }}
+                />
+              )}
+            </div>
+            <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+              <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP ADDRESS</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
+            </div>
+            <Button title={`🧭 WAZE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)} style={{ padding: 16, fontSize: 14 }} />
+            <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} />
+          </Card>
+          {pickupStops.slice(curPickupIdx + 1).length > 0 && (
+            <>
+              <SectionHeader label="Up Next" />
+              {pickupStops.slice(curPickupIdx + 1).map((s, i) => (
+                <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 9, border: `1px solid ${COLORS.wire}`, opacity: .65 }}>
+                  <span style={{ color: COLORS.ghost, fontWeight: 800, minWidth: 22 }}>#{curPickupIdx + 2 + i}</span>
+                  <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 11 }}>{s.agent_name}</div><div style={{ color: COLORS.ghost, fontSize: 10 }}>{s.label}</div></div>
+                  {s.scheduled_time && <div style={{ fontSize: 10, color: COLORS.ghost, whiteSpace: "nowrap" }}>🕐 {s.scheduled_time}</div>}
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      {tripStarted && allPickedUp && !allComplete && curDrop && (
+        <>
+          <div style={{ background: "rgba(29,185,84,.08)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 4, padding: 12 }}>
+            <span style={{ fontWeight: 700, fontSize: 11, color: COLORS.green }}>✓ All {pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} on board — now drop-offs</span>
+          </div>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {dropStops.map((s, i) => (
+              <div key={`${s.lat}-${s.lng}`} style={{ padding: "4px 10px", borderRadius: 2, fontSize: 9, fontWeight: 700, background: s.done ? "rgba(29,185,84,.15)" : i === curDropIdx ? "rgba(232,58,58,.2)" : COLORS.surface, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : i === curDropIdx ? COLORS.red : COLORS.wire}`, color: s.done ? COLORS.green : i === curDropIdx ? COLORS.red : COLORS.ghost }}>
+                {s.done ? "✓ " : i === curDropIdx ? "▶ " : "○ "}D{i + 1}: {s.label?.split(",")[0]}
+              </div>
+            ))}
+          </div>
+          <Card style={{ gap: 12, borderColor: COLORS.red, background: "rgba(232,58,58,.04)" }}>
+            <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.red, fontWeight: 800, textTransform: "uppercase" }}>▶ DROP-OFF {curDropIdx + 1} OF {dropStops.length}</div>
+            <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.red }}>◎ {curDrop.label}</div>
+            {curDrop.passengers.map((p, i) => (
+              <div key={i} style={{ background: COLORS.surface, borderRadius: 3, padding: 7, border: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontWeight: 700, fontSize: 10 }}>{p.name}</span>
+                {p.id != null && (
+                  <Button
+                    title="💬" variant="ghost" size="sm"
+                    onClick={() => setChatWith({ trip: myActiveTrips.find(t => t.trip_id === p.trip_id), otherUser: { id: p.id, name: p.name, role: ROLE.AGENT } })}
+                  />
+                )}
+              </div>
+            ))}
+            <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+              <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>DROP-OFF ADDRESS</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{curDrop.label}</div>
+            </div>
+            <Button title={`🧭 WAZE → DROP-OFF ${curDropIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curDrop.lat, curDrop.lng, curDrop.label, curDrop.isManual)} style={{ padding: 16, fontSize: 14 }} />
+            <Button title={`🏁 DROPPED OFF — ${curDrop.passengers.map(p => p.name.split(" ")[0]).join(" & ")}`} variant="amber" full onClick={() => confirmDropoff(curDrop)} />
+          </Card>
+          {dropStops.slice(curDropIdx + 1).length > 0 && (
+            <>
+              <SectionHeader label="Next Drop-off" />
+              {dropStops.slice(curDropIdx + 1).map((s, i) => (
+                <div key={`${s.lat}-${s.lng}-next`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 9, border: `1px solid ${COLORS.wire}`, opacity: .65 }}>
+                  <span style={{ color: COLORS.ghost, fontWeight: 800, minWidth: 22 }}>D{curDropIdx + 2 + i}</span>
+                  <div><div style={{ fontWeight: 700, fontSize: 11 }}>{s.label}</div><div style={{ color: COLORS.ghost, fontSize: 10 }}>{s.passengers.map(p => p.name).join(", ")}</div></div>
+                </div>
+              ))}
+            </>
+          )}
+        </>
+      )}
+
+      {tripStarted && allComplete && (
+        <Card style={{ alignItems: "center", padding: 28, textAlign: "center", borderColor: COLORS.green, background: "rgba(29,185,84,.05)" }}>
+          <div style={{ fontSize: 48 }}>🏁</div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800, color: COLORS.green }}>RUN COMPLETE</div>
+          <div style={{ fontSize: 10, color: COLORS.mist }}>All {pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} delivered successfully.</div>
+        </Card>
+      )}
+
+      {chatWith && chatWith.trip && (
+        <TripChatModal
+          trip={chatWith.trip}
+          currentUser={user}
+          otherUser={chatWith.otherUser}
+          dispatch={dispatch}
+          onClose={() => setChatWith(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function DriverHistoryTab({ myTrips }) {
+  // Calendar-month archive: this month's completed trips live at the
+  // top; the previous month sits under an ARCHIVE header — the ONE
+  // month of archive the app holds. On the 1st, buckets roll over and
+  // the month before last EXPIRES from this screen automatically. It
+  // is never deleted: expired trips stay in the backend, reachable via
+  // admin Trip History and the Help tab's trip picker.
+  const done = myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
+  const thisMonth = done.filter(t => tripArchiveBucket(t) === "CURRENT");
+  const archived = done.filter(t => tripArchiveBucket(t) === "ARCHIVE");
+  const TripCard = ({ t }) => (
+    <Card key={t.trip_id}>
+      <div style={{ display: "flex", justifyContent: "space-between" }}>
+        <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
+        <StateBadge state={t.state} />
+      </div>
+      <div style={{ fontSize: 11 }}>{t.agent_name}</div>
+      <div style={{ fontSize: 10, color: COLORS.ghost }}>{t.custom_pickup} → {t.custom_dropoff}</div>
+      {t.actual_distance_km && <div style={{ fontSize: 9, color: COLORS.teal }}>Distance: {(t.actual_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
+      <div style={{ fontSize: 9, color: COLORS.dim }}>{t.completed_at}</div>
+    </Card>
+  );
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>TRIP HISTORY</div>
+      {thisMonth.length === 0 && archived.length === 0 ? (
+        <Empty icon="◈" text="No completed trips" />
+      ) : (
+        <>
+          <SectionHeader label="This month" />
+          {thisMonth.length === 0
+            ? <span style={{ fontSize: 10, color: COLORS.ghost }}>No completed trips yet this month.</span>
+            : thisMonth.map(t => <TripCard key={t.trip_id} t={t} />)}
+          {archived.length > 0 && (
+            <>
+              <SectionHeader label={`◈ Archive — ${archiveMonthLabel()}`} />
+              {archived.map(t => <TripCard key={t.trip_id} t={t} />)}
+            </>
+          )}
+        </>
+      )}
+      <span style={{ fontSize: 8, color: COLORS.ghost }}>The app keeps one month of archive. Older trips are retained in the system — ask an admin if you need records beyond {archiveMonthLabel().toLowerCase()}.</span>
+    </div>
+  );
+}
+
+function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
+  const full = load >= DRIVER_CAPACITY;
+  const initials = user.name.split(" ").map(w => w[0]).join("").slice(0, 2);
+  return (
+    <div className="pad">
+      <Card style={{ alignItems: "center", padding: 24, textAlign: "center" }}>
+        <div style={{ width: 64, height: 64, borderRadius: 4, background: COLORS.surface, border: `1px solid ${COLORS.amber}`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONTS.head, fontSize: 24, fontWeight: 800, color: COLORS.amber, margin: "0 auto" }}>{initials}</div>
+        <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, marginTop: 10 }}>{user.name}</div>
+        <div style={{ display: "flex", justifyContent: "center", marginTop: 6 }}><RoleBadge role={user.role} /></div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 4 }}>{user.id}</div>
+      </Card>
+      <Card>
+        <SectionHeader label="Vehicle" />
+        <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{myStatus?.vehicle}</div>
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>{myStatus?.phone}</div>
+        <StateBadge state={full ? "FULLY_BOOKED" : (myStatus?.state || DRIVER_STATE.AVAILABLE)} />
+        <CapacityBar load={load} capacity={DRIVER_CAPACITY} />
+      </Card>
+      <Card body={false}>
+        {[["Total Trips", myTrips.length], ["Completed", myTrips.filter(t => t.state === "ARCHIVED_COMPLETED").length], ["Active", load]].map(([l, v]) => (
+          <div key={l} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${COLORS.wire}` }}>
+            <span style={{ fontSize: 11 }}>{l}</span><span style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.amber }}>{v}</span>
+          </div>
+        ))}
+      </Card>
+      {(() => {
+        // Performance over the loaded window. The Supabase fetch only
+        // pulls the last 30 days of trips, so that's the honest label —
+        // calling it "all time" would be wrong the moment real history
+        // accumulates. All the underlying numbers already existed on the
+        // trip records; they were just never surfaced to the one person
+        // they're about.
+        // Scoped to the CURRENT calendar month — the loaded data now
+        // spans this month plus the one-month archive, so an unscoped
+        // count would silently mix two months into one number.
+        const done = myTrips.filter(t => t.state === "ARCHIVED_COMPLETED" && tripArchiveBucket(t) === "CURRENT");
+        if (done.length === 0) return null;
+        const passengers = done.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+        const km = done.reduce((n, t) => n + (Number(t.actual_distance_km ?? t.est_distance_km) || 0), 0);
+        return (
+          <Card>
+            <SectionHeader label="Performance — this month" />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+              {[
+                ["TRIPS COMPLETED", String(done.length)],
+                ["PASSENGERS", String(passengers)],
+                ["DISTANCE", `${(km * ROAD_FACTOR).toFixed(0)} km`],
+              ].map(([l, v]) => (
+                <div key={l} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: 10 }}>
+                  <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 1 }}>{l}</div>
+                  <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, color: COLORS.teal, marginTop: 2 }}>{v}</div>
+                </div>
+              ))}
+            </div>
+            <span style={{ fontSize: 8, color: COLORS.ghost }}>Distance uses the same 1.35× road-distance estimate as trip records.</span>
+          </Card>
+        );
+      })()}
+      <AlertSoundToggle />
+      <Button title="LOGOUT" variant="ghost" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
+    </div>
+  );
+}
+
+const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
+
+function DriverApp({ state, dispatch, user }) {
+  const [tab, setTab] = useState("trips");
+  const myStatus = state.driver_status.find(d => d.driver_id === user.id);
+  const myUnreadNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read).length;
+  const allMyTrips = state.trips.filter(t => t.driver_id === user.id);
+  // Progressive reveal for week-trip series: a trip that's part of a
+  // week group (week_group_id set) and isn't day 1 stays hidden from the
+  // driver's dashboard until the PRIOR day in that same group has been
+  // completed. This is what makes "next day's trip pops up once today's
+  // is done" actually work — without this, all of a week booking's daily
+  // trips would be visible (and bookable for navigation) at once, which
+  // isn't how a driver should plan a multi-day series.
+  const myTrips = allMyTrips.filter(t => {
+    if (!t.week_group_id || !t.week_day_num || t.week_day_num <= 1) return true;
+    const priorDay = allMyTrips.find(other => other.week_group_id === t.week_group_id && other.week_day_num === t.week_day_num - 1);
+    // If the prior day's trip isn't even in this driver's list yet (e.g.
+    // assigned to a different driver, or not yet assigned at all), don't
+    // reveal this one either — the whole point is sequential visibility.
+    return priorDay ? priorDay.state === TRIP_STATE.ARCHIVED_COMPLETED : false;
+  });
+  const activeTrips = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+  const load = activeTrips.length;
+  const full = load >= DRIVER_CAPACITY;
+  const call = useWebRTCCall(user);
+  // Track whichever trip is currently in progress (IN_TRANSIT) for
+  // position logging context; falls back to the first active trip if
+  // none are in transit yet (still assigned/confirmed but not started).
+  const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
+  const location = useDriverLocationTracking(user, load > 0, trackedTripId);
+
+  return (
+    <div className="screen">
+      <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
+        <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 14, letterSpacing: 2 }}>TRANSIT/OS</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {location.tracking && !location.lastError && (
+            <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, display: "flex", alignItems: "center", gap: 3 }}>
+              <span style={{ width: 6, height: 6, borderRadius: 3, background: COLORS.green }} />GPS LIVE
+            </span>
+          )}
+          {location.lastError && (
+            <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.red }} title={location.lastError}>⚠ GPS</span>
+          )}
+          <StateBadge state={full ? "FULLY_BOOKED" : (myStatus?.state || DRIVER_STATE.AVAILABLE)} />
+          <RoleBadge role={ROLE.DRIVER} />
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} />}
+        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} />}
+        {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
+        {tab === "history" && <DriverHistoryTab myTrips={myTrips} />}
+        {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
+        {tab === "me" && <DriverProfileTab user={user} myStatus={myStatus} myTrips={myTrips} dispatch={dispatch} load={load} />}
+      </div>
+      <div style={{ display: "flex", background: COLORS.panel, borderTop: `1px solid ${COLORS.wire}`, position: "sticky", bottom: 0 }}>
+        {DRIVER_TABS.map(([id, icon, label]) => (
+          <div key={id} onClick={() => setTab(id)} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "10px 0", cursor: "pointer", color: tab === id ? COLORS.amber : COLORS.ghost, position: "relative" }}>
+            <span style={{ fontSize: 17 }}>{icon}</span><span style={{ fontSize: 9, fontWeight: 700 }}>{label}</span>
+            {id === "alerts" && myUnreadNotifs > 0 && (
+              <span style={{ position: "absolute", top: 4, right: "50%", marginRight: -18, background: COLORS.amber, color: "#000", borderRadius: 8, minWidth: 15, height: 15, fontSize: 9, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 3px" }}>{myUnreadNotifs}</span>
+            )}
+          </div>
+        ))}
+      </div>
+      <CallOverlay call={call} />
+    </div>
+  );
+}
+
+/* ============================================================
+   ADMIN APP
+   ============================================================ */
+function AdminDashboard({ state, user }) {
+  // Viewer Administrator only sees TODAY's trips on the dashboard — Fleet
+  // Ops and Standard keep the existing full live-window view (current +
+  // previous month of activity, matching what "All Trips" shows). This does NOT
+  // affect Viewer's access to History (which has its own separate 60-day
+  // cap already) — this is specifically about the Dashboard's daily
+  // snapshot being genuinely daily for that tier.
+  const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER;
+  const todayStr = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const trips = isViewer ? state.trips.filter(t => t.scheduled_date === todayStr) : state.trips;
+  const counts = {
+    total: trips.length,
+    unassign: trips.filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING).length,
+    active: trips.filter(t => [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)).length,
+    done: trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length,
+  };
+  return (
+    <div className="pad">
+      {isViewer && (
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>Showing today's trips only ({todayStr}). Full trip history is available under History.</div>
+      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 1, background: COLORS.wire, border: `1px solid ${COLORS.wire}`, borderRadius: 4, overflow: "hidden" }}>
+        {[["TOTAL", counts.total, COLORS.chalk], ["UNASSIGNED", counts.unassign, COLORS.red], ["ACTIVE", counts.active, COLORS.amber], ["DONE", counts.done, COLORS.green]].map(([l, v, c]) => (
+          <div key={l} style={{ background: COLORS.card, padding: 14, width: "49.5%" }}>
+            <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1.2, color: COLORS.ghost, textTransform: "uppercase" }}>{l}</div>
+            <div style={{ fontSize: 26, fontWeight: 800, marginTop: 4, fontFamily: FONTS.head, color: c }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      <SectionHeader label="Driver Fleet" />
+      {state.driver_status.map(ds => {
+        const u = state.users.find(x => x.id === ds.driver_id);
+        const load = getDriverLoad(state, ds.driver_id, todayStr);
+        const full = load >= DRIVER_CAPACITY;
+        return (
+          <Card key={ds.driver_id} style={{ flexDirection: "row", gap: 14, alignItems: "flex-start" }}>
+            <DriverAvatar name={u?.name} />
+            <div style={{ flex: 1 }}>
+              <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{u?.name}</div>
+              <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{ds.vehicle}</div>
+              <div style={{ margin: "6px 0 8px" }}><StateBadge state={full ? "FULLY_BOOKED" : ds.state} /></div>
+              <CapacityBar load={load} capacity={DRIVER_CAPACITY} />
+            </div>
+          </Card>
+        );
+      })}
+      <SectionHeader label="Recent Activity" />
+      <Card body={false}>
+        {trips.slice(0, 8).length === 0 ? <Empty icon="⊟" text="No bookings or trips yet" /> : trips.slice(0, 8).map(t => (
+          <div key={t.trip_id} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: `1px solid ${COLORS.wire}` }}>
+            <span style={{ width: 80, fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
+            <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{t.agent_name}</span>
+            <StateBadge state={t.state} />
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+function AddAgentPanel({ trip, state, dispatch, onClose }) {
+  const [agentId, setAgentId] = useState("");
+  const [mode, setMode] = useState("street");
+  const [companyId, setCompanyId] = useState((state.companies || [])[0]?.id || "");
+  const [streetValue, setStreetValue] = useState("");
+  const [streetArea, setStreetArea] = useState("");
+  const [streetCoord, setStreetCoord] = useState(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const availableAgents = state.users.filter(u => u.role === ROLE.AGENT && !trip.agent_ids.includes(u.id));
+  const selectedCompany = companyById(state, companyId) || { address: "", lat: null, lng: null };
+  const selectedAgent = state.users.find(u => u.id === agentId);
+
+  // Picking an agent with a saved home address pre-fills it, same convenience
+  // the agent's own booking screen gives them — admin can still override.
+  const chooseAgent = (id) => {
+    setAgentId(id);
+    const a = state.users.find(u => u.id === id);
+    if (a?.home_address) {
+      setMode("street");
+      setStreetValue(a.home_address.label);
+      setStreetArea(a.home_address.area);
+      setStreetCoord({ lat: a.home_address.lat, lng: a.home_address.lng });
+      setConfirmed(true);
+    } else {
+      setStreetValue(""); setStreetCoord(null); setConfirmed(false);
+    }
+  };
+
+  const canSave = agentId && (mode === "company" || (streetValue && confirmed));
+
+  const [saveError, setSaveError] = useState(null);
+  const save = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    setSaveError(null);
+    const pickupLabel = mode === "company" ? selectedCompany.address : streetValue;
+    const pickupCoord = mode === "company" ? { lat: selectedCompany.lat, lng: selectedCompany.lng } : streetCoord;
+    try {
+      await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, pickup_label: pickupLabel, pickup_coord: pickupCoord });
+      onClose();
+    } catch (e) {
+      setSaveError(e.message || "Couldn't add the passenger — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (availableAgents.length === 0) {
+    return (
+      <Card style={{ borderColor: COLORS.wire }}>
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>Every agent is already on this trip.</span>
+        <Button title="CLOSE" variant="ghost" size="sm" onClick={onClose} />
+      </Card>
+    );
+  }
+
+  return (
+    <Card style={{ borderColor: COLORS.amber2, background: "rgba(245,166,35,.03)" }}>
+      <SectionHeader label="Add Passenger" />
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {availableAgents.map(a => (
+          <div key={a.id} onClick={() => chooseAgent(a.id)}
+            style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", border: `1px solid ${agentId === a.id ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, background: agentId === a.id ? COLORS.amber : "transparent" }}>
+            <DriverAvatar name={a.name} size={30} />
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: agentId === a.id ? COLORS.ink : COLORS.chalk }}>{a.name}</div>
+              <div style={{ fontSize: 9, color: agentId === a.id ? COLORS.ink : COLORS.ghost }}>{a.auth.login}</div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {agentId && (
+        <>
+          <SectionHeader label="Pickup Location" />
+          <LocationSelector mode={mode} setMode={setMode} companyId={companyId} setCompanyId={setCompanyId} state={state}
+            streetValue={streetValue} streetCoord={confirmed ? streetCoord : null}
+            onStreetChange={({ street, area, coord, confirmed: c }) => { setStreetValue(street); setStreetArea(area); setStreetCoord(coord); setConfirmed(!!c); }} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} />
+            {saveError && <span style={{ fontSize: 10, color: COLORS.red, display: "block", marginBottom: 6 }}>{saveError}</span>}
+            <Button title={saving ? "ADDING…" : "ADD TO TRIP →"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={!canSave || saving} loading={saving} />
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
+function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClose }) {
+  const [mode, setMode] = useState("street");
+  const [companyId, setCompanyId] = useState((state.companies || [])[0]?.id || "");
+  const [streetValue, setStreetValue] = useState(currentPickup?.label || "");
+  const [streetArea, setStreetArea] = useState("");
+  const [streetCoord, setStreetCoord] = useState(currentPickup ? { lat: currentPickup.lat, lng: currentPickup.lng } : null);
+  const [confirmed, setConfirmed] = useState(!!currentPickup);
+  const [saving, setSaving] = useState(false);
+
+  const selectedCompany = companyById(state, companyId) || { address: "", lat: null, lng: null };
+  const canSave = mode === "company" || (streetValue && confirmed);
+
+  const [saveError, setSaveError] = useState(null);
+  const save = async () => {
+    if (!canSave) return;
+    setSaving(true);
+    setSaveError(null);
+    const pickupLabel = mode === "company" ? selectedCompany.address : streetValue;
+    const pickupCoord = mode === "company" ? { lat: selectedCompany.lat, lng: selectedCompany.lng } : streetCoord;
+    try {
+      await dispatch({ type: "TRIP/RELOCATE_AGENT", trip_id: trip.trip_id, agent_id: agent.id, pickup_label: pickupLabel, pickup_coord: pickupCoord });
+      onClose();
+    } catch (e) {
+      setSaveError(e.message || "Couldn't move the pickup — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card style={{ borderColor: COLORS.blue2, background: "rgba(45,140,240,.04)" }}>
+      <SectionHeader label={`Relocate — ${agent.name}`} />
+      <span style={{ fontSize: 9, color: COLORS.ghost }}>Current pickup: {currentPickup?.label || "—"}</span>
+      <LocationSelector mode={mode} setMode={setMode} companyId={companyId} setCompanyId={setCompanyId} state={state}
+        streetValue={streetValue} streetCoord={confirmed ? streetCoord : null}
+        onStreetChange={({ street, area, coord, confirmed: c }) => { setStreetValue(street); setStreetArea(area); setStreetCoord(coord); setConfirmed(!!c); }} />
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} />
+        {saveError && <span style={{ fontSize: 10, color: COLORS.red, display: "block", marginBottom: 6 }}>{saveError}</span>}
+        <Button title={saving ? "MOVING…" : "MOVE PICKUP →"} variant="blue" style={{ flex: 1 }} onClick={save} disabled={!canSave || saving} loading={saving} />
+      </div>
+    </Card>
+  );
+}
+
+function TripDetailRow({ trip, state, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [addingAgent, setAddingAgent] = useState(false);
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  const [cancelError, setCancelError] = useState(null);
+  const adminCancelTrip = async () => {
+    setCancelError(null);
+    try {
+      await dispatch({ type: "TRIP/ADMIN_CANCEL", trip_id: trip.trip_id });
+      // Row disappears via the refetch/state update — nothing to reset.
+    } catch (e) {
+      setCancelError(e.message || `Couldn't cancel the ${tripNoun(trip)} — please try again.`);
+    }
+  };
+  const [relocatingId, setRelocatingId] = useState(null);
+  const [removingId, setRemovingId] = useState(null);
+  const [delays, setDelays] = useState(null); // null = not loaded yet
+  const driver = state.users.find(u => u.id === trip.driver_id);
+  const passengers = trip.agent_ids.map(id => state.users.find(u => u.id === id)).filter(Boolean);
+  const canEdit = trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && dispatch != null;
+
+  const confirmRemove = async (agentId) => {
+    try {
+      await dispatch({ type: "TRIP/REMOVE_AGENT", trip_id: trip.trip_id, agent_id: agentId });
+    } catch (e) {
+      console.warn("[TripDetailRow] remove agent failed:", e.message);
+    } finally {
+      setRemovingId(null);
+    }
+  };
+
+  const toggleOpen = () => {
+    setOpen(o => {
+      const next = !o;
+      // Fetch delays only the first time this row is expanded, not on
+      // every render — a trip with no delays never needs re-fetching.
+      if (next && delays === null) {
+        fetchTripDelays(trip.trip_id).then(setDelays).catch(() => setDelays([]));
+      }
+      return next;
+    });
+  };
+
+  return (
+    <>
+      <div onClick={toggleOpen} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: `1px solid ${COLORS.wire}` }}>
+        <span style={{ width: 80, fontSize: 10, color: COLORS.amber, fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
+          {trip.trip_id}
+          {trip.is_exception && (
+            <span title="Booked after the 15:00 same-day cutoff" style={{ fontSize: 9, fontWeight: 800, color: "#000", background: COLORS.red, borderRadius: 2, width: 14, height: 14, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>E</span>
+          )}
+        </span>
+        <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{trip.agent_name}{trip.agent_ids.length > 1 ? ` +${trip.agent_ids.length - 1}` : ""}</span>
+        {trip.long_distance_flag && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 2, padding: "2px 5px" }}>40km+</span>}
+        <StateBadge state={trip.state} />
+        <span style={{ color: COLORS.ghost, fontSize: 11 }}>{open ? "▲" : "▼"}</span>
+      </div>
+      {open && (
+        <div style={{ background: COLORS.surface, borderBottom: `1px solid ${COLORS.wire}`, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+          {delays && delays.length > 0 && (
+            <div style={{ background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 10 }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>⏱ DELAY/DETOUR REPORTED</span>
+              {delays.map(d => (
+                <div key={d.id} style={{ fontSize: 10, color: COLORS.chalk, marginTop: 4 }}>
+                  <span style={{ fontWeight: 700 }}>{d.reason}</span>{d.note ? ` — ${d.note}` : ""}
+                  <span style={{ color: COLORS.ghost }}> ({epochToDisplay(d.reported_at)})</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {trip.admin_note && (
+            <div style={{ background: "rgba(232,58,58,.08)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 10 }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>⚠ ADMIN NOTE</span>
+              <div style={{ fontSize: 10, color: COLORS.chalk, marginTop: 3 }}>{trip.admin_note}</div>
+            </div>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>TYPE: </span>{trip.trip_type}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DATE: </span>{trip.scheduled_date}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>TIME: </span>{trip.scheduled_time}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>PHONE: </span>{trip.phone}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>PICKUP #: </span>{trip.pickup_order_num ?? "—"}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DROP #: </span>{trip.drop_sequence_num ?? "—"}</span>
+            {driver && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER: </span>{driver.name}</span>}
+            {driver && canEdit && (
+              <Button title="✕ REMOVE DRIVER" variant="danger" size="sm" onClick={() => dispatch({ type: "TRIP/REMOVE_DRIVER", trip_id: trip.trip_id }).catch(() => {}) /* failure already toasted by the wrapper */} />
+            )}
+            {trip.est_distance_km && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>EST DIST: </span>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span>}
+            {trip.route_total_km != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER'S FULL ROUTE: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{trip.route_total_km.toFixed(1)} km</span></span>}
+          </div>
+
+          <SectionHeader label={`Passengers (${passengers.length})`} />
+          {passengers.map((p, i) => {
+            // Paired by agent_id, not array index — `passengers` is
+            // filter(Boolean)'d over agent_ids, so its indices desync from
+            // pickup_sequence_coords the moment any user record is
+            // missing; index pairing then attributed pickup points to the
+            // wrong passengers. Index-0 fallback covers the primary agent
+            // on legacy coords that predate agent_id stamping.
+            const pickup = trip.pickup_sequence_coords?.find(c => c.agent_id === p.id)
+              ?? (trip.agent_ids[0] === p.id ? trip.pickup_sequence_coords?.[0] : null);
+            const pickedUp = trip.completed_pickups?.includes(p.id);
+            const droppedOff = trip.completed_dropoffs?.includes(p.id);
+            const driverName = trip.driver_id ? state.users.find(u => u.id === trip.driver_id)?.name : null;
+            const isRelocating = relocatingId === p.id;
+            const isConfirmingRemove = removingId === p.id;
+            return (
+              <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0" }}>
+                  <DriverAvatar name={p.name} size={28} />
+                  <div style={{ flex: 1 }}>
+                    <span style={{ fontSize: 11, fontWeight: 700 }}>{p.name}</span>
+                    {pickedUp && <span style={{ fontSize: 9, color: COLORS.green, marginLeft: 6 }}>✓ picked up</span>}
+                    {droppedOff && driverName && <span style={{ fontSize: 9, color: COLORS.teal, marginLeft: 6 }}>✓ dropped by {driverName}</span>}
+                    <div style={{ fontSize: 9, color: COLORS.ghost }}>{pickup?.label || "—"}</div>
+                  </div>
+                  {pickup?.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(pickup.lat, pickup.lng, pickup.label, trip.pickup_is_manual)} />}
+                  {canEdit && !isRelocating && (
+                    <Button title="MOVE" variant="ghost" size="sm" onClick={() => { setRelocatingId(p.id); setRemovingId(null); }} />
+                  )}
+                  {canEdit && passengers.length > 1 && !isConfirmingRemove && (
+                    <Button title="✕" variant="danger" size="sm" onClick={() => { setRemovingId(p.id); setRelocatingId(null); }} />
+                  )}
+                </div>
+                {isRelocating && (
+                  <RelocateAgentPanel trip={trip} agent={p} currentPickup={pickup} state={state} dispatch={dispatch} onClose={() => setRelocatingId(null)} />
+                )}
+                {isConfirmingRemove && (
+                  <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                    <span style={{ fontSize: 10, color: COLORS.chalk }}>Remove {p.name} from this trip?</span>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setRemovingId(null)} />
+                      <Button title="CONFIRM REMOVE" variant="danger" size="sm" style={{ flex: 1 }} onClick={() => confirmRemove(p.id)} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {canEdit && !addingAgent && (
+            trip.agent_ids.length >= DRIVER_CAPACITY
+              ? <div style={{ fontSize: 10, color: COLORS.ghost, padding: "6px 0" }}>{tripNounCap(trip)} full ({trip.agent_ids.length}/{DRIVER_CAPACITY} seats) — remove a passenger to add another.</div>
+              : <Button title={`+ ADD PASSENGER TO THIS ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" onClick={() => setAddingAgent(true)} />
+          )}
+          {addingAgent && <AddAgentPanel trip={trip} state={state} dispatch={dispatch} onClose={() => setAddingAgent(false)} />}
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROPOFF: </span>
+            {(trip.dropoff_sequence_coords || []).map((c, i) => <span key={i} style={{ color: COLORS.red, fontSize: 10 }}>[{c.lat?.toFixed(4)},{c.lng?.toFixed(4)}] </span>)}
+            {trip.dropoff_sequence_coords?.[0] && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(trip.dropoff_sequence_coords[0].lat, trip.dropoff_sequence_coords[0].lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+          </div>
+
+          {canEdit && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
+            !confirmingCancel ? (
+              <Button title={`✕ CANCEL ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" onClick={() => setConfirmingCancel(true)} style={{ alignSelf: "flex-start" }} />
+            ) : (
+              <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                <span style={{ fontSize: 10, color: COLORS.chalk }}>
+                  Cancel {tripNoun(trip)} {trip.trip_id}? {trip.driver_id
+                    ? "The assigned driver will be notified and freed up, and every passenger gets a cancellation alert."
+                    : "Every passenger on it gets a cancellation alert."}
+                </span>
+                {cancelError && <span style={{ fontSize: 10, color: COLORS.red }}>{cancelError}</span>}
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button title={`KEEP ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setConfirmingCancel(false); setCancelError(null); }} />
+                  <Button title="CONFIRM CANCEL" variant="danger" size="sm" style={{ flex: 1 }} onClick={adminCancelTrip} />
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+// Converts an array of trip objects into a downloadable CSV file via a
+// Blob + temporary anchor click — no server round-trip, works entirely
+// client-side against whatever trips are already in state.
+//
+// One row PER PASSENGER, not per trip — a multi-passenger trip becomes
+// multiple rows, each carrying that specific agent's own pickup/dropoff
+// timestamps (pickup_timestamps/dropoff_timestamps are keyed by agent id
+// specifically so this is possible — see the per-agent timestamp
+// migration). Trip-level fields (driver, status, direction, distance)
+// repeat identically across each passenger's row from the same trip.
+function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}) {
+  const headers = [
+    "Trip ID", "Exception", "Direction", "Trip Type", "Agent", "Driver", "Status",
+    "Pickup", "Drop-off", "Scheduled Date", "Scheduled Time",
+    "Booked At", "Driver Confirmed At", "Agent Picked Up At", "Agent Dropped Off At",
+    "Distance (km)", "Driver's Full Route (km)", "Long Distance", "Delay/Detour Reported", "Admin Edits", "Admin Note", "Phone",
+  ];
+  const escapeCsv = (val) => {
+    const s = val == null ? "" : String(val);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const driverName = (id) => users?.find(u => u.id === id)?.name || (id ?? "");
+  const agentName = (id) => users?.find(u => u.id === id)?.name || (id ?? "");
+  // en-ZA gives DD/MM/YYYY, HH:MM:SS — readable in Excel and matches the
+  // date format already used elsewhere in the app (booking form, etc.).
+  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA") : "";
+  // Multiple delay reports on one trip are joined into a single cell —
+  // one row per PASSENGER already fans this trip out into several rows,
+  // and repeating the same delay text on each of those rows (rather than
+  // splitting delays across rows too) keeps the row count tied purely to
+  // passenger count, which is the dimension the rest of this export is
+  // already built around.
+  const delaySummary = (tripId) => {
+    const delays = delaysByTrip[tripId];
+    if (!delays || !delays.length) return "";
+    return delays.map(d => `${d.reason}${d.note ? ` (${d.note})` : ""} @ ${fmtTs(d.reported_at)}`).join(" | ");
+  };
+  // Same joined-cell approach for "which admin edited this trip" — every
+  // audit_logs entry tied to this trip_id, condensed into one readable
+  // cell rather than exploding rows further.
+  const auditSummary = (tripId) => {
+    const entries = auditByTrip[tripId];
+    if (!entries || !entries.length) return "";
+    return entries.map(a => `${a.username} — ${a.actionType}${a.details ? ` (${a.details})` : ""} @ ${fmtTs(a.timestamp)}`).join(" | ");
+  };
+
+  const rows = [];
+  trips.forEach(t => {
+    // Every agent on the trip (primary + any extras) — the whole reason
+    // for the per-passenger row structure is that each of these can have
+    // a genuinely different pickup/dropoff time on a multi-passenger trip.
+    const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
+    agentIds.forEach(aid => {
+      rows.push([
+        t.trip_id, t.is_exception ? "E" : "", t.direction || "", t.trip_type || "",
+        aid != null ? agentName(aid) : (t.agent_name || ""), driverName(t.driver_id), t.state,
+        t.custom_pickup || "", t.custom_dropoff || "",
+        t.scheduled_date || "", t.scheduled_time || "",
+        // booked_at/confirmed_at are already formatted display strings
+        // (converted by tripRowToApp via epochToDisplay) — used as-is.
+        // pickup_timestamps/dropoff_timestamps are raw epoch ms, so those
+        // go through fmtTs() to become readable.
+        t.booked_at || "", t.confirmed_at || "",
+        fmtTs(aid != null ? t.pickup_timestamps?.[aid] : null),
+        fmtTs(aid != null ? t.dropoff_timestamps?.[aid] : null),
+        t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
+        t.route_total_km != null ? t.route_total_km.toFixed(1) : "",
+        t.long_distance_flag ? "YES" : "NO",
+        delaySummary(t.trip_id),
+        auditSummary(t.trip_id),
+        t.admin_note || "", t.phone || "",
+      ]);
+    });
+  });
+  const csv = [headers, ...rows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
+  // BOM prefix so Excel opens UTF-8 CSVs correctly instead of mangling
+  // special characters (common gotcha with plain UTF-8 CSVs in Excel).
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `${filenamePrefix}_${dateStr}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function AdminTrips({ state, dispatch, user }) {
+  const [filter, setFilter] = useState("ALL");
+  const [selectedDriverId, setSelectedDriverId] = useState(null); // null = show all groups
+  const [exporting, setExporting] = useState(false);
+  const filters = ["ALL", ...Object.values(TRIP_STATE)];
+  const displayTrips = filter === "ALL" ? state.trips : state.trips.filter(t => t.state === filter);
+  const canExport = hasAdminPermission(user, "exportCsv");
+  const canEditTrips = hasAdminPermission(user, "manageTrips");
+
+  // Group by driver_id — trips with no driver assigned yet land in their
+  // own "Unassigned" group rather than being dropped from the view.
+  const groups = {};
+  displayTrips.forEach(t => {
+    const key = t.driver_id ?? "UNASSIGNED";
+    (groups[key] ||= []).push(t);
+  });
+  const driverIds = Object.keys(groups).filter(k => k !== "UNASSIGNED");
+  // Group keys come from Object.keys() so they're always strings, but
+  // user ids are numbers (Supabase bigint) OR strings ("USR_…" in demo
+  // mode) — Number(key) turned demo ids into NaN, breaking driver names
+  // and the per-driver filter there. String-compare instead, which is
+  // correct for both id shapes.
+  const findUserByKey = (key) => state.users.find(u => String(u.id) === String(key));
+  const sortedDriverIds = driverIds.sort((a, b) => {
+    const nameA = findUserByKey(a)?.name || "";
+    const nameB = findUserByKey(b)?.name || "";
+    return nameA.localeCompare(nameB);
+  });
+  const orderedKeys = [...sortedDriverIds, ...(groups.UNASSIGNED ? ["UNASSIGNED"] : [])];
+  const visibleKeys = selectedDriverId ? orderedKeys.filter(k => k === String(selectedDriverId)) : orderedKeys;
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+        {filters.map(f => <Button key={f} size="sm" variant={filter === f ? "amber" : "ghost"} title={f === "ALL" ? "ALL" : f.replace("_BOOKING", "").replace("ARCHIVED_", "")} onClick={() => setFilter(f)} />)}
+        {canExport && (
+          <Button
+            size="sm" variant="ghost"
+            title={exporting ? "EXPORTING…" : `⬇ EXPORT CSV (${displayTrips.length})`}
+            disabled={exporting}
+            onClick={async () => {
+              setExporting(true);
+              try {
+                const tripIds = displayTrips.map(t => t.trip_id);
+                const [delaysByTrip, auditByTrip] = await Promise.all([
+                  fetchDelaysForTrips(tripIds),
+                  fetchAuditLogsForTrips(tripIds),
+                ]);
+                exportTripsToCsv(displayTrips, state.users, filter === "ALL" ? "all_trips" : `trips_${filter.toLowerCase()}`, delaysByTrip, auditByTrip);
+              } catch (e) {
+                // Without this catch, a throw here (e.g. CSV/Blob build
+                // failing) escaped the onClick as an unhandled rejection
+                // with the button stuck saying nothing happened.
+                console.warn("[AdminTrips] CSV export failed:", e.message);
+              } finally {
+                setExporting(false);
+              }
+            }}
+            style={{ marginLeft: "auto" }}
+          />
+        )}
+      </div>
+
+      {driverIds.length > 1 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Button size="sm" variant={!selectedDriverId ? "amber" : "ghost"} title="ALL DRIVERS" onClick={() => setSelectedDriverId(null)} />
+          {sortedDriverIds.map(id => (
+            <Button key={id} size="sm" variant={String(selectedDriverId) === id ? "amber" : "ghost"}
+              title={`${findUserByKey(id)?.name || id} (${groups[id].length})`}
+              onClick={() => setSelectedDriverId(id)} />
+          ))}
+        </div>
+      )}
+
+      {displayTrips.length === 0 ? <Empty icon="⊟" text="No bookings or trips" /> : visibleKeys.map(key => {
+        const isUnassigned = key === "UNASSIGNED";
+        const driverUser = isUnassigned ? null : findUserByKey(key);
+        const groupTrips = groups[key];
+        return (
+          <div key={key}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px 4px" }}>
+              {!isUnassigned && <DriverAvatar name={driverUser?.name} size={26} />}
+              <span style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: isUnassigned ? COLORS.ghost : COLORS.chalk }}>
+                {isUnassigned ? "UNASSIGNED" : (driverUser?.name || `Driver ${key}`)}
+              </span>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>({groupTrips.length} {isUnassigned ? "booking" : "trip"}{groupTrips.length !== 1 ? "s" : ""})</span>
+              {!isUnassigned && groupTrips[0]?.route_total_km != null && (
+                <span style={{ fontSize: 10, color: COLORS.teal, marginLeft: "auto" }}>{groupTrips[0].route_total_km.toFixed(1)} km route</span>
+              )}
+            </div>
+            <Card body={false}>
+              {groupTrips.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} />)}
+            </Card>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AdminProfileSearch({ state, user }) {
+  const [query, setQuery] = useState("");
+  const [selectedUserId, setSelectedUserId] = useState(null);
+  const [historyTrips, setHistoryTrips] = useState(null); // null = not loaded yet
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [exporting, setExporting] = useState(false);
+
+  // Viewer can search agent profiles only — driver profiles require
+  // viewDriverProfiles, which Viewer doesn't have.
+  const canSearchDrivers = hasAdminPermission(user, "viewDriverProfiles");
+  const searchable = state.users.filter(u => u.role === ROLE.AGENT || (canSearchDrivers && u.role === ROLE.DRIVER));
+  const matches = query.trim().length >= 1
+    ? searchable.filter(u => u.name.toLowerCase().includes(query.trim().toLowerCase()) || (u.staff_number || "").toLowerCase().includes(query.trim().toLowerCase()))
+    : [];
+
+  const selectedUser = selectedUserId ? state.users.find(u => u.id === selectedUserId) : null;
+  const driverStatus = selectedUser?.role === ROLE.DRIVER ? state.driver_status.find(d => d.driver_id === selectedUser.id) : null;
+
+  const selectProfile = async (u) => {
+    setSelectedUserId(u.id);
+    setQuery("");
+    setHistoryTrips(null);
+    setLoadingHistory(true);
+    try {
+      const hits = await fetchTripHistory(u.role === ROLE.AGENT ? { agentId: u.id } : { driverId: u.id });
+      setHistoryTrips(hits);
+    } catch (e) {
+      setHistoryTrips([]);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
+
+  // Live (current-and-previous-month-or-active) trips for this person, from state
+  // already in memory — combined with the fetched full history above so
+  // "all their trips" genuinely means all of them, not just the recent
+  // window the rest of the app deliberately limits itself to.
+  const liveTrips = selectedUser
+    ? state.trips.filter(t => selectedUser.role === ROLE.AGENT ? t.agent_ids?.includes(selectedUser.id) : t.driver_id === selectedUser.id)
+    : [];
+  const liveTripIds = new Set(liveTrips.map(t => t.trip_id));
+  const allTrips = [...liveTrips, ...(historyTrips || []).filter(t => !liveTripIds.has(t.trip_id))]
+    .sort((a, b) => (b.scheduled_time_epoch || 0) - (a.scheduled_time_epoch || 0));
+
+  const exceptionCount = allTrips.filter(t => t.is_exception).length;
+  const completedCount = allTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
+
+  return (
+    <div className="pad">
+      <SectionHeader label={canSearchDrivers ? "Search Agent / Driver Profiles" : "Search Agent Profiles"} />
+      <TextField
+        label="Search by name or staff number"
+        value={query}
+        onChange={e => { setQuery(e.target.value); setSelectedUserId(null); }}
+        placeholder="e.g. Nomsa Dlamini or AG1001"
+      />
+      {matches.length > 0 && (
+        <Card body={false}>
+          {matches.slice(0, 10).map(u => (
+            <div key={u.id} onClick={() => selectProfile(u)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
+              <DriverAvatar name={u.name} size={28} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}</div>
+                <div style={{ fontSize: 9, color: COLORS.ghost }}>Staff #: {u.staff_number || "—"}</div>
+              </div>
+              <RoleBadge role={u.role} />
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {selectedUser && (
+        <>
+          <Card>
+            <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+              <DriverAvatar name={selectedUser.name} size={48} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: FONTS.head, fontSize: 17, fontWeight: 800 }}>{selectedUser.name}</div>
+                <div style={{ fontSize: 10, color: COLORS.ghost }}>Staff #: {selectedUser.staff_number || "—"}</div>
+              </div>
+              <RoleBadge role={selectedUser.role} />
+            </div>
+          </Card>
+
+          {/* Full stored profile — same component the Users tab uses, so
+              anything visible there (branch history, campaign, admin
+              level, etc.) shows up here too instead of a thinner
+              duplicate that drifts out of sync over time. */}
+          <UserProfilePanel u={selectedUser} driverStatus={driverStatus} state={state} />
+
+          <Card>
+            <div style={{ display: "flex", gap: 16 }}>
+              <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL BOOKINGS: </span><span style={{ fontWeight: 700 }}>{allTrips.length}</span></span>
+              <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>COMPLETED: </span><span style={{ fontWeight: 700, color: COLORS.green }}>{completedCount}</span></span>
+              {exceptionCount > 0 && <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>EXCEPTIONS: </span><span style={{ fontWeight: 700, color: COLORS.red }}>{exceptionCount}</span></span>}
+            </div>
+            <span style={{ fontSize: 8, color: COLORS.ghost }}>Counts here cover this person's FULL history (fetched on demand) — the profile panel above only shows the live current+previous-month window, same as the rest of the app.</span>
+            {hasAdminPermission(user, "exportCsv") && allTrips.length > 0 && (
+              <Button size="sm" variant="ghost" title={exporting ? "EXPORTING…" : "⬇ EXPORT THIS PERSON'S BOOKINGS"} disabled={exporting} onClick={async () => {
+                setExporting(true);
+                try {
+                  const tripIds = allTrips.map(t => t.trip_id);
+                  const [delaysByTrip, auditByTrip] = await Promise.all([
+                    fetchDelaysForTrips(tripIds),
+                    fetchAuditLogsForTrips(tripIds),
+                  ]);
+                  exportTripsToCsv(allTrips, state.users, `${selectedUser.name.replace(/\s+/g, "_")}_trips`, delaysByTrip, auditByTrip);
+                } finally {
+                  setExporting(false);
+                }
+              }} />
+            )}
+          </Card>
+
+          <SectionHeader label={`Trip History (${allTrips.length})`} />
+          {loadingHistory && <div style={{ fontSize: 10, color: COLORS.ghost, padding: 10 }}>Loading full history…</div>}
+          {!loadingHistory && allTrips.length === 0 && <Empty icon="⊟" text="No trips found for this person" />}
+          {!loadingHistory && allTrips.length > 0 && (
+            <Card body={false}>
+              {allTrips.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} />)}
+            </Card>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function AdminHistory({ state, user }) {
+  const today = new Date();
+  // Viewer is capped at 60 days of trip history; other tiers keep the
+  // existing 90-day default (which was never a hard cap for them, just a
+  // starting point — they can still pick any earlier date).
+  const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER;
+  const maxLookbackDays = isViewer ? 60 : 90;
+  const earliestAllowed = new Date(today.getTime() - maxLookbackDays * 24 * 60 * 60 * 1000);
+  const [fromDate, setFromDate] = useState(earliestAllowed.toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(today.toISOString().slice(0, 10));
+  const [agentFilter, setAgentFilter] = useState("");
+  const [driverFilter, setDriverFilter] = useState("");
+  // Company-level filter — separate from the per-agent filter above,
+  // lets a non-Viewer admin narrow the whole search (and its CSV export)
+  // to one or more companies at once, without picking through agents one
+  // by one. Viewers don't get this control: they're already automatically
+  // scoped to their assigned companies via isCompanyScoped, and manually
+  // offering a company picker here would look like it lets them widen
+  // that scope back out, which it must never actually do. Array (not a
+  // single value) so multiple companies can be selected together, same
+  // as the Viewer scoping feature itself.
+  const [companyFilter, setCompanyFilter] = useState([]);
+  // Both on by default — an unfiltered view shows everything, same as
+  // before this feature existed. Unchecking one hides that category
+  // from the already-fetched results rather than re-querying, since
+  // is_exception is already present on every trip object returned by
+  // fetchTripHistory.
+  const [showNormal, setShowNormal] = useState(true);
+  const [showException, setShowException] = useState(true);
+  const [results, setResults] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const agents = state.users.filter(u => u.role === ROLE.AGENT);
+  const drivers = state.users.filter(u => u.role === ROLE.DRIVER);
+
+  // Enforced on the actual query, not just the date picker's default —
+  // a Viewer could still type/select an earlier date directly into the
+  // input, so this clamps whatever's actually submitted, not just what
+  // the field started as.
+  const handleFromDateChange = (v) => {
+    if (isViewer && v < earliestAllowed.toISOString().slice(0, 10)) {
+      setFromDate(earliestAllowed.toISOString().slice(0, 10));
+      return;
+    }
+    setFromDate(v);
+  };
+
+  const runSearch = async () => {
+    setLoading(true); setErr(null);
+    try {
+      const effectiveFromDate = isViewer && fromDate < earliestAllowed.toISOString().slice(0, 10)
+        ? earliestAllowed.toISOString().slice(0, 10)
+        : fromDate;
+      const fromMs = effectiveFromDate ? new Date(`${effectiveFromDate}T00:00:00`).getTime() : undefined;
+      const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
+      const hits = await fetchTripHistory({
+        fromMs, toMs,
+        agentId: agentFilter ? Number(agentFilter) : undefined,
+        driverId: driverFilter ? Number(driverFilter) : undefined,
+      });
+      // fetchTripHistory queries Supabase directly, independent of the
+      // already-scoped state.trips the rest of this tab reads from — so
+      // a company-scoped Viewer's search still needs its own explicit
+      // filter here, or it would return every company's trips regardless
+      // of the scoping applied everywhere else in this tab. A non-Viewer
+      // who picked one or more companies from the (Viewer-only-hidden)
+      // companyFilter checklist gets the same treatment, just driven by
+      // their own one-off selection instead of a permanent account-level
+      // scope.
+      const effectiveCompanyIds = isCompanyScoped(user)
+        ? user.scoped_company_ids
+        : (companyFilter.length ? companyFilter : null);
+      setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
+    } catch (e) {
+      setErr(e.message || "Search failed");
+      setResults(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Quick day/week/month presets — sets the From/To fields and runs the
+  // search immediately, rather than making someone manually calculate
+  // and type a date range for the common cases.
+  const applyQuickRange = (unit) => {
+    const end = new Date();
+    const start = new Date();
+    if (unit === "day") start.setDate(start.getDate() - 1);
+    else if (unit === "week") start.setDate(start.getDate() - 7);
+    else if (unit === "month") start.setMonth(start.getMonth() - 1);
+    const clampedStart = isViewer && start < earliestAllowed ? earliestAllowed : start;
+    const startStr = clampedStart.toISOString().slice(0, 10);
+    const endStr = end.toISOString().slice(0, 10);
+    setFromDate(startStr);
+    setToDate(endStr);
+    setTimeout(() => runSearchWithRange(startStr, endStr), 0);
+  };
+
+  // Same as runSearch but takes explicit dates — needed because
+  // applyQuickRange's setFromDate/setToDate calls don't take effect until
+  // the next render, so runSearch() called immediately after would still
+  // read the OLD state values.
+  const runSearchWithRange = async (fromStr, toStr) => {
+    setLoading(true); setErr(null);
+    try {
+      const fromMs = new Date(`${fromStr}T00:00:00`).getTime();
+      const toMs = new Date(`${toStr}T23:59:59`).getTime();
+      const hits = await fetchTripHistory({
+        fromMs, toMs,
+        agentId: agentFilter ? Number(agentFilter) : undefined,
+        driverId: driverFilter ? Number(driverFilter) : undefined,
+      });
+      // Same scoping as runSearch — this was previously missing entirely
+      // here, so the quick-range buttons let a company-scoped Viewer see
+      // every company's trips regardless of their assigned scope.
+      const effectiveCompanyIds = isCompanyScoped(user)
+        ? user.scoped_company_ids
+        : (companyFilter.length ? companyFilter : null);
+      setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
+    } catch (e) {
+      setErr(e.message || "Search failed");
+      setResults(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <SectionHeader label="Trip History" />
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
+        The live Trips view only shows completed trips from the last 30 days. Search here for anything older.
+        {isViewer && " Your access is limited to the last 60 days of history."}
+      </div>
+      <Card>
+        <SectionHeader label="Quick Range" />
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button title="TODAY" size="sm" variant="ghost" onClick={() => applyQuickRange("day")} style={{ flex: 1 }} />
+          <Button title="PAST WEEK" size="sm" variant="ghost" onClick={() => applyQuickRange("week")} style={{ flex: 1 }} />
+          <Button title="PAST MONTH" size="sm" variant="ghost" onClick={() => applyQuickRange("month")} style={{ flex: 1 }} />
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FROM</label>
+            <input type="date" className="inp" value={fromDate} min={isViewer ? earliestAllowed.toISOString().slice(0, 10) : undefined} onChange={e => handleFromDateChange(e.target.value)} style={{ width: "100%" }} />
+          </div>
+          <div style={{ flex: "1 1 140px" }}>
+            <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>TO</label>
+            <input type="date" className="inp" value={toDate} onChange={e => setToDate(e.target.value)} style={{ width: "100%" }} />
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 10 }}>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>AGENT (optional)</label>
+            <select className="inp" value={agentFilter} onChange={e => setAgentFilter(e.target.value)} style={{ width: "100%" }}>
+              <option value="">All agents</option>
+              {agents.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
+            </select>
+          </div>
+          <div style={{ flex: "1 1 160px" }}>
+            <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>DRIVER (optional)</label>
+            <select className="inp" value={driverFilter} onChange={e => setDriverFilter(e.target.value)} style={{ width: "100%" }}>
+              <option value="">All drivers</option>
+              {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+            </select>
+          </div>
+          {!isViewer && (
+            <div style={{ flex: "1 1 100%" }}>
+              <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>COMPANY (optional — select any number)</label>
+              {(state.companies || []).length === 0 ? (
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet.</span>
+              ) : (
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginTop: 4 }}>
+                  {state.companies.map(c => {
+                    const checked = companyFilter.includes(c.id);
+                    return (
+                      <div key={c.id} onClick={() => setCompanyFilter(checked ? companyFilter.filter(id => id !== c.id) : [...companyFilter, c.id])}
+                        style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                        <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{checked && "✓"}</span>
+                        <span style={{ fontSize: 11, color: COLORS.chalk }}>{c.name}{!c.active ? " (inactive)" : ""}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        <div style={{ display: "flex", gap: 16, marginTop: 10 }}>
+          <div onClick={() => setShowNormal(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${showNormal ? COLORS.amber : COLORS.wire}`, background: showNormal ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{showNormal && "✓"}</span>
+            <span style={{ fontSize: 10, color: COLORS.chalk }}>Normal bookings</span>
+          </div>
+          <div onClick={() => setShowException(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${showException ? COLORS.amber : COLORS.wire}`, background: showException ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{showException && "✓"}</span>
+            <span style={{ fontSize: 10, color: COLORS.chalk }}>Exception bookings <span style={{ color: COLORS.red }}>(E)</span></span>
+          </div>
+        </div>
+        <Button title={loading ? "SEARCHING…" : "SEARCH"} variant="amber" full onClick={runSearch} disabled={loading} style={{ marginTop: 12 }} />
+      </Card>
+
+      {err && (
+        <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
+          <span style={{ color: COLORS.red, fontSize: 11 }}>{err}</span>
+        </div>
+      )}
+
+      {results !== null && (() => {
+        // Applied once here rather than duplicated across the count
+        // display, the row list, and the CSV export below — all three
+        // read from this same derived array, so they can never disagree
+        // about what "filtered" means.
+        const filteredResults = results.filter(t => (t.is_exception ? showException : showNormal));
+        return (
+        <>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ fontSize: 10, color: COLORS.ghost, flex: 1 }}>
+              {filteredResults.length} trip{filteredResults.length !== 1 ? "s" : ""} found
+              {filteredResults.length !== results.length ? ` (${results.length} total before filter)` : ""}
+              {results.length === 500 ? " (capped at 500 — narrow the date range for a complete list)" : ""}
+            </div>
+            {filteredResults.length > 0 && hasAdminPermission(user, "exportCsv") && (
+              <Button size="sm" variant="amber" title={exporting ? "SAVING…" : "💾 SAVE TRIP SHEET (CSV)"} disabled={exporting} onClick={async () => {
+                setExporting(true);
+                try {
+                  const tripIds = filteredResults.map(t => t.trip_id);
+                  const [delaysByTrip, auditByTrip] = await Promise.all([
+                    fetchDelaysForTrips(tripIds),
+                    fetchAuditLogsForTrips(tripIds),
+                  ]);
+                  const companyLabel = companyFilter.length
+                    ? `_${companyFilter.map(id => (state.companies || []).find(c => c.id === id)?.name.replace(/\s+/g, "_")).filter(Boolean).join("-") || "company"}`
+                    : "";
+                  exportTripsToCsv(filteredResults, state.users, `trip_history_${fromDate}_to_${toDate}${companyLabel}`, delaysByTrip, auditByTrip);
+                } catch (e) {
+                  // Surfaced in the tab's existing error banner instead of
+                  // escaping the onClick as an unhandled rejection.
+                  setErr(e.message || "Couldn't build the trip sheet CSV.");
+                } finally {
+                  setExporting(false);
+                }
+              }} />
+            )}
+          </div>
+          <Card body={false}>
+            {filteredResults.length === 0
+              ? <Empty icon="⊟" text={results.length === 0 ? "No completed trips in this range" : "No trips match the current Normal/Exception filter"} />
+              : filteredResults.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} />)}
+          </Card>
+        </>
+        );
+      })()}
+    </div>
+  );
+}
+
+
+function AdminDispatch({ state, dispatch }) {
+  // Multiple unassigned trips can be selected together — for when several
+  // agents happen to be going the same way and one driver should pick up
+  // all of them in a single run instead of separate dispatches. A Set
+  // (not an array) so toggling a trip in/out on tap is a simple
+  // add/delete rather than an indexOf/splice dance.
+  const [selectedTripIds, setSelectedTripIds] = useState(new Set());
+  const [selectedDriverId, setSelectedDriverId] = useState(null);
+  const [msg, setMsg] = useState(null);
+  // Filters the unassigned bookings list down to one calendar date — with
+  // several agents each booking a week (or more), the unassigned list can
+  // easily reach 20-30+ cards all mixed together with no way to tell
+  // which day is which at a glance. Defaults to "" (show every date);
+  // populated from whatever dates actually exist in the CURRENT
+  // unassigned list, not a fixed calendar picker, so the dropdown never
+  // offers a date with nothing to show.
+  const [dayFilter, setDayFilter] = useState("");
+  // Filters the unassigned bookings list to one DIRECTION (INBOUND or
+  // OUTBOUND) — when several agents each make a return booking, their
+  // morning (INBOUND) and evening (OUTBOUND) legs should be dispatched
+  // as SEPARATE groups, not mixed together: 3 agents' inbound legs
+  // combine into one trip, their outbound legs combine into a different
+  // one, grouped by direction regardless of each agent's exact time.
+  const [directionFilter, setDirectionFilter] = useState("");
+  // Filters INBOUND unassigned bookings by the agent's HOME AREA (e.g.
+  // Mitchells Plain, Bellville) — only meaningful for INBOUND (that's
+  // the direction where the agent is being picked up FROM home), so
+  // this only applies/shows once directionFilter === "INBOUND". A
+  // booking's "area" is every one of its agents' home areas (normally
+  // just one agent pre-dispatch, but checked as a set so an edge-case
+  // multi-agent unassigned booking still matches correctly if ANY of
+  // its agents live in the selected area).
+  const [areaFilter, setAreaFilter] = useState("");
+  const unassignedAllDates = state.trips.filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING);
+  const availableDates = [...new Set(unassignedAllDates.map(t => t.scheduled_date))].sort();
+  const unassignedByDay = dayFilter ? unassignedAllDates.filter(t => t.scheduled_date === dayFilter) : unassignedAllDates;
+  const availableDirections = [...new Set(unassignedByDay.map(t => t.direction).filter(Boolean))].sort();
+  const unassignedByDirection = directionFilter ? unassignedByDay.filter(t => t.direction === directionFilter) : unassignedByDay;
+  const tripHomeAreas = (t) => (t.agent_ids || [])
+    .map(id => state.users.find(u => u.id === id)?.home_address?.area)
+    .filter(Boolean);
+  const availableAreas = directionFilter === "INBOUND"
+    ? [...new Set(unassignedByDirection.flatMap(tripHomeAreas))].sort()
+    : [];
+  const unassigned = (directionFilter === "INBOUND" && areaFilter)
+    ? unassignedByDirection.filter(t => tripHomeAreas(t).includes(areaFilter))
+    : unassignedByDirection;
+  const selectedTrips = unassigned.filter(t => selectedTripIds.has(t.trip_id));
+  // The first-selected trip is the "primary" — whichever one absorbs the
+  // others when merged (see TRIP/DISPATCH_MULTI). Order matters for the
+  // audit trail and for which agent's name the merge notification uses,
+  // so this is insertion order, not sorted order.
+  const primaryTrip = selectedTrips[0] || null;
+  // A week booking creates one SEPARATE trip per day (each needs its own
+  // route) — if every selected trip shares the same week_group_id, this
+  // is one agent's week, not several different agents to merge together
+  // for a shared ride. Summing seats across days would be meaningless
+  // (day 1's passenger and day 3's passenger are the same person on
+  // different days, not two people sharing one vehicle at once), so
+  // capacity is checked PER TRIP instead, and the whole selection routes
+  // to TRIP/BULK_ASSIGN_DRIVER (each day assigned independently) rather
+  // than the merge-into-one-trip path DISPATCH_MULTI uses.
+  const isWeekBookingSelection = selectedTrips.length > 1 && selectedTrips.every(t => t.week_group_id && t.week_group_id === primaryTrip?.week_group_id);
+  const totalSeats = isWeekBookingSelection ? Math.max(...selectedTrips.map(t => t.agent_ids.length), 0) : selectedTrips.reduce((n, t) => n + t.agent_ids.length, 0);
+  const overCapacity = totalSeats > DRIVER_CAPACITY;
+  // A vehicle trip should combine enough agent bookings to fill it at
+  // least 75% (3 of 4 seats) before dispatching a driver — a single
+  // booking (or two) is under that target. Per explicit decision this is
+  // a WARNING, not a hard block: an admin can still dispatch below 75%
+  // when there's genuinely no one else to combine with, they just see
+  // it flagged rather than the app silently allowing it as if it were
+  // fully optimal. Week bookings are exempt — one agent's own schedule
+  // repeated across several days is not "several agents sharing a ride"
+  // and was never the kind of under-filled trip this rule targets.
+  const MIN_FULL_PCT = 0.75;
+  const underCapacityWarning = !isWeekBookingSelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
+  const availableDriversRaw = state.driver_status.filter(ds => {
+    if (isWeekBookingSelection) {
+      // Needs room on EVERY selected day independently — a driver full
+      // on Tuesday but free on the other 5 days can't take this whole
+      // week selection (that specific day would fail), so the filter
+      // must check each date, not just the busiest one in isolation.
+      return selectedTrips.every(t => getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= DRIVER_CAPACITY);
+    }
+    const checkDate = primaryTrip?.scheduled_date;
+    return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= DRIVER_CAPACITY;
+  });
+
+  const toggleTrip = (tripId) => {
+    setSelectedTripIds(prev => {
+      const next = new Set(prev);
+      if (next.has(tripId)) { next.delete(tripId); return next; }
+      // Block adding a trip whose agent is already in the current
+      // selection — UNLESS this is a week-booking series (same agent,
+      // several days), where repeating the agent across selected trips
+      // is expected and correct, not a mistake. Checked fresh here
+      // rather than reusing the component-level isWeekBookingSelection,
+      // since that reflects the CURRENT selection, not the prospective
+      // one after this trip is added.
+      const tripBeingAdded = unassigned.find(t => t.trip_id === tripId);
+      const currentlySelected = unassigned.filter(t => next.has(t.trip_id));
+      const isSameWeekSeries = tripBeingAdded?.week_group_id && currentlySelected.every(t => t.week_group_id === tripBeingAdded.week_group_id);
+      if (!isSameWeekSeries && tripBeingAdded) {
+        const incomingAgentIds = new Set(tripBeingAdded.agent_ids || []);
+        const alreadySelectedAgentIds = new Set(currentlySelected.flatMap(t => t.agent_ids || []));
+        const overlap = [...incomingAgentIds].find(id => alreadySelectedAgentIds.has(id));
+        if (overlap) {
+          const overlapName = state.users.find(u => u.id === overlap)?.name || "This agent";
+          setMsg(`✗ ${overlapName} is already on another selected booking — combining two of the same agent's bookings isn't a valid merge.`);
+          setTimeout(() => setMsg(null), 4000);
+          return next; // unchanged — the tap is rejected
+        }
+      }
+      next.add(tripId);
+      return next;
+    });
+    setSelectedDriverId(null);
+  };
+
+  // Sort by proximity to the PRIMARY trip's pickup point (the anchor of
+  // the run) when we know both that and the driver's home address —
+  // closest first. Drivers with no home address on file sort to the
+  // bottom (not excluded, just deprioritized — no data doesn't mean
+  // unavailable).
+  const pickupCoord = primaryTrip?.pickup_sequence_coords?.[0];
+  const availableDrivers = [...availableDriversRaw]
+    .map(ds => {
+      const u = state.users.find(x => x.id === ds.driver_id);
+      const distKm = (pickupCoord && u?.home_address)
+        ? haversineKm(pickupCoord.lat, pickupCoord.lng, u.home_address.lat, u.home_address.lng) * ROAD_FACTOR
+        : null;
+      return { ds, u, distKm };
+    })
+    .sort((a, b) => {
+      if (a.distKm == null && b.distKm == null) return 0;
+      if (a.distKm == null) return 1;
+      if (b.distKm == null) return -1;
+      return a.distKm - b.distKm;
+    });
+  const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
+
+  const handleDispatch = async () => {
+    if (!primaryTrip || !selectedDriverId || overCapacity) return;
+    const driverName = state.users.find(u => u.id === selectedDriverId)?.name;
+    try {
+      if (isWeekBookingSelection) {
+        const results = await dispatch({
+          type: "TRIP/BULK_ASSIGN_DRIVER",
+          trip_ids: selectedTrips.map(t => t.trip_id),
+          driver_id: selectedDriverId,
+        });
+        // results is per-TRIP (one entry per outbound/return leg), but the
+        // admin-facing message should report distinct DAYS — a week with
+        // a return trip every day has 2 trip rows per date, so counting
+        // results.length directly would double the real day count.
+        const tripDateById = Object.fromEntries(selectedTrips.map(t => [t.trip_id, t.scheduled_date]));
+        const okResults = (results || []).filter(r => r.ok);
+        const failResults = (results || []).filter(r => !r.ok);
+        const okDays = new Set(okResults.map(r => tripDateById[r.trip_id])).size;
+        const failDays = new Set(failResults.map(r => tripDateById[r.trip_id])).size;
+        setMsg(failDays === 0
+          ? `✓ All ${okDays} day${okDays !== 1 ? "s" : ""} assigned to ${driverName}`
+          : `⚠ ${okDays} day${okDays !== 1 ? "s" : ""} assigned, ${failDays} failed — ${failResults.map(r => r.reason).join("; ")}`);
+      } else if (selectedTrips.length > 1) {
+        await dispatch({
+          type: "TRIP/DISPATCH_MULTI",
+          trip_ids: selectedTrips.map(t => t.trip_id),
+          driver_id: selectedDriverId,
+        });
+        setMsg(`✓ ${selectedTrips.length} bookings combined into one trip and dispatched to ${driverName}`);
+      } else {
+        // Single-trip case stays on the plain action — same audit trail
+        // and behavior as before this feature existed, no need to route
+        // a 1-trip "merge" through the merge machinery.
+        await dispatch({ type: "TRIP/ASSIGN_DRIVER", trip_id: primaryTrip.trip_id, driver_id: selectedDriverId });
+        setMsg(`✓ Dispatched to ${driverName}`);
+      }
+      setSelectedTripIds(new Set()); setSelectedDriverId(null);
+    } catch (e) {
+      setMsg(`✗ ${e.message || "Dispatch failed — please try again."}`);
+    } finally {
+      setTimeout(() => setMsg(null), 4000);
+    }
+  };
+
+  return (
+    <div className="pad">
+      {msg && (
+        <div style={{ background: msg.startsWith("✗") ? "rgba(220,53,69,.1)" : "rgba(29,185,84,.1)", border: `1px solid ${msg.startsWith("✗") ? "rgba(220,53,69,.3)" : "rgba(29,185,84,.3)"}`, borderRadius: 4, padding: 12 }}>
+          <span style={{ color: msg.startsWith("✗") ? COLORS.red : COLORS.green, fontWeight: 700, fontSize: 11 }}>{msg}</span>
+        </div>
+      )}
+      <SectionHeader label={`Unassigned Bookings (${unassigned.length}${(dayFilter || directionFilter || areaFilter) ? ` of ${unassignedAllDates.length}` : ""})`} />
+      {availableDates.length > 1 && (
+        <div>
+          <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY DAY</label>
+          <select className="inp" value={dayFilter} onChange={e => { setDayFilter(e.target.value); setDirectionFilter(""); setSelectedTripIds(new Set()); setSelectedDriverId(null); }} style={{ width: "100%" }}>
+            <option value="">All dates ({unassignedAllDates.length} bookings)</option>
+            {availableDates.map(d => (
+              <option key={d} value={d}>{d} ({unassignedAllDates.filter(t => t.scheduled_date === d).length} bookings)</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {availableDirections.length > 1 && (
+        <div>
+          <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY DIRECTION</label>
+          <span style={{ display: "block", fontSize: 8, color: COLORS.ghost, marginTop: -2, marginBottom: 3 }}>
+            Agents with a return booking have separate inbound and outbound legs — filter to one direction to dispatch it as its own trip.
+          </span>
+          <select className="inp" value={directionFilter} onChange={e => { setDirectionFilter(e.target.value); setAreaFilter(""); setSelectedTripIds(new Set()); setSelectedDriverId(null); }} style={{ width: "100%" }}>
+            <option value="">Both directions ({unassignedByDay.length} bookings)</option>
+            {availableDirections.map(d => (
+              <option key={d} value={d}>{d} ({unassignedByDay.filter(t => t.direction === d).length} bookings)</option>
+            ))}
+          </select>
+        </div>
+      )}
+      {directionFilter === "INBOUND" && availableAreas.length > 1 && (
+        <div>
+          <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY AREA</label>
+          <span style={{ display: "block", fontSize: 8, color: COLORS.ghost, marginTop: -2, marginBottom: 3 }}>
+            Narrows inbound bookings to one home area — useful for grouping agents who live near each other onto the same driver.
+          </span>
+          <select className="inp" value={areaFilter} onChange={e => { setAreaFilter(e.target.value); setSelectedTripIds(new Set()); setSelectedDriverId(null); }} style={{ width: "100%" }}>
+            <option value="">All areas ({unassignedByDirection.length} bookings)</option>
+            {availableAreas.map(a => (
+              <option key={a} value={a}>{a} ({unassignedByDirection.filter(t => tripHomeAreas(t).includes(a)).length} bookings)</option>
+            ))}
+          </select>
+        </div>
+      )}
+      <span style={{ fontSize: 9, color: COLORS.ghost }}>Tap to select — pick multiple bookings to combine them into one trip.</span>
+      {unassigned.length === 0 ? <Empty icon="⊕" text="No unassigned bookings" /> : unassigned.map(t => {
+        const sel = selectedTripIds.has(t.trip_id);
+        return (
+          <div key={t.trip_id} onClick={() => toggleTrip(t.trip_id)}
+            style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${sel ? COLORS.amber : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${sel ? COLORS.amber : COLORS.wire}`, background: sel ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{sel && "✓"}</span>
+                <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
+              </div>
+              <StateBadge state={t.state} />
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_name}{t.agent_ids.length > 1 && ` +${t.agent_ids.length - 1}`}</div>
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>{t.trip_type}</span>
+            </div>
+            {t.declinedBy?.length > 0 && <span style={{ fontSize: 9, color: COLORS.red }}>Declined by {t.declinedBy.length} driver{t.declinedBy.length !== 1 ? "s" : ""}</span>}
+          </div>
+        );
+      })}
+      {selectedTrips.length > 0 && (
+        <>
+          <SectionHeader label="Select Driver" />
+          <div style={{ background: overCapacity ? "rgba(220,53,69,.08)" : "rgba(245,166,35,.08)", borderRadius: 4, padding: 10, border: `1px solid ${overCapacity ? "rgba(220,53,69,.3)" : "rgba(245,166,35,.3)"}`, display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 10, color: COLORS.mist }}>
+              {selectedTrips.length === 1
+                ? <>Assigning: <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> — {primaryTrip.custom_pickup}</>
+                : isWeekBookingSelection
+                ? <>Assigning <span style={{ color: COLORS.amber }}>{primaryTrip.agent_name}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
+                : <>Combining <span style={{ color: COLORS.amber }}>{selectedTrips.length} bookings</span> onto {primaryTrip.trip_id}: {selectedTrips.map(t => t.agent_name).join(", ")}</>}
+            </span>
+            <span style={{ fontSize: 9, color: overCapacity ? COLORS.red : COLORS.ghost }}>
+              {isWeekBookingSelection
+                ? `${totalSeats}/${DRIVER_CAPACITY} seats on the busiest day${overCapacity ? " — exceeds vehicle capacity" : ""}`
+                : `${totalSeats}/${DRIVER_CAPACITY} seats${overCapacity ? " — exceeds vehicle capacity, remove a trip" : ""}`}
+            </span>
+            {underCapacityWarning && (
+              <span style={{ fontSize: 9, color: COLORS.amber }}>
+                ⚠ Under {Math.round(MIN_FULL_PCT * 100)}% target — a trip normally combines enough bookings to fill at least {Math.ceil(DRIVER_CAPACITY * MIN_FULL_PCT)} of {DRIVER_CAPACITY} seats. Consider combining with another booking before dispatching, if one's available.
+              </span>
+            )}
+          </div>
+          {availableDrivers.length === 0 ? <Empty icon="◉" text="No drivers available — all fully booked" /> : availableDrivers.map(({ ds, u, distKm }) => {
+            const load = getDriverLoad(state, ds.driver_id, primaryTrip?.scheduled_date);
+            const sel = selectedDriverId === ds.driver_id;
+            const declined = selectedTrips.some(t => t.declinedBy?.includes(ds.driver_id));
+            const isNearest = ds.driver_id === nearestDriverId;
+            return (
+              <div key={ds.driver_id} onClick={() => !declined && !overCapacity && setSelectedDriverId(ds.driver_id)}
+                style={{ cursor: (declined || overCapacity) ? "not-allowed" : "pointer", opacity: declined ? .35 : 1, background: sel ? COLORS.amber : COLORS.card, border: `1px solid ${sel ? COLORS.amber2 : isNearest ? COLORS.green : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 13, fontWeight: 700, fontFamily: FONTS.head, color: sel ? COLORS.ink : COLORS.chalk }}>{u?.name}</span>
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    {isNearest && !sel && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, border: `1px solid ${COLORS.green}`, padding: "2px 5px", borderRadius: 2 }}>NEAREST</span>}
+                    {declined && <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>DECLINED</span>}
+                    {sel && <span style={{ color: COLORS.ink }}>✓</span>}
+                  </div>
+                </div>
+                <span style={{ fontSize: 10, color: sel ? COLORS.ink : COLORS.ghost }}>{ds.vehicle}</span>
+                {u?.home_address && (
+                  <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.teal }}>
+                    🏠 {u.home_address.area || u.home_address.label}{distKm != null && ` — ${distKm.toFixed(1)} km from pickup`}
+                  </span>
+                )}
+                <CapacityBar load={load} capacity={DRIVER_CAPACITY} />
+              </div>
+            );
+          })}
+          {selectedDriverId && !overCapacity && <Button title={isWeekBookingSelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"} variant="amber" full onClick={handleDispatch} />}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Simple lat/lng-to-SVG projection over Cape Town's bounding box — used
+// for positioning pins/markers on top of the tile background below.
+// Standard Web Mercator projection, parameterized by a real viewport
+// (center lat/lng + zoom level) instead of a fixed bounding box — this is
+// what makes pan and zoom actually work: tiles and pins are both
+// projected through the exact same math, so they stay perfectly aligned
+// no matter where the viewport is centered or how zoomed in it is.
+const TILE_SIZE = 256;
+function lonLatToWorldPixel(lon, lat, zoom) {
+  const scale = TILE_SIZE * 2 ** zoom;
+  const x = ((lon + 180) / 360) * scale;
+  const latRad = (lat * Math.PI) / 180;
+  const y = (0.5 - Math.log(Math.tan(Math.PI / 4 + latRad / 2)) / (2 * Math.PI)) * scale;
+  return { x, y };
+}
+function worldPixelToLonLat(x, y, zoom) {
+  const scale = TILE_SIZE * 2 ** zoom;
+  const lon = (x / scale) * 360 - 180;
+  const n = Math.PI - (2 * Math.PI * y) / scale;
+  const lat = (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+  return { lon, lat };
+}
+// Projects a lat/lng to on-screen SVG coordinates given the current
+// viewport (center + zoom) and canvas size — replaces the old fixed
+// CPT_BOUNDS-based projectToSvg. Every caller (tiles, pins, company
+// markers) now needs a viewport object, not just width/height.
+function projectToSvg(lat, lng, width, height, viewport) {
+  const centerPx = lonLatToWorldPixel(viewport.centerLng, viewport.centerLat, viewport.zoom);
+  const pointPx = lonLatToWorldPixel(lng, lat, viewport.zoom);
+  return { x: width / 2 + (pointPx.x - centerPx.x), y: height / 2 + (pointPx.y - centerPx.y) };
+}
+// Inverse of projectToSvg — screen pixel back to lat/lng, needed for
+// drag-to-pan (converting a mouse-drag delta into how far the center
+// should move in real-world coordinates).
+function unprojectFromSvg(screenX, screenY, width, height, viewport) {
+  const centerPx = lonLatToWorldPixel(viewport.centerLng, viewport.centerLat, viewport.zoom);
+  const worldX = centerPx.x + (screenX - width / 2);
+  const worldY = centerPx.y + (screenY - height / 2);
+  return worldPixelToLonLat(worldX, worldY, viewport.zoom);
+}
+
+/* ---------- TOMTOM RASTER MAP TILES ----------
+   Real street-map background for the live tracking views, using TomTom's
+   raster tile API directly (plain <img> tiles, standard slippy-map x/y/z
+   math) — NOT the Maps SDK for Web, which is mid-deprecation right now
+   (v6 CDN endpoints scheduled for withdrawal, newer SDK still in public
+   preview). Raster tiles are a stable, well-documented REST endpoint with
+   no SDK dependency, so this is the safer choice while that transition
+   is ongoing.
+
+   If no TomTom key is configured, the background is simply left blank
+   (solid color) — pins/markers still work exactly as before, just
+   without street context underneath. */
+function lonLatToTile(lon, lat, zoom) {
+  const latRad = (lat * Math.PI) / 180;
+  const n = 2 ** zoom;
+  const x = Math.floor(((lon + 180) / 360) * n);
+  const y = Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+  return { x, y };
+}
+function tileToLonLat(x, y, zoom) {
+  const n = 2 ** zoom;
+  const lon = (x / n) * 360 - 180;
+  const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+  return { lon, lat: (latRad * 180) / Math.PI };
+}
+
+function tomtomTileUrl(x, y, zoom) {
+  return `https://api.tomtom.com/map/1/tile/basic/main/${zoom}/${x}/${y}.png?key=${TOMTOM_API_KEY}&tileSize=256`;
+}
+
+// Renders every raster tile visible within the current viewport (center +
+// zoom + canvas size) as an <img> grid absolutely positioned behind the
+// SVG pin overlay. Unlike the earlier fixed-CPT_BOUNDS version, this
+// recomputes which tiles are needed on every viewport change, which is
+// what makes real pan/zoom possible — zooming in requests more, smaller
+// tiles; panning requests a different set of tiles for the new center.
+function LiveMapTiles({ width, height, viewport }) {
+  if (!TOMTOM_API_KEY) {
+    return <div style={{ position: "absolute", inset: 0, background: COLORS.surface }} />;
+  }
+  const zoom = Math.round(viewport.zoom);
+  // Corners of the visible canvas, converted to lon/lat, then to which
+  // tile range covers them — same idea as the old bounds-based version,
+  // just driven by the current viewport's visible area instead of a
+  // fixed Cape Town box.
+  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
+  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
+  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
+  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+  const tiles = [];
+  // +/-1 tile of padding so panning doesn't show a visible gap at the
+  // edge for a frame while new tiles load in.
+  for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
+    for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
+      const nw = tileToLonLat(tx, ty, zoom);
+      const se = tileToLonLat(tx + 1, ty + 1, zoom);
+      const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
+      const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+      tiles.push(
+        <img
+          key={`${zoom}-${tx}-${ty}`}
+          src={tomtomTileUrl(tx, ty, zoom)}
+          alt=""
+          draggable={false}
+          style={{ position: "absolute", left: p1.x, top: p1.y, width: p2.x - p1.x, height: p2.y - p1.y, pointerEvents: "none" }}
+          onError={(e) => { e.target.style.display = "none"; }}
+        />
+      );
+    }
+  }
+  return <div style={{ position: "absolute", inset: 0, background: COLORS.surface, overflow: "hidden" }}>{tiles}</div>;
+}
+
+function timeSinceLabel(isoString) {
+  if (!isoString) return "no data";
+  const diffSec = Math.max(0, Math.round((Date.now() - new Date(isoString).getTime()) / 1000));
+  if (diffSec < 60) return `${diffSec}s ago`;
+  if (diffSec < 3600) return `${Math.round(diffSec / 60)}m ago`;
+  return `${Math.round(diffSec / 3600)}h ago`;
+}
+
+function AdminLiveMap({ state, user }) {
+  const [selectedDriverId, setSelectedDriverId] = useState(null);
+  const W = 700, H = 560;
+  // Viewport state: center lat/lng + zoom level (standard slippy-map
+  // zoom, ~10-18 is a reasonable city-to-street range). Starts centered
+  // on Cape Town's old fixed bounding box at roughly the same zoom the
+  // static version used, so the initial view looks the same as before —
+  // pan/zoom is purely additive from here.
+  const CPT_CENTER = { lat: (CPT_BOUNDS.north + CPT_BOUNDS.south) / 2, lng: (CPT_BOUNDS.east + CPT_BOUNDS.west) / 2 };
+  const [viewport, setViewport] = useState({ centerLat: CPT_CENTER.lat, centerLng: CPT_CENTER.lng, zoom: 11 });
+  const dragRef = useRef(null); // { startScreenX, startScreenY, startCenterLat, startCenterLng } while dragging
+  const svgRef = useRef(null);
+
+  // Live positions from the fast broadcast channel — keyed by driver id,
+  // merged on top of the slower DB-backed state.driver_positions below.
+  // The DB version remains the source of truth right after page load (or
+  // for a driver who hasn't broadcast yet this session); broadcasts take
+  // over the instant they start arriving, giving near-instant pin
+  // movement instead of waiting for the ~25s DB persistence cycle.
+  const [livePositions, setLivePositions] = useState({});
+  useEffect(() => {
+    if (!supabase) return;
+    const driverIds = state.driver_status.map(ds => ds.driver_id);
+    const channels = driverIds.map(id => {
+      const ch = supabase.channel(driverPositionChannelName(id));
+      ch.on("broadcast", { event: "pos" }, ({ payload }) => {
+        setLivePositions(prev => ({
+          ...prev,
+          [id]: { lat: payload.la, lng: payload.lo, heading: payload.h, speed_kmh: payload.s, trip_id: payload.t, updated_at: new Date(payload.ts).toISOString() },
+        }));
+      });
+      ch.subscribe();
+      return ch;
+    });
+    return () => { channels.forEach(ch => supabase.removeChannel(ch)); };
+    // Re-subscribes if the set of drivers changes (new driver added) —
+    // deliberately keyed on the joined id list, not driver_status itself,
+    // so a driver_status field update (e.g. vehicle edited) doesn't tear
+    // down and recreate every channel unnecessarily.
+  }, [state.driver_status.map(ds => ds.driver_id).join(",")]);
+
+  // Viewer sees the live map itself (position, status) but not vehicle/
+  // phone/address detail — same restriction already applied to the
+  // Drivers tab and driver search, just extended to the map's detail
+  // card too.
+  const showVehicleDetail = hasAdminPermission(user, "viewDriverProfiles");
+
+  const driverPoints = state.driver_status.map(ds => {
+    const driverUser = state.users.find(u => u.id === ds.driver_id);
+    // Prefer the live broadcast position when available — it's always
+    // more current than the DB-backed one once a driver starts sending.
+    const pos = livePositions[ds.driver_id] || state.driver_positions?.[ds.driver_id];
+    const trip = pos?.trip_id ? state.trips.find(t => t.trip_id === pos.trip_id) : null;
+    // Stale = no update in over 30s, roughly 4x the expected ~8s interval —
+    // catches a driver whose tab was closed or lost signal, not just normal
+    // jitter between updates.
+    const stale = pos ? (Date.now() - new Date(pos.updated_at).getTime()) > 30000 : true;
+    return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale };
+  });
+
+  const withPosition = driverPoints.filter(d => d.pos);
+  const selected = selectedDriverId ? driverPoints.find(d => d.driverId === selectedDriverId) : null;
+
+  const zoomIn = () => setViewport(v => ({ ...v, zoom: Math.min(18, v.zoom + 1) }));
+  const zoomOut = () => setViewport(v => ({ ...v, zoom: Math.max(3, v.zoom - 1) }));
+
+  // "See all active drivers" — recenter and zoom the viewport so every
+  // currently-reporting driver fits on screen at once. This is the real
+  // fix for pins that looked "missing" because they were outside the old
+  // fixed Cape Town box, or too close together to tell apart without
+  // zooming — recentering makes both cases immediately visible instead
+  // of requiring someone to guess where an off-screen pin might be.
+  const fitAllDrivers = () => {
+    if (withPosition.length === 0) return;
+    const lats = withPosition.map(d => d.pos.lat), lngs = withPosition.map(d => d.pos.lng);
+    const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+    const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+    const centerLat = (minLat + maxLat) / 2, centerLng = (minLng + maxLng) / 2;
+    // Pick the zoom level where the lat/lng span of all drivers still
+    // fits comfortably within the canvas, with some padding — tried from
+    // most-zoomed-in downward until the projected span fits.
+    let zoom = 15;
+    for (; zoom > 3; zoom--) {
+      const p1 = lonLatToWorldPixel(minLng, maxLat, zoom);
+      const p2 = lonLatToWorldPixel(maxLng, minLat, zoom);
+      const spanX = Math.abs(p2.x - p1.x), spanY = Math.abs(p2.y - p1.y);
+      if (spanX < W * 0.75 && spanY < H * 0.75) break;
+    }
+    setViewport({ centerLat, centerLng, zoom });
+  };
+
+  // Drag-to-pan: on mouse/touch down, record the starting screen position
+  // and the viewport's center at that moment. On move, compute how many
+  // screen pixels the pointer has moved and convert that into a real
+  // lat/lng shift for the center — same math as unprojectFromSvg, just
+  // applied to a delta instead of an absolute point.
+  const handlePointerDown = (e) => {
+    const rect = svgRef.current.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    dragRef.current = {
+      startScreenX: clientX, startScreenY: clientY,
+      startCenterLat: viewport.centerLat, startCenterLng: viewport.centerLng,
+      rectWidth: rect.width, rectHeight: rect.height,
+    };
+  };
+  const handlePointerMove = (e) => {
+    if (!dragRef.current) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const dxScreen = clientX - dragRef.current.startScreenX;
+    const dyScreen = clientY - dragRef.current.startScreenY;
+    // Scale from actual rendered CSS pixels to the SVG's internal W/H
+    // coordinate space, since the SVG scales to fill its container.
+    const scaleX = W / dragRef.current.rectWidth, scaleY = H / dragRef.current.rectHeight;
+    const startCenterPx = lonLatToWorldPixel(dragRef.current.startCenterLng, dragRef.current.startCenterLat, viewport.zoom);
+    const newCenterPx = { x: startCenterPx.x - dxScreen * scaleX, y: startCenterPx.y - dyScreen * scaleY };
+    const newCenterLonLat = worldPixelToLonLat(newCenterPx.x, newCenterPx.y, viewport.zoom);
+    setViewport(v => ({ ...v, centerLat: newCenterLonLat.lat, centerLng: newCenterLonLat.lon }));
+  };
+  const handlePointerUp = () => { dragRef.current = null; };
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <SectionHeader label={`Live Driver Tracking (${withPosition.length}/${driverPoints.length} reporting)`} />
+        <div style={{ display: "flex", gap: 6 }}>
+          <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
+          <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
+          <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
+        </div>
+      </div>
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
+        Positions update while a driver has the app open and an active trip. Grey pins haven't reported in over 30 seconds. Drag to pan, use +/− or scroll to zoom.
+      </div>
+
+      <Card body={false} style={{ padding: 0, overflow: "hidden" }}>
+        <div style={{ position: "relative", width: "100%", aspectRatio: `${W} / ${H}` }}>
+          <LiveMapTiles width={W} height={H} viewport={viewport} />
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${W} ${H}`}
+            style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block", cursor: dragRef.current ? "grabbing" : "grab" }}
+            onMouseDown={handlePointerDown} onMouseMove={handlePointerMove} onMouseUp={handlePointerUp} onMouseLeave={handlePointerUp}
+            onTouchStart={handlePointerDown} onTouchMove={handlePointerMove} onTouchEnd={handlePointerUp}
+            onWheel={(e) => { e.preventDefault(); setViewport(v => ({ ...v, zoom: Math.max(3, Math.min(18, v.zoom + (e.deltaY < 0 ? 0.5 : -0.5))) })); }}
+          >
+          {/* Company location reference points */}
+          {(state.companies || []).filter(co => co.address?.lat != null).map(co => {
+            const p = projectToSvg(co.address.lat, co.address.lng, W, H, viewport);
+            return (
+              <g key={co.id}>
+                <rect x={p.x - 5} y={p.y - 5} width={10} height={10} fill={COLORS.amber} opacity={0.7} />
+                <text x={p.x + 8} y={p.y + 4} fontSize={9} fill={COLORS.ghost}>{co.name}</text>
+              </g>
+            );
+          })}
+
+          {driverPoints.filter(d => d.pos).map(d => {
+            const p = projectToSvg(d.pos.lat, d.pos.lng, W, H, viewport);
+            const color = d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green;
+            const isSelected = selectedDriverId === d.driverId;
+            return (
+              <g key={d.driverId} onClick={() => setSelectedDriverId(isSelected ? null : d.driverId)} style={{ cursor: "pointer" }}>
+                {isSelected && <circle cx={p.x} cy={p.y} r={14} fill="none" stroke={color} strokeWidth={1.5} opacity={0.5} />}
+                <circle cx={p.x} cy={p.y} r={7} fill={color} stroke={COLORS.panel} strokeWidth={2} />
+                {d.pos.heading != null && !d.stale && (
+                  <line
+                    x1={p.x} y1={p.y}
+                    x2={p.x + Math.sin((d.pos.heading * Math.PI) / 180) * 14}
+                    y2={p.y - Math.cos((d.pos.heading * Math.PI) / 180) * 14}
+                    stroke={color} strokeWidth={2}
+                  />
+                )}
+                <text x={p.x} y={p.y - 12} fontSize={9} fontWeight={700} fill={COLORS.chalk} textAnchor="middle">{d.name.split(" ")[0]}</text>
+              </g>
+            );
+          })}
+          </svg>
+        </div>
+      </Card>
+
+      {selected && (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{selected.name}</div>
+              {showVehicleDetail && <div style={{ fontSize: 10, color: COLORS.ghost }}>{selected.vehicle}</div>}
+            </div>
+            <StateBadge state={selected.stale ? "OFFLINE" : selected.state} />
+          </div>
+          {selected.pos ? (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8, fontSize: 10 }}>
+              <span><span style={{ color: COLORS.ghost }}>UPDATED: </span>{timeSinceLabel(selected.pos.updated_at)}</span>
+              {selected.pos.speed_kmh != null && <span><span style={{ color: COLORS.ghost }}>SPEED: </span>{Math.round(selected.pos.speed_kmh)} km/h</span>}
+              {selected.pos.accuracy_m != null && <span><span style={{ color: COLORS.ghost }}>ACCURACY: </span>±{Math.round(selected.pos.accuracy_m)}m</span>}
+            </div>
+          ) : (
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>No position data yet.</span>
+          )}
+          {selected.trip && (
+            <div style={{ fontSize: 10, color: COLORS.mist }}>On trip {selected.trip.trip_id} — {selected.trip.agent_name}</div>
+          )}
+        </Card>
+      )}
+
+      <SectionHeader label="All Drivers" />
+      {driverPoints.map(d => (
+        <div key={d.driverId} onClick={() => setSelectedDriverId(d.driverId === selectedDriverId ? null : d.driverId)}
+          style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}`, background: d.driverId === selectedDriverId ? "rgba(245,166,35,.05)" : "transparent" }}>
+          <span style={{ width: 8, height: 8, borderRadius: 4, background: !d.pos || d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green, flexShrink: 0 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 11, fontWeight: 700 }}>{d.name}</div>
+            <div style={{ fontSize: 9, color: COLORS.ghost }}>{d.pos ? timeSinceLabel(d.pos.updated_at) : "never reported"}</div>
+          </div>
+          <StateBadge state={!d.pos || d.stale ? "OFFLINE" : d.state} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
+function AdminDrivers({ state, user }) {
+  // Same "full" question the Dashboard asks — whether a driver is at
+  // capacity RIGHT NOW (today), not across every date they happen to
+  // have any assignment on (a driver booked solid on 4 different future
+  // days of one agent's week isn't "full" today).
+  const todayStr = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  // Viewer sees driver name + vehicle registration only — no phone, no
+  // home address, no live status, no active-route detail. Full tier
+  // (Fleet Ops / Standard) still sees everything, same as before.
+  const fullView = hasAdminPermission(user, "viewDriverProfiles");
+
+  if (!fullView) {
+    return (
+      <div className="pad">
+        <SectionHeader label={`Drivers (${state.driver_status.length})`} />
+        {state.driver_status.length === 0 ? <Empty icon="◉" text="No drivers registered" /> : state.driver_status.map(ds => {
+          const driverUser = state.users.find(u => u.id === ds.driver_id);
+          return (
+            <Card key={ds.driver_id}>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <DriverAvatar name={driverUser?.name} size={40} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{driverUser?.name}</div>
+                  <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
+                </div>
+              </div>
+            </Card>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className="pad">
+      <SectionHeader label={`Drivers (${state.driver_status.length})`} />
+      {state.driver_status.length === 0 ? <Empty icon="◉" text="No drivers registered" /> : state.driver_status.map(ds => {
+        const driverUser = state.users.find(u => u.id === ds.driver_id);
+        const load = getDriverLoad(state, ds.driver_id, todayStr);
+        const full = load >= DRIVER_CAPACITY;
+        const activeTrips = state.trips.filter(t => t.driver_id === ds.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+        return (
+          <Card key={ds.driver_id}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+              <DriverAvatar name={driverUser?.name} size={46} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>{driverUser?.name}</div>
+                <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
+                <div style={{ fontSize: 10, color: COLORS.ghost }}>{ds.phone}</div>
+                {driverUser?.home_address && (
+                  <div style={{ fontSize: 10, color: COLORS.teal, marginTop: 2 }}>🏠 Lives in {driverUser.home_address.area || driverUser.home_address.label}</div>
+                )}
+              </div>
+              <StateBadge state={full ? "FULLY_BOOKED" : ds.state} />
+            </div>
+            <CapacityBar load={load} capacity={DRIVER_CAPACITY} />
+            {activeTrips.length > 0 ? (
+              <>
+                <SectionHeader label="Active Route" />
+                {activeTrips.map(trip => {
+                  const pickupCoord = trip.pickup_sequence_coords?.[0];
+                  const dropCoord = trip.dropoff_sequence_coords?.[0];
+                  return (
+                    <div key={trip.trip_id} style={{ display: "flex", gap: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
+                      <div style={{ width: 26, height: 26, borderRadius: 4, border: "1px solid rgba(29,185,84,.3)", background: "rgba(29,185,84,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                        <span style={{ fontSize: 11, color: COLORS.green, fontWeight: 800 }}>{trip.pickup_order_num}</span>
+                      </div>
+                      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
+                        <StateBadge state={trip.state} />
+                        <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.agent_name}</span>
+                        <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
+                        <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{trip.custom_dropoff}</span>
+                        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                          {pickupCoord && <Button title="🧭 PICKUP" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
+                          {dropCoord && <Button title="🧭 DROP" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </>
+            ) : <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 8 }}>No active trips — driver available</span>}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+// Read-only detail view — every field the app actually stores about this
+// person, not just the sliver shown in the list row. Trip counts are
+// computed from `state.trips`, which only holds the live ~60-day window
+// (see fetchAllFromSupabase) — labelled honestly rather than implying a
+// full lifetime count.
+function UserProfilePanel({ u, driverStatus, state }) {
+  const branch = u.branch_id ? companyById(state, u.branch_id) : null;
+  const campaign = u.campaign_id ? (state.campaigns || []).find(c => c.id === u.campaign_id) : null;
+  const myTrips = state.trips.filter(t => t.agent_ids?.includes(u.id) || t.driver_id === u.id);
+  const activeTrips = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+  const completedTrips = myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
+
+  const Row = ({ label, children }) => (
+    <div style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "6px 0", borderBottom: `1px solid ${COLORS.wire}` }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>{label}</span>
+      <span style={{ fontSize: 10, color: COLORS.chalk, textAlign: "right" }}>{children}</span>
+    </div>
+  );
+
+  return (
+    <Card>
+      <SectionHeader label="Profile" />
+      <Row label="FULL NAME">{u.name}</Row>
+      <Row label="ROLE"><RoleBadge role={u.role} /></Row>
+      <Row label="STAFF NUMBER">{u.staff_number || "—"}</Row>
+      <Row label="USERNAME (LOGIN)">{u.auth?.login || "—"}</Row>
+
+      {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && (
+        <>
+          <Row label="HOME ADDRESS">{u.home_address?.label || "Not on file"}</Row>
+          <Row label="HOME AREA">{u.home_address?.area || "—"}</Row>
+        </>
+      )}
+
+      {u.role === ROLE.AGENT && (
+        <>
+          <Row label="COMPANY">{branch?.label || u.branch_id || "—"}</Row>
+          <Row label="CAMPAIGN / PROJECT">{campaign?.name || (u.campaign_id ? `#${u.campaign_id} (deleted?)` : "None assigned")}</Row>
+        </>
+      )}
+
+      {u.role === ROLE.DRIVER && (
+        <>
+          <Row label="COMPANY">{branch?.label || u.branch_id || "—"}</Row>
+          <Row label="VEHICLE">{driverStatus?.vehicle || "—"}</Row>
+          <Row label="CONTACT PHONE">{driverStatus?.phone || "—"}</Row>
+          <Row label="CURRENT STATE"><StateBadge state={driverStatus?.state || DRIVER_STATE.AVAILABLE} /></Row>
+        </>
+      )}
+
+      {u.role === ROLE.ADMIN && (
+        <>
+          <Row label="ADMIN LEVEL">{ADMIN_LEVEL_LABEL[u.admin_level] || "—"}</Row>
+          <Row label="COMPANIES">
+            {(u.scoped_company_ids || []).length === 0
+              ? "None assigned"
+              : u.scoped_company_ids.map(id => companyById(state, id)?.label || id).join(", ")}
+          </Row>
+        </>
+      )}
+
+      {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && (
+        <>
+          <Row label="ACTIVE TRIPS (LIVE WINDOW)">{activeTrips.length}</Row>
+          <Row label="COMPLETED TRIPS (LIVE WINDOW)">{completedTrips.length}</Row>
+        </>
+      )}
+
+      {u.role === ROLE.AGENT && (u.branch_history || []).length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <SectionHeader label="Company History" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {u.branch_history.map((h, i) => {
+              const oldBranch = companyById(state, h.branch_id);
+              return (
+                <div key={i} style={{ fontSize: 9, color: COLORS.ghost, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: 8 }}>
+                  <div style={{ color: COLORS.chalk, fontWeight: 700 }}>{oldBranch?.label || h.branch_id}</div>
+                  <div style={{ marginTop: 2 }}>{h.reason}</div>
+                  <div style={{ marginTop: 2, color: COLORS.dim }}>{h.changed_at}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
+  const [form, setForm] = useState({
+    name: user.name, staffNumber: user.staff_number || "",
+    vehicle: driverStatus?.vehicle || "", phone: driverStatus?.phone || "",
+    homeStreet: user.home_address?.label || "", homeArea: user.home_address?.area || "",
+    homeCoord: user.home_address ? { lat: user.home_address.lat, lng: user.home_address.lng } : null,
+    branchId: user.branch_id || null,
+    campaignId: user.campaign_id || null,
+    adminLevel: user.admin_level || ADMIN_LEVEL.VIEWER,
+    scopedCompanyIds: user.scoped_company_ids || [],
+  });
+  const [saving, setSaving] = useState(false);
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  // Live preview of the >40 km branch-reassignment rule, computed from
+  // whatever address is currently in the form (not necessarily saved yet),
+  // so the admin sees the warning before committing the change.
+  const branchDistanceKm = (() => {
+    if (!form.homeCoord) return null;
+    const branch = companyById(state, form.branchId);
+    if (!branch || branch.lat == null) return null;
+    return haversineKm(form.homeCoord.lat, form.homeCoord.lng, branch.lat, branch.lng) * ROAD_FACTOR;
+  })();
+  const willFlagFarReassignment = form.branchId !== user.branch_id && branchDistanceKm != null && branchDistanceKm > 40;
+
+  const [saveError, setSaveError] = useState(null);
+  const save = async () => {
+    if (!form.name) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/UPDATE_USER", user_id: user.id,
+        name: form.name,
+        login: form.name, // username is always kept in sync with full name
+        staff_number: form.staffNumber || undefined,
+        // Password mirrors the staff number (the app's credential model),
+        // but only re-synced when the staff number ACTUALLY changed —
+        // previously this was sent on every save, so any unrelated edit
+        // (name fix, address confirmation, branch move) silently reset
+        // the password back to the staff number, clobbering a password
+        // someone had set directly in the database. Undefined = keep
+        // existing in both backends.
+        pass: (form.staffNumber && form.staffNumber !== (user.staff_number || "")) ? form.staffNumber : undefined,
+        vehicle: user.role === ROLE.DRIVER ? form.vehicle : undefined,
+        phone: user.role === ROLE.DRIVER ? form.phone : undefined,
+        // Only sent when the admin actually confirmed a new address via
+        // the search — undefined means "leave unchanged" in both backends.
+        // Previously this sent null whenever homeCoord was null, so
+        // saving ANY edit (even just a name fix) while the address field
+        // was empty or typed-but-unconfirmed silently WIPED the person's
+        // home address — including label-only bulk-imported addresses
+        // that were sitting in the DB awaiting confirmation.
+        home_address: ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER) && form.homeCoord)
+          ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng }
+          : undefined,
+        branch_id: (user.role === ROLE.AGENT || user.role === ROLE.DRIVER) ? form.branchId : undefined,
+        campaign_id: user.role === ROLE.AGENT ? form.campaignId : undefined,
+        admin_level: user.role === ROLE.ADMIN ? form.adminLevel : undefined,
+        scoped_company_ids: user.role === ROLE.ADMIN ? form.scopedCompanyIds : undefined,
+      });
+      onClose();
+    } catch (e) {
+      setSaveError(e.message || "Couldn't save changes — please try again.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card style={{ borderColor: COLORS.amber2, background: "rgba(245,166,35,.03)" }}>
+      <SectionHeader label={`Edit — ${user.role}`} />
+      <TextField label="Full Name" value={form.name} onChange={e => set("name", e.target.value)} />
+      <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Username is always the full name — currently "{form.name || user.name}"</span>
+      <TextField label="Staff Number (also used as password)" value={form.staffNumber} onChange={e => set("staffNumber", e.target.value)} placeholder="e.g. AG1004" />
+      {user.role === ROLE.AGENT && (
+        <>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <SectionHeader label="Home Address (Cape Town)" />
+            <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
+              preConfirmed={form.homeCoord ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
+              onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: confirmed ? coord : null }))} />
+          </div>
+
+          <SectionHeader label="Company" />
+          {(state?.companies || []).length === 0 ? (
+            <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet — add one from Manage Companies before assigning agents.</span>
+          ) : (
+            <select className="inp" value={form.branchId || ""} onChange={e => set("branchId", e.target.value || null)} style={{ width: "100%" }}>
+              <option value="">— None —</option>
+              {state.companies
+                // Active companies, plus whichever one this agent is
+                // CURRENTLY on even if it's since been deactivated — an
+                // admin editing this agent shouldn't see their existing
+                // assignment silently vanish from the list.
+                .filter(c => c.active || c.id === user.branch_id)
+                .map(c => <option key={c.id} value={c.id}>{c.name}{!c.active ? " (inactive)" : ""}</option>)}
+            </select>
+          )}
+          {branchDistanceKm != null && (
+            <span style={{ fontSize: 9, color: willFlagFarReassignment ? COLORS.red : COLORS.ghost }}>
+              {branchDistanceKm.toFixed(1)} km from home address
+              {willFlagFarReassignment ? " — exceeds 40 km, previous company will be kept on file" : ""}
+            </span>
+          )}
+
+          <SectionHeader label="Campaign / Project" />
+          {(state?.campaigns || []).length === 0 ? (
+            <span style={{ fontSize: 9, color: COLORS.ghost }}>No campaigns have been added yet.</span>
+          ) : (
+            <select className="inp" value={form.campaignId || ""} onChange={e => set("campaignId", e.target.value || null)} style={{ width: "100%" }}>
+              <option value="">— None —</option>
+              {state.campaigns.filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          )}
+          {(user.branch_history || []).length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4, background: COLORS.surface, borderRadius: 4, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>Company History</span>
+              {user.branch_history.map((h, i) => {
+                const b = companyById(state, h.branch_id);
+                return <span key={i} style={{ fontSize: 9, color: COLORS.chalk }}>• {b?.label || h.branch_id} — {h.changed_at}</span>;
+              })}
+            </div>
+          )}
+        </>
+      )}
+      {user.role === ROLE.DRIVER && (
+        <>
+          <TextField label="Vehicle" value={form.vehicle} onChange={e => set("vehicle", e.target.value)} placeholder="Toyota Hiace - CA 000-000" />
+          <TextField label="Phone" value={form.phone} onChange={e => set("phone", e.target.value)} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <SectionHeader label="Home Area (Cape Town)" />
+            <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Used by admins to see which area this driver lives in when assigning trips.</span>
+            <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
+              preConfirmed={form.homeCoord ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
+              onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: confirmed ? coord : null }))} />
+          </div>
+          <SectionHeader label="Company" />
+          {(state?.companies || []).length === 0 ? (
+            <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet — add one from Manage Companies before assigning drivers.</span>
+          ) : (
+            <select className="inp" value={form.branchId || ""} onChange={e => set("branchId", e.target.value || null)} style={{ width: "100%" }}>
+              <option value="">— None —</option>
+              {state.companies
+                .filter(c => c.active || c.id === user.branch_id)
+                .map(c => <option key={c.id} value={c.id}>{c.name}{!c.active ? " (inactive)" : ""}</option>)}
+            </select>
+          )}
+        </>
+      )}
+      {user.role === ROLE.ADMIN && (
+        <>
+          <SectionHeader label="Admin Level" />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {Object.values(ADMIN_LEVEL).map(lvl => (
+              <Button key={lvl} title={ADMIN_LEVEL_LABEL[lvl]} size="sm" variant={form.adminLevel === lvl ? "amber" : "ghost"} onClick={() => set("adminLevel", lvl)} full />
+            ))}
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <SectionHeader label="Companies (optional)" />
+            <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>
+              {form.adminLevel === ADMIN_LEVEL.VIEWER
+                ? "If any are checked, this Viewer only sees agents, drivers on their trips, trips, tickets, and alerts belonging to the selected companies. Leave all unchecked for unrestricted (all-company) Viewer access."
+                : "A label for which companies this admin manages — Fleet Ops and Standard admins always see every company's data regardless of what's checked here; this doesn't restrict anything for them."}
+            </span>
+            {(state?.companies || []).length === 0 ? (
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet.</span>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {state.companies
+                  .filter(c => c.active || (user.scoped_company_ids || []).includes(c.id))
+                  .map(c => {
+                    const checked = form.scopedCompanyIds.includes(c.id);
+                    return (
+                      <div key={c.id} onClick={() => set("scopedCompanyIds", checked ? form.scopedCompanyIds.filter(id => id !== c.id) : [...form.scopedCompanyIds, c.id])}
+                        style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                        <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{checked && "✓"}</span>
+                        <span style={{ fontSize: 11, color: COLORS.chalk }}>{c.name}{!c.active ? " (inactive)" : ""}</span>
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+          </div>
+        </>
+      )}
+      {saveError && <span style={{ fontSize: 10, color: COLORS.red }}>{saveError}</span>}
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} />
+        <Button title={saving ? "SAVING…" : "SAVE CHANGES"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={saving} loading={saving} />
+      </div>
+    </Card>
+  );
+}
+
+// Minimal but correct CSV parser — handles quoted fields (with embedded
+// commas/newlines) and escaped double-quotes ("" inside a quoted field).
+// A naive split(",") breaks on any real-world Excel export with a comma
+// inside an address field, which is exactly the kind of data this imports.
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i], next = text[i + 1];
+    if (inQuotes) {
+      if (c === '"' && next === '"') { field += '"'; i++; }
+      else if (c === '"') { inQuotes = false; }
+      else { field += c; }
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === ",") { row.push(field); field = ""; }
+      else if (c === "\r") { /* skip, \n handles the line break */ }
+      else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+      else field += c;
+    }
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(cell => cell.trim() !== ""));
+}
+
+function usersToCsv(users, driverStatusList) {
+  const headers = [
+    "Full Name", "Role", "Staff Number", "Login (username)", "Password (hint)",
+    "Admin Level", "Home Address", "Home Area", "Home Lat", "Home Lng", "Company",
+    "Vehicle", "Phone",
+  ];
+  const escapeCsv = (val) => {
+    const s = val == null ? "" : String(val);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = users.map(u => {
+    const ds = u.role === ROLE.DRIVER ? driverStatusList.find(d => d.driver_id === u.id) : null;
+    return [
+      // Login comes from the account's real auth field, not the name —
+      // the name only matches the DEFAULT at creation time; an account
+      // whose username an admin later changed would otherwise export
+      // the wrong login. The password column is a static onboarding
+      // hint now that passwords are salted-hashed — the actual value is
+      // deliberately unrecoverable from any export.
+      u.name, u.role, u.staff_number || "", u.auth?.login ?? u.name, "(staff number, unless changed)",
+      u.admin_level || "", u.home_address?.label || "", u.home_address?.area || "",
+      u.home_address?.lat ?? "", u.home_address?.lng ?? "", u.branch_id || "",
+      ds?.vehicle || "", ds?.phone || "",
+    ];
+  });
+  const csv = [headers, ...rows].map(r => r.map(escapeCsv).join(",")).join("\r\n");
+  return "\uFEFF" + csv;
+}
+
+function downloadCsv(csvContent, filename) {
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Expected CSV columns for bulk import (case-insensitive, order-independent
+// — matched by header name, not position, so a slightly reordered export
+// from Excel still imports correctly):
+//   Full Name, Role (AGENT/DRIVER), Staff Number, Home Address, Home Area,
+//   Company (AGENT or DRIVER — matched against Manage Companies by name, id, or area),
+//   Vehicle (DRIVER only), Phone (DRIVER only)
+// Home Lat/Lng are deliberately NOT required on import — bulk-uploaded
+// agents get geocoded the normal way (via the address search) the first
+// time an admin edits them, rather than trusting arbitrary lat/lng values
+// pasted into a spreadsheet, which risks silently misplacing someone's
+// pickup point with no validation at all.
+function parseUsersCsv(text, companies = []) {
+  const rows = parseCsv(text);
+  if (rows.length < 2) return { records: [], errors: ["File appears to be empty or has no data rows."] };
+  const headerRow = rows[0].map(h => h.trim().toLowerCase());
+  const col = (name) => headerRow.indexOf(name.toLowerCase());
+  const idxName = col("full name"), idxRole = col("role"), idxStaff = col("staff number");
+  const idxAddr = col("home address"), idxArea = col("home area"), idxBranch = col("company") !== -1 ? col("company") : col("branch");
+  const idxVehicle = col("vehicle"), idxPhone = col("phone");
+
+  const errors = [];
+  if (idxName === -1) errors.push('Missing required column "Full Name".');
+  if (idxRole === -1) errors.push('Missing required column "Role".');
+  if (idxStaff === -1) errors.push('Missing required column "Staff Number".');
+  if (errors.length) return { records: [], errors };
+
+  const records = [];
+  rows.slice(1).forEach((r, i) => {
+    const rowNum = i + 2; // +2: 1-indexed, plus the header row itself
+    const name = (r[idxName] || "").trim();
+    const role = (r[idxRole] || "").trim().toUpperCase();
+    const staffNumber = (r[idxStaff] || "").trim();
+    if (!name || !role || !staffNumber) {
+      errors.push(`Row ${rowNum}: missing Full Name, Role, or Staff Number — skipped.`);
+      return;
+    }
+    if (![ROLE.AGENT, ROLE.DRIVER].includes(role)) {
+      errors.push(`Row ${rowNum}: Role "${role}" must be AGENT or DRIVER — skipped. (Admin accounts can't be bulk-created for security reasons — create those individually.)`);
+      return;
+    }
+    // Branch (company) accepts the internal id, the company name, or
+    // either address's area — case/spacing insensitive — since a real
+    // spreadsheet will contain whatever the admin naturally typed, not
+    // an internal id. Unrecognized values error the row rather than
+    // silently creating an agent tied to a company that doesn't exist
+    // (who then can't book at all, with no hint why).
+    const rawBranch = idxBranch !== -1 ? (r[idxBranch] || "").trim() : "";
+    let branchId = "";
+    if (rawBranch) {
+      const norm = (s) => String(s).toLowerCase().replace(/[\s_]+/g, "");
+      const match = companies.find(c =>
+        norm(c.id) === norm(rawBranch) || norm(c.name) === norm(rawBranch) ||
+        norm(c.address?.area) === norm(rawBranch)
+      );
+      if (!match && (role === ROLE.AGENT || role === ROLE.DRIVER)) {
+        errors.push(`Row ${rowNum}: Company "${rawBranch}" not recognized — use ${companies.length ? companies.map(c => `"${c.name}"`).join(" or ") : "a company added under Manage Companies"}. Row skipped.`);
+        return;
+      }
+      branchId = match?.id || "";
+    }
+    records.push({
+      rowNum, name, role, staffNumber,
+      homeAddress: idxAddr !== -1 ? (r[idxAddr] || "").trim() : "",
+      homeArea: idxArea !== -1 ? (r[idxArea] || "").trim() : "",
+      branchId,
+      vehicle: idxVehicle !== -1 ? (r[idxVehicle] || "").trim() : "",
+      phone: idxPhone !== -1 ? (r[idxPhone] || "").trim() : "",
+    });
+  });
+  return { records, errors };
+}
+
+function BulkUserImportPanel({ state, dispatch, onClose, onDone }) {
+  const [fileName, setFileName] = useState(null);
+  const [parsed, setParsed] = useState(null); // { records, errors }
+  const [importing, setImporting] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [results, setResults] = useState(null); // { succeeded, failed: [{row, reason}] }
+  const fileInputRef = useRef(null);
+
+  const handleFile = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setFileName(file.name);
+    setResults(null);
+    const reader = new FileReader();
+    reader.onload = (ev) => setParsed(parseUsersCsv(String(ev.target.result), state?.companies || []));
+    reader.readAsText(file);
+  };
+
+  const runImport = async () => {
+    if (!parsed?.records?.length) return;
+    setImporting(true);
+    setProgress({ done: 0, total: parsed.records.length });
+    const failed = [];
+    let succeeded = 0;
+    // Sequential, not Promise.all — each ADMIN/CREATE_USER call needs to
+    // land before the next one for clean error attribution per row, and
+    // this is an infrequent bulk-admin operation, not something latency-
+    // sensitive enough to warrant the complexity of parallelizing it.
+    for (const rec of parsed.records) {
+      try {
+        await dispatch({
+          type: "ADMIN/CREATE_USER", name: rec.name, role: rec.role,
+          staff_number: rec.staffNumber, vehicle: rec.vehicle, phone: rec.phone,
+          auth: { login: rec.name, pass: rec.staffNumber },
+          // No coordinates from the CSV — home_address is only set if a
+          // label was actually provided, and even then with lat/lng null
+          // until an admin confirms it via the address search (see
+          // comment on parseUsersCsv above for why).
+          home_address: rec.homeAddress ? { label: rec.homeAddress, area: rec.homeArea || "Cape Town", lat: null, lng: null } : null,
+          branch_id: (rec.role === ROLE.AGENT || rec.role === ROLE.DRIVER) ? (rec.branchId || null) : undefined,
+        });
+        succeeded++;
+      } catch (e) {
+        failed.push({ row: rec.rowNum, name: rec.name, reason: e.message || "Unknown error" });
+      }
+      setProgress(p => ({ ...p, done: p.done + 1 }));
+    }
+    setResults({ succeeded, failed });
+    setImporting(false);
+    if (failed.length === 0) onDone?.();
+  };
+
+  return (
+    <Card>
+      <SectionHeader label="Bulk Import Users (CSV)" />
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Required columns: <b>Full Name, Role (AGENT/DRIVER), Staff Number</b>. Optional: Home Address, Home Area, Company, Vehicle, Phone.
+        Home addresses aren't geocoded automatically — edit each agent afterward to confirm their exact pickup point via address search.
+        Admin accounts can't be bulk-created; add those individually under Users.
+      </div>
+
+      <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFile} style={{ display: "none" }} />
+      <Button title={fileName ? `📄 ${fileName}` : "CHOOSE CSV FILE"} variant="ghost" onClick={() => fileInputRef.current?.click()} />
+
+      {parsed && parsed.errors.length > 0 && (
+        <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10, maxHeight: 140, overflowY: "auto" }}>
+          {parsed.errors.map((e, i) => <div key={i} style={{ fontSize: 10, color: COLORS.red }}>{e}</div>)}
+        </div>
+      )}
+
+      {parsed && parsed.records.length > 0 && !results && (
+        <>
+          <div style={{ fontSize: 10, color: COLORS.chalk }}>{parsed.records.length} valid row{parsed.records.length !== 1 ? "s" : ""} ready to import.</div>
+          {importing && <div style={{ fontSize: 10, color: COLORS.ghost }}>Importing {progress.done}/{progress.total}…</div>}
+          <Button title={importing ? "IMPORTING…" : `IMPORT ${parsed.records.length} USER${parsed.records.length !== 1 ? "S" : ""}`} variant="amber" onClick={runImport} disabled={importing} />
+        </>
+      )}
+
+      {results && (
+        <div>
+          <div style={{ fontSize: 11, color: COLORS.green, fontWeight: 700 }}>✓ {results.succeeded} user{results.succeeded !== 1 ? "s" : ""} created</div>
+          {results.failed.length > 0 && (
+            <>
+              <div style={{ fontSize: 11, color: COLORS.red, fontWeight: 700, marginTop: 6 }}>✗ {results.failed.length} failed</div>
+              {results.failed.map((f, i) => <div key={i} style={{ fontSize: 9, color: COLORS.red }}>Row {f.row} ({f.name}): {f.reason}</div>)}
+            </>
+          )}
+        </div>
+      )}
+
+      <Button title="CLOSE" variant="ghost" onClick={onClose} />
+    </Card>
+  );
+}
+
+function CompanyManagerPanel({ state, dispatch, onClose }) {
+  const emptyForm = { name: "", street: "", area: "", coord: null };
+  const [newCo, setNewCo] = useState(emptyForm);
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editCo, setEditCo] = useState(emptyForm);
+
+  const [companyError, setCompanyError] = useState(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+
+  const toAddressObj = (street, area, coord) => coord ? { label: street, area, lat: coord.lat, lng: coord.lng } : null;
+
+  const addCompany = async () => {
+    if (!newCo.name.trim()) return;
+    const address = toAddressObj(newCo.street, newCo.area, newCo.coord);
+    if (!address) {
+      setCompanyError("Pick the address from the search results (not just typed) before adding a company.");
+      return;
+    }
+    setAdding(true);
+    setCompanyError(null);
+    try {
+      await dispatch({ type: "ADMIN/CREATE_COMPANY", name: newCo.name.trim(), address });
+      setNewCo(emptyForm);
+    } catch (e) {
+      setCompanyError(e.message || "Couldn't add the company — please try again.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const startEdit = (c) => {
+    setEditingId(c.id);
+    setEditCo({
+      name: c.name,
+      street: c.address?.label || "", area: c.address?.area || "", coord: c.address ? { lat: c.address.lat, lng: c.address.lng, area: c.address.area } : null,
+    });
+  };
+
+  const saveEdit = async (id) => {
+    if (!editCo.name.trim()) return;
+    setCompanyError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/UPDATE_COMPANY", company_id: id, name: editCo.name.trim(),
+        address: toAddressObj(editCo.street, editCo.area, editCo.coord),
+      });
+      setEditingId(null);
+    } catch (e) {
+      setCompanyError(e.message || "Couldn't update the company — please try again.");
+    }
+  };
+
+  const toggleActive = async (c) => {
+    setCompanyError(null);
+    try {
+      await dispatch({ type: "ADMIN/UPDATE_COMPANY", company_id: c.id, active: !c.active });
+    } catch (e) {
+      setCompanyError(e.message || "Couldn't update the company — please try again.");
+    }
+  };
+
+  const deleteCompany = async (c) => {
+    setDeletingId(c.id);
+    setCompanyError(null);
+    try {
+      await dispatch({ type: "ADMIN/DELETE_COMPANY", company_id: c.id });
+      setConfirmingDeleteId(null);
+    } catch (e) {
+      setCompanyError(e.message || "Couldn't delete the company — please try again.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  // Single address field — used for both the "add new company" form and
+  // the inline edit form below, so the entry UI is defined once.
+  const AddressField = ({ value, onChange }) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ADDRESS</span>
+      <StreetInput value={value.street} placeholder="e.g. 65 Voortrekker Road, Maitland"
+        preConfirmed={value.coord ? { label: value.street, area: value.area, lat: value.coord.lat, lng: value.coord.lng } : null}
+        onChange={({ street, area, coord }) => onChange({ ...value, street, area, coord })} />
+      <span style={{ fontSize: 8, color: COLORS.dim }}>Pick from the search results so the coordinates are set, not just typed text.</span>
+    </div>
+  );
+
+  return (
+    <Card>
+      <SectionHeader label="Manage Companies" />
+      <TextField label="New Company Name" value={newCo.name} onChange={e => setNewCo(f => ({ ...f, name: e.target.value }))} placeholder="e.g. Telus Bellville" />
+      <AddressField value={newCo} onChange={setNewCo} />
+      <Button title={adding ? "ADDING…" : "+ ADD COMPANY"} variant="amber" size="sm" onClick={addCompany} disabled={adding || !newCo.name.trim()} />
+      {companyError && <span style={{ fontSize: 10, color: COLORS.red }}>{companyError}</span>}
+
+      {(state.companies || []).length === 0 ? (
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>No companies yet — add one above.</span>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {state.companies.map(c => (
+            <div key={c.id} style={{ display: "flex", flexDirection: "column", gap: 8, padding: 10, border: `1px solid ${COLORS.wire}`, borderRadius: 4, opacity: c.active ? 1 : .5 }}>
+              {editingId === c.id ? (
+                <>
+                  <input className="inp" value={editCo.name} onChange={e => setEditCo(f => ({ ...f, name: e.target.value }))} autoFocus />
+                  <AddressField value={editCo} onChange={setEditCo} />
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setEditingId(null)} />
+                    <Button title="SAVE" variant="amber" size="sm" style={{ flex: 1 }} onClick={() => saveEdit(c.id)} />
+                  </div>
+                </>
+              ) : confirmingDeleteId === c.id ? (
+                <>
+                  <span style={{ fontSize: 10, color: COLORS.red }}>Delete "{c.name}"? Agents assigned to it must be reassigned first.</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDeleteId(null)} />
+                    <Button title={deletingId === c.id ? "…" : "CONFIRM"} variant="danger" size="sm" style={{ flex: 1 }} onClick={() => deleteCompany(c)} disabled={deletingId === c.id} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ flex: 1, fontSize: 11, fontWeight: 700 }}>{c.name}</span>
+                    {!c.active && <span style={{ fontSize: 8, color: COLORS.ghost, border: `1px solid ${COLORS.wire}`, borderRadius: 2, padding: "2px 5px" }}>INACTIVE</span>}
+                    <Button title="✎" variant="ghost" size="sm" onClick={() => startEdit(c)} />
+                    <Button title={c.active ? "DEACTIVATE" : "REACTIVATE"} variant="ghost" size="sm" onClick={() => toggleActive(c)} />
+                    <Button title="🗑" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(c.id)} />
+                  </div>
+                  <div style={{ fontSize: 9, color: COLORS.teal }}>{c.address?.label || "—"}</div>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <Button title="CLOSE" variant="ghost" onClick={onClose} />
+    </Card>
+  );
+}
+
+function CampaignManagerPanel({ state, dispatch, onClose }) {
+  const [newName, setNewName] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+
+  const [campaignError, setCampaignError] = useState(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+
+  const deleteCampaign = async (c) => {
+    setDeletingId(c.id);
+    setCampaignError(null);
+    try {
+      await dispatch({ type: "ADMIN/DELETE_CAMPAIGN", campaign_id: c.id });
+      setConfirmingDeleteId(null);
+    } catch (e) {
+      setCampaignError(e.message || "Couldn't delete the campaign — please try again.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const addCampaign = async () => {
+    if (!newName.trim()) return;
+    setAdding(true);
+    setCampaignError(null);
+    try {
+      await dispatch({ type: "ADMIN/CREATE_CAMPAIGN", name: newName.trim() });
+      setNewName("");
+    } catch (e) {
+      setCampaignError(e.message || "Couldn't add the campaign — please try again.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const saveEdit = async (id) => {
+    if (!editName.trim()) return;
+    setCampaignError(null);
+    try {
+      await dispatch({ type: "ADMIN/UPDATE_CAMPAIGN", campaign_id: id, name: editName.trim() });
+      setEditingId(null);
+    } catch (e) {
+      setCampaignError(e.message || "Couldn't rename the campaign — please try again.");
+    }
+  };
+
+  const toggleActive = async (c) => {
+    setCampaignError(null);
+    try {
+      await dispatch({ type: "ADMIN/UPDATE_CAMPAIGN", campaign_id: c.id, active: !c.active });
+    } catch (e) {
+      setCampaignError(e.message || "Couldn't update the campaign — please try again.");
+    }
+  };
+
+  return (
+    <Card>
+      <SectionHeader label="Manage Campaigns / Projects" />
+      <div style={{ display: "flex", gap: 8 }}>
+        <TextField label="New Campaign Name" value={newName} onChange={e => setNewName(e.target.value)} placeholder="e.g. Vodacom Support" style={{ flex: 1 }} />
+      </div>
+      <Button title={adding ? "ADDING…" : "+ ADD CAMPAIGN"} variant="amber" size="sm" onClick={addCampaign} disabled={adding || !newName.trim()} />
+      {campaignError && <span style={{ fontSize: 10, color: COLORS.red }}>{campaignError}</span>}
+
+      {(state.campaigns || []).length === 0 ? (
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>No campaigns yet — add one above.</span>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {state.campaigns.map(c => (
+            <div key={c.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: 8, border: `1px solid ${COLORS.wire}`, borderRadius: 4, opacity: c.active ? 1 : .5 }}>
+              {editingId === c.id ? (
+                <>
+                  <input className="inp" value={editName} onChange={e => setEditName(e.target.value)} style={{ flex: 1 }} autoFocus />
+                  <Button title="SAVE" variant="amber" size="sm" onClick={() => saveEdit(c.id)} />
+                  <Button title="✕" variant="ghost" size="sm" onClick={() => setEditingId(null)} />
+                </>
+              ) : confirmingDeleteId === c.id ? (
+                <>
+                  <span style={{ flex: 1, fontSize: 10, color: COLORS.red }}>Delete "{c.name}"? Agents assigned to it must be reassigned first.</span>
+                  <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(null)} />
+                  <Button title={deletingId === c.id ? "…" : "CONFIRM"} variant="danger" size="sm" onClick={() => deleteCampaign(c)} disabled={deletingId === c.id} />
+                </>
+              ) : (
+                <>
+                  <span style={{ flex: 1, fontSize: 11, fontWeight: 700 }}>{c.name}</span>
+                  {!c.active && <span style={{ fontSize: 8, color: COLORS.ghost, border: `1px solid ${COLORS.wire}`, borderRadius: 2, padding: "2px 5px" }}>INACTIVE</span>}
+                  <Button title="✎" variant="ghost" size="sm" onClick={() => { setEditingId(c.id); setEditName(c.name); }} />
+                  <Button title={c.active ? "DEACTIVATE" : "REACTIVATE"} variant="ghost" size="sm" onClick={() => toggleActive(c)} />
+                  <Button title="🗑" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(c.id)} />
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <Button title="CLOSE" variant="ghost" onClick={onClose} />
+    </Card>
+  );
+}
+
+function AdminUsers({ state, dispatch, user }) {
+  const [show, setShow] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  // editingId = which row is expanded to show its profile; editModeId =
+  // which expanded row (if any) has switched into the editable form.
+  // Separate from editingId so tapping a row always opens the read-only
+  // profile first — edit is an explicit, secondary action from there.
+  const [editModeId, setEditModeId] = useState(null);
+  const canCreateAgentsDrivers = hasAdminPermission(user, "manageAgentsDrivers");
+  const canManageAdmins = hasAdminPermission(user, "manageAdmins");
+  const canCreateAnything = canCreateAgentsDrivers || canManageAdmins;
+
+  // Multi-select delete — a Set so toggling a row on tap is a plain
+  // add/delete rather than an indexOf/splice dance (same pattern as the
+  // Dispatch tab's multi-select). Deliberately separate from editingId:
+  // selection mode and the single-row edit panel are two different
+  // interactions and shouldn't fight over the same row's expanded state.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteResults, setDeleteResults] = useState(null);
+  const toggleSelected = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const exitSelectMode = () => { setSelectMode(false); setSelectedIds(new Set()); setConfirmingDelete(false); setDeleteResults(null); };
+  const runDelete = async () => {
+    setDeleting(true);
+    try {
+      const results = await dispatch({ type: "ADMIN/DELETE_USERS", user_ids: [...selectedIds], acting_admin_id: user.id });
+      setDeleteResults(results || []);
+      // Only clear selection for accounts that actually got deleted —
+      // refused ones (active trip history, self-delete, permission)
+      // stay checked so the admin can see exactly which rows the
+      // results list below refers to, instead of the whole selection
+      // vanishing and leaving them to match names against ids by memory.
+      const deletedIds = new Set((results || []).filter(r => r.ok).map(r => r.id));
+      setSelectedIds(prev => new Set([...prev].filter(id => !deletedIds.has(id))));
+    } catch (e) {
+      setDeleteResults([{ ok: false, reason: e.message || "Delete failed — please try again." }]);
+    } finally {
+      setDeleting(false);
+      setConfirmingDelete(false);
+    }
+  };
+
+  const [form, setForm] = useState({ name: "", staffNumber: "", role: ROLE.AGENT, vehicle: "", phone: "", homeStreet: "", homeArea: "", homeCoord: null, homeConfirmed: false, branchId: null, campaignId: null, adminLevel: ADMIN_LEVEL.VIEWER, scopedCompanyIds: [] });
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const [submitError, setSubmitError] = useState(null);
+  const submit = async () => {
+    if (!form.name || !form.staffNumber) return;
+    setSubmitError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/CREATE_USER", name: form.name, role: form.role, vehicle: form.vehicle, phone: form.phone,
+        staff_number: form.staffNumber,
+        auth: { login: form.name, pass: form.staffNumber }, // username = full name, password = staff number
+        home_address: ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && form.homeCoord) ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null,
+        branch_id: (form.role === ROLE.AGENT || form.role === ROLE.DRIVER) ? form.branchId : undefined,
+        campaign_id: form.role === ROLE.AGENT ? form.campaignId : undefined,
+        admin_level: form.role === ROLE.ADMIN ? form.adminLevel : undefined,
+        scoped_company_ids: form.role === ROLE.ADMIN ? form.scopedCompanyIds : undefined,
+      });
+      setForm({ name: "", staffNumber: "", role: ROLE.AGENT, vehicle: "", phone: "", homeStreet: "", homeArea: "", homeCoord: null, homeConfirmed: false, branchId: null, campaignId: null, adminLevel: ADMIN_LEVEL.VIEWER, scopedCompanyIds: [] });
+      setShow(false);
+    } catch (e) {
+      setSubmitError(e.message || "Couldn't create the account — please try again.");
+    }
+  };
+
+  // A STANDARD admin can create agents/drivers but never admins, even if
+  // they somehow force the role selector open — filter the actual choices
+  // offered rather than relying on the button being hidden.
+  const availableRoles = [
+    ...(canCreateAgentsDrivers ? [ROLE.AGENT, ROLE.DRIVER] : []),
+    ...(canManageAdmins ? [ROLE.ADMIN] : []),
+  ];
+
+  const [showBulkImport, setShowBulkImport] = useState(false);
+  const [showCampaigns, setShowCampaigns] = useState(false);
+  const [showCompanies, setShowCompanies] = useState(false);
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <SectionHeader label="User Registry" />
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {hasAdminPermission(user, "exportCsv") && <Button title="⬇ EXPORT CSV" variant="ghost" size="sm" onClick={() => downloadCsv(usersToCsv(state.users, state.driver_status), `users_${new Date().toISOString().slice(0, 10)}.csv`)} />}
+          {canCreateAnything && <Button title="🏢 COMPANIES" variant="ghost" size="sm" onClick={() => { setShowCompanies(s => !s); setShow(false); setShowBulkImport(false); setShowCampaigns(false); setEditingId(null); setEditModeId(null); }} />}
+          {canCreateAnything && <Button title="🏷 CAMPAIGNS" variant="ghost" size="sm" onClick={() => { setShowCampaigns(s => !s); setShow(false); setShowBulkImport(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
+          {canCreateAnything && <Button title="⬆ BULK IMPORT" variant="ghost" size="sm" onClick={() => { setShowBulkImport(s => !s); setShow(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
+          {canCreateAnything && <Button title="+ CREATE USER" variant="amber" size="sm" onClick={() => { setShow(s => !s); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
+          {canCreateAnything && (
+            selectMode
+              ? <Button title="✕ CANCEL SELECT" variant="ghost" size="sm" onClick={exitSelectMode} />
+              : <Button title="☑ SELECT" variant="ghost" size="sm" onClick={() => { setSelectMode(true); setShow(false); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />
+          )}
+        </div>
+      </div>
+      {showCompanies && canCreateAnything && (
+        <CompanyManagerPanel state={state} dispatch={dispatch} onClose={() => setShowCompanies(false)} />
+      )}
+      {showCampaigns && canCreateAnything && (
+        <CampaignManagerPanel state={state} dispatch={dispatch} onClose={() => setShowCampaigns(false)} />
+      )}
+      {showBulkImport && canCreateAnything && (
+        <BulkUserImportPanel state={state} dispatch={dispatch} onClose={() => setShowBulkImport(false)} onDone={() => setShowBulkImport(false)} />
+      )}
+      {selectMode && (
+        <div style={{ background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+          <span style={{ fontSize: 10, color: COLORS.mist }}>Tap accounts below to select them. {selectedIds.size} selected.</span>
+          {deleteResults && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              {deleteResults.map((r, i) => (
+                <span key={i} style={{ fontSize: 10, color: r.ok ? COLORS.green : COLORS.red }}>
+                  {r.ok ? "✓" : "✗"} {r.name || "Account"}{!r.ok && r.reason ? ` — ${r.reason}` : ""}
+                </span>
+              ))}
+            </div>
+          )}
+          {!confirmingDelete ? (
+            <Button title={`🗑 DELETE SELECTED (${selectedIds.size})`} variant="danger" size="sm" onClick={() => setConfirmingDelete(true)} disabled={selectedIds.size === 0} />
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <span style={{ fontSize: 10, color: COLORS.chalk }}>
+                Delete {selectedIds.size} account{selectedIds.size !== 1 ? "s" : ""}? This can't be undone. Accounts with any trip history will be refused automatically rather than deleted.
+              </span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDelete(false)} />
+                <Button title={deleting ? "DELETING…" : "CONFIRM DELETE"} variant="danger" size="sm" style={{ flex: 1 }} onClick={runDelete} disabled={deleting} loading={deleting} />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {show && canCreateAnything && (
+        <Card>
+          <TextField label="Full Name" value={form.name} onChange={e => set("name", e.target.value)} />
+          <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Username will be the full name above</span>
+          <SectionHeader label="Role" />
+          <div style={{ display: "flex", gap: 8 }}>
+            {availableRoles.map(r => <Button key={r} title={r} size="sm" variant={form.role === r ? "amber" : "ghost"} onClick={() => set("role", r)} style={{ flex: 1 }} />)}
+          </div>
+          <TextField label="Staff Number (also used as password)" value={form.staffNumber} onChange={e => set("staffNumber", e.target.value)} placeholder="e.g. AG1004" />
+          {form.role === ROLE.AGENT && (
+            <>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <SectionHeader label="Home Address (Cape Town)" />
+                <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
+                  onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: coord, homeConfirmed: !!confirmed }))} />
+              </div>
+              <SectionHeader label="Company" />
+              {(state?.companies || []).length === 0 ? (
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet — add one from Manage Companies before creating agent accounts.</span>
+              ) : (
+                <select className="inp" value={form.branchId || ""} onChange={e => set("branchId", e.target.value || null)} style={{ width: "100%" }}>
+                  <option value="">— None —</option>
+                  {state.companies.filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              )}
+              <SectionHeader label="Campaign / Project" />
+              {(state?.campaigns || []).length === 0 ? (
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>No campaigns have been added yet.</span>
+              ) : (
+                <select className="inp" value={form.campaignId || ""} onChange={e => set("campaignId", e.target.value || null)} style={{ width: "100%" }}>
+                  <option value="">— None —</option>
+                  {state.campaigns.filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              )}
+            </>
+          )}
+          {form.role === ROLE.DRIVER && (
+            <>
+              <TextField label="Vehicle" value={form.vehicle} onChange={e => set("vehicle", e.target.value)} placeholder="Toyota Hiace - CA 000-000" />
+              <TextField label="Phone" value={form.phone} onChange={e => set("phone", e.target.value)} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <SectionHeader label="Home Area (Cape Town)" />
+                <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Used by admins to see which area a driver lives in when assigning trips.</span>
+                <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
+                  onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: coord, homeConfirmed: !!confirmed }))} />
+              </div>
+              <SectionHeader label="Company" />
+              {(state?.companies || []).length === 0 ? (
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet — add one from Manage Companies before creating driver accounts.</span>
+              ) : (
+                <select className="inp" value={form.branchId || ""} onChange={e => set("branchId", e.target.value || null)} style={{ width: "100%" }}>
+                  <option value="">— None —</option>
+                  {state.companies.filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+              )}
+            </>
+          )}
+          {form.role === ROLE.ADMIN && (
+            <>
+              <SectionHeader label="Admin Level" />
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {Object.values(ADMIN_LEVEL).map(lvl => (
+                  <Button key={lvl} title={ADMIN_LEVEL_LABEL[lvl]} size="sm" variant={form.adminLevel === lvl ? "amber" : "ghost"} onClick={() => set("adminLevel", lvl)} full />
+                ))}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <SectionHeader label="Companies (optional)" />
+                <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>
+                  {form.adminLevel === ADMIN_LEVEL.VIEWER
+                    ? "If any are checked, this Viewer only sees agents, drivers on their trips, trips, tickets, and alerts belonging to the selected companies. Leave all unchecked for unrestricted (all-company) Viewer access."
+                    : "A label for which companies this admin manages — Fleet Ops and Standard admins always see every company's data regardless of what's checked here; this doesn't restrict anything for them."}
+                </span>
+                {(state?.companies || []).length === 0 ? (
+                  <span style={{ fontSize: 9, color: COLORS.ghost }}>No companies have been added yet.</span>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {state.companies.filter(c => c.active).map(c => {
+                      const checked = form.scopedCompanyIds.includes(c.id);
+                      return (
+                        <div key={c.id} onClick={() => set("scopedCompanyIds", checked ? form.scopedCompanyIds.filter(id => id !== c.id) : [...form.scopedCompanyIds, c.id])}
+                          style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+                          <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink, flexShrink: 0 }}>{checked && "✓"}</span>
+                          <span style={{ fontSize: 11, color: COLORS.chalk }}>{c.name}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          {submitError && <span style={{ fontSize: 10, color: COLORS.red }}>{submitError}</span>}
+          <div style={{ display: "flex", gap: 8 }}>
+            <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={() => setShow(false)} />
+            <Button title="CREATE →" variant="amber" style={{ flex: 1 }} onClick={submit} />
+          </div>
+        </Card>
+      )}
+      <Card body={false}>
+        {state.users.map(u => {
+          const isExpanded = editingId === u.id;
+          const isEditingThisRow = isExpanded && editModeId === u.id;
+          const driverStatus = u.role === ROLE.DRIVER ? state.driver_status.find(d => d.driver_id === u.id) : null;
+          // Editing an admin needs manageAdmins; editing an agent/driver
+          // just needs manageAgentsDrivers — mirrors the server-side check
+          // in ADMIN/UPDATE_USER, so the UI doesn't offer an edit action
+          // that would just get rejected anyway. Viewing the profile has
+          // no such gate — any admin who can see the Users tab at all
+          // can see full account details; only WRITING requires the
+          // extra permission.
+          const canEditThisUser = u.role === ROLE.ADMIN ? canManageAdmins : canCreateAgentsDrivers;
+          const isSelf = u.id === user.id;
+          // Same permission tiering as ADMIN/DELETE_USERS' per-target
+          // check — a STANDARD admin can select agents/drivers but not
+          // other admins; disabling those rows here means the confirm
+          // step never shows a selection that the backend would just
+          // refuse anyway.
+          const canDeleteThisUser = !isSelf && (u.role === ROLE.ADMIN ? canManageAdmins : canCreateAgentsDrivers);
+          const isSelected = selectedIds.has(u.id);
+          const rowClick = selectMode
+            ? () => { if (canDeleteThisUser) toggleSelected(u.id); }
+            : () => { setEditingId(isExpanded ? null : u.id); setEditModeId(null); setShow(false); };
+          return (
+            <React.Fragment key={u.id}>
+              <div onClick={rowClick}
+                style={{ cursor: (selectMode ? canDeleteThisUser : true) ? "pointer" : "default", opacity: selectMode && !canDeleteThisUser ? .4 : 1, display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: isExpanded ? "none" : `1px solid ${COLORS.wire}`, background: isExpanded ? "rgba(245,166,35,.05)" : isSelected ? "rgba(220,53,69,.06)" : "transparent" }}>
+                {selectMode && (
+                  <span style={{ width: 16, height: 16, borderRadius: 3, border: `1px solid ${isSelected ? COLORS.red : COLORS.wire}`, background: isSelected ? COLORS.red : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#fff", flexShrink: 0 }}>{isSelected && "✓"}</span>
+                )}
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}{isSelf && selectMode && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> (you)</span>}</div>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>Staff #: {u.staff_number || "—"}</div>
+                  {u.role === ROLE.AGENT && u.home_address && <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>}
+                  {u.role === ROLE.DRIVER && driverStatus?.vehicle && <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>🚐 {driverStatus.vehicle}</div>}
+                  {u.role === ROLE.ADMIN && u.admin_level && <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>{ADMIN_LEVEL_LABEL[u.admin_level]}</div>}
+                </div>
+                <RoleBadge role={u.role} />
+                {!selectMode && <span style={{ color: COLORS.ghost, fontSize: 11 }}>{isExpanded ? "▲" : "▾"}</span>}
+              </div>
+              {isExpanded && !selectMode && (
+                <div style={{ padding: "0 12px 12px", borderBottom: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", gap: 10 }}>
+                  {isEditingThisRow ? (
+                    <EditUserPanel user={u} driverStatus={driverStatus} dispatch={dispatch} state={state} onClose={() => setEditModeId(null)} />
+                  ) : (
+                    <>
+                      <UserProfilePanel u={u} driverStatus={driverStatus} state={state} />
+                      {canEditThisUser && <Button title="✎ EDIT ACCOUNT" variant="ghost" size="sm" onClick={() => setEditModeId(u.id)} />}
+                    </>
+                  )}
+                </div>
+              )}
+            </React.Fragment>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+function AdminContacts({ state, dispatch, user, call }) {
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState(null);
+  const [dmMessages, setDmMessages] = useState([]);
+  const [loadingDm, setLoadingDm] = useState(false);
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const directory = state.users.filter(u => u.role === ROLE.AGENT || u.role === ROLE.DRIVER);
+  const matches = query.trim().length >= 1
+    ? directory.filter(u => u.name.toLowerCase().includes(query.trim().toLowerCase()) || (u.staff_number || "").toLowerCase().includes(query.trim().toLowerCase()))
+    : directory;
+
+  const selected = selectedId ? state.users.find(u => u.id === selectedId) : null;
+
+  const openConversation = async (u) => {
+    setSelectedId(u.id);
+    setQuery("");
+    setLoadingDm(true);
+    try {
+      const msgs = await fetchDirectMessages(user.id, u.id);
+      setDmMessages(msgs);
+    } catch (e) {
+      setDmMessages([]);
+    } finally {
+      setLoadingDm(false);
+    }
+  };
+
+  const send = async () => {
+    if (!text.trim() || !selected) return;
+    setSending(true);
+    try {
+      await dispatch({ type: "DM/SEND", sender_id: user.id, sender_name: user.name, sender_role: ROLE.ADMIN, recipient_id: selected.id, message: text.trim() });
+      setText("");
+      // DM/SEND doesn't trigger a refetch (direct_messages isn't part of
+      // the main sync cycle) — re-fetch just this conversation so the new
+      // message shows up immediately.
+      const msgs = await fetchDirectMessages(user.id, selected.id);
+      setDmMessages(msgs);
+    } catch (e) {
+      // The global toast wrapper already told the user the send failed
+      // (and re-threw) — without this catch that re-throw escaped the
+      // onClick as an unhandled promise rejection. Text deliberately
+      // stays in the input so they can just hit send again.
+      console.warn("[Contacts] DM send failed:", e.message);
+    } finally {
+      // Previously this only ran after a successful send — a failed
+      // dispatch (now that dispatch throws) left sending stuck true
+      // forever, permanently disabling the send button. The global toast
+      // wrapper already tells the user it failed; this just makes sure
+      // they can try again.
+      setSending(false);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <SectionHeader label="Contacts" />
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
+        Message or call any agent or driver directly — not tied to a specific trip, works at any time.
+      </div>
+      <TextField label="Search by name or staff number" value={query} onChange={e => setQuery(e.target.value)} placeholder="e.g. Nomsa Dlamini or DR2001" />
+
+      {!selected && (
+        <Card body={false}>
+          {matches.length === 0 ? <Empty icon="💬" text="No matches" /> : matches.slice(0, 30).map(u => (
+            <div key={u.id} onClick={() => openConversation(u)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
+              <DriverAvatar name={u.name} size={30} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}</div>
+                <div style={{ fontSize: 9, color: COLORS.ghost }}>Staff #: {u.staff_number || "—"}</div>
+              </div>
+              <RoleBadge role={u.role} />
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {selected && (
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <DriverAvatar name={selected.name} size={36} />
+              <div>
+                <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{selected.name}</div>
+                <RoleBadge role={selected.role} />
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {call && (
+                <Button
+                  title="📞 CALL" variant="green" size="sm"
+                  onClick={() => call.startCall({ id: selected.id, name: selected.name }, null)}
+                  disabled={call.callState !== CALL_STATE.IDLE}
+                />
+              )}
+              <Button title="✕" variant="ghost" size="sm" onClick={() => { setSelectedId(null); setDmMessages([]); }} />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 320, overflowY: "auto", marginTop: 8 }}>
+            {loadingDm && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 12 }}>Loading conversation…</span>}
+            {!loadingDm && dmMessages.length === 0 && <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 12 }}>No messages yet — say hello.</span>}
+            {dmMessages.map(m => {
+              const mine = m.sender_id === user.id;
+              return (
+                <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "82%", borderRadius: 6, padding: 9, background: mine ? "rgba(45,140,240,.15)" : COLORS.surface, border: `1px solid ${mine ? "rgba(45,140,240,.3)" : COLORS.wire}` }}>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, marginBottom: 3 }}>{m.sender_name} · {m.ts}</div>
+                  <div style={{ fontSize: 11 }}>{m.text}</div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ display: "flex", gap: 7, marginTop: 8 }}>
+            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" />
+            <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={sending || !text.trim()} />
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+
+function AdminTickets({ state, dispatch, user }) {
+  const [filterStatus, setFilterStatus] = useState("OPEN");
+  const [expandedId, setExpandedId] = useState(null);
+  const [replyText, setReplyText] = useState("");
+  const [savingId, setSavingId] = useState(null);
+  const canAction = hasAdminPermission(user, "manageTrips");
+
+  const filtered = filterStatus === "ALL" ? state.tickets : state.tickets.filter(t => t.status === filterStatus);
+  const openCount = state.tickets.filter(t => t.status === "OPEN").length;
+
+  const filedByName = (ticket) => {
+    const found = state.users.find(u => u.id === ticket.agent_id);
+    if (found) return found.name;
+    // Only reachable if the user record is genuinely missing (e.g.
+    // deleted account) — falls back to a role-aware label instead of
+    // always saying "Agent", since this same lookup now serves driver
+    // tickets too.
+    return `${ticket.role === ROLE.DRIVER ? "Driver" : "Agent"} ${ticket.agent_id}`;
+  };
+  const STATUS_COLOR = { OPEN: COLORS.amber, IN_PROGRESS: COLORS.blue2, RESOLVED: COLORS.green };
+
+  const [ticketActionError, setTicketActionError] = useState(null);
+
+  const setStatus = async (ticketId, status) => {
+    setSavingId(ticketId);
+    setTicketActionError(null);
+    try {
+      await dispatch({ type: "TICKET/UPDATE", ticket_id: ticketId, status, admin_id: user.id });
+    } catch (e) {
+      setTicketActionError(e.message || "Couldn't update the ticket — please try again.");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  const sendReply = async (ticketId) => {
+    if (!replyText.trim()) return;
+    setSavingId(ticketId);
+    setTicketActionError(null);
+    try {
+      await dispatch({ type: "TICKET/UPDATE", ticket_id: ticketId, admin_reply: replyText.trim(), admin_id: user.id, status: "IN_PROGRESS" });
+      setReplyText("");
+    } catch (e) {
+      setTicketActionError(e.message || "Couldn't send the reply — please try again.");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <SectionHeader label={`Tickets ${openCount > 0 ? `(${openCount} open)` : ""}`} />
+      {ticketActionError && (
+        <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
+          <span style={{ fontSize: 11, color: COLORS.red }}>{ticketActionError}</span>
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {["OPEN", "IN_PROGRESS", "RESOLVED", "ALL"].map(s => (
+          <Button key={s} size="sm" variant={filterStatus === s ? "amber" : "ghost"} title={s.replace("_", " ")} onClick={() => setFilterStatus(s)} />
+        ))}
+      </div>
+
+      {filtered.length === 0 ? <Empty icon="🎫" text="No tickets" /> : filtered.map(t => {
+        const isExpanded = expandedId === t.id;
+        const trip = t.trip_id ? state.trips.find(x => x.trip_id === t.trip_id) : null;
+        return (
+          <Card key={t.id}>
+            <div onClick={() => setExpandedId(isExpanded ? null : t.id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: 12, fontWeight: 700 }}>{t.category}</div>
+                <div style={{ fontSize: 10, color: COLORS.ghost, display: "flex", alignItems: "center", gap: 6 }}>
+                  {filedByName(t)} <RoleBadge role={t.role} /> · {epochToDisplay(t.created_at)}
+                </div>
+              </div>
+              <span style={{ fontSize: 8, fontWeight: 700, color: STATUS_COLOR[t.status], border: `1px solid ${STATUS_COLOR[t.status]}`, borderRadius: 2, padding: "2px 6px" }}>{t.status.replace("_", " ")}</span>
+            </div>
+            <div style={{ fontSize: 11, lineHeight: 1.5 }}>{t.message}</div>
+            {t.trip_id && (
+              <div style={{ fontSize: 10, color: COLORS.teal }}>
+                Re: Trip {t.trip_id}{trip ? ` — Driver: ${state.users.find(u => u.id === trip.driver_id)?.name || "unassigned"}` : ""}
+              </div>
+            )}
+            {t.admin_reply && (
+              <div style={{ background: COLORS.surface, borderRadius: 4, padding: 10 }}>
+                <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>YOUR REPLY</div>
+                <div style={{ fontSize: 11 }}>{t.admin_reply}</div>
+              </div>
+            )}
+            {isExpanded && canAction && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, borderTop: `1px solid ${COLORS.wire}`, paddingTop: 10 }}>
+                <textarea
+                  className="inp" rows={3} value={replyText} onChange={e => setReplyText(e.target.value)}
+                  placeholder="Reply to the agent…" style={{ width: "100%", resize: "vertical", fontFamily: "inherit" }}
+                />
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Button title={savingId === t.id ? "SENDING…" : "SEND REPLY"} variant="amber" size="sm" onClick={() => sendReply(t.id)} disabled={savingId === t.id || !replyText.trim()} />
+                  {t.status !== "IN_PROGRESS" && <Button title="MARK IN PROGRESS" variant="ghost" size="sm" onClick={() => setStatus(t.id, "IN_PROGRESS")} disabled={savingId === t.id} />}
+                  {t.status !== "RESOLVED" && <Button title="MARK RESOLVED" variant="ghost" size="sm" onClick={() => setStatus(t.id, "RESOLVED")} disabled={savingId === t.id} />}
+                  {t.status === "RESOLVED" && <Button title="RE-OPEN" variant="ghost" size="sm" onClick={() => setStatus(t.id, "OPEN")} disabled={savingId === t.id} />}
+                </div>
+              </div>
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
+
+function AdminNotifs({ state, dispatch }) {
+  const [filterDate, setFilterDate] = useState(""); // "" = show all, else YYYY-MM-DD
+  const adminNotifsAll = state.notifications.filter(n => !n.for_user_ids?.length && (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length));
+  // Filtered by calendar day (local time) using the raw epoch timestamp —
+  // n.ts itself is a locale-formatted display string (en-ZA), not
+  // machine-parseable, so ts_epoch is what date filtering actually uses.
+  const adminNotifs = filterDate
+    ? adminNotifsAll.filter(n => {
+        if (n.ts_epoch == null) return false;
+        const d = new Date(n.ts_epoch);
+        const dayStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+        return dayStr === filterDate;
+      })
+    : adminNotifsAll;
+  const unread = adminNotifs.filter(n => !n.read).length;
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "✗", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ALERTS</div>
+          {unread > 0 && <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 2 }}>{unread} unread</div>}
+        </div>
+        {unread > 0 && <Button title="CLEAR ALL" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+        <TextField label="Filter by day" type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)} style={{ flex: 1 }} />
+        {filterDate && <Button title="CLEAR FILTER" variant="ghost" size="sm" onClick={() => setFilterDate("")} />}
+      </div>
+      {filterDate && <div style={{ fontSize: 10, color: COLORS.ghost }}>{adminNotifs.length} alert{adminNotifs.length !== 1 ? "s" : ""} on this day</div>}
+      {adminNotifs.length === 0 ? <Empty icon="◬" text={filterDate ? "No alerts on this day" : "No admin alerts"} /> : adminNotifs.map(n => (
+        <div key={n.id} onClick={() => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {})}
+          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.06)", border: `1px solid ${n.read ? COLORS.wire : "rgba(245,166,35,.25)"}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+            <span style={{ fontSize: 14 }}>{ICONS[n.type] || "◈"}</span>
+            <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1, textTransform: "uppercase", flex: 1 }}>{n.type.replace(/_/g, " ")}</span>
+            {!n.read && <div style={{ width: 7, height: 7, borderRadius: 4, background: COLORS.amber }} />}
+          </div>
+          <div style={{ fontSize: 11, lineHeight: 1.5 }}>{n.message}</div>
+          <div style={{ fontSize: 9, color: COLORS.dim }}>{n.ts}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["notifs", "◬", "Alerts"]];
+
+const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
+
+function AdminApp({ state, dispatch, user }) {
+  const [tab, setTab] = useState("dashboard");
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const notifCount = state.notifications.filter(n => !n.read && n.for_roles?.includes(ROLE.ADMIN)).length;
+  const call = useWebRTCCall(user);
+
+  // A Viewer admin assigned to a specific company only sees that
+  // company's agents (and whichever drivers actually serve them) and
+  // trips — computed once here and threaded down to every tab, rather
+  // than each screen re-deriving its own scoped view. Unscoped admins
+  // (FLEET_OPS, STANDARD, or a Viewer with no company set) get the
+  // identical state object back — scoping is strictly additive, it
+  // never changes behavior for anyone it doesn't apply to.
+  const scopedState = React.useMemo(() => {
+    if (!isCompanyScoped(user)) return state;
+    return {
+      ...state,
+      users: scopeUsersToCompany(state.users, state.trips, user.scoped_company_ids),
+      trips: scopeTripsToCompany(state.trips, state.users, user.scoped_company_ids),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, user.scoped_company_ids),
+      notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, user.scoped_company_ids),
+    };
+  }, [state, user]);
+
+  // Viewer Administrators don't get Dispatch or Users at all (per the
+  // permission model — VIEWER has manageDispatch/manageAgentsDrivers/
+  // manageAdmins all false), regardless of what tab they might try to
+  // force via state — the tab content itself also checks permissions,
+  // this just keeps the sidebar honest about what's actually usable.
+  const visibleNav = ADMIN_NAV.filter(([id]) => {
+    if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
+    if (id === "users") return hasAdminPermission(user, "viewUsers");
+    if (id === "contacts") return hasAdminPermission(user, "manageTrips");
+    return true;
+  });
+
+  return (
+    <div style={{ display: "flex", minHeight: "100vh" }}>
+      <div style={{ width: 220, flexShrink: 0, background: COLORS.panel, borderRight: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", position: "sticky", top: 0, height: "100vh" }}>
+        <div style={{ padding: 16, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ color: COLORS.amber, fontWeight: 800, fontSize: 13, letterSpacing: 2 }}>TRANSIT/OS</span>
+          <RoleBadge role={ROLE.ADMIN} />
+        </div>
+        <div style={{ flex: 1, paddingTop: 12 }}>
+          {visibleNav.map(([id, icon, label]) => {
+            const active = tab === id;
+            const badge = id === "notifs" ? notifCount : 0;
+            return (
+              <div key={id} onClick={() => setTab(id)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", cursor: "pointer", background: active ? "rgba(245,166,35,.06)" : "transparent", borderLeft: `2px solid ${active ? COLORS.amber : "transparent"}` }}>
+                <span style={{ fontSize: 14, width: 16, textAlign: "center", color: COLORS.ghost }}>{icon}</span>
+                <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1, color: active ? COLORS.amber : COLORS.ghost, flex: 1, textTransform: "uppercase" }}>{label}</span>
+                {badge > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 5px", fontSize: 9, fontWeight: 800, color: "#000" }}>{badge}</span>}
+              </div>
+            );
+          })}
+        </div>
+        <div style={{ padding: 16, borderTop: `1px solid ${COLORS.wire}`, display: "flex", flexDirection: "column", gap: 4 }}>
+          <DriverAvatar name={user.name} size={32} />
+          <span style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{user.name}</span>
+          <span style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 10 }}>{ADMIN_LEVEL_LABEL[user.admin_level] || "Administrator"}</span>
+          <AlertSoundToggle />
+          <Button title="LOGOUT" variant="ghost" size="sm" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
+        {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} />}
+        {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
+        {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
+        {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
+        {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
+        {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
+        {tab === "history" && <AdminHistory state={scopedState} user={user} />}
+        {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
+        {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
+        {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} />}
+      </div>
+      <CallOverlay call={call} />
+    </div>
+  );
+}
+
+/* ============================================================
+   ROOT APP
+   ============================================================ */
+// A render error ANYWHERE in the tree — a missing prop, bad data shape,
+// whatever — currently unmounts the whole app to a blank white screen
+// with zero on-screen signal (see the AdminDashboard-missing-user-prop
+// bug this caught). React requires a class component for this; there is
+// no hooks equivalent. Recovery clears the persisted session before
+// reloading — the crash may have been triggered by whatever state that
+// session was carrying, so reloading into the exact same state would
+// just crash again.
+class AppErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("[TransitOS] render error:", error, info); }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 24, background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif", textAlign: "center" }}>
+        <div style={{ fontSize: 18, fontWeight: 800 }}>Something went wrong</div>
+        <div style={{ fontSize: 12, color: "#888", maxWidth: 340 }}>TransitOS hit an unexpected error and couldn't continue. Reloading should fix it.</div>
+        <button
+          onClick={() => { try { localStorage.removeItem("transitos_active_user_id"); } catch (e) {} window.location.reload(); }}
+          style={{ background: "#f5a623", color: "#000", border: "none", borderRadius: 4, padding: "10px 20px", fontWeight: 700, cursor: "pointer" }}
+        >RELOAD</button>
+      </div>
+    );
+  }
+}
+
+function AppInner() {
+  const [state, dispatch] = useAppStore();
+  const [toasts, setToasts] = useState([]);
+  const [loginError, setLoginError] = useState(null);
+  const [installPromptEvent, setInstallPromptEvent] = useState(null);
+
+  const pushToast = useCallback((title, body, color = COLORS.amber) => {
+    const id = Math.random().toString(36).slice(2);
+    setToasts(t => [...t, { id, title, body, color }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200);
+  }, []);
+
+  // Chrome/Edge fire beforeinstallprompt once the PWA installability
+  // criteria are met (manifest + service worker + HTTPS). Capturing it
+  // lets us show our own "Install App" button instead of only relying on
+  // the browser's own (easy to miss) address-bar icon. Not supported on
+  // iOS Safari — there, installation only happens via the Share menu, so
+  // this button simply never appears there, which is expected.
+  useEffect(() => {
+    const handler = (e) => {
+      e.preventDefault();
+      setInstallPromptEvent(e);
+    };
+    window.addEventListener("beforeinstallprompt", handler);
+    const onInstalled = () => setInstallPromptEvent(null);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handler);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  const promptInstall = async () => {
+    if (!installPromptEvent) return;
+    installPromptEvent.prompt();
+    await installPromptEvent.userChoice;
+    setInstallPromptEvent(null); // the prompt can only be used once
+  };
+
+  const activeUser = state.users.find(u => u.id === state.active_user_id);
+
+  // Previously this fired a toast for ANY new notification added anywhere
+  // in the system, regardless of who it was actually for — an agent would
+  // get a toast about another agent's ticket, a driver's delay report,
+  // etc. Now filtered through isNotificationForUser so a person only ever
+  // sees/hears alerts that actually pertain to them, which is also what
+  // makes the alert sound meaningful rather than just noisy.
+  const prevMyNotifIds = useRef(new Set());
+  useEffect(() => {
+    if (!activeUser) { prevMyNotifIds.current = new Set(); return; }
+    const myNotifs = state.notifications.filter(n => isNotificationForUser(n, activeUser));
+    const myNotifIds = new Set(myNotifs.map(n => n.id));
+    const newOnes = myNotifs.filter(n => !prevMyNotifIds.current.has(n.id));
+    // Skip the very first population of this set (right after login /
+    // initial load) — otherwise every notification already sitting in
+    // the person's inbox from before this session would re-announce
+    // itself with a toast+sound the instant they log in.
+    if (prevMyNotifIds.current.size > 0 && newOnes.length > 0) {
+      const newest = newOnes[0];
+      pushToast(newest.type.replace(/_/g, " "), newest.message);
+      playAlertSound();
+    }
+    prevMyNotifIds.current = myNotifIds;
+  }, [state.notifications, activeUser?.id]);
+
+  const handleLogin = async (login, pass) => {
+    setLoginError(null);
+    // Uses the raw store dispatch, not the wrapped one below — login
+    // failures are shown inline via loginError, so routing them through
+    // the auto-toast wrapper too would show the same "Invalid credentials"
+    // message twice in two different places. The catch here matters:
+    // dispatch now throws on failure, and in fallback mode the store's
+    // state._error is hardcoded to null, so this catch is the ONLY path
+    // that surfaces a failed login there.
+    try {
+      await dispatch({ type: "AUTH/LOGIN", login, pass });
+    } catch (e) {
+      setLoginError(e.message || "Login failed — please try again.");
+    }
+  };
+
+  // Every call site across the app does `await dispatch(...)`, many with
+  // no try/catch of their own (dispatch used to swallow failures, so there
+  // was nothing to catch). Now that dispatch throws on failure, wrapping it
+  // once here — instead of threading pushToast as a prop through every
+  // nested component — means a failure anywhere still surfaces to the user
+  // instead of just rejecting silently in the console. Call sites that DO
+  // have their own catch (to show an inline error next to the form/button
+  // that failed) still work exactly as before: this wrapper re-throws, so
+  // their catch still runs; they just also get a toast as a backstop.
+  const dispatchWithToast = useCallback(async (action) => {
+    try {
+      return await dispatch(action);
+    } catch (e) {
+      if (action.type !== "AUTH/LOGIN") {
+        pushToast("ACTION FAILED", e.message || "Something went wrong — please try again.", COLORS.red);
+      }
+      throw e;
+    }
+  }, [dispatch, pushToast]);
+
+  useEffect(() => {
+    if (state._error && !state.active_user_id) setLoginError(state._error);
+  }, [state._error, state.active_user_id]);
+
+  useEffect(() => {
+    const styleEl = document.createElement("style");
+    styleEl.textContent = CSS;
+    document.head.appendChild(styleEl);
+    return () => document.head.removeChild(styleEl);
+  }, []);
+
+  if (state._loading) {
+    return (
+      <div className="loading-screen">
+        <div className="spinner" />
+        <span style={{ color: COLORS.ghost, fontSize: 11, letterSpacing: 1 }}>Connecting to TransitOS…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app-root">
+      {!activeUser ? (
+        <LoginScreen users={state.users} onLogin={handleLogin} error={loginError} />
+      ) : activeUser.role === ROLE.ADMIN ? (
+        <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+      ) : activeUser.role === ROLE.AGENT ? (
+        <AgentApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+      ) : (
+        <DriverApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+      )}
+
+      <div className="toast-stack">
+        {toasts.map(t => (
+          <div key={t.id} className="toast" style={{ borderLeftColor: t.color }}>
+            <div className="toast-title">{t.title}</div>
+            <div className="toast-body">{t.body}</div>
+          </div>
+        ))}
+      </div>
+
+      {installPromptEvent && activeUser && (
+        <button
+          onClick={promptInstall}
+          style={{
+            position: "fixed", bottom: 16, right: 16, zIndex: 500,
+            background: COLORS.amber, color: "#000", border: "none", borderRadius: 24,
+            padding: "10px 16px", fontSize: 11, fontWeight: 800, letterSpacing: 0.5,
+            cursor: "pointer", boxShadow: "0 4px 16px rgba(0,0,0,.4)",
+          }}
+        >
+          ⬇ INSTALL APP
+        </button>
+      )}
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <AppInner />
+    </AppErrorBoundary>
+  );
+}
