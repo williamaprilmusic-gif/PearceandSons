@@ -1,7 +1,7 @@
 {
-  "name": "TransitOS — Staff Transport",
-  "short_name": "TransitOS",
-  "description": "Staff transport booking and dispatch platform",
+  "name": "Pearce & Sons — Staff Transport",
+  "short_name": "Pearce & Sons",
+  "description": "Pearce & Sons staff transport booking and dispatch platform",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

@@ -11117,16 +11117,21 @@ function AdminNotifs({ state, dispatch }) {
         return dayStr === filterDate;
       })
     : adminNotifsAll;
-  const unread = adminNotifs.filter(n => !n.read).length;
+  const unread = adminNotifsAll.filter(n => !n.read).length;
+  const unreadInView = adminNotifs.filter(n => !n.read).length;
   const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "✗", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
         <div>
           <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ALERTS</div>
-          {unread > 0 && <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 2 }}>{unread} unread</div>}
+          {unread > 0 && (
+            <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 2 }}>
+              {unread} unread{filterDate && unreadInView !== unread ? ` (${unreadInView} on this day)` : ""}
+            </div>
+          )}
         </div>
-        {unread > 0 && <Button title="CLEAR ALL" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+        {unread > 0 && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
         <TextField label="Filter by day" type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)} style={{ flex: 1 }} />
