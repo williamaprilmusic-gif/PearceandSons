@@ -1336,18 +1336,18 @@ async function streetNameSearch(query) {
 
 /* ---------- SEED DATA (used for local fallback / first-run reference) ---------- */
 const SEED_USERS = [
-  { id: "USR_ADMIN", role: ROLE.ADMIN, name: "Control Admin", staff_number: "ADM001", auth: { login: "Control Admin", pass: "ADM001" } },
-  { id: "USR_A1", role: ROLE.AGENT, name: "Nomsa Dlamini", staff_number: "AG1001", auth: { login: "Nomsa Dlamini", pass: "AG1001" },
+  { id: "USR_ADMIN", role: ROLE.ADMIN, name: "Control Admin", staff_number: "ADM001", auth: { login: "Control Admin", pass: "ADM001" }, is_online: false },
+  { id: "USR_A1", role: ROLE.AGENT, name: "Nomsa Dlamini", staff_number: "AG1001", auth: { login: "Nomsa Dlamini", pass: "AG1001" }, is_online: false,
     home_address: { label: "Spine Road, Mitchells Plain, Cape Town", area: "Mitchells Plain", lat: -34.0306, lng: 18.6244 },
     branch_id: "TELUS_MAITLAND", branch_history: [] },
-  { id: "USR_A2", role: ROLE.AGENT, name: "Thabo Mokoena", staff_number: "AG1002", auth: { login: "Thabo Mokoena", pass: "AG1002" },
+  { id: "USR_A2", role: ROLE.AGENT, name: "Thabo Mokoena", staff_number: "AG1002", auth: { login: "Thabo Mokoena", pass: "AG1002" }, is_online: false,
     home_address: { label: "Voortrekker Road, Bellville, Cape Town", area: "Bellville", lat: -33.9000, lng: 18.6300 },
     branch_id: "TELUS_MAITLAND", branch_history: [] },
-  { id: "USR_A3", role: ROLE.AGENT, name: "Ayesha Dollie", staff_number: "AG1003", auth: { login: "Ayesha Dollie", pass: "AG1003" },
+  { id: "USR_A3", role: ROLE.AGENT, name: "Ayesha Dollie", staff_number: "AG1003", auth: { login: "Ayesha Dollie", pass: "AG1003" }, is_online: false,
     home_address: { label: "Lansdowne Road, Lansdowne, Cape Town", area: "Lansdowne", lat: -33.9760, lng: 18.4980 },
     branch_id: "TELUS_MAITLAND", branch_history: [] },
-  { id: "USR_D1", role: ROLE.DRIVER, name: "Sipho Nkosi", staff_number: "DR2001", auth: { login: "Sipho Nkosi", pass: "DR2001" } },
-  { id: "USR_D2", role: ROLE.DRIVER, name: "Fatima Adams", staff_number: "DR2002", auth: { login: "Fatima Adams", pass: "DR2002" } },
+  { id: "USR_D1", role: ROLE.DRIVER, name: "Sipho Nkosi", staff_number: "DR2001", auth: { login: "Sipho Nkosi", pass: "DR2001" }, is_online: false },
+  { id: "USR_D2", role: ROLE.DRIVER, name: "Fatima Adams", staff_number: "DR2002", auth: { login: "Fatima Adams", pass: "DR2002" }, is_online: false },
 ];
 const SEED_DRIVER_STATUS = [
   { driver_id: "USR_D1", state: DRIVER_STATE.AVAILABLE, current_trip_id: null, vehicle: "Toyota Hiace - CA 123-456", phone: "071 234 5678", capacity: DRIVER_CAPACITY, is_online: false },
@@ -1380,20 +1380,26 @@ function appReducer(state, action) {
       if (!user) return { ...state, _error: "Invalid credentials" };
       // Per explicit decision: "online" means logged in right now — set
       // the instant login succeeds, cleared on logout, no idle timeout.
-      // Only drivers have a driver_status row to carry this on.
+      // Per a LATER explicit decision, this is now role-agnostic — lives
+      // on users[].is_online so it works for agents/admins too, not just
+      // drivers. driver_status.is_online is kept in sync alongside it
+      // (rather than removed outright), since a lot of existing
+      // driver-specific screens already read it from there.
+      const usersAfterLogin = state.users.map(u => u.id === user.id ? { ...u, is_online: true } : u);
       const driverStatusAfterLogin = user.role === ROLE.DRIVER
         ? state.driver_status.map(d => d.driver_id === user.id ? { ...d, is_online: true } : d)
         : state.driver_status;
-      return { ...state, active_user_id: user.id, driver_status: driverStatusAfterLogin, _error: null };
+      return { ...state, users: usersAfterLogin, active_user_id: user.id, driver_status: driverStatusAfterLogin, _error: null };
     }
     case "AUTH/LOGOUT": {
       // The outgoing user's id is needed to find their driver_status row
       // BEFORE active_user_id is cleared below.
       const loggedOutUser = state.users.find(u => u.id === state.active_user_id);
+      const usersAfterLogout = loggedOutUser ? state.users.map(u => u.id === loggedOutUser.id ? { ...u, is_online: false } : u) : state.users;
       const driverStatusAfterLogout = loggedOutUser?.role === ROLE.DRIVER
         ? state.driver_status.map(d => d.driver_id === loggedOutUser.id ? { ...d, is_online: false } : d)
         : state.driver_status;
-      return { ...state, active_user_id: null, driver_status: driverStatusAfterLogout };
+      return { ...state, users: usersAfterLogout, active_user_id: null, driver_status: driverStatusAfterLogout };
     }
 
     case "ADMIN/DELETE_USERS": {
@@ -1481,6 +1487,15 @@ function appReducer(state, action) {
         ...u,
         name: action.name ?? u.name,
         staff_number: action.staff_number ?? u.staff_number,
+        // Phone is now ONE shared field for every role, per explicit
+        // decision — previously drivers had their own separate number
+        // on driver_status (display-only, never actually used by the
+        // calling feature, which works off user id not phone number),
+        // while agents/admins had no editable phone at all (users.phone
+        // existed only as a NOT-NULL constraint satisfier, "N/A" for
+        // everyone, nothing read it). This replaces both with one real,
+        // admin-editable number that works the same way for everyone.
+        phone: action.phone !== undefined ? action.phone : u.phone,
         auth: { login: action.login ?? u.auth.login, pass: action.pass || u.auth.pass },
         ...(u.role === ROLE.AGENT
           ? { home_address: action.home_address !== undefined ? action.home_address : u.home_address, ...branchUpdate }
@@ -1504,14 +1519,13 @@ function appReducer(state, action) {
           : {}),
       } : u);
       let newDriverStatus = state.driver_status;
-      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.phone !== undefined || action.capacity !== undefined)) {
+      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.capacity !== undefined)) {
         if (action.capacity !== undefined && (!Number.isInteger(action.capacity) || action.capacity < 1)) {
           return { ...state, _error: "Vehicle capacity must be a whole number of at least 1." };
         }
         newDriverStatus = state.driver_status.map(d => d.driver_id === action.user_id ? {
           ...d,
           vehicle: action.vehicle !== undefined ? action.vehicle : d.vehicle,
-          phone: action.phone !== undefined ? action.phone : d.phone,
           capacity: action.capacity !== undefined ? action.capacity : d.capacity,
         } : d);
       }
@@ -1684,6 +1698,10 @@ function appReducer(state, action) {
     case "ADMIN/CREATE_USER": {
       const newUser = {
         id: "USR_" + mkId(), role: action.role, name: action.name, staff_number: action.staff_number || action.auth?.pass || null, auth: action.auth,
+        // Phone is now ONE shared field for every role, per explicit
+        // decision — see ADMIN/UPDATE_USER's comment for the full
+        // rationale.
+        phone: action.phone || null,
         ...((action.role === ROLE.AGENT || action.role === ROLE.DRIVER) && action.home_address ? { home_address: action.home_address } : {}),
         // No fallback to "the first company" — once companies are an
         // admin-managed, addable/removable list, there's no meaningful
@@ -1706,7 +1724,7 @@ function appReducer(state, action) {
       if (action.role === ROLE.DRIVER) {
         newDriverStatus = [...state.driver_status, {
           driver_id: newUser.id, state: DRIVER_STATE.AVAILABLE, current_trip_id: null,
-          vehicle: action.vehicle || "—", phone: action.phone || "—",
+          vehicle: action.vehicle || "—",
           capacity: DRIVER_CAPACITY,
         }];
       }
@@ -2726,7 +2744,7 @@ function appReducer(state, action) {
 // id columns are bigint (DB-generated), not app-generated USR_/TRP_
 // strings — see ADMIN/CREATE_USER and TRIP/BOOK for insert+readback.
 function userRowToApp(row) {
-  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username, pass: row.passwordhash } };
+  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username, pass: row.passwordhash }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
   // Home address is meaningful for both agents (pickup point) and drivers
   // (which area they live in, for assignment purposes) — not agent-only.
   if ((row.role === ROLE.AGENT || row.role === ROLE.DRIVER) && row.homelat != null) {
@@ -3127,7 +3145,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       persistActiveUserId(data.id);
       // Per explicit decision: "online" means logged in right now — set
       // the instant login succeeds, no idle timeout. Best-effort (a
-      // failed update here shouldn't block a successful login).
+      // failed update here shouldn't block a successful login). Per a
+      // LATER explicit decision, this is now role-agnostic — written to
+      // users.isonline for everyone, with driver_status.isonline kept in
+      // sync too (not removed) since existing driver-specific screens
+      // already read it from there.
+      await supabase.from("users").update({ isonline: true }).eq("id", data.id).then(() => {}, () => {});
       if (data.role === ROLE.DRIVER) {
         await supabase.from("driver_status").update({ isonline: true }).eq("driverid", data.id).then(() => {}, () => {});
       }
@@ -3140,6 +3163,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const loggedOutUserId = activeUserRef.current;
       if (loggedOutUserId) {
         const { data: loggedOutUserRow } = await supabase.from("users").select("role").eq("id", loggedOutUserId).maybeSingle();
+        await supabase.from("users").update({ isonline: false }).eq("id", loggedOutUserId).then(() => {}, () => {});
         if (loggedOutUserRow?.role === ROLE.DRIVER) {
           await supabase.from("driver_status").update({ isonline: false }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
         }
@@ -3230,6 +3254,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         staffnumber: action.staff_number ?? target.staffnumber,
         username: action.login ?? target.username,
       };
+      // Phone is now ONE shared field for every role, per explicit
+      // decision — see the in-memory reducer's case for the full
+      // rationale (drivers previously had a separate, purely-display
+      // number on driver_status that the calling feature never actually
+      // used; agents/admins had no editable phone at all).
+      if (action.phone !== undefined) update.phone = action.phone;
       // A provided password is stored salted-hashed; absent means keep
       // whatever is there (hashed or legacy plaintext awaiting its
       // lazy upgrade at next login).
@@ -3297,13 +3327,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
 
       const { error } = await supabase.from("users").update(update).eq("id", action.user_id);
       if (error) throw error;
-      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.phone !== undefined || action.capacity !== undefined)) {
+      if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.capacity !== undefined)) {
         if (action.capacity !== undefined && (!Number.isInteger(action.capacity) || action.capacity < 1)) {
           throw new Error("Vehicle capacity must be a whole number of at least 1.");
         }
         const dsUpdate = { updatedat: new Date().toISOString() };
         if (action.vehicle !== undefined) dsUpdate.vehicle = action.vehicle;
-        if (action.phone !== undefined) dsUpdate.phone = action.phone;
         if (action.capacity !== undefined) dsUpdate.capacity = action.capacity;
         const { error: dErr } = await supabase.from("driver_status").update(dsUpdate).eq("driverid", action.user_id);
         if (dErr) throw dErr;
@@ -3557,14 +3586,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // plan (transitos_security_hardening.sql) for when a real email
         // becomes meaningful. Without this, EVERY user creation — single
         // AND bulk CSV import — failed with a not-null violation.
-        // users.phone is ALSO a NOT NULL column the app never asks for on
-        // this form — the only phone field in the UI is the driver's
-        // live contact number, which is a different, separate column on
-        // driver_status (used for the in-app calling feature), not this
-        // one. Placeholder here, same reasoning as email above: nothing
-        // in the app reads users.phone, so a stable non-empty default
-        // satisfies the constraint without inventing UI nobody would use.
-        phone: action.phone || "N/A",
+        // users.phone is now a REAL, admin-editable field for every
+        // role, per explicit decision — previously this was just a
+        // NOT-NULL placeholder ("N/A") since the only editable phone
+        // field in the UI was the driver's separate driver_status.phone
+        // (display-only, never actually used by the calling feature,
+        // which works off user id not phone number). That field is now
+        // retired in favor of this one shared number for everyone.
+        phone: action.phone || null,
         email: `${action.auth.login.toLowerCase().replace(/[^a-z0-9]+/g, ".")}@transitos.internal`,
         staffnumber: action.staff_number || action.auth.pass || null,
         homeaddress: action.home_address?.label ?? null, homearea: action.home_address?.area ?? null,
@@ -3580,7 +3609,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (action.role === ROLE.DRIVER) {
         const { error: dErr } = await supabase.from("driver_status").insert({
           driverid: inserted.id, state: DRIVER_STATE.AVAILABLE, currenttripid: null,
-          vehicle: action.vehicle || "—", phone: action.phone || "—", capacity: DRIVER_CAPACITY,
+          vehicle: action.vehicle || "—", capacity: DRIVER_CAPACITY,
         });
         if (dErr) throw dErr;
       }
@@ -4988,11 +5017,24 @@ function GpsBlock({ coord }) {
   );
 }
 
-function DriverAvatar({ name, size = 42 }) {
+function DriverAvatar({ name, size = 42, isOnline }) {
   const init = (name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+  const dotSize = Math.max(8, Math.round(size * 0.28));
   return (
-    <div className="driver-av" style={{ width: size, height: size, fontSize: size * 0.38, borderRadius: size * 0.07 }}>
-      {init}
+    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+      <div className="driver-av" style={{ width: size, height: size, fontSize: size * 0.38, borderRadius: size * 0.07 }}>
+        {init}
+      </div>
+      {isOnline != null && (
+        <span
+          title={isOnline ? "Online" : "Offline"}
+          style={{
+            position: "absolute", bottom: -1, right: -1, width: dotSize, height: dotSize, borderRadius: dotSize / 2,
+            background: isOnline ? COLORS.green : COLORS.ghost,
+            border: `2px solid ${COLORS.ink}`, boxSizing: "border-box",
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -5795,7 +5837,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
         <Card>
           <SectionHeader label="Assigned Driver" />
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <DriverAvatar name={driverUser.name} />
+            <DriverAvatar name={driverUser.name} isOnline={driverUser.is_online} />
             <div>
               <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{driverUser.name}</div>
               <div style={{ fontSize: 10, color: COLORS.ghost }}>{driverStatus?.vehicle}</div>
@@ -6614,13 +6656,17 @@ function playAlertSound() {
     const now = ctx.currentTime;
     // Two quick notes (a rising interval) rather than a single flat beep —
     // more recognizable as "an alert happened" without being harsh.
-    [[880, now, 0.12], [1175, now + 0.12, 0.16]].forEach(([freq, start, dur]) => {
+    // Peak gain raised to 0.5 (previously 0.25) per explicit request to
+    // make it louder — kept below 1.0 deliberately, since a full-scale
+    // sine tone risks clipping/distorting on some device speakers and
+    // would sound harsh rather than just louder.
+    [[880, now, 0.14], [1175, now + 0.14, 0.18]].forEach(([freq, start, dur]) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
       osc.frequency.value = freq;
       gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(0.25, start + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.5, start + 0.015);
       gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
       osc.connect(gain);
       gain.connect(ctx.destination);
@@ -6634,6 +6680,55 @@ function playAlertSound() {
   }
 }
 
+let ringtoneIntervalId = null;
+function playRingtonePulse() {
+  try {
+    if (!sharedAudioCtx) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) return;
+      sharedAudioCtx = new AudioContextClass();
+    }
+    const ctx = sharedAudioCtx;
+    if (ctx.state === "suspended") ctx.resume();
+    const now = ctx.currentTime;
+    // Classic "ring-ring" — two short bursts at a landline-style
+    // frequency, close together, then a gap before the next pulse
+    // (see startRingtone's interval below) — recognizable as a phone
+    // ringing rather than a generic alert beep.
+    [[now, 0.4], [now + 0.5, 0.4]].forEach(([start, dur]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = 1000;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.45, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
+    });
+  } catch (e) {
+    console.warn("[Ringtone] playback failed:", e.message);
+  }
+}
+function startRingtone() {
+  if (ringtoneIntervalId != null) return; // already ringing — don't stack intervals
+  playRingtonePulse();
+  ringtoneIntervalId = setInterval(playRingtonePulse, 2000);
+}
+function stopRingtone() {
+  if (ringtoneIntervalId != null) {
+    clearInterval(ringtoneIntervalId);
+    ringtoneIntervalId = null;
+  }
+}
+
+// Controls notification/alert beeps ONLY (playAlertSound) — deliberately
+// does NOT affect the call ringtone (startRingtone/playRingtonePulse),
+// per explicit decision: missing an incoming call matters more than
+// missing a notification beep, so calls always ring regardless of this
+// setting.
 function AlertSoundToggle() {
   const [muted, setMuted] = useState(isAlertSoundMuted());
   const toggle = () => {
@@ -6655,6 +6750,21 @@ function CallOverlay({ call }) {
   const [muted, setMuted] = useState(false);
 
   const handleToggleMute = () => setMuted(toggleMute());
+
+  // Ringtone — genuinely silent before this (only the "Incoming call…"
+  // text existed). Rings for BOTH directions: the receiver hears it
+  // while deciding whether to answer, and the caller hears it too while
+  // waiting for the other person to pick up, matching how a real phone
+  // call sounds on both ends. Stops the instant the call leaves either
+  // ringing state, for any reason (answered, declined, hung up, failed).
+  useEffect(() => {
+    if (callState === CALL_STATE.RINGING_INCOMING || callState === CALL_STATE.RINGING_OUTGOING) {
+      startRingtone();
+    } else {
+      stopRingtone();
+    }
+    return () => stopRingtone();
+  }, [callState]);
 
   if (callState === CALL_STATE.IDLE) return null;
 
@@ -6726,7 +6836,7 @@ function AgentApp({ state, dispatch, user }) {
         {tab === "home" && <AgentHomeTab myTrips={myTrips} dispatch={dispatch} goToTrip={goToTrip} setTab={setTab} />}
         {tab === "book" && <AgentBookTab user={user} state={state} dispatch={dispatch} setTab={setTab} myTrips={myTrips} />}
         {tab === "trips" && <AgentTripsTab myTrips={myTrips} state={state} dispatch={dispatch} user={user} call={call} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
-        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} />}
+        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
         {tab === "me" && <AgentProfileTab user={user} myTrips={myTrips} dispatch={dispatch} />}
@@ -6761,7 +6871,7 @@ function AgentApp({ state, dispatch, user }) {
 // see or reply to a message an admin sent them — this closes that gap.
 // Trip-scoped chat (TripChatModal below) already worked both ways and
 // stays completely separate; this is specifically the DM system.
-function MessagesTab({ user, dispatch }) {
+function MessagesTab({ user, dispatch, state }) {
   const [conversations, setConversations] = useState(null); // null = loading
   const [openWith, setOpenWith] = useState(null); // { id, name } | null
   const [err, setErr] = useState(null);
@@ -6797,7 +6907,7 @@ function MessagesTab({ user, dispatch }) {
       ) : conversations.map(c => (
         <div key={c.counterpart_id} onClick={() => setOpenWith({ id: c.counterpart_id, name: c.counterpart_name })}
           style={{ display: "flex", alignItems: "center", gap: 10, background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: 12, cursor: "pointer" }}>
-          <DriverAvatar name={c.counterpart_name} size={36} />
+          <DriverAvatar name={c.counterpart_name} size={36} isOnline={state?.users.find(u => u.id === c.counterpart_id)?.is_online} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 12, fontWeight: 700 }}>{c.counterpart_name}</div>
             <div style={{ fontSize: 10, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
@@ -7696,7 +7806,7 @@ function DriverApp({ state, dispatch, user }) {
       <div style={{ flex: 1, overflowY: "auto" }}>
         {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} />}
         {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} />}
-        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} />}
+        {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "history" && <DriverHistoryTab myTrips={myTrips} />}
         {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
@@ -7760,7 +7870,7 @@ function AdminDashboard({ state, user }) {
         const full = load >= driverCapacityDash;
         return (
           <Card key={ds.driver_id} style={{ flexDirection: "row", gap: 14, alignItems: "flex-start" }}>
-            <DriverAvatar name={u?.name} />
+            <DriverAvatar name={u?.name} isOnline={u?.is_online} />
             <div style={{ flex: 1 }}>
               <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 700 }}>{u?.name}</div>
               <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{ds.vehicle}</div>
@@ -7849,7 +7959,7 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
         {availableAgents.map(a => (
           <div key={a.id} onClick={() => chooseAgent(a.id)}
             style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", border: `1px solid ${agentId === a.id ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, background: agentId === a.id ? COLORS.amber : "transparent" }}>
-            <DriverAvatar name={a.name} size={30} />
+            <DriverAvatar name={a.name} isOnline={a.is_online} size={30} />
             <div>
               <div style={{ fontSize: 11, fontWeight: 700, color: agentId === a.id ? COLORS.ink : COLORS.chalk }}>{a.name}</div>
               <div style={{ fontSize: 9, color: agentId === a.id ? COLORS.ink : COLORS.ghost }}>{a.auth.login}</div>
@@ -8029,7 +8139,7 @@ function TripDetailRow({ trip, state, dispatch }) {
             return (
               <div key={p.id} style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0" }}>
-                  <DriverAvatar name={p.name} size={28} />
+                  <DriverAvatar name={p.name} isOnline={p.is_online} size={28} />
                   <div style={{ flex: 1 }}>
                     <span style={{ fontSize: 11, fontWeight: 700 }}>{p.name}</span>
                     {pickedUp && <span style={{ fontSize: 9, color: COLORS.green, marginLeft: 6 }}>✓ picked up</span>}
@@ -8335,7 +8445,7 @@ function AdminTrips({ state, dispatch, user }) {
         return (
           <div key={key}>
             <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px 4px" }}>
-              {!isUnassigned && <DriverAvatar name={driverUser?.name} size={26} />}
+              {!isUnassigned && <DriverAvatar name={driverUser?.name} isOnline={driverUser?.is_online} size={26} />}
               <span style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: isUnassigned ? COLORS.ghost : COLORS.chalk }}>
                 {isUnassigned ? "UNASSIGNED" : (driverUser?.name || `Driver ${key}`)}
               </span>
@@ -8498,7 +8608,7 @@ function AdminProfileSearch({ state, user }) {
         <Card body={false}>
           {matches.slice(0, 10).map(u => (
             <div key={u.id} onClick={() => selectProfile(u)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
-              <DriverAvatar name={u.name} size={28} />
+              <DriverAvatar name={u.name} isOnline={u.is_online} size={28} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}</div>
                 <div style={{ fontSize: 9, color: COLORS.ghost }}>Staff #: {u.staff_number || "—"}</div>
@@ -8513,7 +8623,7 @@ function AdminProfileSearch({ state, user }) {
         <>
           <Card>
             <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-              <DriverAvatar name={selectedUser.name} size={48} />
+              <DriverAvatar name={selectedUser.name} isOnline={selectedUser.is_online} size={48} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontFamily: FONTS.head, fontSize: 17, fontWeight: 800 }}>{selectedUser.name}</div>
                 <div style={{ fontSize: 10, color: COLORS.ghost }}>Staff #: {selectedUser.staff_number || "—"}</div>
@@ -9748,8 +9858,8 @@ function UserProfilePanel({ u, driverStatus, state }) {
 
 function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
   const [form, setForm] = useState({
-    name: user.name, staffNumber: user.staff_number || "",
-    vehicle: driverStatus?.vehicle || "", phone: driverStatus?.phone || "",
+    name: user.name, staffNumber: user.staff_number || "", phone: user.phone || "",
+    vehicle: driverStatus?.vehicle || "",
     capacity: driverStatus?.capacity || DRIVER_CAPACITY,
     homeStreet: user.home_address?.label || "", homeArea: user.home_address?.area || "",
     homeCoord: user.home_address ? { lat: user.home_address.lat, lng: user.home_address.lng } : null,
@@ -9792,7 +9902,7 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
         // existing in both backends.
         pass: (form.staffNumber && form.staffNumber !== (user.staff_number || "")) ? form.staffNumber : undefined,
         vehicle: user.role === ROLE.DRIVER ? form.vehicle : undefined,
-        phone: user.role === ROLE.DRIVER ? form.phone : undefined,
+        phone: form.phone,
         capacity: user.role === ROLE.DRIVER ? form.capacity : undefined,
         // Only sent when the admin actually confirmed a new address via
         // the search — undefined means "leave unchanged" in both backends.
@@ -9823,6 +9933,7 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
       <TextField label="Full Name" value={form.name} onChange={e => set("name", e.target.value)} />
       <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Username is always the full name — currently "{form.name || user.name}"</span>
       <TextField label="Staff Number (also used as password)" value={form.staffNumber} onChange={e => set("staffNumber", e.target.value)} placeholder="e.g. AG1004" />
+      <TextField label="Cellphone Number" value={form.phone} onChange={e => set("phone", e.target.value)} placeholder="07x xxx xxxx" />
       {user.role === ROLE.AGENT && (
         <>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -9877,7 +9988,6 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
       {user.role === ROLE.DRIVER && (
         <>
           <TextField label="Vehicle" value={form.vehicle} onChange={e => set("vehicle", e.target.value)} placeholder="Toyota Hiace - CA 000-000" />
-          <TextField label="Phone" value={form.phone} onChange={e => set("phone", e.target.value)} />
           <TextField label="Vehicle Capacity (seats)" type="number" min="1" value={form.capacity} onChange={e => set("capacity", e.target.value === "" ? "" : parseInt(e.target.value, 10) || 1)} placeholder="4" />
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <SectionHeader label="Home Area (Cape Town)" />
@@ -10015,7 +10125,7 @@ function downloadCsv(csvContent, filename) {
 // from Excel still imports correctly):
 //   Full Name, Role (AGENT/DRIVER), Staff Number, Home Address, Home Area,
 //   Company (AGENT or DRIVER — matched against Manage Companies by name, id, or area),
-//   Vehicle (DRIVER only), Phone (DRIVER only)
+//   Vehicle (DRIVER only), Phone (any role)
 // Home Lat/Lng are deliberately NOT required on import — bulk-uploaded
 // agents get geocoded the normal way (via the address search) the first
 // time an admin edits them, rather than trusting arbitrary lat/lng values
@@ -10568,6 +10678,7 @@ function AdminUsers({ state, dispatch, user }) {
             {availableRoles.map(r => <Button key={r} title={r} size="sm" variant={form.role === r ? "amber" : "ghost"} onClick={() => set("role", r)} style={{ flex: 1 }} />)}
           </div>
           <TextField label="Staff Number (also used as password)" value={form.staffNumber} onChange={e => set("staffNumber", e.target.value)} placeholder="e.g. AG1004" />
+          <TextField label="Cellphone Number" value={form.phone} onChange={e => set("phone", e.target.value)} placeholder="07x xxx xxxx" />
           {form.role === ROLE.AGENT && (
             <>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -10598,7 +10709,6 @@ function AdminUsers({ state, dispatch, user }) {
           {form.role === ROLE.DRIVER && (
             <>
               <TextField label="Vehicle" value={form.vehicle} onChange={e => set("vehicle", e.target.value)} placeholder="Toyota Hiace - CA 000-000" />
-              <TextField label="Phone" value={form.phone} onChange={e => set("phone", e.target.value)} />
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 <SectionHeader label="Home Area (Cape Town)" />
                 <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Used by admins to see which area a driver lives in when assigning trips.</span>
@@ -10725,8 +10835,27 @@ function AdminContacts({ state, dispatch, user, call }) {
   const [loadingDm, setLoadingDm] = useState(false);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
+  // Inbox of existing conversations — the real gap this was missing:
+  // an admin could only ever START a conversation by searching someone
+  // out, never see one that another admin (or agent/driver) started
+  // WITH them. fetchMyConversations is already genuinely role-agnostic
+  // (built for the agent/driver MessagesTab), reused here as-is.
+  const [conversations, setConversations] = useState(null); // null = loading
+  const loadConversations = useCallback(async () => {
+    if (!supabase) { setConversations([]); return; }
+    try {
+      const convos = await fetchMyConversations(user.id, state.users);
+      setConversations(convos.sort((a, b) => b.last_ts_epoch - a.last_ts_epoch));
+    } catch (e) {
+      setConversations([]);
+    }
+  }, [user.id, state.users]);
+  useEffect(() => { loadConversations(); }, [loadConversations]);
 
-  const directory = state.users.filter(u => u.role === ROLE.AGENT || u.role === ROLE.DRIVER);
+  // Directory now includes admins too, per explicit decision — excluding
+  // the current admin themselves, since messaging/calling yourself isn't
+  // meaningful.
+  const directory = state.users.filter(u => (u.role === ROLE.AGENT || u.role === ROLE.DRIVER || u.role === ROLE.ADMIN) && u.id !== user.id);
   const matches = query.trim().length >= 1
     ? directory.filter(u => u.name.toLowerCase().includes(query.trim().toLowerCase()) || (u.staff_number || "").toLowerCase().includes(query.trim().toLowerCase()))
     : directory;
@@ -10758,6 +10887,7 @@ function AdminContacts({ state, dispatch, user, call }) {
       // message shows up immediately.
       const msgs = await fetchDirectMessages(user.id, selected.id);
       setDmMessages(msgs);
+      loadConversations(); // also refresh the inbox list's preview/order
     } catch (e) {
       // The global toast wrapper already told the user the send failed
       // (and re-threw) — without this catch that re-throw escaped the
@@ -10778,15 +10908,39 @@ function AdminContacts({ state, dispatch, user, call }) {
     <div className="pad">
       <SectionHeader label="Contacts" />
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
-        Message or call any agent or driver directly — not tied to a specific trip, works at any time.
+        Message or call any agent, driver, or fellow admin directly — not tied to a specific trip, works at any time.
       </div>
+
+      {!selected && conversations !== null && conversations.length > 0 && (
+        <>
+          <SectionHeader label="Recent Conversations" />
+          <Card body={false}>
+            {conversations.map(c => {
+              const cUser = state.users.find(u => u.id === c.counterpart_id);
+              return (
+                <div key={c.counterpart_id} onClick={() => openConversation({ id: c.counterpart_id, name: c.counterpart_name, role: cUser?.role })} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
+                  <DriverAvatar name={c.counterpart_name} isOnline={cUser?.is_online} size={30} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700 }}>{c.counterpart_name}</div>
+                    <div style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {c.last_sender_id === user.id ? "You: " : ""}{c.last_message}
+                    </div>
+                  </div>
+                  {cUser && <RoleBadge role={cUser.role} />}
+                </div>
+              );
+            })}
+          </Card>
+        </>
+      )}
+
       <TextField label="Search by name or staff number" value={query} onChange={e => setQuery(e.target.value)} placeholder="e.g. Nomsa Dlamini or DR2001" />
 
       {!selected && (
         <Card body={false}>
           {matches.length === 0 ? <Empty icon="💬" text="No matches" /> : matches.slice(0, 30).map(u => (
             <div key={u.id} onClick={() => openConversation(u)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
-              <DriverAvatar name={u.name} size={30} />
+              <DriverAvatar name={u.name} isOnline={u.is_online} size={30} />
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}</div>
                 <div style={{ fontSize: 9, color: COLORS.ghost }}>Staff #: {u.staff_number || "—"}</div>
@@ -10801,7 +10955,7 @@ function AdminContacts({ state, dispatch, user, call }) {
         <Card>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <DriverAvatar name={selected.name} size={36} />
+              <DriverAvatar name={selected.name} isOnline={selected.is_online} size={36} />
               <div>
                 <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{selected.name}</div>
                 <RoleBadge role={selected.role} />
