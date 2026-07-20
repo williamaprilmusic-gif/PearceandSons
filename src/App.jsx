@@ -8199,10 +8199,59 @@ function AdminTrips({ state, dispatch, user }) {
   const [filter, setFilter] = useState("ALL");
   const [selectedDriverId, setSelectedDriverId] = useState(null); // null = show all groups
   const [exporting, setExporting] = useState(false);
+  // Date filter + multi-select delete — moved here from Dispatch per
+  // explicit request, so an admin can find and remove unwanted bookings
+  // from the same screen where they already browse/filter every trip,
+  // rather than a separate dispatch-focused screen. The actual DELETE
+  // stays scoped to still-UNASSIGNED bookings only (same as it always
+  // was) — per explicit decision, this move is a relocation of the UI,
+  // not an expansion of what can be bulk-deleted.
+  const [dateFilter, setDateFilter] = useState("");
+  const [selectedTripIds, setSelectedTripIds] = useState(new Set());
+  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [bulkMsg, setBulkMsg] = useState(null);
   const filters = ["ALL", ...Object.values(TRIP_STATE)];
-  const displayTrips = filter === "ALL" ? state.trips : state.trips.filter(t => t.state === filter);
+  const displayTripsByState = filter === "ALL" ? state.trips : state.trips.filter(t => t.state === filter);
+  const displayTrips = dateFilter ? displayTripsByState.filter(t => t.scheduled_date === dateFilter) : displayTripsByState;
+  const availableTripDates = [...new Set(state.trips.map(t => t.scheduled_date).filter(Boolean))].sort();
   const canExport = hasAdminPermission(user, "exportCsv");
   const canEditTrips = hasAdminPermission(user, "manageTrips");
+  const canManageAdmins = hasAdminPermission(user, "manageAdmins");
+  // Danger Zone (Fleet Ops full trip-data wipe) — moved here from
+  // AdminUsers per explicit request, since this screen is where trip
+  // data actually lives; state moved along with the UI.
+  const [showWipeConfirm, setShowWipeConfirm] = useState(false);
+  const [wipeConfirmText, setWipeConfirmText] = useState("");
+  const [wiping, setWiping] = useState(false);
+  const [wipeError, setWipeError] = useState(null);
+  const [wipeDone, setWipeDone] = useState(false);
+  const WIPE_CONFIRM_PHRASE = "DELETE ALL TRIP DATA";
+  const toggleTripSelect = (tripId) => {
+    setSelectedTripIds(prev => {
+      const next = new Set(prev);
+      if (next.has(tripId)) next.delete(tripId); else next.add(tripId);
+      return next;
+    });
+  };
+  const selectedUnassignedIds = [...selectedTripIds].filter(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.UNASSIGNED_BOOKING);
+  const handleBulkDeleteTrips = async () => {
+    if (selectedUnassignedIds.length === 0) return;
+    setBulkDeleting(true);
+    try {
+      const results = await dispatch({ type: "TRIP/ADMIN_BULK_DELETE_UNASSIGNED", trip_ids: selectedUnassignedIds });
+      const okCount = (results || []).filter(r => r.ok).length;
+      const failResults = (results || []).filter(r => !r.ok);
+      setBulkMsg(failResults.length === 0
+        ? `✓ Deleted ${okCount} booking${okCount !== 1 ? "s" : ""}`
+        : `⚠ Deleted ${okCount}, ${failResults.length} skipped — ${failResults.map(r => r.reason).join("; ")}`);
+      setSelectedTripIds(new Set()); setConfirmingBulkDelete(false);
+    } catch (e) {
+      setBulkMsg(`✗ ${e.message || "Delete failed — please try again."}`);
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
 
   // Group by driver_id — trips with no driver assigned yet land in their
   // own "Unassigned" group rather than being dropped from the view.
@@ -8258,6 +8307,16 @@ function AdminTrips({ state, dispatch, user }) {
         )}
       </div>
 
+      {availableTripDates.length > 1 && (
+        <div>
+          <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY DATE</label>
+          <select className="inp" value={dateFilter} onChange={e => { setDateFilter(e.target.value); setSelectedTripIds(new Set()); }} style={{ width: "100%" }}>
+            <option value="">All dates</option>
+            {availableTripDates.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </div>
+      )}
+
       {driverIds.length > 1 && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <Button size="sm" variant={!selectedDriverId ? "amber" : "ghost"} title="ALL DRIVERS" onClick={() => setSelectedDriverId(null)} />
@@ -8286,11 +8345,95 @@ function AdminTrips({ state, dispatch, user }) {
               )}
             </div>
             <Card body={false}>
-              {groupTrips.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} />)}
+              {groupTrips.map(t => {
+                const isSelectableUnassigned = canEditTrips && t.state === TRIP_STATE.UNASSIGNED_BOOKING;
+                if (!isSelectableUnassigned) {
+                  return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} />;
+                }
+                const checked = selectedTripIds.has(t.trip_id);
+                return (
+                  <div key={t.trip_id} style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+                    <div onClick={() => toggleTripSelect(t.trip_id)} style={{ padding: "14px 0 0 10px", cursor: "pointer", flexShrink: 0 }}>
+                      <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink }}>{checked && "✓"}</span>
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <TripDetailRow trip={t} state={state} dispatch={dispatch} />
+                    </div>
+                  </div>
+                );
+              })}
             </Card>
           </div>
         );
       })}
+
+      {bulkMsg && (
+        <div style={{ background: bulkMsg.startsWith("✗") ? "rgba(232,58,58,.08)" : "rgba(29,185,84,.08)", border: `1px solid ${bulkMsg.startsWith("✗") ? "rgba(232,58,58,.3)" : "rgba(29,185,84,.3)"}`, borderRadius: 4, padding: 10 }}>
+          <span style={{ color: bulkMsg.startsWith("✗") ? COLORS.red : COLORS.green, fontWeight: 700, fontSize: 11 }}>{bulkMsg}</span>
+        </div>
+      )}
+      {selectedUnassignedIds.length > 0 && (
+        confirmingBulkDelete ? (
+          <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8, position: "sticky", bottom: 8 }}>
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>
+              Delete {selectedUnassignedIds.length} selected booking{selectedUnassignedIds.length !== 1 ? "s" : ""}? This can't be undone.
+            </span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingBulkDelete(false)} />
+              <Button title={bulkDeleting ? "DELETING…" : `DELETE ${selectedUnassignedIds.length}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={handleBulkDeleteTrips} disabled={bulkDeleting} loading={bulkDeleting} />
+            </div>
+          </div>
+        ) : (
+          <Button title={`🗑 DELETE ${selectedUnassignedIds.length} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingBulkDelete(true)} style={{ alignSelf: "flex-start", position: "sticky", bottom: 8 }} />
+        )
+      )}
+
+      {canManageAdmins && (
+        <Card style={{ borderColor: "rgba(232,58,58,.4)", background: "rgba(232,58,58,.03)" }}>
+          <SectionHeader label="⚠ Danger Zone (Fleet Ops only)" />
+          {!showWipeConfirm ? (
+            <>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>
+                Permanently deletes every trip, delay report, in-trip message, driver position history, and trip-related audit entry from the entire app. This cannot be undone and affects ALL companies, not just your own.
+              </span>
+              <Button title="🗑 DELETE ALL TRIP DATA" variant="danger" size="sm" onClick={() => setShowWipeConfirm(true)} style={{ alignSelf: "flex-start" }} />
+            </>
+          ) : wipeDone ? (
+            <>
+              <span style={{ fontSize: 11, color: COLORS.green }}>✓ All trip data has been deleted.</span>
+              <Button title="CLOSE" variant="ghost" size="sm" onClick={() => { setShowWipeConfirm(false); setWipeDone(false); setWipeConfirmText(""); }} />
+            </>
+          ) : (
+            <>
+              <span style={{ fontSize: 11, color: COLORS.red, fontWeight: 700 }}>
+                This will permanently erase every trip and everything related to it, for every company, with no way to recover it. To confirm, type the phrase below exactly:
+              </span>
+              <span style={{ fontSize: 11, fontFamily: "monospace", color: COLORS.chalk, background: COLORS.surface, padding: "6px 10px", borderRadius: 4, alignSelf: "flex-start" }}>{WIPE_CONFIRM_PHRASE}</span>
+              <input className="inp" value={wipeConfirmText} onChange={e => { setWipeConfirmText(e.target.value); setWipeError(null); }} placeholder="Type the phrase above" autoFocus />
+              {wipeError && <span style={{ fontSize: 10, color: COLORS.red }}>{wipeError}</span>}
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setShowWipeConfirm(false); setWipeConfirmText(""); setWipeError(null); }} />
+                <Button
+                  title={wiping ? "DELETING…" : "PERMANENTLY DELETE EVERYTHING"} variant="danger" size="sm" style={{ flex: 1 }}
+                  disabled={wiping || wipeConfirmText !== WIPE_CONFIRM_PHRASE}
+                  loading={wiping}
+                  onClick={async () => {
+                    setWiping(true); setWipeError(null);
+                    try {
+                      await dispatch({ type: "FLEET/WIPE_ALL_TRIP_DATA", confirm_phrase: wipeConfirmText });
+                      setWipeDone(true);
+                    } catch (e) {
+                      setWipeError(e.message || "Failed to wipe trip data — please try again.");
+                    } finally {
+                      setWiping(false);
+                    }
+                  }}
+                />
+              </div>
+            </>
+          )}
+        </Card>
+      )}
     </div>
   );
 }
@@ -8691,8 +8834,6 @@ function AdminDispatch({ state, dispatch }) {
   const [selectedTripIds, setSelectedTripIds] = useState(new Set());
   const [selectedDriverId, setSelectedDriverId] = useState(null);
   const [msg, setMsg] = useState(null);
-  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
-  const [bulkDeleting, setBulkDeleting] = useState(false);
   // Filters the unassigned bookings list down to one calendar date — with
   // several agents each booking a week (or more), the unassigned list can
   // easily reach 20-30+ cards all mixed together with no way to tell
@@ -8831,24 +8972,6 @@ function AdminDispatch({ state, dispatch }) {
     });
   const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
 
-  const handleBulkDelete = async () => {
-    if (selectedTrips.length === 0) return;
-    setBulkDeleting(true);
-    try {
-      const results = await dispatch({ type: "TRIP/ADMIN_BULK_DELETE_UNASSIGNED", trip_ids: selectedTrips.map(t => t.trip_id) });
-      const okCount = (results || []).filter(r => r.ok).length;
-      const failResults = (results || []).filter(r => !r.ok);
-      setMsg(failResults.length === 0
-        ? `✓ Deleted ${okCount} booking${okCount !== 1 ? "s" : ""}`
-        : `⚠ Deleted ${okCount}, ${failResults.length} skipped — ${failResults.map(r => r.reason).join("; ")}`);
-      setSelectedTripIds(new Set()); setSelectedDriverId(null); setConfirmingBulkDelete(false);
-    } catch (e) {
-      setMsg(`✗ ${e.message || "Delete failed — please try again."}`);
-    } finally {
-      setBulkDeleting(false);
-    }
-  };
-
   const handleDispatch = async () => {
     if (!primaryTrip || !selectedDriverId || overCapacity) return;
     const driverName = state.users.find(u => u.id === selectedDriverId)?.name;
@@ -8901,21 +9024,6 @@ function AdminDispatch({ state, dispatch }) {
         </div>
       )}
       <SectionHeader label={`Unassigned Bookings (${unassigned.length}${(dayFilter || directionFilter || areaFilter) ? ` of ${unassignedAllDates.length}` : ""})`} />
-      {selectedTrips.length > 0 && (
-        confirmingBulkDelete ? (
-          <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-            <span style={{ fontSize: 11, color: COLORS.chalk }}>
-              Delete {selectedTrips.length} selected booking{selectedTrips.length !== 1 ? "s" : ""}? This can't be undone — the agent{selectedTrips.length !== 1 ? "s" : ""} will need to rebook if this was a mistake.
-            </span>
-            <div style={{ display: "flex", gap: 8 }}>
-              <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingBulkDelete(false)} />
-              <Button title={bulkDeleting ? "DELETING…" : `DELETE ${selectedTrips.length}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={handleBulkDelete} disabled={bulkDeleting} loading={bulkDeleting} />
-            </div>
-          </div>
-        ) : (
-          <Button title={`🗑 DELETE ${selectedTrips.length} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingBulkDelete(true)} style={{ alignSelf: "flex-start" }} />
-        )
-      )}
       {availableDates.length > 1 && (
         <div>
           <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY DAY</label>
@@ -10322,15 +10430,6 @@ function AdminUsers({ state, dispatch, user }) {
   const canCreateAgentsDrivers = hasAdminPermission(user, "manageAgentsDrivers");
   const canManageAdmins = hasAdminPermission(user, "manageAdmins");
   const canCreateAnything = canCreateAgentsDrivers || canManageAdmins;
-  // Fleet-Ops-only "wipe all trip data" flow — a genuinely destructive,
-  // whole-database action, so this needs its own confirmation state
-  // completely separate from the batch user-delete flow below.
-  const [showWipeConfirm, setShowWipeConfirm] = useState(false);
-  const [wipeConfirmText, setWipeConfirmText] = useState("");
-  const [wiping, setWiping] = useState(false);
-  const [wipeError, setWipeError] = useState(null);
-  const [wipeDone, setWipeDone] = useState(false);
-  const WIPE_CONFIRM_PHRASE = "DELETE ALL TRIP DATA";
 
   // Multi-select delete — a Set so toggling a row on tap is a plain
   // add/delete rather than an indexOf/splice dance (same pattern as the
@@ -10615,53 +10714,6 @@ function AdminUsers({ state, dispatch, user }) {
           );
         })}
       </Card>
-
-      {canManageAdmins && (
-        <Card style={{ borderColor: "rgba(232,58,58,.4)", background: "rgba(232,58,58,.03)" }}>
-          <SectionHeader label="⚠ Danger Zone (Fleet Ops only)" />
-          {!showWipeConfirm ? (
-            <>
-              <span style={{ fontSize: 10, color: COLORS.ghost }}>
-                Permanently deletes every trip, delay report, in-trip message, driver position history, and trip-related audit entry from the entire app. This cannot be undone and affects ALL companies, not just your own.
-              </span>
-              <Button title="🗑 DELETE ALL TRIP DATA" variant="danger" size="sm" onClick={() => setShowWipeConfirm(true)} style={{ alignSelf: "flex-start" }} />
-            </>
-          ) : wipeDone ? (
-            <>
-              <span style={{ fontSize: 11, color: COLORS.green }}>✓ All trip data has been deleted.</span>
-              <Button title="CLOSE" variant="ghost" size="sm" onClick={() => { setShowWipeConfirm(false); setWipeDone(false); setWipeConfirmText(""); }} />
-            </>
-          ) : (
-            <>
-              <span style={{ fontSize: 11, color: COLORS.red, fontWeight: 700 }}>
-                This will permanently erase every trip and everything related to it, for every company, with no way to recover it. To confirm, type the phrase below exactly:
-              </span>
-              <span style={{ fontSize: 11, fontFamily: "monospace", color: COLORS.chalk, background: COLORS.surface, padding: "6px 10px", borderRadius: 4, alignSelf: "flex-start" }}>{WIPE_CONFIRM_PHRASE}</span>
-              <input className="inp" value={wipeConfirmText} onChange={e => { setWipeConfirmText(e.target.value); setWipeError(null); }} placeholder="Type the phrase above" autoFocus />
-              {wipeError && <span style={{ fontSize: 10, color: COLORS.red }}>{wipeError}</span>}
-              <div style={{ display: "flex", gap: 8 }}>
-                <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setShowWipeConfirm(false); setWipeConfirmText(""); setWipeError(null); }} />
-                <Button
-                  title={wiping ? "DELETING…" : "PERMANENTLY DELETE EVERYTHING"} variant="danger" size="sm" style={{ flex: 1 }}
-                  disabled={wiping || wipeConfirmText !== WIPE_CONFIRM_PHRASE}
-                  loading={wiping}
-                  onClick={async () => {
-                    setWiping(true); setWipeError(null);
-                    try {
-                      await dispatch({ type: "FLEET/WIPE_ALL_TRIP_DATA", confirm_phrase: wipeConfirmText });
-                      setWipeDone(true);
-                    } catch (e) {
-                      setWipeError(e.message || "Failed to wipe trip data — please try again.");
-                    } finally {
-                      setWiping(false);
-                    }
-                  }}
-                />
-              </div>
-            </>
-          )}
-        </Card>
-      )}
     </div>
   );
 }
