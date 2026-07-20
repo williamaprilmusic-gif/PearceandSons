@@ -6630,6 +6630,30 @@ function useWebRTCCall(currentUser) {
 // not the database, so it doesn't need a schema change or sync across
 // devices. Defaults to enabled (opt-out, not opt-in) since that's what
 // "add a sound to notify" implies as the baseline behavior.
+// Remembers the last-active tab per (role, user) in localStorage, so a
+// page refresh lands back where the person actually was instead of
+// resetting to that app's hardcoded default tab every time. Keyed by
+// user id too, not just role — two different agents sharing a browser
+// shouldn't inherit each other's last-open tab. validTabIds guards
+// against a stale saved value from a future tab rename/removal
+// silently breaking navigation (falls back to defaultTab instead).
+function usePersistedTab(roleKey, userId, defaultTab, validTabIds) {
+  const storageKey = `transitos_last_tab_${roleKey}_${userId}`;
+  const [tab, setTabState] = useState(() => {
+    try {
+      const saved = localStorage.getItem(storageKey);
+      return saved && validTabIds.includes(saved) ? saved : defaultTab;
+    } catch (e) {
+      return defaultTab;
+    }
+  });
+  const setTab = useCallback((next) => {
+    setTabState(next);
+    try { localStorage.setItem(storageKey, next); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+  }, [storageKey]);
+  return [tab, setTab];
+}
+
 const ALERT_SOUND_PREF_KEY = "transitos_alert_sound_muted";
 function isAlertSoundMuted() {
   try { return localStorage.getItem(ALERT_SOUND_PREF_KEY) === "true"; } catch (e) { return false; }
@@ -6806,7 +6830,7 @@ function CallOverlay({ call }) {
 
 
 function AgentApp({ state, dispatch, user }) {
-  const [tab, setTab] = useState("home");
+  const [tab, setTab] = usePersistedTab("agent", user.id, "home", AGENT_TABS.map(t => t[0]));
   const myTrips = state.trips.filter(t => t.agent_ids.includes(user.id));
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read);
   // Home-screen cards say "Tap to view details" — so land on THAT trip's
@@ -7752,7 +7776,7 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
 const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
 
 function DriverApp({ state, dispatch, user }) {
-  const [tab, setTab] = useState("trips");
+  const [tab, setTab] = usePersistedTab("driver", user.id, "trips", DRIVER_TABS.map(t => t[0]));
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myUnreadNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read).length;
   const allMyTrips = state.trips.filter(t => t.driver_id === user.id);
@@ -8317,8 +8341,12 @@ function AdminTrips({ state, dispatch, user }) {
   const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkMsg, setBulkMsg] = useState(null);
+  // Ids just successfully deleted, hidden immediately regardless of
+  // refetch timing — see handleBulkDeleteTrips.
+  const [locallyHiddenTripIds, setLocallyHiddenTripIds] = useState(new Set());
   const filters = ["ALL", ...Object.values(TRIP_STATE)];
-  const displayTripsByState = filter === "ALL" ? state.trips : state.trips.filter(t => t.state === filter);
+  const visibleStateTrips = state.trips.filter(t => !locallyHiddenTripIds.has(t.trip_id));
+  const displayTripsByState = filter === "ALL" ? visibleStateTrips : visibleStateTrips.filter(t => t.state === filter);
   const displayTrips = dateFilter ? displayTripsByState.filter(t => t.scheduled_date === dateFilter) : displayTripsByState;
   const availableTripDates = [...new Set(state.trips.map(t => t.scheduled_date).filter(Boolean))].sort();
   const canExport = hasAdminPermission(user, "exportCsv");
@@ -8351,6 +8379,15 @@ function AdminTrips({ state, dispatch, user }) {
       setBulkMsg(failResults.length === 0
         ? `✓ Deleted ${okCount} item${okCount !== 1 ? "s" : ""}`
         : `⚠ Deleted ${okCount}, ${failResults.length} skipped — ${failResults.map(r => r.reason).join("; ")}`);
+      // Belt-and-suspenders: the dispatch above already triggers a real
+      // backend refetch (Supabase mode) or a direct state mutation (demo
+      // mode), both of which SHOULD make deleted trips vanish from this
+      // screen on their own. This makes it deterministic and immediate
+      // regardless — every successfully-deleted id is excluded from the
+      // locally-rendered list right away, rather than the screen relying
+      // purely on the async refetch's timing to catch up.
+      const justDeletedIds = new Set(allResults.filter(r => r.ok).map(r => r.trip_id));
+      setLocallyHiddenTripIds(prev => new Set([...prev, ...justDeletedIds]));
       setSelectedTripIds(new Set()); setConfirmingBulkDelete(false);
     } catch (e) {
       setBulkMsg(`✗ ${e.message || "Delete failed — please try again."}`);
@@ -11117,7 +11154,22 @@ const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Book
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
 
 function AdminApp({ state, dispatch, user }) {
-  const [tab, setTab] = useState("dashboard");
+  // Viewer Administrators don't get Dispatch or Users at all (per the
+  // permission model — VIEWER has manageDispatch/manageAgentsDrivers/
+  // manageAdmins all false), regardless of what tab they might try to
+  // force via state — the tab content itself also checks permissions,
+  // this just keeps the sidebar honest about what's actually usable.
+  // Computed BEFORE the tab state below so a persisted/restored tab can
+  // be validated against what THIS admin can actually see — restoring
+  // someone into a tab their permissions no longer allow would show a
+  // broken/blank screen instead of falling back to the default.
+  const visibleNav = ADMIN_NAV.filter(([id]) => {
+    if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
+    if (id === "users") return hasAdminPermission(user, "viewUsers");
+    if (id === "contacts") return hasAdminPermission(user, "manageTrips");
+    return true;
+  });
+  const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
   const [drawerOpen, setDrawerOpen] = useState(false);
   const isNarrow = useIsNarrowScreen();
   const notifCount = state.notifications.filter(n => !n.read && n.for_roles?.includes(ROLE.ADMIN)).length;
@@ -11140,18 +11192,6 @@ function AdminApp({ state, dispatch, user }) {
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, user.scoped_company_ids),
     };
   }, [state, user]);
-
-  // Viewer Administrators don't get Dispatch or Users at all (per the
-  // permission model — VIEWER has manageDispatch/manageAgentsDrivers/
-  // manageAdmins all false), regardless of what tab they might try to
-  // force via state — the tab content itself also checks permissions,
-  // this just keeps the sidebar honest about what's actually usable.
-  const visibleNav = ADMIN_NAV.filter(([id]) => {
-    if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
-    if (id === "users") return hasAdminPermission(user, "viewUsers");
-    if (id === "contacts") return hasAdminPermission(user, "manageTrips");
-    return true;
-  });
 
   // Shared nav content — identical markup whether it's rendered as the
   // permanent wide-screen sidebar or the narrow-screen slide-in drawer,
