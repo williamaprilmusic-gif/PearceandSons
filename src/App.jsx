@@ -2659,26 +2659,34 @@ function appReducer(state, action) {
       };
     }
 
-    case "FLEET/WIPE_ALL_TRIP_DATA": {
-      // Fleet Ops ONLY (permission checked by the caller/UI — see the
-      // Supabase case for the real enforcement, since demo mode has no
-      // server-side gate to bypass). Requires the exact confirmation
-      // phrase, checked HERE too (not just in the UI) so this can't be
-      // triggered by a forged/malformed action that skips the UI's own
-      // confirm step. Wipes every trip and everything trip-related —
-      // demo mode's in-memory state doesn't have separate delay/
-      // message/position-log tables, so "everything trip-related" here
-      // just means trips + trip-scoped notifications; the Supabase
-      // case does the real multi-table wipe.
-      if (action.confirm_phrase !== "DELETE ALL TRIP DATA") {
-        return { ...state, _error: "Confirmation phrase didn't match — nothing was deleted." };
+    case "TRIP/ADMIN_BULK_DELETE_COMPLETED": {
+      // New, SEPARATE action from the unassigned-only one above —
+      // deliberately not widening that action's scope, since deleting a
+      // real completed/archived trip (a genuine historical record —
+      // feeds CSV exports, driver trip counts, audit trail) has very
+      // different implications than deleting a still-pending booking
+      // nobody's acted on yet. Same select-one-or-many pattern, same
+      // per-trip results so one trip that somehow isn't actually
+      // completed doesn't block deleting the rest of the batch. Demo
+      // mode has no separate delay/message/audit tables to clean up
+      // (see the Supabase case for that side); this just removes the
+      // trip record and any trip-tagged notifications referencing it.
+      const results = [];
+      for (const tripId of action.trip_ids || []) {
+        const trip = state.trips.find(t => t.trip_id === tripId);
+        if (!trip) { results.push({ trip_id: tripId, ok: false, reason: "Trip not found" }); continue; }
+        if (trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+          results.push({ trip_id: tripId, ok: false, reason: "Not a completed trip" });
+          continue;
+        }
+        results.push({ trip_id: tripId, ok: true });
       }
+      const deletedIds = new Set(results.filter(r => r.ok).map(r => r.trip_id));
       return {
         ...state,
-        trips: [],
-        notifications: state.notifications.filter(n => !n.trip_id),
-        driver_status: state.driver_status.map(d => ({ ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null })),
-        _error: null,
+        trips: state.trips.filter(t => !deletedIds.has(t.trip_id)),
+        notifications: state.notifications.filter(n => !deletedIds.has(n.trip_id)),
+        _error: null, _lastBulkDeleteResults: results,
       };
     }
 
@@ -4012,48 +4020,36 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await refetch();
       return results;
     }
-    case "FLEET/WIPE_ALL_TRIP_DATA": {
-      // Fleet Ops ONLY — manageAdmins is the one permission unique to
-      // that tier (Standard has viewUsers/manageAgentsDrivers/
-      // manageTrips/manageDispatch but NOT manageAdmins), matching the
-      // explicit requirement precisely. Requires the exact confirmation
-      // phrase, checked HERE (server-side) rather than trusting the
-      // UI's own confirm dialog, since a network-level replay or a
-      // forged action object could otherwise skip that step entirely.
-      const wipeAdmin = await assertAdminPermission(activeUserRef, "manageAdmins");
-      if (action.confirm_phrase !== "DELETE ALL TRIP DATA") {
-        throw new Error("Confirmation phrase didn't match — nothing was deleted.");
+
+    case "TRIP/ADMIN_BULK_DELETE_COMPLETED": {
+      // See the in-memory reducer's case for the full rationale — a
+      // SEPARATE action from the unassigned-only one above, scoped to
+      // ONLY completed trips. Also cleans up trip-tagged trip_delays/
+      // messages/audit_logs for each deleted trip, so a deleted trip
+      // doesn't leave orphaned rows referencing a trip_id that no
+      // longer exists.
+      const actingAdminBulkDeleteCompleted = await assertAdminPermission(activeUserRef, "manageTrips");
+      const resultsCompleted = [];
+      for (const tripId of action.trip_ids || []) {
+        const { data: bdcTripRow } = await supabase.from("trips").select("*").eq("id", tripId).maybeSingle();
+        if (!bdcTripRow) { resultsCompleted.push({ trip_id: tripId, ok: false, reason: "Trip not found" }); continue; }
+        if (bdcTripRow.status !== TRIP_STATE.ARCHIVED_COMPLETED) {
+          resultsCompleted.push({ trip_id: tripId, ok: false, reason: "Not a completed trip" });
+          continue;
+        }
+        await supabase.from("trip_delays").delete().eq("tripid", tripId);
+        await supabase.from("messages").delete().eq("tripid", tripId);
+        await supabase.from("audit_logs").delete().eq("tripid", tripId);
+        const { error: bdcDelErr } = await supabase.from("trips").delete().eq("id", tripId);
+        if (bdcDelErr) { resultsCompleted.push({ trip_id: tripId, ok: false, reason: bdcDelErr.message }); continue; }
+        await logAuditAction({
+          actorId: actingAdminBulkDeleteCompleted.id, actorName: actingAdminBulkDeleteCompleted.name, actionType: "TRIP/ADMIN_BULK_DELETE_COMPLETED",
+          details: `Deleted completed trip ${tripId} (bulk delete)`,
+        });
+        resultsCompleted.push({ trip_id: tripId, ok: true });
       }
-      // Per explicit decision: wipe EVERYTHING trip-related, not just
-      // the trips table itself — delay reports, in-trip chat messages,
-      // driver GPS position history, and any audit log entry that
-      // references a trip. Audit entries with NO tripid (user
-      // management, company edits, etc.) are deliberately preserved —
-      // only .not("tripid", "is", null) rows are removed.
-      const { error: wipeDelaysErr } = await supabase.from("trip_delays").delete().not("tripid", "is", null);
-      if (wipeDelaysErr) throw wipeDelaysErr;
-      const { error: wipeMessagesErr } = await supabase.from("messages").delete().not("tripid", "is", null);
-      if (wipeMessagesErr) throw wipeMessagesErr;
-      const { error: wipePosLogErr } = await supabase.from("driver_position_log").delete().not("tripid", "is", null);
-      if (wipePosLogErr) throw wipePosLogErr;
-      const { error: wipeAuditErr } = await supabase.from("audit_logs").delete().not("tripid", "is", null);
-      if (wipeAuditErr) throw wipeAuditErr;
-      const { error: wipeTripsErr } = await supabase.from("trips").delete().not("id", "is", null);
-      if (wipeTripsErr) throw wipeTripsErr;
-      // Every driver's current_trip_id now points at a deleted row —
-      // clear it and free them up, or the app would show drivers stuck
-      // "busy" on trips that no longer exist.
-      await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null }).not("driverid", "is", null);
-      // Logged AFTER every delete above succeeds, so this entry only
-      // records that the wipe genuinely completed — and has no tripid
-      // itself, so it correctly survives the audit_logs purge that ran
-      // just before it.
-      await logAuditAction({
-        actorId: wipeAdmin.id, actorName: wipeAdmin.name, actionType: "FLEET/WIPE_ALL_TRIP_DATA",
-        details: "Wiped ALL trip data — trips, delays, messages, position history, and trip-related audit entries.",
-      });
       await refetch();
-      return;
+      return resultsCompleted;
     }
     case "TRIP/ADMIN_CANCEL": {
       // Admin-initiated cancellation of any not-yet-completed trip — see
@@ -8327,16 +8323,6 @@ function AdminTrips({ state, dispatch, user }) {
   const availableTripDates = [...new Set(state.trips.map(t => t.scheduled_date).filter(Boolean))].sort();
   const canExport = hasAdminPermission(user, "exportCsv");
   const canEditTrips = hasAdminPermission(user, "manageTrips");
-  const canManageAdmins = hasAdminPermission(user, "manageAdmins");
-  // Danger Zone (Fleet Ops full trip-data wipe) — moved here from
-  // AdminUsers per explicit request, since this screen is where trip
-  // data actually lives; state moved along with the UI.
-  const [showWipeConfirm, setShowWipeConfirm] = useState(false);
-  const [wipeConfirmText, setWipeConfirmText] = useState("");
-  const [wiping, setWiping] = useState(false);
-  const [wipeError, setWipeError] = useState(null);
-  const [wipeDone, setWipeDone] = useState(false);
-  const WIPE_CONFIRM_PHRASE = "DELETE ALL TRIP DATA";
   const toggleTripSelect = (tripId) => {
     setSelectedTripIds(prev => {
       const next = new Set(prev);
@@ -8345,15 +8331,25 @@ function AdminTrips({ state, dispatch, user }) {
     });
   };
   const selectedUnassignedIds = [...selectedTripIds].filter(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.UNASSIGNED_BOOKING);
+  const selectedCompletedIds = [...selectedTripIds].filter(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.ARCHIVED_COMPLETED);
   const handleBulkDeleteTrips = async () => {
-    if (selectedUnassignedIds.length === 0) return;
+    if (selectedUnassignedIds.length === 0 && selectedCompletedIds.length === 0) return;
     setBulkDeleting(true);
     try {
-      const results = await dispatch({ type: "TRIP/ADMIN_BULK_DELETE_UNASSIGNED", trip_ids: selectedUnassignedIds });
-      const okCount = (results || []).filter(r => r.ok).length;
-      const failResults = (results || []).filter(r => !r.ok);
+      // A selection can contain BOTH categories at once (an admin
+      // multi-selecting across different driver groups) — each needs
+      // its own action (different safety scope per action, see the
+      // reducer cases), so both are dispatched when both are present,
+      // then combined into one summary message.
+      const [unassignedResults, completedResults] = await Promise.all([
+        selectedUnassignedIds.length > 0 ? dispatch({ type: "TRIP/ADMIN_BULK_DELETE_UNASSIGNED", trip_ids: selectedUnassignedIds }) : Promise.resolve([]),
+        selectedCompletedIds.length > 0 ? dispatch({ type: "TRIP/ADMIN_BULK_DELETE_COMPLETED", trip_ids: selectedCompletedIds }) : Promise.resolve([]),
+      ]);
+      const allResults = [...(unassignedResults || []), ...(completedResults || [])];
+      const okCount = allResults.filter(r => r.ok).length;
+      const failResults = allResults.filter(r => !r.ok);
       setBulkMsg(failResults.length === 0
-        ? `✓ Deleted ${okCount} booking${okCount !== 1 ? "s" : ""}`
+        ? `✓ Deleted ${okCount} item${okCount !== 1 ? "s" : ""}`
         : `⚠ Deleted ${okCount}, ${failResults.length} skipped — ${failResults.map(r => r.reason).join("; ")}`);
       setSelectedTripIds(new Set()); setConfirmingBulkDelete(false);
     } catch (e) {
@@ -8456,8 +8452,8 @@ function AdminTrips({ state, dispatch, user }) {
             </div>
             <Card body={false}>
               {groupTrips.map(t => {
-                const isSelectableUnassigned = canEditTrips && t.state === TRIP_STATE.UNASSIGNED_BOOKING;
-                if (!isSelectableUnassigned) {
+                const isSelectable = canEditTrips && (t.state === TRIP_STATE.UNASSIGNED_BOOKING || t.state === TRIP_STATE.ARCHIVED_COMPLETED);
+                if (!isSelectable) {
                   return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} />;
                 }
                 const checked = selectedTripIds.has(t.trip_id);
@@ -8482,68 +8478,30 @@ function AdminTrips({ state, dispatch, user }) {
           <span style={{ color: bulkMsg.startsWith("✗") ? COLORS.red : COLORS.green, fontWeight: 700, fontSize: 11 }}>{bulkMsg}</span>
         </div>
       )}
-      {selectedUnassignedIds.length > 0 && (
-        confirmingBulkDelete ? (
+      {(selectedUnassignedIds.length > 0 || selectedCompletedIds.length > 0) && (() => {
+        const totalSelected = selectedUnassignedIds.length + selectedCompletedIds.length;
+        return confirmingBulkDelete ? (
           <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8, position: "sticky", bottom: 8 }}>
             <span style={{ fontSize: 11, color: COLORS.chalk }}>
-              Delete {selectedUnassignedIds.length} selected booking{selectedUnassignedIds.length !== 1 ? "s" : ""}? This can't be undone.
+              Delete {totalSelected} selected item{totalSelected !== 1 ? "s" : ""}
+              {selectedUnassignedIds.length > 0 && selectedCompletedIds.length > 0
+                ? ` (${selectedUnassignedIds.length} unassigned booking${selectedUnassignedIds.length !== 1 ? "s" : ""}, ${selectedCompletedIds.length} completed trip${selectedCompletedIds.length !== 1 ? "s" : ""})`
+                : ""}? This can't be undone.
             </span>
+            {selectedCompletedIds.length > 0 && (
+              <span style={{ fontSize: 10, color: COLORS.red, fontWeight: 700 }}>
+                ⚠ {selectedCompletedIds.length} of these {selectedCompletedIds.length !== 1 ? "are" : "is a"} completed trip{selectedCompletedIds.length !== 1 ? "s" : ""} — a real historical record, permanently removed from CSV exports and driver trip counts too, not just this list.
+              </span>
+            )}
             <div style={{ display: "flex", gap: 8 }}>
               <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingBulkDelete(false)} />
-              <Button title={bulkDeleting ? "DELETING…" : `DELETE ${selectedUnassignedIds.length}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={handleBulkDeleteTrips} disabled={bulkDeleting} loading={bulkDeleting} />
+              <Button title={bulkDeleting ? "DELETING…" : `DELETE ${totalSelected}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={handleBulkDeleteTrips} disabled={bulkDeleting} loading={bulkDeleting} />
             </div>
           </div>
         ) : (
-          <Button title={`🗑 DELETE ${selectedUnassignedIds.length} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingBulkDelete(true)} style={{ alignSelf: "flex-start", position: "sticky", bottom: 8 }} />
-        )
-      )}
-
-      {canManageAdmins && (
-        <Card style={{ borderColor: "rgba(232,58,58,.4)", background: "rgba(232,58,58,.03)" }}>
-          <SectionHeader label="⚠ Danger Zone (Fleet Ops only)" />
-          {!showWipeConfirm ? (
-            <>
-              <span style={{ fontSize: 10, color: COLORS.ghost }}>
-                Permanently deletes every trip, delay report, in-trip message, driver position history, and trip-related audit entry from the entire app. This cannot be undone and affects ALL companies, not just your own.
-              </span>
-              <Button title="🗑 DELETE ALL TRIP DATA" variant="danger" size="sm" onClick={() => setShowWipeConfirm(true)} style={{ alignSelf: "flex-start" }} />
-            </>
-          ) : wipeDone ? (
-            <>
-              <span style={{ fontSize: 11, color: COLORS.green }}>✓ All trip data has been deleted.</span>
-              <Button title="CLOSE" variant="ghost" size="sm" onClick={() => { setShowWipeConfirm(false); setWipeDone(false); setWipeConfirmText(""); }} />
-            </>
-          ) : (
-            <>
-              <span style={{ fontSize: 11, color: COLORS.red, fontWeight: 700 }}>
-                This will permanently erase every trip and everything related to it, for every company, with no way to recover it. To confirm, type the phrase below exactly:
-              </span>
-              <span style={{ fontSize: 11, fontFamily: "monospace", color: COLORS.chalk, background: COLORS.surface, padding: "6px 10px", borderRadius: 4, alignSelf: "flex-start" }}>{WIPE_CONFIRM_PHRASE}</span>
-              <input className="inp" value={wipeConfirmText} onChange={e => { setWipeConfirmText(e.target.value); setWipeError(null); }} placeholder="Type the phrase above" autoFocus />
-              {wipeError && <span style={{ fontSize: 10, color: COLORS.red }}>{wipeError}</span>}
-              <div style={{ display: "flex", gap: 8 }}>
-                <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setShowWipeConfirm(false); setWipeConfirmText(""); setWipeError(null); }} />
-                <Button
-                  title={wiping ? "DELETING…" : "PERMANENTLY DELETE EVERYTHING"} variant="danger" size="sm" style={{ flex: 1 }}
-                  disabled={wiping || wipeConfirmText !== WIPE_CONFIRM_PHRASE}
-                  loading={wiping}
-                  onClick={async () => {
-                    setWiping(true); setWipeError(null);
-                    try {
-                      await dispatch({ type: "FLEET/WIPE_ALL_TRIP_DATA", confirm_phrase: wipeConfirmText });
-                      setWipeDone(true);
-                    } catch (e) {
-                      setWipeError(e.message || "Failed to wipe trip data — please try again.");
-                    } finally {
-                      setWiping(false);
-                    }
-                  }}
-                />
-              </div>
-            </>
-          )}
-        </Card>
-      )}
+          <Button title={`🗑 DELETE ${totalSelected} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingBulkDelete(true)} style={{ alignSelf: "flex-start", position: "sticky", bottom: 8 }} />
+        );
+      })()}
     </div>
   );
 }
