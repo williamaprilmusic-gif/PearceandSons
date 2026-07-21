@@ -1878,8 +1878,16 @@ function appReducer(state, action) {
             // one-time notification — needed so the CSV export's
             // Exception column can later say WHICH kind of exception
             // this was (late booking vs no-show vs late cancellation),
-            // per explicit decision.
+            // per explicit decision. is_exception is ALSO set here
+            // (previously it wasn't) — no-show and late-cancellation
+            // both correctly set is_exception when they happen; late
+            // booking was the one path that set its own specific flag
+            // but never the general one, meaning a late-booked trip
+            // never showed the exception badge/CSV flag through any of
+            // the is_exception-gated UI, only through late_booking_flag
+            // directly — a real desync, now fixed.
             trip.late_booking_flag = true;
+            trip.is_exception = true;
             notifs.unshift({
               id: mkId(), type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
               message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
@@ -4128,9 +4136,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (hoursUntil < 2) {
             // Persisted as a real column, not just a one-time
             // notification — see the in-memory reducer's case for the
-            // full rationale (needed for the CSV export's Exception
-            // column to say WHICH kind of exception this was).
-            await supabase.from("trips").update({ latebookingflag: true }).eq("id", tripId);
+            // full rationale. isexception set here too (previously
+            // wasn't) — matches no-show/late-cancellation, which both
+            // already correctly set it; this was the one exception
+            // type that didn't, causing a real desync between what
+            // the UI badge/CSV column check and what actually got set.
+            await supabase.from("trips").update({ latebookingflag: true, isexception: true }).eq("id", tripId);
             notifRows.push({
               type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
               message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
@@ -8635,6 +8646,14 @@ function exceptionLabel(t) {
   if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) labels.push("Late Cancellation");
   if (t.no_shows && t.no_shows.length > 0) labels.push("No Show");
   if (t.late_booking_flag) labels.push("Late Booking");
+  // Fallback: is_exception can be true without matching any of the 3
+  // specific reasons above (confirmed via a real trip that showed the
+  // exception badge in the app but no label here) — rather than
+  // silently showing nothing, which makes a genuine, confirmed
+  // exception disappear from the export entirely, fall back to a
+  // generic label so it's never invisible, even if this function
+  // doesn't yet know how to name the specific cause.
+  if (labels.length === 0 && t.is_exception) labels.push("Exception");
   return labels.join(" + ");
 }
 
