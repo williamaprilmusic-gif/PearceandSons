@@ -240,6 +240,14 @@ const TRIP_STATE = Object.freeze({
   DRIVER_CONFIRMED:   "DRIVER_CONFIRMED",
   IN_TRANSIT:         "IN_TRANSIT",
   ARCHIVED_COMPLETED: "ARCHIVED_COMPLETED",
+  // A trip that was CANCELLED rather than completed — kept as a real
+  // record (not deleted) specifically so a late cancellation can still
+  // show up in the CSV export's Exception column, per explicit
+  // decision. Deliberately separate from ARCHIVED_COMPLETED: a
+  // cancelled trip never actually happened, so folding it into
+  // "completed" would corrupt trip-completion stats and driver trip
+  // counts that assume ARCHIVED_COMPLETED means a real finished trip.
+  ARCHIVED_CANCELLED: "ARCHIVED_CANCELLED",
 });
 
 const DRIVER_STATE = Object.freeze({ AVAILABLE: "AVAILABLE", BUSY: "BUSY" });
@@ -255,10 +263,11 @@ const TRIP_TRANSITIONS = {
   // and UI checks (StateBadge, active-trip filters) for forward compatibility
   // if a manual "awaiting driver confirmation" step is reintroduced later.
   [TRIP_STATE.UNASSIGNED_BOOKING]: [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED],
-  [TRIP_STATE.ASSIGNED]:           [TRIP_STATE.DRIVER_CONFIRMED],
-  [TRIP_STATE.DRIVER_CONFIRMED]:   [TRIP_STATE.IN_TRANSIT],
+  [TRIP_STATE.ASSIGNED]:           [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.ARCHIVED_CANCELLED],
+  [TRIP_STATE.DRIVER_CONFIRMED]:   [TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.IN_TRANSIT]:         [TRIP_STATE.ARCHIVED_COMPLETED],
   [TRIP_STATE.ARCHIVED_COMPLETED]: [],
+  [TRIP_STATE.ARCHIVED_CANCELLED]: [],
 };
 
 function assertTripTransition(from, to) {
@@ -1433,6 +1442,12 @@ function appReducer(state, action) {
           ...workingState,
           users: workingState.users.filter(u => u.id !== targetId),
           driver_status: workingState.driver_status.filter(d => d.driver_id !== targetId),
+          // Mirrors the real DB's RESTRICT constraint being resolved on
+          // the Supabase side (delete their notifications first, then
+          // the user) — demo mode has no actual foreign key to violate,
+          // but leaving these behind would still be a real bug: they'd
+          // linger forever referencing a user id that no longer exists.
+          notifications: workingState.notifications.filter(n => !n.for_user_ids?.includes(targetId)),
         };
         results.push({ id: targetId, ok: true, name: target.name });
       }
@@ -1859,6 +1874,12 @@ function appReducer(state, action) {
         if (scheduledDt) {
           const hoursUntil = (scheduledDt.getTime() - Date.now()) / 3600000;
           if (hoursUntil < 2) {
+            // Stored as a real field on the trip itself, not just a
+            // one-time notification — needed so the CSV export's
+            // Exception column can later say WHICH kind of exception
+            // this was (late booking vs no-show vs late cancellation),
+            // per explicit decision.
+            trip.late_booking_flag = true;
             notifs.unshift({
               id: mkId(), type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
               message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
@@ -2509,10 +2530,23 @@ function appReducer(state, action) {
       }
 
       if (wasOnlyAgent) {
-        // Only agent on the trip — cancel the whole thing and free the
-        // driver, same logic ADMIN_CANCEL already uses.
-        const newTrips = state.trips.filter(t => t.trip_id !== action.trip_id);
-        let newDriverStatus = state.driver_status;
+        // Only agent on the trip. Per explicit decision: a LATE
+        // cancellation is archived (kept as a real ARCHIVED_CANCELLED
+        // record) so it can still show up in the CSV export's Exception
+        // column — previously EVERY single-agent cancellation deleted
+        // the trip row outright, making it impossible for a late
+        // cancellation to ever appear in an export after the fact. An
+        // on-time cancellation still deletes cleanly, unchanged — this
+        // is specifically about preserving the EXCEPTION, not every
+        // cancellation.
+        let newTrips, newDriverStatus = state.driver_status;
+        if (isLate) {
+          try { assertTripTransition(trip.state, TRIP_STATE.ARCHIVED_CANCELLED); }
+          catch (e) { return { ...state, _error: e.message }; }
+          newTrips = state.trips.map(t => t.trip_id === action.trip_id ? { ...t, state: TRIP_STATE.ARCHIVED_CANCELLED, cancelled_at: cancelNowTs, is_exception: true } : t);
+        } else {
+          newTrips = state.trips.filter(t => t.trip_id !== action.trip_id);
+        }
         if (trip.driver_id) {
           const remaining = newTrips.filter(t =>
             t.driver_id === trip.driver_id &&
@@ -2848,7 +2882,8 @@ function tripRowToApp(row, chatByTrip) {
     trip_type: row.triptype, scheduled_date: row.scheduleddate,
     scheduled_time: row.scheduledtimestr || row.scheduledtime, scheduled_time_epoch: row.scheduledtime,
     booked_at: epochToDisplay(row.bookedat), confirmed_at: epochToDisplay(row.confirmedat),
-    in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat),
+    in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat), cancelled_at: epochToDisplay(row.cancelledat),
+    late_booking_flag: row.latebookingflag || false,
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
     driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), declinedBy: row.declinedby || [], reminder_sent: row.remindersent,
@@ -3038,6 +3073,59 @@ async function fetchMyConversations(myUserId, users) {
 // an array — this fans a { for_roles, for_user_ids, ... } notification out
 // into one row per target user (or a single role-only broadcast row when
 // for_user_ids is empty), matching what fetchAllFromSupabase re-merges.
+// VAPID public key — Web Push requires an app-specific public/private
+// keypair (VAPID) so browsers know which server is allowed to push to a
+// given subscription. This is a PLACEHOLDER the user must replace with
+// their own real key once generated (see the Edge Function README) —
+// left as an obviously-fake string rather than a real key value, since
+// a real VAPID key pair is specific to one project and can't be
+// invented here.
+const VAPID_PUBLIC_KEY = "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY";
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map(c => c.charCodeAt(0)));
+}
+
+// Requests notification permission and registers a real Web Push
+// subscription — the actual mechanism that lets a message reach the
+// user's phone even with the app fully closed or the screen locked, per
+// explicit requirement. Best-effort throughout: permission can be
+// denied, push isn't supported on every browser (notably older iOS
+// Safari versions), and none of that should ever be treated as an app
+// error — it just means this one user on this one device won't get
+// push notifications, same as if they'd simply never opted in.
+async function subscribeToPushNotifications(userId) {
+  try {
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+    if (VAPID_PUBLIC_KEY.startsWith("REPLACE_WITH")) {
+      console.warn("[Push] VAPID_PUBLIC_KEY is still a placeholder — see the send-push-notification Edge Function's README to generate a real one.");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return;
+    const registration = await navigator.serviceWorker.ready;
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      });
+    }
+    // Stored keyed by (userid, endpoint) — a person can have the app
+    // installed on more than one device, and each is a genuinely
+    // separate subscription that should all receive the same push.
+    await supabase.from("push_subscriptions").upsert({
+      userid: userId, endpoint: subscription.endpoint,
+      subscription: subscription.toJSON(), updatedat: new Date().toISOString(),
+    }, { onConflict: "endpoint" });
+  } catch (e) {
+    console.warn("[Push] subscription failed (non-fatal):", e.message);
+  }
+}
+
 async function insertNotification(n) {
   // notifications.title is NOT NULL with no default, but the app's
   // notification model never tracked a separate title — only type and
@@ -3048,7 +3136,26 @@ async function insertNotification(n) {
   const base = { title, type: n.type, forroles: n.for_roles || [], message: n.message, tripid: n.trip_id ?? null, timestamp: n.ts, isread: n.read ?? false };
   const userIds = n.for_user_ids && n.for_user_ids.length ? n.for_user_ids : [null];
   const rows = userIds.map(uid => ({ ...base, userid: uid }));
-  return supabase.from("notifications").insert(rows);
+  const result = await supabase.from("notifications").insert(rows);
+  // Real Web Push — reaches the user's phone even with the app fully
+  // closed or the screen locked, per explicit requirement. A specific,
+  // targeted user list (userIds, filtering out the null/broadcast-to-
+  // everyone case) is sent to a server-side Edge Function, since only a
+  // server holding the push service's private key can actually send a
+  // push — the browser client can subscribe to push, but can never
+  // send one itself, to anyone, including the current user's other
+  // devices. Fire-and-forget: a push failure (permission never granted,
+  // subscription expired, browser doesn't support push) is common and
+  // expected, and must never break the app's own in-app notification,
+  // which always succeeds/fails independently above.
+  const pushTargets = userIds.filter(Boolean);
+  if (pushTargets.length > 0 && SUPABASE_URL) {
+    fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_ids: pushTargets, title, message: n.message, type: n.type, trip_id: n.trip_id ?? null }),
+    }).catch(() => { /* best-effort — see rationale above */ });
+  }
+  return result;
 }
 
 // Writes to the real production audit_logs table (actiontype, username,
@@ -3279,6 +3386,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           results.push({ id: targetId, ok: false, name: target.fullname, reason: "Has trip history on file — the database keeps trip records tied to their account and won't allow deletion while any exist" });
           continue;
         }
+        // Notifications tied to this user are cleaned up automatically
+        // before deleting them, per explicit decision — unlike trip
+        // history (a real business record, correctly BLOCKS deletion
+        // above), notifications are just transient alerts, so there's
+        // no reason to refuse a delete over them. Without this, the
+        // delete failed with a raw Postgres foreign-key error
+        // ("violates foreign key constraint notifications_userid_fkey")
+        // instead of either succeeding cleanly or giving a real reason.
+        await supabase.from("notifications").delete().eq("userid", targetId);
         // Logged BEFORE the delete, not after — audit_logs.targetuserid
         // is a foreign key to users, so writing the log entry once the
         // row is already gone always fails its own FK constraint. That
@@ -4010,6 +4126,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (scheduledDt) {
           const hoursUntil = (scheduledDt.getTime() - Date.now()) / 3600000;
           if (hoursUntil < 2) {
+            // Persisted as a real column, not just a one-time
+            // notification — see the in-memory reducer's case for the
+            // full rationale (needed for the CSV export's Exception
+            // column to say WHICH kind of exception this was).
+            await supabase.from("trips").update({ latebookingflag: true }).eq("id", tripId);
             notifRows.push({
               type: "LATE_BOOKING", for_roles: [ROLE.ADMIN],
               message: `⏰ LATE BOOKING: ${action.agent_name} booked trip ${tripId} only ${hoursUntil < 0 ? "after" : hoursUntil.toFixed(1) + "h before"} the scheduled time (${action.scheduled_date} ${action.scheduled_time}).`,
@@ -4189,7 +4310,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       });
 
       if (acWasOnlyAgent) {
-        must(await supabase.from("trips").delete().eq("id", action.trip_id));
+        // Per explicit decision: only a LATE cancellation gets archived
+        // (kept as a real ARCHIVED_CANCELLED row, so it can show up in
+        // the CSV export's Exception column) — an on-time cancellation
+        // still deletes cleanly, unchanged.
+        if (acIsLate) {
+          assertTripTransition(acTripRow.status, TRIP_STATE.ARCHIVED_CANCELLED);
+          must(await supabase.from("trips").update({ status: TRIP_STATE.ARCHIVED_CANCELLED, cancelledat: acNowTs, isexception: true, updatedat: acNowTs }).eq("id", action.trip_id));
+        } else {
+          must(await supabase.from("trips").delete().eq("id", action.trip_id));
+        }
         if (acTripRow.driverid) {
           const { data: acRemaining } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
             .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
@@ -6729,9 +6859,50 @@ function usePersistedTab(roleKey, userId, defaultTab, validTabIds) {
       return defaultTab;
     }
   });
+  // Real browser/device back-button integration — the actual bug this
+  // fixes: without this, tab switches never touch browser history at
+  // all (no pushState anywhere), so from the browser/OS's perspective
+  // every screen in the app is the SAME single history entry. Hitting
+  // the phone's back button then has nothing to step back through, so
+  // it correctly (from the browser's own view) exits the whole app —
+  // which is exactly the reported "back takes me completely out."
+  const hasPushedInitialRef = useRef(false);
+  useEffect(() => {
+    // First mount: REPLACE the current history entry with a tagged one
+    // rather than pushing a new one — opening the app shouldn't itself
+    // create an extra back-step before the user has navigated anywhere.
+    if (!hasPushedInitialRef.current) {
+      hasPushedInitialRef.current = true;
+      try { window.history.replaceState({ transitosTab: tab }, ""); } catch (e) { /* ignore */ }
+    }
+    const onPopState = (e) => {
+      // popstate firing means the browser ALREADY moved history back
+      // one step on its own — this only ever syncs local React state
+      // to match, it never touches history itself (no push/replace
+      // here), since doing so would fight the navigation that already
+      // happened.
+      const poppedTab = e.state?.transitosTab;
+      if (poppedTab && validTabIds.includes(poppedTab)) {
+        setTabState(poppedTab);
+        try { localStorage.setItem(storageKey, poppedTab); } catch (err) { /* ignore */ }
+      }
+      // No usable tab on this history entry (e.g. it's from before the
+      // app loaded, or state is missing) — let the browser's default
+      // back behavior proceed instead of trapping the user inside the
+      // app with no way to ever actually leave it.
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Only ever called for genuine forward in-app navigation (a tab
+  // click) — popstate above never calls this, it updates state
+  // directly — so this can unconditionally push a new history entry
+  // every time, no flag needed to distinguish anything.
   const setTab = useCallback((next) => {
     setTabState(next);
     try { localStorage.setItem(storageKey, next); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+    try { window.history.pushState({ transitosTab: next }, ""); } catch (e) { /* ignore — worst case, this tab switch just doesn't get a back-step */ }
   }, [storageKey]);
   return [tab, setTab];
 }
@@ -6756,13 +6927,15 @@ function playAlertSound() {
     const ctx = sharedAudioCtx;
     if (ctx.state === "suspended") ctx.resume();
     const now = ctx.currentTime;
-    // Two quick notes (a rising interval) rather than a single flat beep —
-    // more recognizable as "an alert happened" without being harsh.
-    // Peak gain raised to 0.5 (previously 0.25) per explicit request to
-    // make it louder — kept below 1.0 deliberately, since a full-scale
-    // sine tone risks clipping/distorting on some device speakers and
-    // would sound harsh rather than just louder.
-    [[880, now, 0.14], [1175, now + 0.14, 0.18]].forEach(([freq, start, dur]) => {
+    // A bright, upbeat 4-note ascending chime — per explicit request
+    // for "a popular tone." An actual copyrighted ringtone or song
+    // can't be used here (copyright applies regardless of framing —
+    // see the app's own copyright-compliance rules), so this is an
+    // ORIGINAL short pattern in the style of a cheerful notification
+    // chime, not a reproduction of any specific real product's sound.
+    // Replaces the previous flat 2-note beep with something more
+    // recognizable and pleasant as "a new message arrived."
+    [[880, now, 0.11], [1108, now + 0.1, 0.11], [1318, now + 0.2, 0.11], [1760, now + 0.32, 0.22]].forEach(([freq, start, dur]) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
@@ -6793,22 +6966,31 @@ function playRingtonePulse() {
     const ctx = sharedAudioCtx;
     if (ctx.state === "suspended") ctx.resume();
     const now = ctx.currentTime;
-    // Classic "ring-ring" — two short bursts at a landline-style
-    // frequency, close together, then a gap before the next pulse
-    // (see startRingtone's interval below) — recognizable as a phone
-    // ringing rather than a generic alert beep.
+    // The REAL classic telephone ring, per explicit request — the
+    // actual North American landline ringing signal is two frequencies
+    // played TOGETHER (440Hz + 480Hz), producing the familiar warbling
+    // "brrring" quality, not a single clean tone. This is a real,
+    // decades-old telecom industry standard (not owned by any phone
+    // manufacturer), so it's the correct thing to replicate here — the
+    // previous version was a single 1000Hz pulse with none of that
+    // characteristic warble. Standard cadence: ~2s on, ~4s off per
+    // full ring cycle; this plays two short bursts within the "on"
+    // portion (see startRingtone's repeat interval below) so it still
+    // reads clearly as "ringing" rather than one long drone.
     [[now, 0.4], [now + 0.5, 0.4]].forEach(([start, dur]) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = 1000;
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(0.45, start + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(start);
-      osc.stop(start + dur + 0.02);
+      [440, 480].forEach(freq => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.35, start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(start);
+        osc.stop(start + dur + 0.02);
+      });
     });
   } catch (e) {
     console.warn("[Ringtone] playback failed:", e.message);
@@ -7284,7 +7466,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
 
 const DELAY_REASONS = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
 
-function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubmitted }) {
+function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubmitted, getFreshDriverCoord }) {
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
@@ -7297,19 +7479,14 @@ function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubm
     try {
       // Fresh GPS read at the moment of confirming — more accurate than
       // whatever was last broadcast, since a driver marking a no-show
-      // is standing right at the failed pickup point RIGHT NOW. Falls
-      // back to the last live-tracked position (still meaningfully
-      // "at or near the pickup") rather than losing the location
-      // entirely if a fresh read times out or permission was revoked
-      // mid-session.
-      const driverCoord = await new Promise((resolve) => {
-        if (!navigator.geolocation) { resolve(null); return; }
-        navigator.geolocation.getCurrentPosition(
-          (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-          () => resolve(null),
-          { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
-        );
-      });
+      // is standing right at the failed pickup point RIGHT NOW. Uses
+      // the SHARED getFreshDriverCoord (passed down from DriverNavTab)
+      // rather than a separate inline copy — the earlier separate copy
+      // is exactly how the "ocean coordinates" bug happened: it claimed
+      // a fallback to the last live-tracked position but never actually
+      // had one, and had no check for (0,0), a real GPS-failure
+      // artifact on some devices that looks like a valid coordinate.
+      const driverCoord = await getFreshDriverCoord();
       await dispatch({
         type: "TRIP/MARK_NO_SHOW", trip_id: trip.trip_id, agent_id: agentId,
         driver_coord: driverCoord, note: note.trim() || undefined,
@@ -7517,11 +7694,30 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   // than throwing) on failure/no permission, matching NoShowModal's
   // existing behavior — a missing location shouldn't block confirming
   // the pickup/drop-off itself.
+  // Genuinely falls back to the driver's last live-tracked position on
+  // failure (state.driver_positions[user.id]) — a comment on the OLDER
+  // version of this logic claimed this fallback existed, but the code
+  // only ever resolved to null. Also rejects (0,0) specifically: a
+  // technically-valid-looking coordinate pair that's a well-documented
+  // GPS-failure artifact on some devices/browsers (permission granted,
+  // but no real fix obtained) — this was confirmed live in production:
+  // a no-show's saved location rendered as "somewhere in the ocean"
+  // because 0°N 0°E is a real point in the Atlantic, not a null-check
+  // catching it. (0,0) is treated exactly like a failed read.
   const getFreshDriverCoord = () => new Promise((resolve) => {
-    if (!navigator.geolocation) { resolve(null); return; }
+    const isUsableCoord = (c) => c && Number.isFinite(c.lat) && Number.isFinite(c.lng) && !(c.lat === 0 && c.lng === 0);
+    const fallback = () => {
+      const livePos = state.driver_positions?.[user.id];
+      resolve(isUsableCoord(livePos) ? { lat: livePos.lat, lng: livePos.lng } : null);
+    };
+    if (!navigator.geolocation) { fallback(); return; }
     navigator.geolocation.getCurrentPosition(
-      (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-      () => resolve(null),
+      (pos) => {
+        const fresh = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        if (isUsableCoord(fresh)) resolve(fresh);
+        else fallback();
+      },
+      () => fallback(),
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 10000 }
     );
   });
@@ -7630,7 +7826,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         <NoShowModal
           trip={myActiveTrips.find(t => t.trip_id === noShowFor.trip_id)}
           agentId={noShowFor.agent_id} agentName={noShowFor.agent_name}
-          user={user} dispatch={dispatch}
+          user={user} dispatch={dispatch} getFreshDriverCoord={getFreshDriverCoord}
           onClose={() => setNoShowFor(null)}
           onSubmitted={() => {
             // Same auto-navigate behavior confirmPickup already has for
@@ -8214,7 +8410,7 @@ function TripDetailRow({ trip, state, dispatch }) {
         <span style={{ width: 80, fontSize: 10, color: COLORS.amber, fontWeight: 700, display: "flex", alignItems: "center", gap: 4 }}>
           {trip.trip_id}
           {trip.is_exception && (
-            <span title="Booked after the 15:00 same-day cutoff" style={{ fontSize: 9, fontWeight: 800, color: "#000", background: COLORS.red, borderRadius: 2, width: 14, height: 14, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>E</span>
+            <span title={exceptionLabel(trip) || "Exception"} style={{ fontSize: 9, fontWeight: 800, color: "#000", background: COLORS.red, borderRadius: 2, width: 14, height: 14, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>E</span>
           )}
         </span>
         <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{trip.agent_name}{trip.agent_ids.length > 1 ? ` +${trip.agent_ids.length - 1}` : ""}</span>
@@ -8239,6 +8435,36 @@ function TripDetailRow({ trip, state, dispatch }) {
             <div style={{ background: "rgba(232,58,58,.08)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 10 }}>
               <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>⚠ ADMIN NOTE</span>
               <div style={{ fontSize: 10, color: COLORS.chalk, marginTop: 3 }}>{trip.admin_note}</div>
+            </div>
+          )}
+          {trip.no_shows && trip.no_shows.length > 0 && (
+            <div style={{ background: "rgba(232,58,58,.08)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 10 }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>🚫 NO SHOW{trip.no_shows.length > 1 ? "S" : ""}</span>
+              {trip.no_shows.map((ns, i) => {
+                const nsAgent = state.users.find(u => u.id === ns.agent_id);
+                // (0,0) is a real GPS-failure artifact on some devices,
+                // not a real location — treated as "not available" here
+                // too, in case any bad data from before this was fixed
+                // still exists in the database.
+                const hasRealLocation = ns.location && !(ns.location.lat === 0 && ns.location.lng === 0);
+                return (
+                  <div key={i} style={{ fontSize: 10, color: COLORS.chalk, marginTop: 6, display: "flex", flexDirection: "column", gap: 2 }}>
+                    <span><span style={{ fontWeight: 700 }}>{nsAgent?.name || ns.agent_id}</span> <span style={{ color: COLORS.ghost }}>({epochToDisplay(ns.ts)})</span></span>
+                    {hasRealLocation ? (
+                      <a
+                        href={`https://www.google.com/maps?q=${ns.location.lat},${ns.location.lng}`}
+                        target="_blank" rel="noopener noreferrer"
+                        style={{ color: COLORS.teal, fontSize: 9, textDecoration: "underline" }}
+                      >
+                        📍 Driver's location at the time ({ns.location.lat.toFixed(5)}, {ns.location.lng.toFixed(5)})
+                      </a>
+                    ) : (
+                      <span style={{ color: COLORS.ghost, fontSize: 9 }}>Location not available</span>
+                    )}
+                    {ns.note && <span style={{ color: COLORS.ghost, fontSize: 9 }}>Note: {ns.note}</span>}
+                  </div>
+                );
+              })}
             </div>
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -8352,6 +8578,20 @@ function TripDetailRow({ trip, state, dispatch }) {
 // specifically so this is possible — see the per-agent timestamp
 // migration). Trip-level fields (driver, status, direction, distance)
 // repeat identically across each passenger's row from the same trip.
+// Determines WHICH kind of exception(s) apply to a trip, for the CSV's
+// Exception column, per explicit decision — previously this column just
+// showed a plain "E" for any is_exception=true trip with no way to tell
+// which kind. A trip can technically have more than one at once (e.g.
+// booked late, then later had a no-show) — all that genuinely apply are
+// joined together rather than picking just one and hiding the rest.
+function exceptionLabel(t) {
+  const labels = [];
+  if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) labels.push("Late Cancellation");
+  if (t.no_shows && t.no_shows.length > 0) labels.push("No Show");
+  if (t.late_booking_flag) labels.push("Late Booking");
+  return labels.join(" + ");
+}
+
 function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}) {
   const headers = [
     "Trip ID", "Exception", "Direction", "Trip Type", "Agent", "Driver", "Status",
@@ -8397,7 +8637,7 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
     agentIds.forEach(aid => {
       rows.push([
-        t.trip_id, t.is_exception ? "E" : "", t.direction || "", t.trip_type || "",
+        t.trip_id, exceptionLabel(t), t.direction || "", t.trip_type || "",
         aid != null ? agentName(aid) : (t.agent_name || ""), driverName(t.driver_id), t.state,
         t.custom_pickup || "", t.custom_dropoff || "",
         t.scheduled_date || "", t.scheduled_time || "",
@@ -8415,7 +8655,8 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
         t.long_distance_flag ? "YES" : "NO",
         (t.no_shows || []).length === 0 ? "" : t.no_shows.map(ns => {
           const noShowAgentName = users.find(u => u.id === ns.agent_id)?.name || ns.agent_id;
-          const locStr = ns.location ? ` @ ${ns.location.lat.toFixed(5)},${ns.location.lng.toFixed(5)}` : "";
+          const hasRealLocation = ns.location && !(ns.location.lat === 0 && ns.location.lng === 0);
+          const locStr = hasRealLocation ? ` @ ${ns.location.lat.toFixed(5)},${ns.location.lng.toFixed(5)}` : "";
           const noteStr = ns.note ? ` — "${ns.note}"` : "";
           return `${noShowAgentName}${locStr}${noteStr}`;
         }).join("; "),
@@ -11512,6 +11753,17 @@ function AppInner() {
   };
 
   const activeUser = state.users.find(u => u.id === state.active_user_id);
+
+  // Register for push notifications the moment someone logs in — the
+  // actual mechanism behind "notify even when the app isn't open," per
+  // explicit requirement. Only meaningful in Supabase mode (demo mode
+  // has no server to ever deliver a push to, and no real user id to
+  // key a subscription against). Re-fires if the logged-in user
+  // changes, e.g. someone logs out and a different person logs in on
+  // the same shared device — each person's subscription is separate.
+  useEffect(() => {
+    if (activeUser?.id && supabase) subscribeToPushNotifications(activeUser.id);
+  }, [activeUser?.id]);
 
   // Previously this fired a toast for ANY new notification added anywhere
   // in the system, regardless of who it was actually for — an agent would
