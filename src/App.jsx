@@ -8360,6 +8360,26 @@ function AdminTrips({ state, dispatch, user }) {
   };
   const selectedUnassignedIds = [...selectedTripIds].filter(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.UNASSIGNED_BOOKING);
   const selectedCompletedIds = [...selectedTripIds].filter(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.ARCHIVED_COMPLETED);
+  // Every completed trip CURRENTLY VISIBLE on screen — respects
+  // whatever filters are active (state filter, date filter), same as
+  // displayTrips itself, per explicit decision: "select all" means all
+  // completed trips you can actually see right now, not literally every
+  // completed trip in the whole database regardless of filtering.
+  const visibleCompletedTripIds = displayTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).map(t => t.trip_id);
+  const allVisibleCompletedSelected = visibleCompletedTripIds.length > 0 && visibleCompletedTripIds.every(id => selectedTripIds.has(id));
+  const toggleSelectAllCompleted = () => {
+    setSelectedTripIds(prev => {
+      const next = new Set(prev);
+      if (allVisibleCompletedSelected) {
+        // Already all selected — this toggle deselects them, leaving
+        // any selected UNASSIGNED bookings untouched.
+        visibleCompletedTripIds.forEach(id => next.delete(id));
+      } else {
+        visibleCompletedTripIds.forEach(id => next.add(id));
+      }
+      return next;
+    });
+  };
   const handleBulkDeleteTrips = async () => {
     if (selectedUnassignedIds.length === 0 && selectedCompletedIds.length === 0) return;
     setBulkDeleting(true);
@@ -8458,6 +8478,13 @@ function AdminTrips({ state, dispatch, user }) {
             {availableTripDates.map(d => <option key={d} value={d}>{d}</option>)}
           </select>
         </div>
+      )}
+
+      {canEditTrips && visibleCompletedTripIds.length > 0 && (
+        <Button
+          title={allVisibleCompletedSelected ? `☑ DESELECT ALL COMPLETED (${visibleCompletedTripIds.length})` : `☐ SELECT ALL COMPLETED (${visibleCompletedTripIds.length})`}
+          variant="ghost" size="sm" onClick={toggleSelectAllCompleted} style={{ alignSelf: "flex-start" }}
+        />
       )}
 
       {driverIds.length > 1 && (
