@@ -7476,7 +7476,22 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       const driverCoord = await getFreshDriverCoord();
       for (const tid of group.trip_ids) {
         const t = state.trips.find(x => x.trip_id === tid);
-        if (t && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) await dispatch({ type: "TRIP/COMPLETE", trip_id: tid, driver_coord: driverCoord });
+        if (t && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+          try {
+            await dispatch({ type: "TRIP/COMPLETE", trip_id: tid, driver_coord: driverCoord });
+          } catch (perTripErr) {
+            // The LOCAL copy of this trip's state can be briefly stale
+            // relative to what's actually in the database (e.g. right
+            // after a different action partially failed) — if the
+            // backend rejects this specifically because the trip is
+            // ALREADY completed, that's not a real problem: the driver
+            // wanted it done, and it's done. Only genuinely surface
+            // errors that aren't this specific, already-handled case.
+            if (!/ARCHIVED_COMPLETED.*ARCHIVED_COMPLETED/.test(perTripErr.message || "")) {
+              throw perTripErr;
+            }
+          }
+        }
       }
     } catch (e) {
       setStartTripError(e.message || "Couldn't complete drop-off — please try again.");
