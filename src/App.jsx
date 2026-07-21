@@ -6480,6 +6480,52 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
   const lastBroadcastRef = useRef(0);
   const lastPersistRef = useRef(0);
   const channelRef = useRef(null);
+  const wakeLockRef = useRef(null);
+
+  // Screen Wake Lock — the real, genuine improvement available for
+  // keeping tracking alive longer while the app is open, per explicit
+  // request. Prevents the phone's screen from dimming/auto-locking and
+  // reduces how aggressively the browser throttles a backgrounded tab
+  // — meaningfully extends how long GPS tracking survives if a driver
+  // briefly switches to another app or their phone would otherwise
+  // auto-sleep. Does NOT and CANNOT survive the app being fully closed
+  // — that's a genuine platform limit no website can work around, not
+  // something this feature claims to fix. Kept as a fully separate
+  // effect from the GPS tracking logic below (not merged into it) so a
+  // wake-lock failure (unsupported browser, permission denied) can
+  // never affect whether the actual location tracking keeps working —
+  // they're independent concerns, one is a nice-to-have on top of the
+  // other, not a dependency.
+  useEffect(() => {
+    if (!isLoggedIn || !("wakeLock" in navigator)) return;
+    let released = false;
+    const requestLock = async () => {
+      try {
+        if (released) return;
+        wakeLockRef.current = await navigator.wakeLock.request("screen");
+      } catch (e) {
+        // Common and expected — some browsers require a very recent
+        // user gesture, or don't support this at all. Never surface as
+        // an app error; this is purely a best-effort enhancement.
+        console.warn("[WakeLock] request failed (non-fatal):", e.message);
+      }
+    };
+    requestLock();
+    // The Wake Lock API auto-releases itself the instant the tab goes
+    // into the background — re-request it every time the tab becomes
+    // visible again, or this would silently stop protecting the driver
+    // after the very first time they glanced at another app.
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") requestLock();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      released = true;
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      wakeLockRef.current?.release().catch(() => {});
+      wakeLockRef.current = null;
+    };
+  }, [isLoggedIn]);
 
   useEffect(() => {
     if (!isLoggedIn || !user?.id || !navigator.geolocation || !supabase) {
