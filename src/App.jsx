@@ -2263,9 +2263,39 @@ function appReducer(state, action) {
         location: action.driver_coord ? { lat: action.driver_coord.lat, lng: action.driver_coord.lng } : null,
         note: action.note?.trim() || null,
       };
+      // Per explicit requirement: once every agent is handled (picked up
+      // or no-show), the trip needs to go one of two ways depending on
+      // whether ANYONE was actually picked up. If at least one real
+      // pickup happened, there's still a drop-off to do — IN_TRANSIT,
+      // same as before. But if EVERY agent on the trip turned out to be
+      // a no-show (nobody actually got in the vehicle), there's nothing
+      // left to drop off at all — the trip should conclude entirely
+      // rather than sit in IN_TRANSIT forever waiting for a drop-off
+      // that will never happen. existingNoShowIds is checked BEFORE
+      // adding this one, since a trip already fully no-showed before
+      // this call shouldn't be possible (allHandled would already have
+      // fired), but this keeps the check correct regardless of order.
+      const allNoShowIds = new Set([...(trip.no_shows || []).map(ns => ns.agent_id), action.agent_id]);
+      const everyoneWasNoShow = allHandled && trip.agent_ids.every(id => allNoShowIds.has(id));
       let newState = trip.state;
       let inTransitAt = trip.in_transit_at;
-      if (allHandled && trip.state !== TRIP_STATE.IN_TRANSIT) {
+      let completedAt = trip.completed_at;
+      if (allHandled && everyoneWasNoShow && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+        // The state machine requires passing THROUGH IN_TRANSIT — there's
+        // no direct DRIVER_CONFIRMED -> ARCHIVED_COMPLETED edge, since a
+        // trip normally only reaches ARCHIVED_COMPLETED via TRIP/COMPLETE
+        // from IN_TRANSIT. Validate and apply both steps in sequence
+        // (instantaneously, since there's genuinely nothing to drop off)
+        // rather than attempting an illegal direct jump.
+        try {
+          if (trip.state !== TRIP_STATE.IN_TRANSIT) assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT);
+          assertTripTransition(TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED);
+        }
+        catch (e) { return { ...state, _error: e.message }; }
+        newState = TRIP_STATE.ARCHIVED_COMPLETED;
+        inTransitAt = inTransitAt || nowTs;
+        completedAt = nowTs;
+      } else if (allHandled && !everyoneWasNoShow && trip.state !== TRIP_STATE.IN_TRANSIT) {
         try { assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT); }
         catch (e) { return { ...state, _error: e.message }; }
         newState = TRIP_STATE.IN_TRANSIT;
@@ -2273,9 +2303,25 @@ function appReducer(state, action) {
       }
       const newTrips = state.trips.map(t =>
         t.trip_id === action.trip_id
-          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, no_shows: [...(t.no_shows || []), noShowRecord], is_exception: true }
+          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_at: completedAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, no_shows: [...(t.no_shows || []), noShowRecord], is_exception: true }
           : t
       );
+      // If the trip just auto-completed (everyone was a no-show, nobody
+      // to drop off), the driver needs to be freed up the same way
+      // ADMIN_CANCEL/AGENT_CANCEL already do — otherwise they'd stay
+      // marked BUSY on a trip that's genuinely finished.
+      let newDriverStatus = state.driver_status;
+      if (newState === TRIP_STATE.ARCHIVED_COMPLETED && trip.driver_id) {
+        const remaining = newTrips.filter(t =>
+          t.driver_id === trip.driver_id &&
+          [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+        );
+        newDriverStatus = state.driver_status.map(d =>
+          d.driver_id === trip.driver_id
+            ? { ...d, state: remaining.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remaining[0]?.trip_id || null }
+            : d
+        );
+      }
       const noShowAgent = state.users.find(u => u.id === action.agent_id);
       const notifs = [
         {
@@ -2283,13 +2329,17 @@ function appReducer(state, action) {
           message: `🚫 NO SHOW: ${noShowAgent?.name || "An agent"} wasn't at pickup for trip ${action.trip_id}.${action.note?.trim() ? ` Note: ${action.note.trim()}` : ""}`,
           trip_id: action.trip_id, ts: nowTs, read: false,
         },
-        ...(allHandled ? [{
+        ...(newState === TRIP_STATE.ARCHIVED_COMPLETED ? [{
+          id: mkId(), type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id} concluded automatically — every agent was a no-show, nothing left to drop off.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        }] : newState === TRIP_STATE.IN_TRANSIT ? [{
           id: mkId(), type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers handled. Now in transit.`,
           trip_id: action.trip_id, ts: nowTs, read: false,
         }] : []),
       ];
-      return { ...state, trips: newTrips, notifications: [...notifs, ...state.notifications], _error: null };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...notifs, ...state.notifications], _error: null };
     }
 
     case "TRIP/COMPLETE": {
@@ -4589,8 +4639,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nsNewCompleted = nsCompletedPrior.includes(action.agent_id) ? nsCompletedPrior : [...nsCompletedPrior, action.agent_id];
       const nsAllHandled = nsAgentIds.every(id => nsNewCompleted.includes(id));
       const nsNowTs = nowEpoch();
-      let nsNewState = tripRow.status, nsInTransitAt = tripRow.intransitat;
-      if (nsAllHandled && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
+      // Per explicit requirement: once every agent is handled, check
+      // whether ANYONE was actually picked up — if every single agent on
+      // the trip turns out to be a no-show, there's nothing left to drop
+      // off at all, so the trip should conclude entirely instead of
+      // sitting in IN_TRANSIT forever. See the in-memory reducer's case
+      // for the full rationale.
+      const nsAllNoShowIds = new Set([...(tripRow.noshows || []).map(ns => ns.agent_id), action.agent_id]);
+      const nsEveryoneWasNoShow = nsAllHandled && nsAgentIds.every(id => nsAllNoShowIds.has(id));
+      let nsNewState = tripRow.status, nsInTransitAt = tripRow.intransitat, nsCompletedAt = tripRow.completedat;
+      if (nsAllHandled && nsEveryoneWasNoShow && tripRow.status !== TRIP_STATE.ARCHIVED_COMPLETED) {
+        // See the in-memory reducer's case — the state machine requires
+        // passing THROUGH IN_TRANSIT, no direct edge to ARCHIVED_COMPLETED
+        // exists from any earlier state.
+        if (tripRow.status !== TRIP_STATE.IN_TRANSIT) assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
+        assertTripTransition(TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED);
+        nsNewState = TRIP_STATE.ARCHIVED_COMPLETED;
+        nsInTransitAt = nsInTransitAt || nsNowTs;
+        nsCompletedAt = nsNowTs;
+      } else if (nsAllHandled && !nsEveryoneWasNoShow && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
         assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
         nsNewState = TRIP_STATE.IN_TRANSIT;
         nsInTransitAt = nsNowTs;
@@ -4602,16 +4669,31 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       };
       const newNoShows = [...(tripRow.noshows || []), noShowRecord];
       must(await supabase.from("trips").update({
-        status: nsNewState, intransitat: nsInTransitAt, completedpickups: nsNewCompleted,
+        status: nsNewState, intransitat: nsInTransitAt, completedat: nsCompletedAt, completedpickups: nsNewCompleted,
         noshows: newNoShows, isexception: true, updatedat: nsNowTs,
       }).eq("id", action.trip_id));
+      // If the trip just auto-completed, free the driver the same way
+      // ADMIN_CANCEL/AGENT_CANCEL already do.
+      if (nsNewState === TRIP_STATE.ARCHIVED_COMPLETED && tripRow.driverid) {
+        const { data: nsRemaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+        if (!nsRemaining || nsRemaining.length === 0) {
+          await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nsNowTs).toISOString() }).eq("driverid", tripRow.driverid);
+        }
+      }
       const { data: noShowAgentRow } = await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle();
       await insertNotification({
         type: "NO_SHOW", for_roles: [ROLE.ADMIN],
         message: `🚫 NO SHOW: ${noShowAgentRow?.fullname || "An agent"} wasn't at pickup for trip ${action.trip_id}.${action.note?.trim() ? ` Note: ${action.note.trim()}` : ""}`,
         trip_id: action.trip_id, ts: nsNowTs, read: false,
       });
-      if (nsAllHandled) {
+      if (nsNewState === TRIP_STATE.ARCHIVED_COMPLETED) {
+        await insertNotification({
+          type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id} concluded automatically — every agent was a no-show, nothing left to drop off.`,
+          trip_id: action.trip_id, ts: nsNowTs, read: false,
+        });
+      } else if (nsNewState === TRIP_STATE.IN_TRANSIT) {
         await insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers handled. Now in transit.`,
@@ -7202,7 +7284,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
 
 const DELAY_REASONS = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
 
-function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose }) {
+function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubmitted }) {
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
@@ -7251,7 +7333,7 @@ function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose }) {
         {done ? (
           <>
             <div style={{ fontSize: 12, color: COLORS.green, textAlign: "center", padding: 16 }}>✓ Recorded. Admins have been notified — you can continue your route.</div>
-            <Button title="CLOSE" variant="amber" full onClick={onClose} />
+            <Button title="CLOSE" variant="amber" full onClick={() => { onClose(); onSubmitted?.(); }} />
           </>
         ) : (
           <>
@@ -7550,6 +7632,24 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           agentId={noShowFor.agent_id} agentName={noShowFor.agent_name}
           user={user} dispatch={dispatch}
           onClose={() => setNoShowFor(null)}
+          onSubmitted={() => {
+            // Same auto-navigate behavior confirmPickup already has for
+            // a successful pickup, per explicit requirement — after a
+            // no-show is submitted, go straight to whichever stop is
+            // next: another pickup if one remains, otherwise the first
+            // drop-off (skipped entirely if there's truly nothing left
+            // to drop off, since MARK_NO_SHOW auto-completes that case).
+            // Read fresh, not from a stale closure — state has already
+            // updated by the time this fires.
+            const remainingPickups = pickupStops.filter(s => !(s.trip_id === noShowFor.trip_id && s.agent_id === noShowFor.agent_id)).filter(s => !s.done);
+            const nextPickup = remainingPickups[0];
+            if (nextPickup?.lat && nextPickup?.lng) {
+              smartOpenWaze(nextPickup.lat, nextPickup.lng, nextPickup.label, nextPickup.isManual);
+              return;
+            }
+            const firstDrop = dropStops.find(s => !s.done);
+            if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+          }}
         />
       )}
 
