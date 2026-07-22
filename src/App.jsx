@@ -1656,12 +1656,30 @@ function appReducer(state, action) {
         newTripsRemove = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
       }
 
-      const removeNotif = {
-        id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
-        message: `You've been removed from trip ${trip.trip_id}.`,
-        trip_id: trip.trip_id, ts: now(), read: false,
-      };
-      return { ...state, trips: newTripsRemove, notifications: [removeNotif, ...state.notifications], _error: null };
+      // Notify everyone genuinely affected, per explicit decision — the
+      // removed agent, the driver (their route just changed), and every
+      // admin EXCEPT Viewer-tier ones specifically. See the Supabase
+      // case for the full rationale.
+      const removedAgentNameLocal = state.users.find(u => u.id === action.agent_id)?.name || "A passenger";
+      const nonViewerAdminIds = state.users.filter(u => u.role === ROLE.ADMIN && u.admin_level !== ADMIN_LEVEL.VIEWER).map(u => u.id);
+      const removeNotifs = [
+        {
+          id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
+          message: `You've been removed from trip ${trip.trip_id}.`,
+          trip_id: trip.trip_id, ts: now(), read: false,
+        },
+        ...(trip.driver_id ? [{
+          id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.DRIVER], for_user_ids: [trip.driver_id],
+          message: `${removedAgentNameLocal} was removed from trip ${trip.trip_id} by an admin — your route has been updated.`,
+          trip_id: trip.trip_id, ts: now(), read: false,
+        }] : []),
+        ...(nonViewerAdminIds.length > 0 ? [{
+          id: mkId(), type: "TRIP_UPDATED", for_roles: [ROLE.ADMIN], for_user_ids: nonViewerAdminIds,
+          message: `${removedAgentNameLocal} was removed from trip ${trip.trip_id}.`,
+          trip_id: trip.trip_id, ts: now(), read: false,
+        }] : []),
+      ];
+      return { ...state, trips: newTripsRemove, notifications: [...removeNotifs, ...state.notifications], _error: null };
     }
 
     case "TRIP/RELOCATE_AGENT": {
@@ -2441,6 +2459,64 @@ function appReducer(state, action) {
 
     case "NOTIF/MARK_READ":
       return { ...state, notifications: state.notifications.map(n => n.id === action.id ? { ...n, read: true } : n) };
+    case "TRIP/CHECK_LATE_START": {
+      // Per explicit request: warn the driver AND admins if a trip
+      // hasn't started (still DRIVER_CONFIRMED, never reached
+      // IN_TRANSIT) 30+ minutes past its scheduled time. Called
+      // periodically (see the client-side interval in AdminApp/
+      // DriverApp) rather than for one specific trip — scans every
+      // DRIVER_CONFIRMED trip each time it runs, so it catches
+      // whichever ones have crossed the threshold since the last check,
+      // regardless of who (if anyone) happens to have the app open at
+      // any given moment. late_start_notified prevents re-firing the
+      // same warning on every subsequent check — fires exactly once
+      // per trip, the moment it first crosses 30 minutes late.
+      const nowTs2 = now();
+      let anyFired = false;
+      const newNotifs = [];
+      const newTrips = state.trips.map(t => {
+        if (t.state !== TRIP_STATE.DRIVER_CONFIRMED || t.late_start_notified) return t;
+        const scheduledDt = parseScheduledDateTime(t.scheduled_date, t.scheduled_time);
+        if (!scheduledDt) return t; // malformed date/time — skip rather than false-positive
+        const minutesLate = (Date.now() - scheduledDt.getTime()) / 60000;
+        if (minutesLate < 30) return t;
+        anyFired = true;
+        const driverUser = state.users.find(u => u.id === t.driver_id);
+        newNotifs.push({
+          id: mkId(), type: "TRIP_LATE_START", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${t.trip_id} hasn't started — scheduled for ${t.scheduled_date} ${t.scheduled_time}, driver ${driverUser?.name || t.driver_id} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
+          trip_id: t.trip_id, ts: nowTs2, read: false,
+        });
+        if (t.driver_id) {
+          newNotifs.push({
+            id: mkId(), type: "TRIP_LATE_START", for_roles: [ROLE.DRIVER], for_user_ids: [t.driver_id],
+            message: `⚠ Trip ${t.trip_id} was due to start at ${t.scheduled_time} — please begin the pickup or contact dispatch if there's a delay.`,
+            trip_id: t.trip_id, ts: nowTs2, read: false,
+          });
+        }
+        return { ...t, late_start_notified: true };
+      });
+      if (!anyFired) return state; // nothing changed — avoid a pointless re-render/refetch
+      return { ...state, trips: newTrips, notifications: [...newNotifs, ...state.notifications], _error: null };
+    }
+
+    case "NOTIF/DELETE_SELECTED": {
+      // Genuinely NEW capability, distinct from NOTIF/MARK_ALL_READ
+      // below (which only ever marks read, never removes) — per
+      // explicit request, admins/agents/drivers can select several
+      // alerts and delete them together. Same ownership scoping as
+      // MARK_ALL_READ: user_id = only that user's own notifications,
+      // admin = only the admin-broadcast ones — action.ids is filtered
+      // against this scope before anything is removed, so a forged or
+      // malformed id list can never be used to delete a notification
+      // that doesn't actually belong to the caller.
+      const idsToDelete = new Set(action.ids || []);
+      const matchesDel = (n) => action.user_id != null
+        ? n.for_user_ids?.includes(action.user_id)
+        : (action.admin ? (!n.for_user_ids?.length && (!n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN))) : true);
+      return { ...state, notifications: state.notifications.filter(n => !(idsToDelete.has(n.id) && matchesDel(n))) };
+    }
+
     case "NOTIF/MARK_ALL_READ": {
       // Scoped to the caller — previously this marked EVERY user's
       // notifications read (fine when only admins triggered it, but wrong
@@ -2880,6 +2956,7 @@ function tripRowToApp(row, chatByTrip) {
     dropoff_sequence_coords: row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel }] : [],
     completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
     no_shows: row.noshows || [],
+    late_start_notified: row.latestartnotified || false,
     pickup_company_id: row.pickupcompanyid, dropoff_company_id: row.dropoffcompanyid,
     pickup_is_manual: row.pickupismanual || false, dropoff_is_manual: row.dropoffismanual || false,
     direction: row.direction, is_exception: row.isexception || false, completed_dropoffs: row.completeddropoffs || [],
@@ -3672,11 +3749,34 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
 
+      // Notify everyone genuinely affected, per explicit decision — the
+      // removed agent, the driver (their route just changed), and every
+      // admin EXCEPT Viewer-tier ones specifically. There's no existing
+      // "broadcast to a role except one sub-tier" mechanism (every other
+      // admin notification is either everyone with ROLE.ADMIN, or a
+      // specific user id) — resolved explicitly here via a query on
+      // adminlevel, and targeted individually through for_user_ids.
+      const removedAgentName = (await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle()).data?.fullname;
       await insertNotification({
         type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
         message: `You've been removed from trip ${action.trip_id}.`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       });
+      if (tripRow.driverid) {
+        await insertNotification({
+          type: "TRIP_UPDATED", for_roles: [ROLE.DRIVER], for_user_ids: [tripRow.driverid],
+          message: `${removedAgentName || "A passenger"} was removed from trip ${action.trip_id} by an admin — your route has been updated.`,
+          trip_id: action.trip_id, ts: nowEpoch(), read: false,
+        });
+      }
+      const { data: nonViewerAdmins } = await supabase.from("users").select("id").eq("role", ROLE.ADMIN).neq("adminlevel", ADMIN_LEVEL.VIEWER);
+      if (nonViewerAdmins && nonViewerAdmins.length > 0) {
+        await insertNotification({
+          type: "TRIP_UPDATED", for_roles: [ROLE.ADMIN], for_user_ids: nonViewerAdmins.map(a => a.id),
+          message: `${removedAgentName || "A passenger"} was removed from trip ${action.trip_id} by ${actingAdminRemove.name}.`,
+          trip_id: action.trip_id, ts: nowEpoch(), read: false,
+        });
+      }
       await logAuditAction({
         actorId: actingAdminRemove.id, actorName: actingAdminRemove.name, actionType: "TRIP/REMOVE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: "Removed passenger from trip",
@@ -4263,14 +4363,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminCancel.id, actorName: actingAdminCancel.name, actionType: "TRIP/ADMIN_CANCEL",
         tripId: action.trip_id, details: `Cancelled trip (was ${tripRow.status})`,
       });
-      must(await supabase.from("trips").delete().eq("id", action.trip_id));
+      // Clear the driver's currenttripid BEFORE deleting the trip, not
+      // after — driver_status.currenttripid is a foreign key pointing
+      // AT trips.id, so deleting the trip while this driver's
+      // currenttripid still points to it fails with a real, confirmed
+      // production error: "update or delete on table trips violates
+      // foreign key constraint driver_status_currenttripid_fkey".
+      // Reversed from the original order (delete first, clear after),
+      // which is exactly what was hitting that error.
       if (tripRow.driverid) {
         const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
-          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
-        if (!remaining || remaining.length === 0) {
-          await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", tripRow.driverid);
-        }
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+          .neq("id", action.trip_id);
+        await supabase.from("driver_status").update({
+          state: remaining && remaining.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
+          currenttripid: remaining?.[0]?.id || null,
+          updatedat: new Date(nowTs).toISOString(),
+        }).eq("driverid", tripRow.driverid);
       }
+      must(await supabase.from("trips").delete().eq("id", action.trip_id));
       await refetch();
       return;
     }
@@ -4329,12 +4440,35 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           assertTripTransition(acTripRow.status, TRIP_STATE.ARCHIVED_CANCELLED);
           must(await supabase.from("trips").update({ status: TRIP_STATE.ARCHIVED_CANCELLED, cancelledat: acNowTs, isexception: true, updatedat: acNowTs }).eq("id", action.trip_id));
         } else {
+          // Clear/update the driver's currenttripid BEFORE deleting the
+          // trip — driver_status.currenttripid is a foreign key
+          // pointing AT trips.id, so deleting first (the original
+          // order) fails with a real, confirmed production error:
+          // "violates foreign key constraint
+          // driver_status_currenttripid_fkey". The archive branch
+          // above doesn't need this — it's an UPDATE, not a DELETE, so
+          // it never touches this constraint at all.
+          if (acTripRow.driverid) {
+            const { data: acRemaining } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
+              .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+              .neq("id", action.trip_id);
+            await supabase.from("driver_status").update({
+              state: acRemaining && acRemaining.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
+              currenttripid: acRemaining?.[0]?.id || null,
+              updatedat: new Date(acNowTs).toISOString(),
+            }).eq("driverid", acTripRow.driverid);
+          }
           must(await supabase.from("trips").delete().eq("id", action.trip_id));
         }
-        if (acTripRow.driverid) {
-          const { data: acRemaining } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
+        if (acIsLate && acTripRow.driverid) {
+          // The archive branch above never actually frees the driver
+          // (an ARCHIVED_CANCELLED trip is a stopping point, same as
+          // ARCHIVED_COMPLETED — the driver shouldn't stay pointed at
+          // it) — this is safe as a plain UPDATE, no delete involved,
+          // so no ordering constraint applies here either way.
+          const { data: acRemainingLate } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
             .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
-          if (!acRemaining || acRemaining.length === 0) {
+          if (!acRemainingLate || acRemainingLate.length === 0) {
             await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(acNowTs).toISOString() }).eq("driverid", acTripRow.driverid);
           }
         }
@@ -4905,6 +5039,60 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         tripid: action.trip_id, senderid: action.sender_id, sendername: action.sender_name,
         senderrole: action.sender_role, content: action.text, timestamp: nowEpoch(),
       }));
+      await refetch();
+      return;
+    }
+    case "TRIP/CHECK_LATE_START": {
+      // See the in-memory reducer's case for the full rationale. No
+      // permission check — this isn't an admin-initiated action, it's
+      // a periodic background check any logged-in session (admin or
+      // driver) can trigger, and it only ever reads/updates trip
+      // lateness state, nothing destructive or sensitive.
+      const { data: confirmedTrips } = await supabase.from("trips").select("*")
+        .eq("status", TRIP_STATE.DRIVER_CONFIRMED)
+        .or("latestartnotified.is.null,latestartnotified.eq.false");
+      if (!confirmedTrips || confirmedTrips.length === 0) return;
+      const clsNowTs = nowEpoch();
+      let anyFired = false;
+      for (const t of confirmedTrips) {
+        const scheduledDt = parseScheduledDateTime(t.scheduleddate, t.scheduledtime);
+        if (!scheduledDt) continue; // malformed date/time — skip rather than false-positive
+        const minutesLate = (Date.now() - scheduledDt.getTime()) / 60000;
+        if (minutesLate < 30) continue;
+        anyFired = true;
+        await supabase.from("trips").update({ latestartnotified: true }).eq("id", t.id);
+        const { data: driverUserRow } = t.driverid ? await supabase.from("users").select("fullname").eq("id", t.driverid).maybeSingle() : { data: null };
+        await insertNotification({
+          type: "TRIP_LATE_START", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${t.id} hasn't started — scheduled for ${t.scheduleddate} ${t.scheduledtime}, driver ${driverUserRow?.fullname || t.driverid} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
+          trip_id: t.id, ts: clsNowTs, read: false,
+        });
+        if (t.driverid) {
+          await insertNotification({
+            type: "TRIP_LATE_START", for_roles: [ROLE.DRIVER], for_user_ids: [t.driverid],
+            message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtime} — please begin the pickup or contact dispatch if there's a delay.`,
+            trip_id: t.id, ts: clsNowTs, read: false,
+          });
+        }
+      }
+      if (anyFired) await refetch();
+      return;
+    }
+    case "NOTIF/DELETE_SELECTED": {
+      // Genuinely NEW capability, distinct from NOTIF/MARK_ALL_READ
+      // below (which only ever marks read, never removes) — per
+      // explicit request. Same ownership scoping as MARK_ALL_READ,
+      // combined with an explicit id list, so only the caller's OWN
+      // selected notifications are ever actually deleted — a forged
+      // id list can't reach anyone else's rows.
+      if (!action.ids || action.ids.length === 0) return;
+      let delQ = supabase.from("notifications").delete().in("id", action.ids);
+      if (action.user_id != null) {
+        delQ = delQ.eq("userid", action.user_id);
+      } else if (action.admin) {
+        delQ = delQ.is("userid", null);
+      }
+      must(await delQ);
       await refetch();
       return;
     }
@@ -5674,7 +5862,15 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
     trip_type: "DAY",
     date: new Date().toLocaleDateString("en-ZA"), // used for DAY bookings
     weekStart: todayStr, weekEnd: todayStr, // used for WEEK bookings (native date inputs, YYYY-MM-DD)
-    time: "08:00", phone: "",
+    // Pre-filled from the agent's own stored account phone number, per
+    // the scan finding — previously this started genuinely empty and
+    // only ever got filled via the explicit "use my usual trip" button
+    // (which copies the PHONE FROM THEIR LAST BOOKING, not their
+    // account). A first-time booker, or anyone who doesn't tap that
+    // button, had to type their number by hand every time even though
+    // it's already on file. Still fully editable — this is just a
+    // sensible starting point, not a locked value.
+    time: "08:00", phone: user.phone || "",
     wantsReturn: false, returnTime: "17:00",
   });
   const [errs, setErrs] = useState({});
@@ -6210,16 +6406,65 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
   const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  // Multi-select delete — genuinely new feature, per explicit request
+  // (distinct from CLEAR, which only ever marks read). Same pattern as
+  // AdminNotifs' identical feature.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const exitSelectMode = () => { setSelectMode(false); setSelectedIds(new Set()); setConfirmingDelete(false); };
+  const deleteSelected = async () => {
+    setDeleting(true);
+    try {
+      await dispatch({ type: "NOTIF/DELETE_SELECTED", ids: [...selectedIds], user_id: user.id });
+      exitSelectMode();
+    } catch (e) {
+      console.warn("[AlertsTab] delete failed:", e.message);
+    } finally {
+      setDeleting(false);
+    }
+  };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ALERTS</div>
-        <Button title="CLEAR" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", user_id: user.id }).catch(() => {})} />
+        <div style={{ display: "flex", gap: 6 }}>
+          {myNotifs.length > 0 && (
+            <Button title={selectMode ? "CANCEL" : "SELECT"} variant="ghost" size="sm" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))} />
+          )}
+          {!selectMode && <Button title="CLEAR" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", user_id: user.id }).catch(() => {})} />}
+        </div>
       </div>
+      {selectMode && selectedIds.size > 0 && (
+        confirmingDelete ? (
+          <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>Delete {selectedIds.size} selected alert{selectedIds.size !== 1 ? "s" : ""}? This can't be undone.</span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDelete(false)} />
+              <Button title={deleting ? "DELETING…" : `DELETE ${selectedIds.size}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={deleteSelected} disabled={deleting} loading={deleting} />
+            </div>
+          </div>
+        ) : (
+          <Button title={`🗑 DELETE ${selectedIds.size} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingDelete(true)} style={{ alignSelf: "flex-start" }} />
+        )
+      )}
       {myNotifs.length === 0 ? <Empty icon="◬" text="No alerts" /> : myNotifs.map(n => (
-        <div key={n.id} onClick={() => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {})}
-          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.08)", border: n.read ? "none" : "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 13 }}>
-          <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1, marginBottom: 5 }}>{ICONS[n.type] || "◈"} {n.type.replace(/_/g, " ")}</div>
+        <div key={n.id} onClick={() => (selectMode ? toggleSelect(n.id) : dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {}))}
+          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.08)", border: selectMode && selectedIds.has(n.id) ? `1px solid ${COLORS.amber}` : (n.read ? "none" : "1px solid rgba(245,166,35,.3)"), borderRadius: 4, padding: 13 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 5 }}>
+            {selectMode && (
+              <span style={{ width: 14, height: 14, borderRadius: 3, border: `1px solid ${selectedIds.has(n.id) ? COLORS.amber : COLORS.wire}`, background: selectedIds.has(n.id) ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: COLORS.ink, flexShrink: 0 }}>{selectedIds.has(n.id) && "✓"}</span>
+            )}
+            <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>{ICONS[n.type] || "◈"} {n.type.replace(/_/g, " ")}</span>
+          </div>
           <div style={{ fontSize: 11 }}>{n.message}</div>
           <div style={{ fontSize: 9, color: COLORS.dim, marginTop: 5 }}>{n.ts}</div>
         </div>
@@ -6684,6 +6929,7 @@ function useWebRTCCall(currentUser) {
   const channelRef = useRef(null); // MY OWN inbox channel — always listening
   const callChannelRef = useRef(null); // the active call's shared channel, if any
   const pendingIceRef = useRef([]); // ICE candidates that arrive before remoteDescription is set
+  const incomingCallNotifRef = useRef(null); // the system Notification shown for the current incoming call, if any — closed once answered/declined/ended
   // Mirrors callState for the inbox effect below to read without needing
   // callState itself in that effect's dependency array — that dependency
   // was causing the inbox WebSocket channel to be torn down and recreated
@@ -6703,6 +6949,13 @@ function useWebRTCCall(currentUser) {
     pendingIceRef.current = [];
     setRemoteUser(null);
     setCallTripId(null);
+    // Dismiss the system notification (if one's showing) whenever a
+    // call genuinely ends — covers decline and hang-up, both of which
+    // route through this function. Accepting a call is handled
+    // separately in acceptCall, since cleanup() isn't called there
+    // (the call is now ACTIVE, tearing down its refs would break it).
+    incomingCallNotifRef.current?.close();
+    incomingCallNotifRef.current = null;
   }, []);
 
   const hangUp = useCallback((notifyPeer = true) => {
@@ -6738,6 +6991,39 @@ function useWebRTCCall(currentUser) {
       setCallTripId(payload.tripId || null);
       setCallState(CALL_STATE.RINGING_INCOMING);
       pcRef.current = { pendingOffer: payload.offer, callChannelName: payload.callChannelName };
+      // Real system-level notification the instant a call comes in —
+      // the actual fix for "app is open but I'm not looking at it right
+      // now." Previously only React state changed here, so the
+      // ringtone/incoming-call screen only ever showed if this exact
+      // tab was already in the foreground — a different browser tab, a
+      // different app on the phone, or a backgrounded tab all meant no
+      // signal at all despite the app being technically "open." This is
+      // the plain Notification API, not the full push-subscription
+      // round-trip — no server call needed since the page is already
+      // open and running. Silently does nothing if permission was
+      // never granted (same as every other place notification
+      // permission is used in this app) rather than nagging the person
+      // mid-call-setup. incomingCallNotifRef lets this be explicitly
+      // closed the moment the call is answered/declined/ends, so it
+      // doesn't linger in the notification tray after they've already
+      // dealt with it from inside the app.
+      try {
+        if ("Notification" in window && Notification.permission === "granted") {
+          incomingCallNotifRef.current?.close();
+          incomingCallNotifRef.current = new Notification(`Incoming call — ${payload.fromName}`, {
+            body: "Tap to open Pearce & Sons and answer.",
+            icon: "/icons/icon-192.png",
+            tag: payload.callChannelName,
+            requireInteraction: true,
+          });
+          incomingCallNotifRef.current.onclick = () => {
+            window.focus();
+            incomingCallNotifRef.current?.close();
+          };
+        }
+      } catch (e) {
+        console.warn("[Call] system notification failed (non-fatal):", e.message);
+      }
     });
 
     inbox.subscribe();
@@ -6819,6 +7105,12 @@ function useWebRTCCall(currentUser) {
   const acceptCall = useCallback(async () => {
     if (!pcRef.current?.pendingOffer) return;
     setErrorMsg(null);
+    // The call is now being answered — dismiss the "incoming call"
+    // system notification, since it's no longer accurate (not handled
+    // by cleanup() here, since accepting keeps the call ACTIVE rather
+    // than tearing everything down the way decline/hangup do).
+    incomingCallNotifRef.current?.close();
+    incomingCallNotifRef.current = null;
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
       setErrorMsg("Voice calling isn't supported in this browser.");
       setCallState(CALL_STATE.FAILED);
@@ -8148,6 +8440,20 @@ function DriverApp({ state, dispatch, user }) {
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myUnreadNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read).length;
   const allMyTrips = state.trips.filter(t => t.driver_id === user.id);
+
+  // Client-side half of the late-start warning — see AdminApp's
+  // identical effect for the full rationale. A driver having the app
+  // open catching their OWN late trip is genuinely useful (lets them
+  // self-correct sooner than waiting for dispatch to notice and call).
+  useEffect(() => {
+    if (!supabase) return;
+    dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    const intervalId = setInterval(() => {
+      dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    }, 5 * 60 * 1000);
+    return () => clearInterval(intervalId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Progressive reveal for week-trip series: a trip that's part of a
   // week group (week_group_id set) and isn't day 1 stays hidden from the
   // driver's dashboard until the PRIOR day in that same group has been
@@ -8284,6 +8590,7 @@ function AdminDashboard({ state, user }) {
 
 function AddAgentPanel({ trip, state, dispatch, onClose }) {
   const [agentId, setAgentId] = useState("");
+  const [agentSearch, setAgentSearch] = useState("");
   const [mode, setMode] = useState("street");
   const [companyId, setCompanyId] = useState((state.companies || [])[0]?.id || "");
   const [streetValue, setStreetValue] = useState("");
@@ -8292,7 +8599,14 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   const [confirmed, setConfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  const availableAgents = state.users.filter(u => u.role === ROLE.AGENT && !trip.agent_ids.includes(u.id));
+  const availableAgentsAll = state.users.filter(u => u.role === ROLE.AGENT && !trip.agent_ids.includes(u.id));
+  // Search-to-filter, per explicit request — a flat unfiltered list is
+  // fine for a handful of agents, but genuinely slow to scroll through
+  // on a real fleet with many. Same case-insensitive substring match on
+  // name/staff-number already used elsewhere in this file (AdminContacts).
+  const availableAgents = agentSearch.trim().length >= 1
+    ? availableAgentsAll.filter(a => a.name.toLowerCase().includes(agentSearch.trim().toLowerCase()) || (a.staff_number || "").toLowerCase().includes(agentSearch.trim().toLowerCase()))
+    : availableAgentsAll;
   const selectedCompany = companyById(state, companyId) || { address: "", lat: null, lng: null };
   const selectedAgent = state.users.find(u => u.id === agentId);
 
@@ -8331,7 +8645,7 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
     }
   };
 
-  if (availableAgents.length === 0) {
+  if (availableAgentsAll.length === 0) {
     return (
       <Card style={{ borderColor: COLORS.wire }}>
         <span style={{ fontSize: 10, color: COLORS.ghost }}>Every agent is already on this trip.</span>
@@ -8343,8 +8657,11 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   return (
     <Card style={{ borderColor: COLORS.amber2, background: "rgba(245,166,35,.03)" }}>
       <SectionHeader label="Add Passenger" />
+      <TextField label="Search by name or staff number" value={agentSearch} onChange={e => setAgentSearch(e.target.value)} placeholder="e.g. Nomsa Dlamini or AG1001" />
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {availableAgents.map(a => (
+        {availableAgents.length === 0 ? (
+          <span style={{ fontSize: 10, color: COLORS.ghost, padding: "8px 0" }}>No agents match "{agentSearch}"</span>
+        ) : availableAgents.map(a => (
           <div key={a.id} onClick={() => chooseAgent(a.id)}
             style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", border: `1px solid ${agentId === a.id ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, background: agentId === a.id ? COLORS.amber : "transparent" }}>
             <DriverAvatar name={a.name} isOnline={a.is_online} size={30} />
@@ -8418,8 +8735,8 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
   );
 }
 
-function TripDetailRow({ trip, state, dispatch }) {
-  const [open, setOpen] = useState(false);
+function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
+  const [open, setOpen] = useState(!!initiallyOpen);
   const [addingAgent, setAddingAgent] = useState(false);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
   const [cancelError, setCancelError] = useState(null);
@@ -8577,7 +8894,11 @@ function TripDetailRow({ trip, state, dispatch }) {
                 )}
                 {isConfirmingRemove && (
                   <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                    <span style={{ fontSize: 10, color: COLORS.chalk }}>Remove {p.name} from this trip?</span>
+                    <span style={{ fontSize: 10, color: COLORS.chalk }}>
+                      {trip.driver_id
+                        ? `This is an active trip — a driver (${driver?.name || "assigned"}) is already on this route. Remove ${p.name}? The driver, ${p.name}, and admins will all be notified.`
+                        : `Remove ${p.name} from this booking?`}
+                    </span>
                     <div style={{ display: "flex", gap: 8 }}>
                       <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setRemovingId(null)} />
                       <Button title="CONFIRM REMOVE" variant="danger" size="sm" style={{ flex: 1 }} onClick={() => confirmRemove(p.id)} />
@@ -8746,7 +9067,7 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
   URL.revokeObjectURL(url);
 }
 
-function AdminTrips({ state, dispatch, user }) {
+function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   const [filter, setFilter] = useState("ALL");
   const [selectedDriverId, setSelectedDriverId] = useState(null); // null = show all groups
   const [exporting, setExporting] = useState(false);
@@ -8762,6 +9083,22 @@ function AdminTrips({ state, dispatch, user }) {
   const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkMsg, setBulkMsg] = useState(null);
+
+  // Jump-to-trip from a notification tap — per the scan finding, an
+  // admin notification previously only marked itself read with no way
+  // to actually navigate to the trip it's about. Clears every filter
+  // that could hide the target (state/date/driver-group) so it's
+  // genuinely visible, not left invisible behind a stale filter from
+  // whatever the admin was doing before tapping the notification.
+  useEffect(() => {
+    if (jumpTripId) {
+      setFilter("ALL");
+      setDateFilter("");
+      setSelectedDriverId(null);
+      onJumpConsumed?.();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpTripId]);
   // Ids just successfully deleted, hidden immediately regardless of
   // refetch timing — see handleBulkDeleteTrips.
   const [locallyHiddenTripIds, setLocallyHiddenTripIds] = useState(new Set());
@@ -8939,7 +9276,7 @@ function AdminTrips({ state, dispatch, user }) {
               {groupTrips.map(t => {
                 const isSelectable = canEditTrips && (t.state === TRIP_STATE.UNASSIGNED_BOOKING || t.state === TRIP_STATE.ARCHIVED_COMPLETED);
                 if (!isSelectable) {
-                  return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} />;
+                  return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} initiallyOpen={t.trip_id === jumpTripId} />;
                 }
                 const checked = selectedTripIds.has(t.trip_id);
                 return (
@@ -8948,7 +9285,7 @@ function AdminTrips({ state, dispatch, user }) {
                       <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink }}>{checked && "✓"}</span>
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <TripDetailRow trip={t} state={state} dispatch={dispatch} />
+                      <TripDetailRow trip={t} state={state} dispatch={dispatch} initiallyOpen={t.trip_id === jumpTripId} />
                     </div>
                   </div>
                 );
@@ -9386,6 +9723,11 @@ function AdminDispatch({ state, dispatch }) {
   // add/delete rather than an indexOf/splice dance.
   const [selectedTripIds, setSelectedTripIds] = useState(new Set());
   const [selectedDriverId, setSelectedDriverId] = useState(null);
+  // Search on the driver list — per the scan finding. Existing filters
+  // (day/direction/area) already shorten the unassigned-bookings list,
+  // but the driver list itself has no filtering at all, which matters
+  // on a fleet with many drivers.
+  const [driverSearch, setDriverSearch] = useState("");
   const [msg, setMsg] = useState(null);
   // Filters the unassigned bookings list down to one calendar date — with
   // several agents each booking a week (or more), the unassigned list can
@@ -9524,6 +9866,20 @@ function AdminDispatch({ state, dispatch }) {
       return a.distKm - b.distKm;
     });
   const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
+  // Search-filtered list for DISPLAY only — per the scan finding, a
+  // fleet with many drivers had no way to narrow this list at all.
+  // Deliberately a SEPARATE list from availableDrivers itself, so
+  // nearestDriverId above still reflects the true nearest driver across
+  // the whole fleet, not just whoever currently matches a search.
+  // Matches on name OR vehicle description (searching "hiace" finds
+  // every driver with a Toyota Hiace, a genuinely useful thing to
+  // filter by when picking a vehicle for a larger group).
+  const displayedDrivers = driverSearch.trim().length >= 1
+    ? availableDrivers.filter(({ u, ds }) => {
+        const q = driverSearch.trim().toLowerCase();
+        return (u?.name || "").toLowerCase().includes(q) || (ds.vehicle || "").toLowerCase().includes(q);
+      })
+    : availableDrivers;
 
   const handleDispatch = async () => {
     if (!primaryTrip || !selectedDriverId || overCapacity) return;
@@ -9561,7 +9917,13 @@ function AdminDispatch({ state, dispatch }) {
         await dispatch({ type: "TRIP/ASSIGN_DRIVER", trip_id: primaryTrip.trip_id, driver_id: selectedDriverId });
         setMsg(`✓ Dispatched to ${driverName}`);
       }
-      setSelectedTripIds(new Set()); setSelectedDriverId(null);
+      // Only the completed bookings' selection clears — the chosen
+      // driver deliberately STAYS selected, per the scan finding.
+      // Assigning several separate bookings to the same driver in a
+      // row is a genuinely common workflow, and re-picking the same
+      // driver from the list after every single assignment was a real,
+      // repeated, unnecessary step.
+      setSelectedTripIds(new Set());
     } catch (e) {
       setMsg(`✗ ${e.message || "Dispatch failed — please try again."}`);
     } finally {
@@ -9663,7 +10025,14 @@ function AdminDispatch({ state, dispatch }) {
               </span>
             )}
           </div>
-          {availableDrivers.length === 0 ? <Empty icon="◉" text="No drivers available — all fully booked" /> : availableDrivers.map(({ ds, u, distKm, usedLivePosition }) => {
+          {availableDrivers.length > 1 && (
+            <TextField label="Search drivers by name or vehicle" value={driverSearch} onChange={e => setDriverSearch(e.target.value)} placeholder="e.g. Sipho or Hiace" />
+          )}
+          {availableDrivers.length === 0 ? (
+            <Empty icon="◉" text="No drivers available — all fully booked" />
+          ) : displayedDrivers.length === 0 ? (
+            <Empty icon="◉" text={`No drivers match "${driverSearch}"`} />
+          ) : displayedDrivers.map(({ ds, u, distKm, usedLivePosition }) => {
             const load = getDriverLoad(state, ds.driver_id, primaryTrip?.scheduled_date);
             const driverCapacityDispatch = ds.capacity || DRIVER_CAPACITY;
             // Workload warning: per explicit decision ("select it per
@@ -10994,6 +11363,18 @@ function AdminUsers({ state, dispatch, user }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteResults, setDeleteResults] = useState(null);
+  // Search/filter — genuinely missing before (a flat, unfiltered list
+  // of every user in the whole system), found during a scan for real
+  // friction points and built per explicit approval. Matches on name,
+  // staff number, or role (typing "driver"/"admin"/"agent" filters by
+  // role too, a natural thing to want on a screen mixing all three).
+  const [userSearch, setUserSearch] = useState("");
+  const filteredUsers = userSearch.trim().length >= 1
+    ? state.users.filter(u => {
+        const q = userSearch.trim().toLowerCase();
+        return u.name.toLowerCase().includes(q) || (u.staff_number || "").toLowerCase().includes(q) || u.role.toLowerCase().includes(q);
+      })
+    : state.users;
   const toggleSelected = (id) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
@@ -11210,8 +11591,11 @@ function AdminUsers({ state, dispatch, user }) {
           </div>
         </Card>
       )}
+      <TextField label="Search by name, staff number, or role" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="e.g. Nomsa Dlamini, AG1001, or driver" />
       <Card body={false}>
-        {state.users.map(u => {
+        {filteredUsers.length === 0 ? (
+          <Empty icon="👤" text={`No users match "${userSearch}"`} />
+        ) : filteredUsers.map(u => {
           const isExpanded = editingId === u.id;
           const isEditingThisRow = isExpanded && editModeId === u.id;
           const driverStatus = u.role === ROLE.DRIVER ? state.driver_status.find(d => d.driver_id === u.id) : null;
@@ -11551,8 +11935,33 @@ function AdminTickets({ state, dispatch, user }) {
 }
 
 
-function AdminNotifs({ state, dispatch }) {
+function AdminNotifs({ state, dispatch, onJumpToTrip }) {
   const [filterDate, setFilterDate] = useState(""); // "" = show all, else YYYY-MM-DD
+  // Multi-select delete for alerts — genuinely new feature, per explicit
+  // request (distinct from CLEAR ALL above, which only ever marks read).
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedNotifIds, setSelectedNotifIds] = useState(new Set());
+  const [confirmingDeleteNotifs, setConfirmingDeleteNotifs] = useState(false);
+  const [deletingNotifs, setDeletingNotifs] = useState(false);
+  const toggleNotifSelect = (id) => {
+    setSelectedNotifIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const exitSelectMode = () => { setSelectMode(false); setSelectedNotifIds(new Set()); setConfirmingDeleteNotifs(false); };
+  const deleteSelectedNotifs = async () => {
+    setDeletingNotifs(true);
+    try {
+      await dispatch({ type: "NOTIF/DELETE_SELECTED", ids: [...selectedNotifIds], admin: true });
+      exitSelectMode();
+    } catch (e) {
+      console.warn("[AdminNotifs] delete failed:", e.message);
+    } finally {
+      setDeletingNotifs(false);
+    }
+  };
   const adminNotifsAll = state.notifications.filter(n => !n.for_user_ids?.length && (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length));
   // Filtered by calendar day (local time) using the raw epoch timestamp —
   // n.ts itself is a locale-formatted display string (en-ZA), not
@@ -11579,23 +11988,51 @@ function AdminNotifs({ state, dispatch }) {
             </div>
           )}
         </div>
-        {unread > 0 && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+        <div style={{ display: "flex", gap: 6 }}>
+          {adminNotifsAll.length > 0 && (
+            <Button title={selectMode ? "CANCEL" : "SELECT"} variant="ghost" size="sm" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))} />
+          )}
+          {unread > 0 && !selectMode && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+        </div>
       </div>
+      {selectMode && selectedNotifIds.size > 0 && (
+        confirmingDeleteNotifs ? (
+          <div style={{ background: "rgba(232,58,58,.06)", border: "1px solid rgba(232,58,58,.3)", borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>Delete {selectedNotifIds.size} selected alert{selectedNotifIds.size !== 1 ? "s" : ""}? This can't be undone.</span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDeleteNotifs(false)} />
+              <Button title={deletingNotifs ? "DELETING…" : `DELETE ${selectedNotifIds.size}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={deleteSelectedNotifs} disabled={deletingNotifs} loading={deletingNotifs} />
+            </div>
+          </div>
+        ) : (
+          <Button title={`🗑 DELETE ${selectedNotifIds.size} SELECTED`} variant="ghost" size="sm" onClick={() => setConfirmingDeleteNotifs(true)} style={{ alignSelf: "flex-start" }} />
+        )
+      )}
       <div style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
         <TextField label="Filter by day" type="date" value={filterDate} onChange={e => setFilterDate(e.target.value)} style={{ flex: 1 }} />
         {filterDate && <Button title="CLEAR FILTER" variant="ghost" size="sm" onClick={() => setFilterDate("")} />}
       </div>
       {filterDate && <div style={{ fontSize: 10, color: COLORS.ghost }}>{adminNotifs.length} alert{adminNotifs.length !== 1 ? "s" : ""} on this day</div>}
       {adminNotifs.length === 0 ? <Empty icon="◬" text={filterDate ? "No alerts on this day" : "No admin alerts"} /> : adminNotifs.map(n => (
-        <div key={n.id} onClick={() => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {})}
-          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.06)", border: `1px solid ${n.read ? COLORS.wire : "rgba(245,166,35,.25)"}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 6 }}>
+        <div key={n.id} onClick={() => {
+          if (selectMode) { toggleNotifSelect(n.id); return; }
+          dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {});
+          if (n.trip_id) onJumpToTrip?.(n.trip_id);
+        }}
+          style={{ cursor: "pointer", background: n.read ? COLORS.card : "rgba(245,166,35,.06)", border: `1px solid ${selectMode && selectedNotifIds.has(n.id) ? COLORS.amber : (n.read ? COLORS.wire : "rgba(245,166,35,.25)")}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 6 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+            {selectMode && (
+              <span style={{ width: 14, height: 14, borderRadius: 3, border: `1px solid ${selectedNotifIds.has(n.id) ? COLORS.amber : COLORS.wire}`, background: selectedNotifIds.has(n.id) ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 9, color: COLORS.ink, flexShrink: 0 }}>{selectedNotifIds.has(n.id) && "✓"}</span>
+            )}
             <span style={{ fontSize: 14 }}>{ICONS[n.type] || "◈"}</span>
             <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.amber, letterSpacing: 1, textTransform: "uppercase", flex: 1 }}>{n.type.replace(/_/g, " ")}</span>
             {!n.read && <div style={{ width: 7, height: 7, borderRadius: 4, background: COLORS.amber }} />}
           </div>
           <div style={{ fontSize: 11, lineHeight: 1.5 }}>{n.message}</div>
-          <div style={{ fontSize: 9, color: COLORS.dim }}>{n.ts}</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 9, color: COLORS.dim }}>{n.ts}</div>
+            {!selectMode && n.trip_id && <span style={{ fontSize: 9, color: COLORS.teal }}>→ View trip</span>}
+          </div>
         </div>
       ))}
     </div>
@@ -11627,6 +12064,29 @@ function AdminApp({ state, dispatch, user }) {
   const isNarrow = useIsNarrowScreen();
   const notifCount = state.notifications.filter(n => !n.read && n.for_roles?.includes(ROLE.ADMIN)).length;
   const call = useWebRTCCall(user);
+
+  // Client-side half of the late-start warning, per explicit decision
+  // (built alongside a server-side scheduled version too, so this gets
+  // caught reliably even when nobody has the app open — see the
+  // separate Edge Function package). Runs once immediately, then every
+  // 5 minutes, so an admin with the app open catches this without
+  // waiting on the server-side schedule.
+  useEffect(() => {
+    if (!supabase) return;
+    dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    const intervalId = setInterval(() => {
+      dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    }, 5 * 60 * 1000);
+    return () => clearInterval(intervalId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // Tapping a notification about a specific trip now jumps straight to
+  // it — mirrors the agent app's existing home-card-tap pattern.
+  // Previously an admin notification only marked itself read and did
+  // nothing else, even though most notification types already carry a
+  // trip_id internally — reading "trip 87 booking exception" meant
+  // manually going to All Bookings & Trips and finding it yourself.
+  const [jumpTripId, setJumpTripId] = useState(null);
 
   // A Viewer admin assigned to a specific company only sees that
   // company's agents (and whichever drivers actually serve them) and
@@ -11681,7 +12141,7 @@ function AdminApp({ state, dispatch, user }) {
   const mainContent = (
     <div style={{ flex: 1, overflowY: "auto", minWidth: 0 }}>
       {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
-      {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} />}
+      {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
@@ -11690,7 +12150,7 @@ function AdminApp({ state, dispatch, user }) {
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
-      {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} />}
+      {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }} />}
     </div>
   );
 
