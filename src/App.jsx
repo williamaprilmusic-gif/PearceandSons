@@ -3165,7 +3165,7 @@ async function fetchMyConversations(myUserId, users) {
 // left as an obviously-fake string rather than a real key value, since
 // a real VAPID key pair is specific to one project and can't be
 // invented here.
-const VAPID_PUBLIC_KEY = "REPLACE_WITH_YOUR_VAPID_PUBLIC_KEY";
+const VAPID_PUBLIC_KEY = "BMJk0yevqTBRrkZnR3jYmifhfELzhbXMNJV6HR5iNREt7GCGeNFZx_dfBumHyIOLnJv_UWgjbquNBmNQK6FrgsE";
 
 function urlBase64ToUint8Array(base64String) {
   const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
@@ -6929,7 +6929,17 @@ function useWebRTCCall(currentUser) {
   const channelRef = useRef(null); // MY OWN inbox channel — always listening
   const callChannelRef = useRef(null); // the active call's shared channel, if any
   const pendingIceRef = useRef([]); // ICE candidates that arrive before remoteDescription is set
-  const incomingCallNotifRef = useRef(null); // the system Notification shown for the current incoming call, if any — closed once answered/declined/ended
+  // Closes any currently-showing incoming-call system notification by
+  // its tag (the call channel name) — the correct mechanism now that
+  // registration.showNotification() (mobile-compatible, unlike the
+  // direct Notification() constructor) doesn't hand back a live object
+  // to call .close() on directly the way the old approach did.
+  const closeIncomingCallNotification = useCallback((callChannelName) => {
+    if (!callChannelName || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.ready.then((registration) => {
+      registration.getNotifications({ tag: callChannelName }).then(existing => existing.forEach(n => n.close()));
+    }).catch(() => {});
+  }, []);
   // Mirrors callState for the inbox effect below to read without needing
   // callState itself in that effect's dependency array — that dependency
   // was causing the inbox WebSocket channel to be torn down and recreated
@@ -6940,6 +6950,10 @@ function useWebRTCCall(currentUser) {
   useEffect(() => { callStateRef.current = callState; }, [callState]);
 
   const cleanup = useCallback(() => {
+    // Captured BEFORE pcRef.current is cleared below — it's the only
+    // place the current call's channel name (used as the notification
+    // tag) is stored, needed to close the right notification.
+    const callChannelNameForNotifClose = pcRef.current?.callChannelName;
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
     if (callChannelRef.current && callChannelRef.current !== channelRef.current) {
@@ -6954,9 +6968,8 @@ function useWebRTCCall(currentUser) {
     // route through this function. Accepting a call is handled
     // separately in acceptCall, since cleanup() isn't called there
     // (the call is now ACTIVE, tearing down its refs would break it).
-    incomingCallNotifRef.current?.close();
-    incomingCallNotifRef.current = null;
-  }, []);
+    closeIncomingCallNotification(callChannelNameForNotifClose);
+  }, [closeIncomingCallNotification]);
 
   const hangUp = useCallback((notifyPeer = true) => {
     if (notifyPeer && callChannelRef.current) {
@@ -6997,29 +7010,39 @@ function useWebRTCCall(currentUser) {
       // ringtone/incoming-call screen only ever showed if this exact
       // tab was already in the foreground — a different browser tab, a
       // different app on the phone, or a backgrounded tab all meant no
-      // signal at all despite the app being technically "open." This is
-      // the plain Notification API, not the full push-subscription
-      // round-trip — no server call needed since the page is already
-      // open and running. Silently does nothing if permission was
-      // never granted (same as every other place notification
-      // permission is used in this app) rather than nagging the person
-      // mid-call-setup. incomingCallNotifRef lets this be explicitly
-      // closed the moment the call is answered/declined/ends, so it
-      // doesn't linger in the notification tray after they've already
-      // dealt with it from inside the app.
+      // signal at all despite the app being technically "open."
+      //
+      // IMPORTANT: the plain `new Notification(...)` constructor
+      // genuinely throws a TypeError on nearly all mobile browsers —
+      // this is a real, permanent, well-documented platform
+      // restriction (confirmed via MDN), not something that can be
+      // worked around by catching the error and retrying. The correct
+      // API for showing a notification from a non-foreground page on
+      // mobile is registration.showNotification() via the service
+      // worker, which is what this now uses instead. Silently does
+      // nothing if permission was never granted (same as every other
+      // place notification permission is used in this app) rather
+      // than nagging the person mid-call-setup.
       try {
-        if ("Notification" in window && Notification.permission === "granted") {
-          incomingCallNotifRef.current?.close();
-          incomingCallNotifRef.current = new Notification(`Incoming call — ${payload.fromName}`, {
-            body: "Tap to open Pearce & Sons and answer.",
-            icon: "/icons/icon-192.png",
-            tag: payload.callChannelName,
-            requireInteraction: true,
+        if ("Notification" in window && Notification.permission === "granted" && "serviceWorker" in navigator) {
+          navigator.serviceWorker.ready.then((registration) => {
+            // Close any notification already showing for THIS SAME call
+            // channel first (covers a resent offer) before showing a
+            // fresh one — showNotification() doesn't return a live
+            // object to hold a ref to and call .close() on later the
+            // way the direct constructor did, so tag-based lookup is
+            // used instead, both here and wherever this needs closing.
+            registration.getNotifications({ tag: payload.callChannelName }).then(existing => {
+              existing.forEach(n => n.close());
+              registration.showNotification(`Incoming call — ${payload.fromName}`, {
+                body: "Tap to open Pearce & Sons and answer.",
+                icon: "/icons/icon-192.png",
+                tag: payload.callChannelName,
+                requireInteraction: true,
+                data: { callChannelName: payload.callChannelName },
+              });
+            });
           });
-          incomingCallNotifRef.current.onclick = () => {
-            window.focus();
-            incomingCallNotifRef.current?.close();
-          };
         }
       } catch (e) {
         console.warn("[Call] system notification failed (non-fatal):", e.message);
@@ -7109,8 +7132,7 @@ function useWebRTCCall(currentUser) {
     // system notification, since it's no longer accurate (not handled
     // by cleanup() here, since accepting keeps the call ACTIVE rather
     // than tearing everything down the way decline/hangup do).
-    incomingCallNotifRef.current?.close();
-    incomingCallNotifRef.current = null;
+    closeIncomingCallNotification(pcRef.current?.callChannelName);
     if (!navigator.mediaDevices?.getUserMedia || typeof RTCPeerConnection === "undefined") {
       setErrorMsg("Voice calling isn't supported in this browser.");
       setCallState(CALL_STATE.FAILED);
@@ -7151,8 +7173,9 @@ function useWebRTCCall(currentUser) {
   }, [buildPeerConnection, hangUp, cleanup]);
 
   const declineCall = useCallback(() => {
-    if (pcRef.current?.callChannelName) {
-      const chan = supabase.channel(pcRef.current.callChannelName);
+    const callChannelNameForDecline = pcRef.current?.callChannelName;
+    if (callChannelNameForDecline) {
+      const chan = supabase.channel(callChannelNameForDecline);
       chan.subscribe((status) => {
         if (status === "SUBSCRIBED") {
           chan.send({ type: "broadcast", event: "declined", payload: {} });
@@ -7160,10 +7183,18 @@ function useWebRTCCall(currentUser) {
         }
       });
     }
+    // Close the notification HERE, using the channel name captured
+    // above — pcRef.current is nulled on the next line, and cleanup()
+    // (called right after) can no longer read it from there by the
+    // time it runs, which was a real bug in an earlier version of this
+    // fix (cleanup() read pcRef.current AFTER this function had
+    // already cleared it, always getting undefined during a decline
+    // specifically — the one path this most needs to work for).
+    closeIncomingCallNotification(callChannelNameForDecline);
     pcRef.current = null;
     cleanup();
     setCallState(CALL_STATE.IDLE);
-  }, [cleanup]);
+  }, [cleanup, closeIncomingCallNotification]);
 
   const resetAfterEnd = useCallback(() => setCallState(CALL_STATE.IDLE), []);
 
@@ -7265,6 +7296,32 @@ function setAlertSoundMuted(muted) {
 }
 
 let sharedAudioCtx = null;
+// Every selectable sound for ringtone / message tone. "synth" options
+// Built-in options only — the app's own original, always-available
+// tones (zero setup, already proven copyright-clear per the app's own
+// compliance rules).
+const RINGTONE_OPTIONS = [
+  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
+];
+const MESSAGE_TONE_OPTIONS = [
+  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
+];
+
+function getUserSoundPref(userId, kind) {
+  // kind is "ringtone" or "messageTone" — stored per-user, like every
+  // other per-user preference in this app (see usePersistedTab).
+  try {
+    return localStorage.getItem(`transitos_sound_${kind}_${userId}`) || "synth_chime";
+  } catch (e) {
+    return "synth_chime";
+  }
+}
+function setUserSoundPref(userId, kind, optionId) {
+  try {
+    localStorage.setItem(`transitos_sound_${kind}_${userId}`, optionId);
+  } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+}
+
 function playAlertSound() {
   if (isAlertSoundMuted()) return;
   try {
@@ -7315,31 +7372,28 @@ function playRingtonePulse() {
     const ctx = sharedAudioCtx;
     if (ctx.state === "suspended") ctx.resume();
     const now = ctx.currentTime;
-    // The REAL classic telephone ring, per explicit request — the
-    // actual North American landline ringing signal is two frequencies
-    // played TOGETHER (440Hz + 480Hz), producing the familiar warbling
-    // "brrring" quality, not a single clean tone. This is a real,
-    // decades-old telecom industry standard (not owned by any phone
-    // manufacturer), so it's the correct thing to replicate here — the
-    // previous version was a single 1000Hz pulse with none of that
-    // characteristic warble. Standard cadence: ~2s on, ~4s off per
-    // full ring cycle; this plays two short bursts within the "on"
-    // portion (see startRingtone's repeat interval below) so it still
-    // reads clearly as "ringing" rather than one long drone.
-    [[now, 0.4], [now + 0.5, 0.4]].forEach(([start, dur]) => {
-      [440, 480].forEach(freq => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(0.35, start + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(start);
-        osc.stop(start + dur + 0.02);
-      });
+    // Redesigned per explicit request for something that sounds nicer
+    // — the previous version replicated the REAL telecom dual-tone
+    // ring standard (440Hz+480Hz), which is authentic but has a harsh,
+    // buzzy quality that isn't pleasant to hear repeatedly. This is a
+    // gentle, warm 3-note ascending chime instead — a rounder
+    // "triangle" waveform (softer than a flat sine, much softer than a
+    // square/sawtooth) rather than the phone-buzz character. Still
+    // fully original/synthesized code, same as every sound in this
+    // app — no copyright concern, this is just a nicer-sounding
+    // pattern, not a real recording of anything.
+    [[523.25, now, 0.16], [659.25, now + 0.14, 0.16], [783.99, now + 0.28, 0.26]].forEach(([freq, start, dur]) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.4, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.02);
     });
   } catch (e) {
     console.warn("[Ringtone] playback failed:", e.message);
