@@ -6283,8 +6283,15 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
     ? (trip.pickup_sequence_coords?.find(c => c.agent_id === user.id) ?? trip.pickup_sequence_coords?.[0]) ?? null
     : null;
   // Per-agent dropoff: find this agent's specific dropoff (their home for OUTBOUND).
+  // Falls back to [0] for primary agent on legacy coords, then to the user's
+  // home_address for OUTBOUND trips where extradropoffs wasn't stored yet
+  // (trips dispatched before the per-agent dropoff feature was added).
   const myDropoffCoord = trip
-    ? (trip.dropoff_sequence_coords?.find(c => c.agent_id === user.id) ?? trip.dropoff_sequence_coords?.[0]) ?? null
+    ? (trip.dropoff_sequence_coords?.find(c => c.agent_id === user.id)
+        ?? (trip.agent_ids[0] === user.id ? trip.dropoff_sequence_coords?.[0] : null)
+        ?? (trip.direction === "OUTBOUND" && state.users.find(u => u.id === user.id)?.home_address
+            ? state.users.find(u => u.id === user.id).home_address
+            : null))
     : null;
   const trackingReferencePoint = trip
     ? (trip.completed_pickups?.includes(user.id) ? myDropoffCoord : myPickupCoord) ?? null
@@ -8030,7 +8037,24 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                 )}
               </div>
             ))}
-            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
+            {/* Drop-off: for OUTBOUND multi-agent trips each passenger has their own home address */}
+            {(trip.dropoff_sequence_coords || []).length > 1 ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS</span>
+                {trip.dropoff_sequence_coords.map((dc, dci) => {
+                  const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
+                  return (
+                    <div key={dci} style={{ fontSize: 11 }}>
+                      <span style={{ color: COLORS.red }}>◎ </span>
+                      {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
+                      {dc.label || trip.custom_dropoff}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
+            )}
             {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
             {trip.driver_route_km != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
