@@ -858,6 +858,27 @@ function buildDropoffSequence(trips, lastPickupCoord) {
   return ordered;
 }
 
+// Picks the correct anchor coord for buildDropoffSequence.
+//
+// The naive anchor — ordered[ordered.length - 1]?.coord, the last pickup
+// in the driver's full cross-trip sequence — is wrong for mixed routes:
+// if a driver has both INBOUND (home→work) and OUTBOUND (work→home) trips,
+// the last pickup in the overall sequence may be an agent's home address
+// (from an inbound leg), which gives a completely wrong starting point for
+// sequencing the outbound dropoffs (home addresses that should be ordered
+// starting from the company office, not from a random suburb).
+//
+// Rule: if ANY trip in the driver's set is OUTBOUND, anchor from the
+// company coord — outbound dropoffs are home addresses that depart from
+// work, and using the company coord for pure-inbound sets (single work
+// dropoff) is harmless. Otherwise fall back to the last pickup coord,
+// which is correct for pure-inbound routes with multiple home pickups.
+function dropoffAnchor(allForDriver, pickupOrdered, companyCoord) {
+  const hasOutbound = allForDriver.some(t => t.direction === "OUTBOUND");
+  if (hasOutbound) return companyCoord;
+  return pickupOrdered[pickupOrdered.length - 1]?.coord ?? companyCoord;
+}
+
 // Nearest-neighbour route through all not-yet-done dropoffs, continuing
 // the chain from wherever the driver currently is (last completed pickup,
 // or the last completed dropoff once some are done) — NOT a single sort
@@ -1582,7 +1603,7 @@ function appReducer(state, action) {
         // sequencing chains from. Re-running it here keeps the displayed
         // drop_sequence_num honest instead of going stale the moment a
         // passenger is added mid-route.
-        const dropOrderedAdd = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrderedAdd = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
         const seqMap = {}, dropMapAdd = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrderedAdd.forEach((t, i) => { dropMapAdd[t.trip_id] = i + 1; });
@@ -1639,7 +1660,7 @@ function appReducer(state, action) {
         // Same reasoning as ADD_AGENT — removing a passenger's pickup
         // point can shift the pickup route, which shifts the anchor the
         // drop-off chain continues from.
-        const dropOrderedRem = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrderedRem = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
         const seqMap = {}, dropMapRem = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrderedRem.forEach((t, i) => { dropMapRem[t.trip_id] = i + 1; });
@@ -1703,7 +1724,7 @@ function appReducer(state, action) {
         // Same reasoning — moving a pickup point can shift the pickup
         // route's last stop, which is the anchor drop-off sequencing
         // continues from.
-        const dropOrderedReloc = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrderedReloc = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
         const seqMap = {}, dropMapReloc = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrderedReloc.forEach((t, i) => { dropMapReloc[t.trip_id] = i + 1; });
@@ -1826,6 +1847,7 @@ function appReducer(state, action) {
         // silently breaking week-booking grouping in demo mode.
         week_group_id: action.week_group_id || null,
         week_day_num: action.week_day_num || null,
+        direction: action.direction || null,
         booked_at: nowTs,
         confirmed_at: null,
         tripStartedAt: null,
@@ -2048,7 +2070,7 @@ function appReducer(state, action) {
       );
       const allForDriver = [...existingAssigned, { ...trip, driver_id: action.driver_id }];
       const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
-      const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+      const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
       const seqMap = {};
       const dropMap = {};
       ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -2663,7 +2685,7 @@ function appReducer(state, action) {
         const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
-        const dropOrderedAgentCancel = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrderedAgentCancel = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrderedAgentCancel.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
@@ -3651,15 +3673,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
             dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            direction: r.direction,
           };
         });
+        const supaCo = { lat: -33.9249, lng: 18.4241 };
         const ordered = buildPickupSequence(allForDriver, null);
-        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmAdd = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const routeDistanceKmAdd = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
         const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
         for (const t of driverTripsRaw || []) {
@@ -3729,15 +3753,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
             dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            direction: r.direction,
           };
         });
+        const supaCo = { lat: -33.9249, lng: 18.4241 };
         const ordered = buildPickupSequence(allForDriver, null);
-        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmRem = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const routeDistanceKmRem = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
         const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
         for (const t of driverTripsRaw || []) {
@@ -3817,15 +3843,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
             dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            direction: r.direction,
           };
         });
+        const supaCo = { lat: -33.9249, lng: 18.4241 };
         const ordered = buildPickupSequence(allForDriver, null);
-        const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmReloc = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, ordered, dropOrdered);
+        const routeDistanceKmReloc = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
         const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
         for (const t of driverTripsRaw || []) {
@@ -4510,10 +4538,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
             dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            direction: r.direction,
           };
         });
+        const acSupaCo = { lat: -33.9249, lng: 18.4241 };
         const acOrdered = buildPickupSequence(acAllForDriver, null);
-        const acDropOrdered = buildDropoffSequence(acAllForDriver, acOrdered[acOrdered.length - 1]?.coord);
+        const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acSupaCo));
         const acSeqMap = {}, acDropMap = {};
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
         acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
@@ -4677,17 +4707,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           pickup_sequence_coords: [...first, ...extra],
           dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
           scheduled_time: r.scheduledtimestr,
+          direction: r.direction,
         };
       });
+      const startAnchor = { lat: -33.9249, lng: 18.4241 }; // same fallback buildPickupSequence(..., null) uses internally
       const ordered = buildPickupSequence(allForDriver, null);
-      const dropOrdered = buildDropoffSequence(allForDriver, ordered[ordered.length - 1]?.coord);
+      const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, startAnchor));
       const seqMap = {}, dropMap = {};
       ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
       dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
       // Total route distance across ALL the driver's active trips, from
       // the SAME ordered sequences just built above — matches the local
       // reducer's approach (see its comment for the full rationale).
-      const startAnchor = { lat: -33.9249, lng: 18.4241 }; // same fallback buildPickupSequence(..., null) uses internally
       const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
       const routeDistanceKm = computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
       const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
@@ -7496,8 +7527,21 @@ function CallOverlay({ call }) {
 }
 
 
-function AgentApp({ state, dispatch, user }) {
+function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [tab, setTab] = usePersistedTab("agent", user.id, "home", AGENT_TABS.map(t => t[0]));
+
+  // Register handler for NOTIFICATION_CLICKED — jump to trips tab for
+  // a trip notification, alerts tab for DMs, so tapping a push
+  // notification from the OS always lands on the right screen.
+  useEffect(() => {
+    if (!notifClickHandlerRef) return;
+    notifClickHandlerRef.current = (data) => {
+      if (data.tripId) setTab("trips");
+      else if (data.notifType === "DIRECT_MESSAGE") setTab("alerts");
+    };
+    return () => { if (notifClickHandlerRef.current) notifClickHandlerRef.current = null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notifClickHandlerRef]);
   const myTrips = state.trips.filter(t => t.agent_ids.includes(user.id));
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read);
   // Home-screen cards say "Tap to view details" — so land on THAT trip's
@@ -8489,8 +8533,21 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
 
 const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
 
-function DriverApp({ state, dispatch, user }) {
+function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [tab, setTab] = usePersistedTab("driver", user.id, "trips", DRIVER_TABS.map(t => t[0]));
+
+  // Register handler for NOTIFICATION_CLICKED — drivers mostly get
+  // trip notifications and DMs. Jump to Navigate for an active trip
+  // notification, Alerts for DMs.
+  useEffect(() => {
+    if (!notifClickHandlerRef) return;
+    notifClickHandlerRef.current = (data) => {
+      if (data.tripId) setTab("trips");
+      else if (data.notifType === "DIRECT_MESSAGE") setTab("alerts");
+    };
+    return () => { if (notifClickHandlerRef.current) notifClickHandlerRef.current = null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notifClickHandlerRef]);
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myUnreadNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read).length;
   const allMyTrips = state.trips.filter(t => t.driver_id === user.id);
@@ -12097,7 +12154,7 @@ const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Book
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
 
-function AdminApp({ state, dispatch, user }) {
+function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // Viewer Administrators don't get Dispatch or Users at all (per the
   // permission model — VIEWER has manageDispatch/manageAgentsDrivers/
   // manageAdmins all false), regardless of what tab they might try to
@@ -12142,6 +12199,24 @@ function AdminApp({ state, dispatch, user }) {
   // manually going to All Bookings & Trips and finding it yourself.
   const [jumpTripId, setJumpTripId] = useState(null);
 
+  // Register handler for NOTIFICATION_CLICKED messages from the
+  // service worker — fired when a push notification is tapped. Routes
+  // to the right screen: jump to the trip, switch to contacts for a
+  // DM, or just bring the app to the right state for a call.
+  useEffect(() => {
+    if (!notifClickHandlerRef) return;
+    notifClickHandlerRef.current = (data) => {
+      if (data.tripId) {
+        setJumpTripId(data.tripId);
+        setTab("trips");
+      } else if (data.notifType === "DIRECT_MESSAGE") {
+        setTab("contacts");
+      }
+    };
+    return () => { if (notifClickHandlerRef.current) notifClickHandlerRef.current = null; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notifClickHandlerRef]);
+
   // A Viewer admin assigned to a specific company only sees that
   // company's agents (and whichever drivers actually serve them) and
   // trips — computed once here and threaded down to every tab, rather
@@ -12172,7 +12247,10 @@ function AdminApp({ state, dispatch, user }) {
       <div style={{ flex: 1, paddingTop: 12, overflowY: "auto" }}>
         {visibleNav.map(([id, icon, label]) => {
           const active = tab === id;
-          const badge = id === "notifs" ? notifCount : 0;
+          const unreadDmCount = state.notifications.filter(n =>
+            n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.includes(user.id)
+          ).length;
+          const badge = id === "notifs" ? notifCount : id === "contacts" ? unreadDmCount : 0;
           return (
             <div key={id} onClick={() => { setTab(id); setDrawerOpen(false); }} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", cursor: "pointer", background: active ? "rgba(245,166,35,.06)" : "transparent", borderLeft: `2px solid ${active ? COLORS.amber : "transparent"}` }}>
               <span style={{ fontSize: 14, width: 16, textAlign: "center", color: COLORS.ghost }}>{icon}</span>
@@ -12304,6 +12382,22 @@ function AppInner() {
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 4200);
   }, []);
 
+  // Service-worker postMessage listener — when a push notification is
+  // tapped, the service worker focuses the app and sends this message
+  // so the app knows what to do (jump to a trip, show ringing screen,
+  // etc.). Each role's app shell registers its own handler via
+  // notifClickHandlerRef below; this outer listener just routes to it.
+  const notifClickHandlerRef = useRef(null);
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    const onMessage = (event) => {
+      if (event.data?.type !== "NOTIFICATION_CLICKED") return;
+      notifClickHandlerRef.current?.(event.data);
+    };
+    navigator.serviceWorker.addEventListener("message", onMessage);
+    return () => navigator.serviceWorker.removeEventListener("message", onMessage);
+  }, []);
+
   // Chrome/Edge fire beforeinstallprompt once the PWA installability
   // criteria are met (manifest + service worker + HTTPS). Capturing it
   // lets us show our own "Install App" button instead of only relying on
@@ -12429,11 +12523,11 @@ function AppInner() {
       {!activeUser ? (
         <LoginScreen users={state.users} onLogin={handleLogin} error={loginError} />
       ) : activeUser.role === ROLE.ADMIN ? (
-        <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+        <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.AGENT ? (
-        <AgentApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+        <AgentApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : (
-        <DriverApp state={state} dispatch={dispatchWithToast} user={activeUser} />
+        <DriverApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       )}
 
       <div className="toast-stack">
