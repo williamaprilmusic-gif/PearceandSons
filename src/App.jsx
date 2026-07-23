@@ -674,6 +674,32 @@ function haversineKm(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// Sort an array of dropoff coord objects ({ lat, lng, label, agent_id, ... })
+// nearest-to-furthest from a given anchor point using nearest-neighbour chaining.
+// Used for OUTBOUND trip display so the trip card always shows D1 (closest to
+// company) → D2 → D3 (furthest) regardless of agent array order.
+// Coords without lat/lng are pushed to the end.
+function sortDropoffCoordsByProximity(coords, anchorCoord) {
+  if (!anchorCoord || coords.length <= 1) return coords;
+  const valid = coords.filter(c => c?.lat != null && c?.lng != null);
+  const invalid = coords.filter(c => c?.lat == null || c?.lng == null);
+  if (valid.length <= 1) return [...valid, ...invalid];
+  const ordered = [];
+  let remaining = [...valid];
+  let cur = anchorCoord;
+  while (remaining.length) {
+    let best = null, bestDist = Infinity;
+    for (const c of remaining) {
+      const d = haversineKm(cur.lat, cur.lng, c.lat, c.lng);
+      if (d < bestDist) { bestDist = d; best = c; }
+    }
+    ordered.push(best);
+    cur = { lat: best.lat, lng: best.lng };
+    remaining = remaining.filter(c => c !== best);
+  }
+  return [...ordered, ...invalid];
+}
+
 // Turns a stored "YYYY/MM/DD" scheduled_date into a clear, scannable
 // label for a driver's trip card — "TODAY", "TOMORROW", or "Wed, Jul 22"
 // for anything further out. Built for exactly this: a driver assigned to
@@ -5194,7 +5220,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       } else if (action.admin) {
         delQ = delQ.is("userid", null);
       }
-      must(await delQ);
+      // Try scoped delete first (adds userid filter as extra safety); if
+      // Supabase RLS blocks that specific combination (e.g. admin broadcast
+      // rows where userid IS NULL but the policy requires a non-null match),
+      // fall back to deleting purely by the notification IDs, which are
+      // already pre-filtered on the client by the caller's own notification
+      // list — a user can never submit IDs they didn't receive.
+      const scopedRes = await delQ;
+      if (scopedRes?.error) {
+        // Scoped delete failed — retry with id-only (no userid constraint).
+        // This handles the case where admin broadcast rows (userid=null) are
+        // blocked by RLS policies that don't allow IS NULL userid matching.
+        const fallbackQ = supabase.from("notifications").delete().in("id", action.ids);
+        must(await fallbackQ);
+      }
       await refetch();
       return;
     }
@@ -8038,7 +8077,8 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
               </div>
             ))}
             {/* Drop-off: for OUTBOUND multi-agent trips each passenger has their own home address.
-                For old trips (no extradropoffs stored), derive from each agent's home_address. */}
+                For old trips (no extradropoffs stored), derive from each agent's home_address.
+                Sorted nearest-to-furthest from company so the driver sees stops in route order. */}
             {(() => {
               let dropCoords = trip.dropoff_sequence_coords || [];
               if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
@@ -8051,6 +8091,10 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                 });
                 dropCoords = derived;
               }
+              if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
+                const anchor = defaultCompanyAnchor(state);
+                dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
+              }
               if (dropCoords.length > 1) return (
                 <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                   <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({dropCoords.length})</span>
@@ -8059,6 +8103,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                     return (
                       <div key={dci} style={{ fontSize: 11 }}>
                         <span style={{ color: COLORS.red }}>◎ </span>
+                        <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{dci + 1} </span>
                         {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
                         {dc.label || trip.custom_dropoff}
                       </div>
@@ -8320,6 +8365,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         }
       });
       dropCoords = derivedCoords;
+    }
+    // Sort OUTBOUND stops nearest-to-furthest from company so the nav shows
+    // them in the correct driving order (same order as dispatch-time sequencing).
+    if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
+      const anchor = defaultCompanyAnchor(state);
+      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
     }
 
     if (dropCoords.length === 0) return;
@@ -9336,7 +9387,9 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
           {addingAgent && <AddAgentPanel trip={trip} state={state} dispatch={dispatch} onClose={() => setAddingAgent(false)} />}
 
           {/* DROP-OFFS footer — derives missing per-agent dropoffs from home_address
-              for OUTBOUND trips dispatched before the extradropoffs feature. */}
+              for OUTBOUND trips dispatched before the extradropoffs feature, then
+              sorts nearest-to-furthest from the company (OUTBOUND: driver leaves
+              office and drops each agent at their own home in the most efficient order). */}
           {(() => {
             let allDropCoords = trip.dropoff_sequence_coords || [];
             if (trip.direction === "OUTBOUND" && allDropCoords.length < (trip.agent_ids?.length || 0)) {
@@ -9349,6 +9402,12 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
               });
               allDropCoords = derived;
             }
+            // Sort OUTBOUND dropoffs nearest-to-furthest from the company so the
+            // admin sees them in the same order the driver will visit them.
+            if (trip.direction === "OUTBOUND" && allDropCoords.length > 1) {
+              const anchor = defaultCompanyAnchor(state);
+              allDropCoords = sortDropoffCoordsByProximity(allDropCoords, anchor);
+            }
             return (
               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                 <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{allDropCoords.length > 1 ? "S" : ""}: </span>
@@ -9357,6 +9416,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
                   const label = c.label || trip.custom_dropoff;
                   return (
                     <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      {allDropCoords.length > 1 && <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{i + 1}</span>}
                       {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
                       <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
                       {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
@@ -9424,37 +9484,57 @@ function exceptionLabel(t) {
   return labels.join(" + ");
 }
 
-function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}) {
+function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}) {
+  // ── Column headers ────────────────────────────────────────────────────────
+  // Ordered: identity → scheduling → people → locations → timing → financials
+  // → route stats → status flags → operational detail
   const headers = [
-    "Trip ID", "Exception", "Direction", "Trip Type", "Agent", "Driver", "Status",
-    "Pickup", "Drop-off", "Scheduled Date", "Scheduled Time",
-    "Booked At", "Driver Confirmed At", "Agent Picked Up At", "Pickup Location (lat,lng)", "Agent Dropped Off At", "Dropoff Location (lat,lng)",
-    "Distance (km)", "Driver's Full Route (km)", "Long Distance", "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note", "Phone",
+    // Identity
+    "Trip ID", "Week Group ID", "Week Day #", "Trip Type", "Direction", "Exception",
+    // Scheduling
+    "Scheduled Date", "Scheduled Time", "Late Booking",
+    // People
+    "Agent", "Agent Staff #", "Phone", "Driver", "Driver Vehicle",
+    // Pickup (per agent)
+    "Pickup Address", "Booked Pickup Coord (lat,lng)",
+    // Dropoff (per agent)
+    "Drop-off Address", "Booked Dropoff Coord (lat,lng)",
+    // Dispatch sequencing
+    "Pickup Order #", "Drop Sequence #",
+    // Financials
+    "Est. Distance (km)", "Est. Cost (ZAR)", "Actual Distance (km)", "Long Distance",
+    // Driver route
+    "Driver Full Route (km)", "Driver Route Cap (km)", "Exceeds Policy",
+    // Status
+    "Status", "Driver Accepted", "Driver Accepted At", "Reminder Sent",
+    // Timestamps (epoch → readable)
+    "Booked At", "Driver Confirmed At", "In Transit At", "Completed At", "Cancelled At",
+    // Per-agent timing & GPS (driver's location at moment of pickup/dropoff)
+    "Agent Picked Up At", "GPS at Pickup (lat,lng)",
+    "Agent Dropped Off At", "GPS at Dropoff (lat,lng)",
+    // Operational
+    "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note",
   ];
+
   const escapeCsv = (val) => {
     const s = val == null ? "" : String(val);
     return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const driverName = (id) => users?.find(u => u.id === id)?.name || (id ?? "");
-  const agentName = (id) => users?.find(u => u.id === id)?.name || (id ?? "");
-  // en-ZA gives DD/MM/YYYY, HH:MM:SS — readable in Excel and matches the
-  // date format already used elsewhere in the app (booking form, etc.).
+  const userName = (id) => users?.find(u => u.id === id)?.name || (id ?? "");
+  const userStaffNum = (id) => users?.find(u => u.id === id)?.staff_number || "";
+  const driverVehicle = (id) => (driverStatusList || []).find(d => d.driver_id === id)?.vehicle || "";
+  // en-ZA gives DD/MM/YYYY, HH:MM:SS — readable in Excel.
   const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA") : "";
-  const fmtLoc = (loc) => loc ? `${loc.lat.toFixed(5)},${loc.lng.toFixed(5)}` : "";
-  // Multiple delay reports on one trip are joined into a single cell —
-  // one row per PASSENGER already fans this trip out into several rows,
-  // and repeating the same delay text on each of those rows (rather than
-  // splitting delays across rows too) keeps the row count tied purely to
-  // passenger count, which is the dimension the rest of this export is
-  // already built around.
+  const fmtCoord = (loc) => loc ? `${loc.lat.toFixed(5)},${loc.lng.toFixed(5)}` : "";
+
+  // Multiple delay reports joined into one cell — one row per PASSENGER
+  // already fans this trip out; repeating delays per passenger row keeps
+  // row count tied purely to passenger count.
   const delaySummary = (tripId) => {
     const delays = delaysByTrip[tripId];
     if (!delays || !delays.length) return "";
     return delays.map(d => `${d.reason}${d.note ? ` (${d.note})` : ""} @ ${fmtTs(d.reported_at)}`).join(" | ");
   };
-  // Same joined-cell approach for "which admin edited this trip" — every
-  // audit_logs entry tied to this trip_id, condensed into one readable
-  // cell rather than exploding rows further.
   const auditSummary = (tripId) => {
     const entries = auditByTrip[tripId];
     if (!entries || !entries.length) return "";
@@ -9463,56 +9543,104 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
 
   const rows = [];
   trips.forEach(t => {
-    // Every agent on the trip (primary + any extras) — the whole reason
-    // for the per-passenger row structure is that each of these can have
-    // a genuinely different pickup/dropoff time on a multi-passenger trip.
+    // One row per passenger — each has their own pickup/dropoff address,
+    // timing, and GPS location even on a shared multi-passenger trip.
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
     agentIds.forEach((aid, aidIdx) => {
-      // Per-agent dropoff: for OUTBOUND trips each agent drops at their own
-      // home address. dropoff_sequence_coords now carries one entry per agent
-      // (keyed by agent_id, or by position for legacy single-agent trips).
-      // For old trips without extradropoffs stored, fall back to the user's
-      // home_address for OUTBOUND trips (derived from the users list).
-      const agentDropoff = aid != null
+      const agentUser = aid != null ? users?.find(u => u.id === aid) : null;
+
+      // ── Per-agent pickup ─────────────────────────────────────────────────
+      // For INBOUND trips each agent is picked up at their own home address.
+      // For OUTBOUND all agents are picked up at the company.
+      // pickup_sequence_coords carries per-agent coords keyed by agent_id.
+      const agentPickupCoord = aid != null
+        ? (t.pickup_sequence_coords?.find(p => p.agent_id === aid) || t.pickup_sequence_coords?.[aidIdx] || t.pickup_sequence_coords?.[0])
+        : t.pickup_sequence_coords?.[0];
+      const agentPickupLabel = agentPickupCoord?.label || t.custom_pickup || "";
+
+      // ── Per-agent dropoff ────────────────────────────────────────────────
+      // For OUTBOUND trips each agent drops at their own home address.
+      // dropoff_sequence_coords carries per-agent coords keyed by agent_id.
+      // Falls back to user's stored home_address for old trips (no extradropoffs).
+      const agentDropoffCoord = aid != null
         ? (t.dropoff_sequence_coords?.find(d => d.agent_id === aid) || t.dropoff_sequence_coords?.[aidIdx] || t.dropoff_sequence_coords?.[0])
         : t.dropoff_sequence_coords?.[0];
-      const agentUser = aid != null ? users?.find(u => u.id === aid) : null;
-      const agentDropoffLabel = agentDropoff?.label
+      const agentDropoffLabel = agentDropoffCoord?.label
         || (t.direction === "OUTBOUND" && agentUser?.home_address?.label)
         || t.custom_dropoff || "";
+      // Dropoff coord for old trips without extradropoffs: derive from home_address.
+      const agentDropoffLatLng = agentDropoffCoord
+        || (t.direction === "OUTBOUND" && agentUser?.home_address?.lat != null ? agentUser.home_address : null);
+
       rows.push([
-        t.trip_id, exceptionLabel(t), t.direction || "", t.trip_type || "",
-        aid != null ? agentName(aid) : (t.agent_name || ""), driverName(t.driver_id), t.state,
-        t.custom_pickup || "", agentDropoffLabel,
-        t.scheduled_date || "", t.scheduled_time || "",
-        // booked_at/confirmed_at are already formatted display strings
-        // (converted by tripRowToApp via epochToDisplay) — used as-is.
-        // pickup_timestamps/dropoff_timestamps are raw epoch ms, so those
-        // go through fmtTs() to become readable.
-        t.booked_at || "", t.confirmed_at || "",
-        fmtTs(aid != null ? t.pickup_timestamps?.[aid] : null),
-        fmtLoc(aid != null ? t.pickup_locations?.[aid] : null),
-        fmtTs(aid != null ? t.dropoff_timestamps?.[aid] : null),
-        fmtLoc(aid != null ? t.dropoff_locations?.[aid] : null),
+        // Identity
+        t.trip_id,
+        t.week_group_id || "",
+        t.week_day_num || "",
+        t.trip_type || "",
+        t.direction || "",
+        exceptionLabel(t),
+        // Scheduling
+        t.scheduled_date || "",
+        t.scheduled_time || "",
+        t.late_booking_flag ? "YES" : "NO",
+        // People
+        aid != null ? userName(aid) : (t.agent_name || ""),
+        aid != null ? userStaffNum(aid) : "",
+        t.phone || agentUser?.phone || "",
+        userName(t.driver_id),
+        driverVehicle(t.driver_id),
+        // Pickup
+        agentPickupLabel,
+        fmtCoord(agentPickupCoord),
+        // Dropoff
+        agentDropoffLabel,
+        fmtCoord(agentDropoffLatLng),
+        // Sequencing
+        t.pickup_order_num || "",
+        t.drop_sequence_num || "",
+        // Financials
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
-        (t.route_total_km ?? t.driver_route_km) != null ? (t.route_total_km ?? t.driver_route_km).toFixed(1) : "",
+        t.est_cost_zar != null ? t.est_cost_zar.toFixed(2) : "",
+        t.actual_distance_km != null ? (t.actual_distance_km * ROAD_FACTOR).toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
+        // Driver route
+        (t.route_total_km ?? t.driver_route_km) != null ? (t.route_total_km ?? t.driver_route_km).toFixed(1) : "",
+        t.driver_route_cap_km != null ? t.driver_route_cap_km.toFixed(1) : "",
+        t.driver_route_exceeds_policy ? "YES" : "NO",
+        // Status
+        t.state || "",
+        t.driverAccepted ? "YES" : "NO",
+        t.acceptedAt || "",
+        t.reminder_sent ? "YES" : "NO",
+        // Timestamps (booked_at/confirmed_at are already display strings from tripRowToApp)
+        t.booked_at || "",
+        t.confirmed_at || "",
+        t.in_transit_at || "",
+        t.completed_at || "",
+        t.cancelled_at || "",
+        // Per-agent timing & GPS
+        fmtTs(aid != null ? t.pickup_timestamps?.[aid] : null),
+        fmtCoord(aid != null ? t.pickup_locations?.[aid] : null),
+        fmtTs(aid != null ? t.dropoff_timestamps?.[aid] : null),
+        fmtCoord(aid != null ? t.dropoff_locations?.[aid] : null),
+        // Operational
         (t.no_shows || []).length === 0 ? "" : t.no_shows.map(ns => {
-          const noShowAgentName = users.find(u => u.id === ns.agent_id)?.name || ns.agent_id;
-          const hasRealLocation = ns.location && !(ns.location.lat === 0 && ns.location.lng === 0);
-          const locStr = hasRealLocation ? ` @ ${ns.location.lat.toFixed(5)},${ns.location.lng.toFixed(5)}` : "";
+          const nsName = users?.find(u => u.id === ns.agent_id)?.name || ns.agent_id;
+          const hasLoc = ns.location && !(ns.location.lat === 0 && ns.location.lng === 0);
+          const locStr = hasLoc ? ` @ ${ns.location.lat.toFixed(5)},${ns.location.lng.toFixed(5)}` : "";
           const noteStr = ns.note ? ` — "${ns.note}"` : "";
-          return `${noShowAgentName}${locStr}${noteStr}`;
+          return `${nsName}${locStr}${noteStr}`;
         }).join("; "),
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
-        t.admin_note || "", t.phone || "",
+        t.admin_note || "",
       ]);
     });
   });
+
+  // BOM prefix so Excel opens UTF-8 CSVs correctly.
   const csv = [headers, ...rows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
-  // BOM prefix so Excel opens UTF-8 CSVs correctly instead of mangling
-  // special characters (common gotcha with plain UTF-8 CSVs in Excel).
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -9671,7 +9799,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                   fetchDelaysForTrips(tripIds),
                   fetchAuditLogsForTrips(tripIds),
                 ]);
-                exportTripsToCsv(displayTrips, state.users, filter === "ALL" ? "all_trips" : `trips_${filter.toLowerCase()}`, delaysByTrip, auditByTrip);
+                exportTripsToCsv(displayTrips, state.users, state.driver_status, filter === "ALL" ? "all_trips" : `trips_${filter.toLowerCase()}`, delaysByTrip, auditByTrip);
               } catch (e) {
                 // Without this catch, a throw here (e.g. CSV/Blob build
                 // failing) escaped the onClick as an unhandled rejection
@@ -9892,7 +10020,7 @@ function AdminProfileSearch({ state, user }) {
                     fetchDelaysForTrips(tripIds),
                     fetchAuditLogsForTrips(tripIds),
                   ]);
-                  exportTripsToCsv(allTrips, state.users, `${selectedUser.name.replace(/\s+/g, "_")}_trips`, delaysByTrip, auditByTrip);
+                  exportTripsToCsv(allTrips, state.users, state.driver_status, `${selectedUser.name.replace(/\s+/g, "_")}_trips`, delaysByTrip, auditByTrip);
                 } finally {
                   setExporting(false);
                 }
@@ -10149,7 +10277,7 @@ function AdminHistory({ state, user }) {
                   const companyLabel = companyFilter.length
                     ? `_${companyFilter.map(id => (state.companies || []).find(c => c.id === id)?.name.replace(/\s+/g, "_")).filter(Boolean).join("-") || "company"}`
                     : "";
-                  exportTripsToCsv(filteredResults, state.users, `trip_history_${fromDate}_to_${toDate}${companyLabel}`, delaysByTrip, auditByTrip);
+                  exportTripsToCsv(filteredResults, state.users, state.driver_status, `trip_history_${fromDate}_to_${toDate}${companyLabel}`, delaysByTrip, auditByTrip);
                 } catch (e) {
                   // Surfaced in the tab's existing error banner instead of
                   // escaping the onClick as an unhandled rejection.
@@ -11011,6 +11139,7 @@ function AdminDrivers({ state, user }) {
                   const pickupCoord = trip.pickup_sequence_coords?.[0];
                   // For OUTBOUND multi-agent trips, collect all per-agent dropoffs.
                   // For old trips (no extradropoffs stored), derive from home_address.
+                  // Sorted nearest-to-furthest from company for correct display order.
                   let dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
                     ? trip.dropoff_sequence_coords
                     : [];
@@ -11023,6 +11152,10 @@ function AdminDrivers({ state, user }) {
                       if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
                     });
                     dropCoords = derived;
+                  }
+                  if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
+                    const anchor = defaultCompanyAnchor(state);
+                    dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
                   }
                   const hasMultipleDropoffs = dropCoords.length > 1;
                   return (
@@ -11039,7 +11172,7 @@ function AdminDrivers({ state, user }) {
                             const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
                             return (
                               <div key={dci} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{dropAgent ? `${dropAgent.name.split(" ")[0]}: ` : ""}{dc.label || trip.custom_dropoff}</span>
+                                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span><span style={{ fontSize: 9, fontWeight: 700, color: COLORS.ghost }}>D{dci + 1} </span>{dropAgent ? `${dropAgent.name.split(" ")[0]}: ` : ""}{dc.label || trip.custom_dropoff}</span>
                                 {dc.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(dc.lat, dc.lng, dc.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
                               </div>
                             );
