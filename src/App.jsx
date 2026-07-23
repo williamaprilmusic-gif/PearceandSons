@@ -8037,24 +8037,37 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                 )}
               </div>
             ))}
-            {/* Drop-off: for OUTBOUND multi-agent trips each passenger has their own home address */}
-            {(trip.dropoff_sequence_coords || []).length > 1 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS</span>
-                {trip.dropoff_sequence_coords.map((dc, dci) => {
-                  const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
-                  return (
-                    <div key={dci} style={{ fontSize: 11 }}>
-                      <span style={{ color: COLORS.red }}>◎ </span>
-                      {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
-                      {dc.label || trip.custom_dropoff}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
-            )}
+            {/* Drop-off: for OUTBOUND multi-agent trips each passenger has their own home address.
+                For old trips (no extradropoffs stored), derive from each agent's home_address. */}
+            {(() => {
+              let dropCoords = trip.dropoff_sequence_coords || [];
+              if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+                const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+                const derived = [...dropCoords];
+                (trip.agent_ids || []).forEach(aid => {
+                  if (covered.has(aid)) return;
+                  const u = state.users.find(x => x.id === aid);
+                  if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
+                });
+                dropCoords = derived;
+              }
+              if (dropCoords.length > 1) return (
+                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                  <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({dropCoords.length})</span>
+                  {dropCoords.map((dc, dci) => {
+                    const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
+                    return (
+                      <div key={dci} style={{ fontSize: 11 }}>
+                        <span style={{ color: COLORS.red }}>◎ </span>
+                        {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
+                        {dc.label || trip.custom_dropoff}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+              return <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{dropCoords[0]?.label || trip.custom_dropoff}</div>;
+            })()}
             {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
             {trip.driver_route_km != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
@@ -8284,7 +8297,31 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     // home address per agent. Previously only dropoff_sequence_coords[0] was
     // used, meaning all extra agents were silently attached to the first
     // agent's stop and the driver never got the other home addresses.
-    const dropCoords = trip.dropoff_sequence_coords || [];
+    let dropCoords = trip.dropoff_sequence_coords || [];
+
+    // For OUTBOUND trips where extradropoffs wasn't stored (dispatched before
+    // the per-agent dropoff feature) and there are more agents than dropoff
+    // entries, derive the missing dropoffs from each agent's home_address.
+    // This makes old trips show all 3 home stops without requiring re-dispatch.
+    if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+      const derivedCoords = [...dropCoords];
+      const coveredAgentIds = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+      (trip.agent_ids || []).forEach(agentId => {
+        if (coveredAgentIds.has(agentId)) return;
+        const agentUser = state.users.find(u => u.id === agentId);
+        if (agentUser?.home_address?.lat != null) {
+          derivedCoords.push({
+            lat: agentUser.home_address.lat,
+            lng: agentUser.home_address.lng,
+            label: agentUser.home_address.label,
+            agent_id: agentId,
+            _derived: true,
+          });
+        }
+      });
+      dropCoords = derivedCoords;
+    }
+
     if (dropCoords.length === 0) return;
     dropCoords.forEach((coord, coordIdx) => {
       if (!coord) return;
@@ -9298,20 +9335,38 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
           )}
           {addingAgent && <AddAgentPanel trip={trip} state={state} dispatch={dispatch} onClose={() => setAddingAgent(false)} />}
 
-          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{(trip.dropoff_sequence_coords || []).length > 1 ? "S" : ""}: </span>
-            {(trip.dropoff_sequence_coords || []).map((c, i) => {
-              const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
-              const label = c.label || trip.custom_dropoff;
-              return (
-                <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                  {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
-                  <span style={{ color: COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}</span>
-                  {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
-                </span>
-              );
-            })}
-          </div>
+          {/* DROP-OFFS footer — derives missing per-agent dropoffs from home_address
+              for OUTBOUND trips dispatched before the extradropoffs feature. */}
+          {(() => {
+            let allDropCoords = trip.dropoff_sequence_coords || [];
+            if (trip.direction === "OUTBOUND" && allDropCoords.length < (trip.agent_ids?.length || 0)) {
+              const covered = new Set(allDropCoords.map(d => d.agent_id).filter(Boolean));
+              const derived = [...allDropCoords];
+              (trip.agent_ids || []).forEach(aid => {
+                if (covered.has(aid)) return;
+                const u = state.users.find(x => x.id === aid);
+                if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid, _derived: true });
+              });
+              allDropCoords = derived;
+            }
+            return (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{allDropCoords.length > 1 ? "S" : ""}: </span>
+                {allDropCoords.map((c, i) => {
+                  const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
+                  const label = c.label || trip.custom_dropoff;
+                  return (
+                    <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                      {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
+                      <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
+                      {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
+                    </span>
+                  );
+                })}
+                {allDropCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
+              </div>
+            );
+          })()}
 
           {canEdit && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
             !confirmingCancel ? (
@@ -10955,9 +11010,20 @@ function AdminDrivers({ state, user }) {
                 {activeTrips.map(trip => {
                   const pickupCoord = trip.pickup_sequence_coords?.[0];
                   // For OUTBOUND multi-agent trips, collect all per-agent dropoffs.
-                  const dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
+                  // For old trips (no extradropoffs stored), derive from home_address.
+                  let dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
                     ? trip.dropoff_sequence_coords
-                    : (trip.dropoff_sequence_coords?.[0] ? [trip.dropoff_sequence_coords[0]] : []);
+                    : [];
+                  if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+                    const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+                    const derived = [...dropCoords];
+                    (trip.agent_ids || []).forEach(aid => {
+                      if (covered.has(aid)) return;
+                      const u = state.users.find(x => x.id === aid);
+                      if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
+                    });
+                    dropCoords = derived;
+                  }
                   const hasMultipleDropoffs = dropCoords.length > 1;
                   return (
                     <div key={trip.trip_id} style={{ display: "flex", gap: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
