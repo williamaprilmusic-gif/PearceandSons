@@ -5284,7 +5284,27 @@ function useAppStore() {
       .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refetch)
       .on("postgres_changes", { event: "*", schema: "public", table: "users" }, refetch)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+
+    // Backstop polling — Supabase realtime subscriptions can silently
+    // drop on mobile (network switch, device sleep, background throttling).
+    // A 60-second interval ensures the app stays in sync even when the
+    // WebSocket has quietly died, at the cost of one lightweight DB read
+    // per minute. New bookings, messages, calls and so on all arrive
+    // within one polling cycle at worst.
+    const pollInterval = setInterval(refetch, 60000);
+
+    // Also refetch immediately whenever the tab/app comes back to the
+    // foreground — a driver returning from Maps or an admin switching
+    // back from another app gets fresh data instantly rather than waiting
+    // up to 60s for the next poll tick.
+    const onVisible = () => { if (document.visibilityState === "visible") refetch(); };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(pollInterval);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [refetch]);
 
   // Separate, lightweight subscription for live driver positions — these
@@ -6987,8 +7007,15 @@ function useWebRTCCall(currentUser) {
     const callChannelNameForNotifClose = pcRef.current?.callChannelName;
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
-    if (callChannelRef.current && callChannelRef.current !== channelRef.current) {
-      supabase.removeChannel(callChannelRef.current);
+    if (callChannelRef.current) {
+      // Clear any pending re-ring interval before removing the channel
+      if (callChannelRef.current._reRingInterval) {
+        clearInterval(callChannelRef.current._reRingInterval);
+        callChannelRef.current._reRingInterval = null;
+      }
+      if (callChannelRef.current !== channelRef.current) {
+        supabase.removeChannel(callChannelRef.current);
+      }
     }
     callChannelRef.current = null;
     pendingIceRef.current = [];
@@ -7070,7 +7097,7 @@ function useWebRTCCall(currentUser) {
                 icon: "/icons/icon-192.png",
                 tag: payload.callChannelName,
                 requireInteraction: true,
-                data: { callChannelName: payload.callChannelName },
+                data: { callChannelName: payload.callChannelName, notifType: "INCOMING_CALL" },
               });
             });
           });
@@ -7149,6 +7176,28 @@ function useWebRTCCall(currentUser) {
       setRemoteUser(targetUser);
       setCallTripId(tripId || null);
       setCallState(CALL_STATE.RINGING_OUTGOING);
+
+      // Re-broadcast the offer every 4 seconds while ringing — the
+      // recipient may have been backgrounded when the first offer arrived,
+      // tapped the push notification after, and opened the app fresh with
+      // the original offer already gone from the Supabase broadcast channel.
+      // A repeated offer is idempotent on the callee side (it just
+      // overwrites pcRef.current.pendingOffer with the same value). Stop
+      // after 30 seconds (missed call) — cleanup() called by hangUp will
+      // also clear this via the normal call teardown path.
+      let ringAttempts = 0;
+      const reRingInterval = setInterval(async () => {
+        ringAttempts++;
+        if (ringAttempts >= 7) { clearInterval(reRingInterval); return; } // ~30s total
+        try {
+          const reInbox = supabase.channel(callChannelName(targetUser.id));
+          await new Promise((resolve) => reInbox.subscribe((status) => { if (status === "SUBSCRIBED") resolve(); }));
+          reInbox.send({ type: "broadcast", event: "offer", payload: { offer, fromId: currentUser.id, fromName: currentUser.name, tripId, callChannelName: chanName } });
+          supabase.removeChannel(reInbox);
+        } catch { /* non-fatal — best effort re-ring */ }
+      }, 4000);
+      // Store the interval id on the channel ref so cleanup() can clear it
+      callChannelRef.current._reRingInterval = reRingInterval;
     } catch (e) {
       setErrorMsg(e.name === "NotAllowedError" ? "Microphone access denied." : (e.message || "Could not start call."));
       cleanup();
@@ -7533,11 +7582,20 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   // Register handler for NOTIFICATION_CLICKED — jump to trips tab for
   // a trip notification, alerts tab for DMs, so tapping a push
   // notification from the OS always lands on the right screen.
+  // INCOMING_CALL: the call offer will arrive via re-ring within ~4s of
+  // the app opening — no tab-switch needed (call overlay is position:fixed
+  // and renders over everything), but we switch to "nav" for a driver or
+  // "trips" for an agent so the context behind the overlay is right.
   useEffect(() => {
     if (!notifClickHandlerRef) return;
     notifClickHandlerRef.current = (data) => {
-      if (data.tripId) setTab("trips");
-      else if (data.notifType === "DIRECT_MESSAGE") setTab("alerts");
+      if (data.notifType === "INCOMING_CALL") {
+        setTab("trips"); // call overlay renders over this — just ensure a sensible background tab
+      } else if (data.tripId) {
+        setTab("trips");
+      } else if (data.notifType === "DIRECT_MESSAGE") {
+        setTab("alerts");
+      }
     };
     return () => { if (notifClickHandlerRef.current) notifClickHandlerRef.current = null; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -8538,12 +8596,18 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
 
   // Register handler for NOTIFICATION_CLICKED — drivers mostly get
   // trip notifications and DMs. Jump to Navigate for an active trip
-  // notification, Alerts for DMs.
+  // notification, Alerts for DMs. INCOMING_CALL: call overlay renders
+  // position:fixed over everything — just land on a sensible background tab.
   useEffect(() => {
     if (!notifClickHandlerRef) return;
     notifClickHandlerRef.current = (data) => {
-      if (data.tripId) setTab("trips");
-      else if (data.notifType === "DIRECT_MESSAGE") setTab("alerts");
+      if (data.notifType === "INCOMING_CALL") {
+        setTab("nav"); // call overlay covers this — sensible context behind it for a driver
+      } else if (data.tripId) {
+        setTab("trips");
+      } else if (data.notifType === "DIRECT_MESSAGE") {
+        setTab("alerts");
+      }
     };
     return () => { if (notifClickHandlerRef.current) notifClickHandlerRef.current = null; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
