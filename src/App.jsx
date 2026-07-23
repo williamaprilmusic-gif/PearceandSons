@@ -1844,7 +1844,7 @@ function appReducer(state, action) {
         // row.agentid on the primary coord) — TRIP/REMOVE_AGENT filters
         // and the driver nav's per-passenger stop list both key on it.
         pickup_sequence_coords: [{ ...pickupCoord, label: action.pickup_label, agent_id: action.agent_id }],
-        dropoff_sequence_coords: [{ ...dropCoord, label: action.dropoff_label }],
+        dropoff_sequence_coords: [{ ...dropCoord, label: action.dropoff_label, agent_id: action.agent_id }],
         completed_pickups: [],
         current_gps_coordinates: pickupCoord,
         current_nav_idx: 0,
@@ -6509,7 +6509,14 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
               <StateBadge state={t.state} />
             </div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
-            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
+            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{
+              // Show this agent's own dropoff, not the primary's — OUTBOUND trips
+              // each have a different home address per agent.
+              (t.dropoff_sequence_coords?.find(c => c.agent_id === user.id)
+                ?? (t.agent_ids[0] === user.id ? t.dropoff_sequence_coords?.[0] : null)
+                ?? (t.direction === "OUTBOUND" && state.users.find(u => u.id === user.id)?.home_address)
+              )?.label || t.custom_dropoff
+            }</div>
             <div style={{ display: "flex", gap: 10 }}>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
@@ -9201,8 +9208,16 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             const pickup = trip.pickup_sequence_coords?.find(c => c.agent_id === p.id)
               ?? (trip.agent_ids[0] === p.id ? trip.pickup_sequence_coords?.[0] : null);
             // Per-agent dropoff — OUTBOUND trips have one home address per agent.
-            const agentDropoff = trip.dropoff_sequence_coords?.find(c => c.agent_id === p.id)
-              ?? (trip.agent_ids[0] === p.id ? trip.dropoff_sequence_coords?.[0] : null);
+            // Try: (1) stored dropoff_sequence_coords entry by agent_id,
+            // (2) position-0 fallback for the primary agent on legacy coords,
+            // (3) user's home_address for OUTBOUND trips where extradropoffs
+            //     wasn't stored (trips dispatched before the per-agent dropoff
+            //     feature was added) — avoids showing wrong address for non-primary agents.
+            const agentDropoff = (trip.dropoff_sequence_coords?.find(c => c.agent_id === p.id)
+              ?? (trip.agent_ids[0] === p.id ? trip.dropoff_sequence_coords?.[0] : null))
+              ?? (trip.direction === "OUTBOUND" && state.users.find(u => u.id === p.id)?.home_address
+                ? { ...state.users.find(u => u.id === p.id).home_address, _derived: true }
+                : null);
             const pickedUp = trip.completed_pickups?.includes(p.id);
             const droppedOff = trip.completed_dropoffs?.includes(p.id);
             const driverName = trip.driver_id ? state.users.find(u => u.id === trip.driver_id)?.name : null;
@@ -9377,10 +9392,15 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
       // Per-agent dropoff: for OUTBOUND trips each agent drops at their own
       // home address. dropoff_sequence_coords now carries one entry per agent
       // (keyed by agent_id, or by position for legacy single-agent trips).
+      // For old trips without extradropoffs stored, fall back to the user's
+      // home_address for OUTBOUND trips (derived from the users list).
       const agentDropoff = aid != null
         ? (t.dropoff_sequence_coords?.find(d => d.agent_id === aid) || t.dropoff_sequence_coords?.[aidIdx] || t.dropoff_sequence_coords?.[0])
         : t.dropoff_sequence_coords?.[0];
-      const agentDropoffLabel = agentDropoff?.label || t.custom_dropoff || "";
+      const agentUser = aid != null ? users?.find(u => u.id === aid) : null;
+      const agentDropoffLabel = agentDropoff?.label
+        || (t.direction === "OUTBOUND" && agentUser?.home_address?.label)
+        || t.custom_dropoff || "";
       rows.push([
         t.trip_id, exceptionLabel(t), t.direction || "", t.trip_type || "",
         aid != null ? agentName(aid) : (t.agent_name || ""), driverName(t.driver_id), t.state,
@@ -10910,7 +10930,11 @@ function AdminDrivers({ state, user }) {
                 <SectionHeader label="Active Route" />
                 {activeTrips.map(trip => {
                   const pickupCoord = trip.pickup_sequence_coords?.[0];
-                  const dropCoord = trip.dropoff_sequence_coords?.[0];
+                  // For OUTBOUND multi-agent trips, collect all per-agent dropoffs.
+                  const dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
+                    ? trip.dropoff_sequence_coords
+                    : (trip.dropoff_sequence_coords?.[0] ? [trip.dropoff_sequence_coords[0]] : []);
+                  const hasMultipleDropoffs = dropCoords.length > 1;
                   return (
                     <div key={trip.trip_id} style={{ display: "flex", gap: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
                       <div style={{ width: 26, height: 26, borderRadius: 4, border: "1px solid rgba(29,185,84,.3)", background: "rgba(29,185,84,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
@@ -10920,10 +10944,22 @@ function AdminDrivers({ state, user }) {
                         <StateBadge state={trip.state} />
                         <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.trip_id} · {trip.agent_ids?.length || 1} passenger{(trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
                         <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
-                        <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{trip.custom_dropoff}</span>
+                        {hasMultipleDropoffs ? (
+                          dropCoords.map((dc, dci) => {
+                            const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
+                            return (
+                              <div key={dci} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{dropAgent ? `${dropAgent.name.split(" ")[0]}: ` : ""}{dc.label || trip.custom_dropoff}</span>
+                                {dc.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(dc.lat, dc.lng, dc.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{trip.custom_dropoff}</span>
+                        )}
                         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                           {pickupCoord && <Button title="🧭 PICKUP" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
-                          {dropCoord && <Button title="🧭 DROP" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+                          {!hasMultipleDropoffs && dropCoords[0] && <Button title="🧭 DROP" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoords[0].lat, dropCoords[0].lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
                         </div>
                       </div>
                     </div>
