@@ -262,7 +262,7 @@ const TRIP_TRANSITIONS = {
   // so ASSIGNED is never actually produced today. Kept in the state machine
   // and UI checks (StateBadge, active-trip filters) for forward compatibility
   // if a manual "awaiting driver confirmation" step is reintroduced later.
-  [TRIP_STATE.UNASSIGNED_BOOKING]: [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED],
+  [TRIP_STATE.UNASSIGNED_BOOKING]: [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.ASSIGNED]:           [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.DRIVER_CONFIRMED]:   [TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.IN_TRANSIT]:         [TRIP_STATE.ARCHIVED_COMPLETED],
@@ -928,10 +928,13 @@ function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropof
     cur = p.coord;
   }
   for (const t of orderedDropoffs) {
-    const c = t.dropoff_sequence_coords?.[0];
-    if (!c) continue;
-    total += haversineKm(cur.lat, cur.lng, c.lat, c.lng);
-    cur = { lat: c.lat, lng: c.lng };
+    // Iterate ALL per-agent dropoffs on this trip — OUTBOUND multi-agent
+    // trips have one home address per agent, not a single shared stop.
+    for (const c of (t.dropoff_sequence_coords || [t.dropoff_sequence_coords?.[0]]).filter(Boolean)) {
+      if (!c) continue;
+      total += haversineKm(cur.lat, cur.lng, c.lat, c.lng);
+      cur = { lat: c.lat, lng: c.lng };
+    }
   }
   return total * ROAD_FACTOR;
 }
@@ -1591,11 +1594,17 @@ function appReducer(state, action) {
 
       const newAgentIds = [...trip.agent_ids, action.agent_id];
       const newPickupCoords = [...trip.pickup_sequence_coords, { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id }];
+      // Per-agent dropoff — for OUTBOUND trips each agent drops at their own
+      // home address, not the primary's. Store alongside extrapickups so the
+      // driver nav and CSV export can show the correct address per passenger.
+      const newDropoffCoords = action.dropoff_coord
+        ? [...(trip.dropoff_sequence_coords || []), { ...action.dropoff_coord, label: action.dropoff_label, agent_id: action.agent_id }]
+        : trip.dropoff_sequence_coords;
 
       let newTrips;
       if (trip.driver_id) {
         const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
-        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords };
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
         // Adding a passenger's pickup point can shift the whole pickup
@@ -1621,7 +1630,7 @@ function appReducer(state, action) {
           return t;
         });
       } else {
-        newTrips = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords } : t);
+        newTrips = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords } : t);
       }
 
       const notif = {
@@ -1648,13 +1657,19 @@ function appReducer(state, action) {
         const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
         return !belongsToRemoved;
       });
+      // Also remove this agent's per-agent dropoff entry if one exists —
+      // keeps dropoff_sequence_coords in sync with agent_ids/pickup_sequence_coords.
+      const newDropoffCoords = (trip.dropoff_sequence_coords || []).filter((c, i) => {
+        const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        return !belongsToRemoved;
+      });
       const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
       const newAgentName = newAgentIds[0] ? (state.users.find(u => u.id === newAgentIds[0])?.name || trip.agent_name) : trip.agent_name;
 
       let newTripsRemove;
       if (trip.driver_id) {
         const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
-        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
         // Same reasoning as ADD_AGENT — removing a passenger's pickup
@@ -1674,7 +1689,7 @@ function appReducer(state, action) {
           return t;
         });
       } else {
-        newTripsRemove = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
+        newTripsRemove = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
       }
 
       // Notify everyone genuinely affected, per explicit decision — the
@@ -1995,7 +2010,14 @@ function appReducer(state, action) {
       }
       const mergedAgentIds = [...primary.agent_ids, ...secondaries.flatMap(t => t.agent_ids)];
       const mergedPickupCoords = [...primary.pickup_sequence_coords, ...secondaries.flatMap(t => t.pickup_sequence_coords)];
-      const mergedTrip = { ...primary, agent_ids: mergedAgentIds, pickup_sequence_coords: mergedPickupCoords };
+      // Merge per-agent dropoffs from every secondary into the primary.
+      // For OUTBOUND trips each secondary agent has their own home address
+      // as dropoff — without this they all inherit the primary's dropoff.
+      const mergedDropoffCoords = [
+        ...( primary.dropoff_sequence_coords || []),
+        ...secondaries.flatMap(t => t.dropoff_sequence_coords || []),
+      ];
+      const mergedTrip = { ...primary, agent_ids: mergedAgentIds, pickup_sequence_coords: mergedPickupCoords, dropoff_sequence_coords: mergedDropoffCoords };
       const secondaryIdSet = new Set(secondaryIds);
       const stateAfterMerge = {
         ...state,
@@ -2290,16 +2312,18 @@ function appReducer(state, action) {
         newState = TRIP_STATE.IN_TRANSIT;
         inTransitAt = nowTs;
       }
-      // Driver's location AT THE MOMENT of confirming this specific
-      // pickup, keyed by agent id — matching the existing
-      // pickup_timestamps pattern exactly, but for location instead of
-      // time. Per explicit requirement: saved for trip detail + CSV.
+      // Per-agent pickup timestamp (epoch ms) AND driver location at
+      // the moment of confirming this specific pickup — both keyed by
+      // agent id. Supabase handler writes both; local reducer was only
+      // writing pickup_locations, leaving pickup_timestamps blank in
+      // demo mode (CSV column always empty). Fixed to match Supabase.
+      const newPickupTimestamps = { ...(trip.pickup_timestamps || {}), [action.agent_id]: Date.now() };
       const newPickupLocations = action.driver_coord
         ? { ...(trip.pickup_locations || {}), [action.agent_id]: { lat: action.driver_coord.lat, lng: action.driver_coord.lng } }
         : (trip.pickup_locations || {});
       const newTrips = state.trips.map(t =>
         t.trip_id === action.trip_id
-          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, pickup_locations: newPickupLocations }
+          ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, pickup_timestamps: newPickupTimestamps, pickup_locations: newPickupLocations }
           : t
       );
       const notifs = allPickedUp ? [{
@@ -2676,13 +2700,18 @@ function appReducer(state, action) {
         const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
         return !belongsToRemoved;
       });
+      // Remove this agent's dropoff entry too — mirrors TRIP/REMOVE_AGENT.
+      const newDropoffCoordsAC = (trip.dropoff_sequence_coords || []).filter((c, i) => {
+        const belongsToRemoved = c.agent_id === action.agent_id || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        return !belongsToRemoved;
+      });
       const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
       const newAgentName = newAgentIds[0] ? (state.users.find(u => u.id === newAgentIds[0])?.name || trip.agent_name) : trip.agent_name;
 
       let newTripsAgentCancel;
       if (trip.driver_id) {
         const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
-        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
+        const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoordsAC, completed_pickups: newCompletedPickups, agent_name: newAgentName };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
         const dropOrderedAgentCancel = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, defaultCompanyAnchor(state)));
@@ -2699,7 +2728,7 @@ function appReducer(state, action) {
           return t;
         });
       } else {
-        newTripsAgentCancel = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
+        newTripsAgentCancel = state.trips.map(t => t.trip_id === trip.trip_id ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoordsAC, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
       }
       return { ...state, trips: newTripsAgentCancel, notifications: [...cancelNotifs, ...state.notifications], _error: null };
     }
@@ -2972,10 +3001,17 @@ function driverStatusRowToApp(row) {
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
   const extraPickups = Array.isArray(row.extrapickups) ? row.extrapickups : [];
+  // Per-agent dropoffs — primary agent uses dropofflat/lng/label; extra agents
+  // use extradropoffs (parallel to extrapickups). For INBOUND trips all agents
+  // drop at the same company location, so extradropoffs is typically empty and
+  // the primary dropoff is reused. For OUTBOUND each agent drops at their own
+  // home address — extradropoffs holds those individual home coords.
+  const firstDropoff = row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel, agent_id: row.agentid }] : [];
+  const extraDropoffs = Array.isArray(row.extradropoffs) ? row.extradropoffs : [];
   return {
     trip_id: row.id, agent_ids: [row.agentid, ...(row.extraagentids || [])].filter(Boolean), driver_id: row.driverid, state: row.status,
     pickup_sequence_coords: [...firstPickup, ...extraPickups],
-    dropoff_sequence_coords: row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel }] : [],
+    dropoff_sequence_coords: extraDropoffs.length > 0 ? [...firstDropoff, ...extraDropoffs] : firstDropoff,
     completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
     no_shows: row.noshows || [],
     late_start_notified: row.latestartnotified || false,
@@ -3656,8 +3692,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
 
       const newExtraAgentIds = [...(tripRow.extraagentids || []), action.agent_id];
       const newExtraPickups = [...(tripRow.extrapickups || []), { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id }];
+      // Per-agent dropoff — OUTBOUND trips drop each agent at their own home.
+      const newExtraDropoffs = action.dropoff_coord
+        ? [...(tripRow.extradropoffs || []), { lat: action.dropoff_coord.lat, lng: action.dropoff_coord.lng, label: action.dropoff_label, agent_id: action.agent_id }]
+        : (tripRow.extradropoffs || []);
 
-      const { error: upErr } = await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups }).eq("id", action.trip_id);
+      const { error: upErr } = await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", action.trip_id);
       if (upErr) throw upErr;
 
       // Re-sequence this driver's active trips the same way ASSIGN_DRIVER does,
@@ -3670,9 +3710,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const allForDriver = (driverTripsRaw || []).map(r => {
           const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
           const extra = (r.id === action.trip_id ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          const firstDrop = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [];
+          const extraDrop = (r.id === action.trip_id ? newExtraDropoffs : (r.extradropoffs || [])).map(d => ({ lat: d.lat, lng: d.lng }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            dropoff_sequence_coords: extraDrop.length > 0 ? [...firstDrop, ...extraDrop] : firstDrop,
             direction: r.direction,
           };
         });
@@ -3721,8 +3763,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const wasPrimary = tripRow.agentid === action.agent_id;
       const newExtraPickups = (tripRow.extrapickups || []).filter(p => p.agent_id !== action.agent_id);
       const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => id !== action.agent_id);
+      // Remove this agent's dropoff entry too (parallel to extrapickups cleanup).
+      const newExtraDropoffs = (tripRow.extradropoffs || []).filter(d => d.agent_id !== action.agent_id);
 
-      const update = { completedpickups: newCompletedPickups, extrapickups: newExtraPickups, extraagentids: newExtraAgentIds };
+      const update = { completedpickups: newCompletedPickups, extrapickups: newExtraPickups, extraagentids: newExtraAgentIds, extradropoffs: newExtraDropoffs };
       if (wasPrimary) {
         // The removed agent held the primary agentid/pickuplat/lng/label slot —
         // promote the next remaining pickup (first extrapickups entry, if
@@ -3734,6 +3778,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label;
           update.extrapickups = newExtraPickups.slice(1);
           update.extraagentids = newExtraAgentIds.filter(id => id !== promoted.agent_id);
+        }
+        // If the primary agent also had the primary dropoff slot, promote the
+        // first extradropoff entry into it so dropofflat/lng/label stays right.
+        const promotedDrop = newExtraDropoffs[0];
+        if (promotedDrop) {
+          update.dropofflat = promotedDrop.lat; update.dropofflng = promotedDrop.lng; update.dropofflabel = promotedDrop.label;
+          update.extradropoffs = newExtraDropoffs.slice(1);
         }
         const { data: newPrimaryUser } = await supabase.from("users").select("fullname").eq("id", update.agentid).maybeSingle();
         if (newPrimaryUser) update.agentname = newPrimaryUser.fullname;
@@ -3752,7 +3803,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const extra = (isThisTrip ? (update.extrapickups ?? newExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -3842,7 +3893,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const extra = (isThisTrip ? (update.extrapickups ?? r.extrapickups ?? []) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -4489,16 +4540,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           must(await supabase.from("trips").delete().eq("id", action.trip_id));
         }
         if (acIsLate && acTripRow.driverid) {
-          // The archive branch above never actually frees the driver
-          // (an ARCHIVED_CANCELLED trip is a stopping point, same as
-          // ARCHIVED_COMPLETED — the driver shouldn't stay pointed at
-          // it) — this is safe as a plain UPDATE, no delete involved,
-          // so no ordering constraint applies here either way.
+          // The archive branch above updates the trip row in place —
+          // driver_status.currenttripid may still point at this now-
+          // ARCHIVED_CANCELLED trip. Update it the same way the on-time
+          // delete path does: point at a remaining active trip if one
+          // exists, or free the driver entirely if none do.
           const { data: acRemainingLate } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
             .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
-          if (!acRemainingLate || acRemainingLate.length === 0) {
-            await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(acNowTs).toISOString() }).eq("driverid", acTripRow.driverid);
-          }
+          await supabase.from("driver_status").update({
+            state: acRemainingLate && acRemainingLate.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
+            currenttripid: acRemainingLate?.[0]?.id || null,
+            updatedat: new Date(acNowTs).toISOString(),
+          }).eq("driverid", acTripRow.driverid);
         }
         await refetch();
         return;
@@ -4509,9 +4562,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const acWasPrimary = acTripRow.agentid === action.agent_id;
       const acNewExtraPickups = (acTripRow.extrapickups || []).filter(p => p.agent_id !== action.agent_id);
       const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => id !== action.agent_id);
+      // Also remove this agent's dropoff entry.
+      const acNewExtraDropoffs = (acTripRow.extradropoffs || []).filter(d => d.agent_id !== action.agent_id);
       const acUpdate = {
         completedpickups: (acTripRow.completedpickups || []).filter(id => id !== action.agent_id),
-        extrapickups: acNewExtraPickups, extraagentids: acNewExtraAgentIds,
+        extrapickups: acNewExtraPickups, extraagentids: acNewExtraAgentIds, extradropoffs: acNewExtraDropoffs,
       };
       if (acWasPrimary) {
         const acPromoted = acNewExtraPickups[0];
@@ -4520,6 +4575,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label;
           acUpdate.extrapickups = acNewExtraPickups.slice(1);
           acUpdate.extraagentids = acNewExtraAgentIds.filter(id => id !== acPromoted.agent_id);
+        }
+        // Promote dropoff slot too if primary agent held it.
+        const acPromotedDrop = acNewExtraDropoffs[0];
+        if (acPromotedDrop) {
+          acUpdate.dropofflat = acPromotedDrop.lat; acUpdate.dropofflng = acPromotedDrop.lng; acUpdate.dropofflabel = acPromotedDrop.label;
+          acUpdate.extradropoffs = acNewExtraDropoffs.slice(1);
         }
         const { data: acNewPrimaryUser } = await supabase.from("users").select("fullname").eq("id", acUpdate.agentid).maybeSingle();
         if (acNewPrimaryUser) acUpdate.agentname = acNewPrimaryUser.fullname;
@@ -4537,7 +4598,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const extra = (isThisTrip ? (acUpdate.extrapickups ?? acNewExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -4613,22 +4674,28 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         throw new Error(`Driver doesn't have room — ${driverExistingSeats}/${dispatchMultiDriverCapacitySupa} seats taken, these trips need ${totalSeats}.`);
       }
       // Fold every secondary trip's agent(s) + pickup point(s) into the
-      // primary's extraagentids/extrapickups — same shape TRIP/ADD_AGENT
+      // primary's extraagentids/extrapickups/extradropoffs — same shape TRIP/ADD_AGENT
       // writes, so the merged trip is indistinguishable from one built up
       // via repeated single ADD_AGENT calls.
       const newExtraAgentIds = [...(primaryRow.extraagentids || [])];
       const newExtraPickups = [...(primaryRow.extrapickups || [])];
+      const newExtraDropoffs = [...(primaryRow.extradropoffs || [])];
       for (const sec of secondaryRows || []) {
         if (sec.agentid) {
           newExtraAgentIds.push(sec.agentid);
           newExtraPickups.push({ lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.agentid });
+          // Store this secondary agent's own dropoff (their home address for OUTBOUND trips).
+          newExtraDropoffs.push({ lat: sec.dropofflat, lng: sec.dropofflng, label: sec.dropofflocation, agent_id: sec.agentid });
         }
         for (let i = 0; i < (sec.extraagentids || []).length; i++) {
           newExtraAgentIds.push(sec.extraagentids[i]);
           newExtraPickups.push(sec.extrapickups?.[i] || { lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.extraagentids[i] });
+          // Extra agents from the secondary also get their own dropoff entry.
+          const extraDrop = sec.extradropoffs?.[i];
+          if (extraDrop) newExtraDropoffs.push(extraDrop);
         }
       }
-      must(await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups }).eq("id", primaryId));
+      must(await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", primaryId));
       if (secondaryIds.length) {
         must(await supabase.from("trips").delete().in("id", secondaryIds));
         await supabase.from("notifications").delete().in("tripid", secondaryIds);
@@ -4705,7 +4772,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // assignment to an already-multi-agent trip ignores the extra
           // passengers entirely when computing nearest-neighbour order.
           pickup_sequence_coords: [...first, ...extra],
-          dropoff_sequence_coords: r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [],
+          dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
           scheduled_time: r.scheduledtimestr,
           direction: r.direction,
         };
@@ -5086,7 +5153,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const clsNowTs = nowEpoch();
       let anyFired = false;
       for (const t of confirmedTrips) {
-        const scheduledDt = parseScheduledDateTime(t.scheduleddate, t.scheduledtime);
+        // scheduledtimestr is the human-readable "HH:MM" string;
+        // scheduledtime is an epoch number — parseScheduledDateTime
+        // needs the string form or it always returns null (silently
+        // skipping every trip and never firing the late-start warning).
+        const scheduledDt = parseScheduledDateTime(t.scheduleddate, t.scheduledtimestr);
         if (!scheduledDt) continue; // malformed date/time — skip rather than false-positive
         const minutesLate = (Date.now() - scheduledDt.getTime()) / 60000;
         if (minutesLate < 30) continue;
@@ -5095,13 +5166,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const { data: driverUserRow } = t.driverid ? await supabase.from("users").select("fullname").eq("id", t.driverid).maybeSingle() : { data: null };
         await insertNotification({
           type: "TRIP_LATE_START", for_roles: [ROLE.ADMIN],
-          message: `⚠ Trip ${t.id} hasn't started — scheduled for ${t.scheduleddate} ${t.scheduledtime}, driver ${driverUserRow?.fullname || t.driverid} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
+          message: `⚠ Trip ${t.id} hasn't started — scheduled for ${t.scheduleddate} ${t.scheduledtimestr}, driver ${driverUserRow?.fullname || t.driverid} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
           trip_id: t.id, ts: clsNowTs, read: false,
         });
         if (t.driverid) {
           await insertNotification({
             type: "TRIP_LATE_START", for_roles: [ROLE.DRIVER], for_user_ids: [t.driverid],
-            message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtime} — please begin the pickup or contact dispatch if there's a delay.`,
+            message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtimestr} — please begin the pickup or contact dispatch if there's a delay.`,
             trip_id: t.id, ts: clsNowTs, read: false,
           });
         }
@@ -5135,16 +5206,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Scoped to the caller (see the in-memory reducer's case) — the old
       // .neq("id", -1) matched every row, so any user clearing their
       // alerts marked the whole table read.
-      let q = supabase.from("notifications").update({ isread: true });
+      // Scope is always required — every call site passes either user_id
+      // or admin:true. The old else-branch (.neq("id",-1)) matched ALL
+      // rows, silently marking the entire notifications table read for
+      // every user if neither was provided. Replaced with a safe no-op.
       if (action.user_id != null) {
-        q = q.eq("userid", action.user_id);
+        must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.user_id));
       } else if (action.admin) {
         // Admin-role broadcasts are stored with userid null.
-        q = q.is("userid", null);
-      } else {
-        q = q.neq("id", -1);
+        must(await supabase.from("notifications").update({ isread: true }).is("userid", null));
       }
-      must(await q);
+      // else: no scope provided — no-op rather than marking everything read
       await refetch();
       return;
     }
@@ -5171,6 +5243,7 @@ function useAppStore() {
   const [supaState, setSupaState] = useState(null);
   const [supaError, setSupaError] = useState(null);
   const [useFallback, setUseFallback] = useState(!supabase);
+  const [dmVersion, setDmVersion] = useState(0); // incremented on every direct_messages change
   // Rehydrated from localStorage so a page refresh doesn't log everyone
   // out — the initial refetch below then loads data for this user. An id
   // that doesn't match any real user just lands on the login screen.
@@ -5283,6 +5356,13 @@ function useAppStore() {
       .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, refetch)
       .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refetch)
       .on("postgres_changes", { event: "*", schema: "public", table: "users" }, refetch)
+      // direct_messages is NOT part of refetch() (it's fetched on-demand
+      // per conversation thread, not downloaded into app state) — but we
+      // DO need to know when it changes so MessagesTab and AdminContacts
+      // can reload their conversation lists and show new messages in real
+      // time. Incrementing dmVersion is enough: any component watching it
+      // will re-run its load() without us having to plumb a callback here.
+      .on("postgres_changes", { event: "*", schema: "public", table: "direct_messages" }, () => setDmVersion(v => v + 1))
       .subscribe();
 
     // Backstop polling — Supabase realtime subscriptions can silently
@@ -5421,8 +5501,8 @@ function useAppStore() {
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], _error: null, _loading: false }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, _error: supaError, _loading: loading };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -6202,8 +6282,12 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const myPickupCoord = trip
     ? (trip.pickup_sequence_coords?.find(c => c.agent_id === user.id) ?? trip.pickup_sequence_coords?.[0]) ?? null
     : null;
+  // Per-agent dropoff: find this agent's specific dropoff (their home for OUTBOUND).
+  const myDropoffCoord = trip
+    ? (trip.dropoff_sequence_coords?.find(c => c.agent_id === user.id) ?? trip.dropoff_sequence_coords?.[0]) ?? null
+    : null;
   const trackingReferencePoint = trip
-    ? (trip.completed_pickups?.includes(user.id) ? trip.dropoff_sequence_coords?.[0] : myPickupCoord) ?? null
+    ? (trip.completed_pickups?.includes(user.id) ? myDropoffCoord : myPickupCoord) ?? null
     : null;
   const shuttleStatus = useAgentShuttleStatus(isActiveTripForTracking ? trip?.driver_id : null, trackingReferencePoint);
   if (!trip) return <div className="pad"><span style={{ color: COLORS.ghost }}>Trip not found.</span></div>;
@@ -6211,7 +6295,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const driverUser = state.users.find(u => u.id === trip.driver_id);
   const driverStatus = state.driver_status.find(d => d.driver_id === trip.driver_id);
   const pickupCoord = trip.pickup_sequence_coords?.[0] ?? null;
-  const dropCoord = trip.dropoff_sequence_coords?.[0] ?? null;
+  const dropCoord = myDropoffCoord;
   // Was previously always the trip's PRIMARY agent (agent_ids[0]), which
   // misattributed every message sent by a secondary agent on a
   // multi-passenger trip to the primary agent's identity instead of
@@ -6283,7 +6367,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
       <Card>
         <SectionHeader label="Route" />
         <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ PICKUP: </span>{trip.custom_pickup}</div>
-        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{trip.custom_dropoff}</div>
+        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{myDropoffCoord?.label || trip.custom_dropoff}</div>
         {trip.est_distance_km && <div style={{ fontSize: 10, color: COLORS.teal }}>Est. distance: {(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
         {trip.driver_route_km != null && (
           <div style={{ fontSize: 10, color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, marginTop: 2 }}>
@@ -6296,7 +6380,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
         {pickupCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
         <SectionHeader label="Drop-off Location" />
         {dropCoord ? <GpsBlock coord={dropCoord} /> : <span style={{ fontSize: 10, color: COLORS.ghost }}>Coordinates pending</span>}
-        {dropCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+        {dropCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, myDropoffCoord?.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
       </Card>
 
       {driverUser && (
@@ -7683,7 +7767,25 @@ function MessagesTab({ user, dispatch, state }) {
     }
   }, [user.id]);
 
-  useEffect(() => { load(); }, [load]);
+  // Load on mount AND whenever a new DM arrives anywhere in the system
+  // (state._dmVersion increments on every direct_messages realtime event).
+  // Without this, new incoming messages never appeared without a manual
+  // page refresh — the conversation list was stale from the initial load.
+  useEffect(() => { load(); }, [load, state._dmVersion]);
+
+  // Mark all DIRECT_MESSAGE notifications read for this user the moment
+  // they open the Messages tab — the badge and AlertsTab entry persist
+  // forever otherwise, since no individual "open conversation" event ever
+  // fired NOTIF/MARK_READ. DM notifications don't carry a sender id, so
+  // we can't scope this to one conversation; marking all DM notifs read
+  // on tab-open is the correct behaviour (same as most messaging apps).
+  useEffect(() => {
+    const dmNotifs = state.notifications.filter(
+      n => n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.includes(user.id)
+    );
+    dmNotifs.forEach(n => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {}));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div className="pad">
@@ -7706,12 +7808,12 @@ function MessagesTab({ user, dispatch, state }) {
           <span style={{ fontSize: 9, color: COLORS.ghost, flexShrink: 0 }}>{epochToDisplay(c.last_ts_epoch)}</span>
         </div>
       ))}
-      {openWith && <DmThreadModal currentUser={user} counterpart={openWith} dispatch={dispatch} onClose={() => { setOpenWith(null); load(); }} />}
+      {openWith && <DmThreadModal currentUser={user} counterpart={openWith} dispatch={dispatch} dmVersion={state._dmVersion} onClose={() => { setOpenWith(null); load(); }} />}
     </div>
   );
 }
 
-function DmThreadModal({ currentUser, counterpart, dispatch, onClose }) {
+function DmThreadModal({ currentUser, counterpart, dispatch, onClose, dmVersion }) {
   const [msgs, setMsgs] = useState(null);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
@@ -7726,7 +7828,10 @@ function DmThreadModal({ currentUser, counterpart, dispatch, onClose }) {
     }
   }, [currentUser.id, counterpart.id]);
 
-  useEffect(() => { load(); }, [load]);
+  // Reload thread when a new DM arrives anywhere (dmVersion increments
+  // on every direct_messages realtime event) — new messages now appear
+  // in the open conversation without the user having to close and reopen.
+  useEffect(() => { load(); }, [load, dmVersion]);
 
   const send = async () => {
     if (!text.trim()) return;
@@ -8144,17 +8249,35 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
 
   const dropoffGroups = {};
   myActiveTrips.forEach(trip => {
-    const coord = trip.dropoff_sequence_coords?.[0];
-    if (!coord) return;
-    const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
-    if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, trip_ids: [], passengers: [], done: false, isManual: trip.dropoff_is_manual || false };
-    dropoffGroups[key].trip_ids.push(trip.trip_id);
-    // Include every agent on this trip, not just the primary — a
-    // multi-passenger trip drops off more than one person at this stop.
-    const tripAgentIds = trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null];
-    tripAgentIds.forEach(aid => {
-      const u = state.users.find(x => x.id === aid);
-      dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+    // Iterate ALL per-agent dropoffs — OUTBOUND multi-agent trips have one
+    // home address per agent. Previously only dropoff_sequence_coords[0] was
+    // used, meaning all extra agents were silently attached to the first
+    // agent's stop and the driver never got the other home addresses.
+    const dropCoords = trip.dropoff_sequence_coords || [];
+    if (dropCoords.length === 0) return;
+    dropCoords.forEach((coord, coordIdx) => {
+      if (!coord) return;
+      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
+      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, trip_ids: [], passengers: [], done: false, isManual: trip.dropoff_is_manual || false };
+      if (!dropoffGroups[key].trip_ids.includes(trip.trip_id)) dropoffGroups[key].trip_ids.push(trip.trip_id);
+      // Each coord entry has an agent_id when built from extradropoffs —
+      // attach only that specific agent to this stop. Fall back to all
+      // trip agents for single-dropoff trips (INBOUND / legacy data).
+      if (coord.agent_id) {
+        const u = state.users.find(x => x.id === coord.agent_id);
+        if (!dropoffGroups[key].passengers.find(p => p.id === coord.agent_id && p.trip_id === trip.trip_id)) {
+          dropoffGroups[key].passengers.push({ id: coord.agent_id, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+        }
+      } else if (coordIdx === 0) {
+        // Legacy single-dropoff: attach all trip agents to this one stop.
+        const tripAgentIds = trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null];
+        tripAgentIds.forEach(aid => {
+          const u = state.users.find(x => x.id === aid);
+          if (!dropoffGroups[key].passengers.find(p => p.id === aid && p.trip_id === trip.trip_id)) {
+            dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+          }
+        });
+      }
     });
   });
   Object.values(dropoffGroups).forEach(group => { group.done = group.trip_ids.every(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.ARCHIVED_COMPLETED); });
@@ -8292,7 +8415,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div>
       <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1.5, textTransform: "uppercase", marginTop: -8 }}>
         {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
-        {myActiveTrips[0]?.route_total_km != null && ` · ${myActiveTrips[0].route_total_km.toFixed(1)} km TOTAL ROUTE`}
+        {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
       </div>
       {startTripError && (
         <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
@@ -8494,7 +8617,7 @@ function DriverHistoryTab({ myTrips }) {
         <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
         <StateBadge state={t.state} />
       </div>
-      <div style={{ fontSize: 11 }}>{t.agent_name}</div>
+      <div style={{ fontSize: 11 }}>{t.agent_ids?.length || 1} passenger{(t.agent_ids?.length || 1) !== 1 ? "s" : ""}</div>
       <div style={{ fontSize: 10, color: COLORS.ghost }}>{t.custom_pickup} → {t.custom_dropoff}</div>
       {t.actual_distance_km && <div style={{ fontSize: 9, color: COLORS.teal }}>Distance: {(t.actual_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
       <div style={{ fontSize: 9, color: COLORS.dim }}>{t.completed_at}</div>
@@ -8754,7 +8877,7 @@ function AdminDashboard({ state, user }) {
         {trips.slice(0, 8).length === 0 ? <Empty icon="⊟" text="No bookings or trips yet" /> : trips.slice(0, 8).map(t => (
           <div key={t.trip_id} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: `1px solid ${COLORS.wire}` }}>
             <span style={{ width: 80, fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
-            <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{t.agent_name}</span>
+            <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{t.agent_ids?.length || 1} passenger{(t.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
             <StateBadge state={t.state} />
           </div>
         ))}
@@ -8772,6 +8895,13 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   const [streetArea, setStreetArea] = useState("");
   const [streetCoord, setStreetCoord] = useState(null);
   const [confirmed, setConfirmed] = useState(false);
+  // For OUTBOUND trips each agent has their own dropoff (home address).
+  // For INBOUND trips there's one shared dropoff (the company) — inherited from the trip.
+  const isOutbound = trip.direction === "OUTBOUND";
+  const [dropMode, setDropMode] = useState("street");
+  const [dropStreetValue, setDropStreetValue] = useState("");
+  const [dropStreetCoord, setDropStreetCoord] = useState(null);
+  const [dropConfirmed, setDropConfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const availableAgentsAll = state.users.filter(u => u.role === ROLE.AGENT && !trip.agent_ids.includes(u.id));
@@ -8787,6 +8917,7 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
 
   // Picking an agent with a saved home address pre-fills it, same convenience
   // the agent's own booking screen gives them — admin can still override.
+  // For OUTBOUND trips also pre-fills the dropoff (their home address).
   const chooseAgent = (id) => {
     setAgentId(id);
     const a = state.users.find(u => u.id === id);
@@ -8796,12 +8927,22 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
       setStreetArea(a.home_address.area);
       setStreetCoord({ lat: a.home_address.lat, lng: a.home_address.lng });
       setConfirmed(true);
+      // OUTBOUND: home is also the dropoff
+      if (isOutbound) {
+        setDropMode("street");
+        setDropStreetValue(a.home_address.label);
+        setDropStreetCoord({ lat: a.home_address.lat, lng: a.home_address.lng });
+        setDropConfirmed(true);
+      }
     } else {
       setStreetValue(""); setStreetCoord(null); setConfirmed(false);
+      if (isOutbound) { setDropStreetValue(""); setDropStreetCoord(null); setDropConfirmed(false); }
     }
   };
 
-  const canSave = agentId && (mode === "company" || (streetValue && confirmed));
+  const canSave = agentId &&
+    (mode === "company" || (streetValue && confirmed)) &&
+    (!isOutbound || dropStreetValue && dropConfirmed);
 
   const [saveError, setSaveError] = useState(null);
   const save = async () => {
@@ -8810,8 +8951,11 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
     setSaveError(null);
     const pickupLabel = mode === "company" ? selectedCompany.address : streetValue;
     const pickupCoord = mode === "company" ? { lat: selectedCompany.lat, lng: selectedCompany.lng } : streetCoord;
+    // For OUTBOUND pass per-agent dropoff; for INBOUND the trip's shared dropoff is used by default.
+    const dropoffLabel = isOutbound ? dropStreetValue : null;
+    const dropoffCoord = isOutbound && dropStreetCoord ? dropStreetCoord : null;
     try {
-      await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, pickup_label: pickupLabel, pickup_coord: pickupCoord });
+      await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, pickup_label: pickupLabel, pickup_coord: pickupCoord, dropoff_label: dropoffLabel, dropoff_coord: dropoffCoord });
       onClose();
     } catch (e) {
       setSaveError(e.message || "Couldn't add the passenger — please try again.");
@@ -8854,6 +8998,14 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
           <LocationSelector mode={mode} setMode={setMode} companyId={companyId} setCompanyId={setCompanyId} state={state}
             streetValue={streetValue} streetCoord={confirmed ? streetCoord : null}
             onStreetChange={({ street, area, coord, confirmed: c }) => { setStreetValue(street); setStreetArea(area); setStreetCoord(coord); setConfirmed(!!c); }} />
+          {isOutbound && (
+            <>
+              <SectionHeader label="Drop-off Location (this agent's home)" />
+              <LocationSelector mode={dropMode} setMode={setDropMode} companyId={companyId} setCompanyId={setCompanyId} state={state}
+                streetValue={dropStreetValue} streetCoord={dropConfirmed ? dropStreetCoord : null}
+                onStreetChange={({ street, coord, confirmed: c }) => { setDropStreetValue(street); setDropStreetCoord(coord); setDropConfirmed(!!c); }} />
+            </>
+          )}
           <div style={{ display: "flex", gap: 8 }}>
             <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} />
             {saveError && <span style={{ fontSize: 10, color: COLORS.red, display: "block", marginBottom: 6 }}>{saveError}</span>}
@@ -8930,6 +9082,11 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
   const driver = state.users.find(u => u.id === trip.driver_id);
   const passengers = trip.agent_ids.map(id => state.users.find(u => u.id === id)).filter(Boolean);
   const canEdit = trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && dispatch != null;
+  // Use the assigned driver's own vehicle capacity, not the global default —
+  // a driver with an 8-seat minibus would be incorrectly blocked at 4 seats
+  // otherwise. Falls back to DRIVER_CAPACITY for unassigned trips (no driver
+  // to look up) or when the driver_status record is missing.
+  const tripDriverCapacity = (state.driver_status?.find(d => d.driver_id === trip.driver_id)?.capacity) || DRIVER_CAPACITY;
 
   const confirmRemove = async (agentId) => {
     try {
@@ -8962,7 +9119,9 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             <span title={exceptionLabel(trip) || "Exception"} style={{ fontSize: 9, fontWeight: 800, color: "#000", background: COLORS.red, borderRadius: 2, width: 14, height: 14, display: "inline-flex", alignItems: "center", justifyContent: "center" }}>E</span>
           )}
         </span>
-        <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>{trip.agent_name}{trip.agent_ids.length > 1 ? ` +${trip.agent_ids.length - 1}` : ""}</span>
+        <span style={{ flex: 1, fontWeight: 600, fontSize: 11 }}>
+          {trip.agent_ids.length} passenger{trip.agent_ids.length !== 1 ? "s" : ""}
+        </span>
         {trip.long_distance_flag && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 2, padding: "2px 5px" }}>40km+</span>}
         <StateBadge state={trip.state} />
         <span style={{ color: COLORS.ghost, fontSize: 11 }}>{open ? "▲" : "▼"}</span>
@@ -9028,7 +9187,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
               <Button title="✕ REMOVE DRIVER" variant="danger" size="sm" onClick={() => dispatch({ type: "TRIP/REMOVE_DRIVER", trip_id: trip.trip_id }).catch(() => {}) /* failure already toasted by the wrapper */} />
             )}
             {trip.est_distance_km && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>EST DIST: </span>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span>}
-            {trip.route_total_km != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER'S FULL ROUTE: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{trip.route_total_km.toFixed(1)} km</span></span>}
+            {(trip.route_total_km ?? trip.driver_route_km) != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER'S FULL ROUTE: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km</span></span>}
           </div>
 
           <SectionHeader label={`Passengers (${passengers.length})`} />
@@ -9041,6 +9200,9 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             // on legacy coords that predate agent_id stamping.
             const pickup = trip.pickup_sequence_coords?.find(c => c.agent_id === p.id)
               ?? (trip.agent_ids[0] === p.id ? trip.pickup_sequence_coords?.[0] : null);
+            // Per-agent dropoff — OUTBOUND trips have one home address per agent.
+            const agentDropoff = trip.dropoff_sequence_coords?.find(c => c.agent_id === p.id)
+              ?? (trip.agent_ids[0] === p.id ? trip.dropoff_sequence_coords?.[0] : null);
             const pickedUp = trip.completed_pickups?.includes(p.id);
             const droppedOff = trip.completed_dropoffs?.includes(p.id);
             const driverName = trip.driver_id ? state.users.find(u => u.id === trip.driver_id)?.name : null;
@@ -9055,8 +9217,14 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
                     {pickedUp && <span style={{ fontSize: 9, color: COLORS.green, marginLeft: 6 }}>✓ picked up</span>}
                     {droppedOff && driverName && <span style={{ fontSize: 9, color: COLORS.teal, marginLeft: 6 }}>✓ dropped by {driverName}</span>}
                     <div style={{ fontSize: 9, color: COLORS.ghost }}>{pickup?.label || "—"}</div>
+                    {agentDropoff && agentDropoff.label && agentDropoff.label !== (pickup?.label) && (
+                      <div style={{ fontSize: 9, color: COLORS.red }}>◎ {agentDropoff.label}</div>
+                    )}
                   </div>
-                  {pickup?.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(pickup.lat, pickup.lng, pickup.label, trip.pickup_is_manual)} />}
+                  {pickup?.lat && <Button title="🧭 P" variant="waze" size="sm" onClick={() => smartOpenWaze(pickup.lat, pickup.lng, pickup.label, trip.pickup_is_manual)} />}
+                  {agentDropoff?.lat && agentDropoff.label !== pickup?.label && (
+                    <Button title="🧭 D" variant="waze" size="sm" onClick={() => smartOpenWaze(agentDropoff.lat, agentDropoff.lng, agentDropoff.label, trip.dropoff_is_manual)} />
+                  )}
                   {canEdit && !isRelocating && (
                     <Button title="MOVE" variant="ghost" size="sm" onClick={() => { setRelocatingId(p.id); setRemovingId(null); }} />
                   )}
@@ -9085,16 +9253,25 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
           })}
 
           {canEdit && !addingAgent && (
-            trip.agent_ids.length >= DRIVER_CAPACITY
-              ? <div style={{ fontSize: 10, color: COLORS.ghost, padding: "6px 0" }}>{tripNounCap(trip)} full ({trip.agent_ids.length}/{DRIVER_CAPACITY} seats) — remove a passenger to add another.</div>
+            trip.agent_ids.length >= tripDriverCapacity
+              ? <div style={{ fontSize: 10, color: COLORS.ghost, padding: "6px 0" }}>{tripNounCap(trip)} full ({trip.agent_ids.length}/{tripDriverCapacity} seats) — remove a passenger to add another.</div>
               : <Button title={`+ ADD PASSENGER TO THIS ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" onClick={() => setAddingAgent(true)} />
           )}
           {addingAgent && <AddAgentPanel trip={trip} state={state} dispatch={dispatch} onClose={() => setAddingAgent(false)} />}
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-            <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROPOFF: </span>
-            {(trip.dropoff_sequence_coords || []).map((c, i) => <span key={i} style={{ color: COLORS.red, fontSize: 10 }}>[{c.lat?.toFixed(4)},{c.lng?.toFixed(4)}] </span>)}
-            {trip.dropoff_sequence_coords?.[0] && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(trip.dropoff_sequence_coords[0].lat, trip.dropoff_sequence_coords[0].lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
+            <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{(trip.dropoff_sequence_coords || []).length > 1 ? "S" : ""}: </span>
+            {(trip.dropoff_sequence_coords || []).map((c, i) => {
+              const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
+              const label = c.label || trip.custom_dropoff;
+              return (
+                <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                  {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
+                  <span style={{ color: COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}</span>
+                  {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
+                </span>
+              );
+            })}
           </div>
 
           {canEdit && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
@@ -9196,11 +9373,18 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
     // for the per-passenger row structure is that each of these can have
     // a genuinely different pickup/dropoff time on a multi-passenger trip.
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
-    agentIds.forEach(aid => {
+    agentIds.forEach((aid, aidIdx) => {
+      // Per-agent dropoff: for OUTBOUND trips each agent drops at their own
+      // home address. dropoff_sequence_coords now carries one entry per agent
+      // (keyed by agent_id, or by position for legacy single-agent trips).
+      const agentDropoff = aid != null
+        ? (t.dropoff_sequence_coords?.find(d => d.agent_id === aid) || t.dropoff_sequence_coords?.[aidIdx] || t.dropoff_sequence_coords?.[0])
+        : t.dropoff_sequence_coords?.[0];
+      const agentDropoffLabel = agentDropoff?.label || t.custom_dropoff || "";
       rows.push([
         t.trip_id, exceptionLabel(t), t.direction || "", t.trip_type || "",
         aid != null ? agentName(aid) : (t.agent_name || ""), driverName(t.driver_id), t.state,
-        t.custom_pickup || "", t.custom_dropoff || "",
+        t.custom_pickup || "", agentDropoffLabel,
         t.scheduled_date || "", t.scheduled_time || "",
         // booked_at/confirmed_at are already formatted display strings
         // (converted by tripRowToApp via epochToDisplay) — used as-is.
@@ -9212,7 +9396,7 @@ function exportTripsToCsv(trips, users, filenamePrefix = "trips", delaysByTrip =
         fmtTs(aid != null ? t.dropoff_timestamps?.[aid] : null),
         fmtLoc(aid != null ? t.dropoff_locations?.[aid] : null),
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
-        t.route_total_km != null ? t.route_total_km.toFixed(1) : "",
+        (t.route_total_km ?? t.driver_route_km) != null ? (t.route_total_km ?? t.driver_route_km).toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
         (t.no_shows || []).length === 0 ? "" : t.no_shows.map(ns => {
           const noShowAgentName = users.find(u => u.id === ns.agent_id)?.name || ns.agent_id;
@@ -9443,8 +9627,8 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                 {isUnassigned ? "UNASSIGNED" : (driverUser?.name || `Driver ${key}`)}
               </span>
               <span style={{ fontSize: 10, color: COLORS.ghost }}>({groupTrips.length} {isUnassigned ? "booking" : "trip"}{groupTrips.length !== 1 ? "s" : ""})</span>
-              {!isUnassigned && groupTrips[0]?.route_total_km != null && (
-                <span style={{ fontSize: 10, color: COLORS.teal, marginLeft: "auto" }}>{groupTrips[0].route_total_km.toFixed(1)} km route</span>
+              {!isUnassigned && (groupTrips[0]?.route_total_km ?? groupTrips[0]?.driver_route_km) != null && (
+                <span style={{ fontSize: 10, color: COLORS.teal, marginLeft: "auto" }}>{(groupTrips[0].route_total_km ?? groupTrips[0].driver_route_km).toFixed(1)} km route</span>
               )}
             </div>
             <Card body={false}>
@@ -10166,7 +10350,7 @@ function AdminDispatch({ state, dispatch }) {
               </div>
               <StateBadge state={t.state} />
             </div>
-            <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_name}{t.agent_ids.length > 1 && ` +${t.agent_ids.length - 1}`}</div>
+            <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_ids.length} passenger{t.agent_ids.length !== 1 ? "s" : ""}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
             <div style={{ display: "flex", gap: 10 }}>
@@ -10186,8 +10370,8 @@ function AdminDispatch({ state, dispatch }) {
               {selectedTrips.length === 1
                 ? <>Assigning: <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> — {primaryTrip.custom_pickup}</>
                 : isWeekBookingSelection
-                ? <>Assigning <span style={{ color: COLORS.amber }}>{primaryTrip.agent_name}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
-                : <>Combining <span style={{ color: COLORS.amber }}>{selectedTrips.length} bookings</span> onto {primaryTrip.trip_id}: {selectedTrips.map(t => t.agent_name).join(", ")}</>}
+                ? <>Assigning <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
+                : <>Combining <span style={{ color: COLORS.amber }}>{selectedTrips.length} bookings</span> ({selectedTrips.reduce((n, t) => n + (t.agent_ids?.length || 1), 0)} passengers total) onto {primaryTrip.trip_id}</>}
             </span>
             <span style={{ fontSize: 9, color: overCapacity ? COLORS.red : COLORS.ghost }}>
               {isWeekBookingSelection
@@ -10628,7 +10812,7 @@ function AdminLiveMap({ state, user }) {
             <span style={{ fontSize: 10, color: COLORS.ghost }}>No position data yet.</span>
           )}
           {selected.trip && (
-            <div style={{ fontSize: 10, color: COLORS.mist }}>On trip {selected.trip.trip_id} — {selected.trip.agent_name}</div>
+            <div style={{ fontSize: 10, color: COLORS.mist }}>On trip {selected.trip.trip_id} — {selected.trip.agent_ids?.length || 1} passenger{(selected.trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</div>
           )}
         </Card>
       )}
@@ -10734,7 +10918,7 @@ function AdminDrivers({ state, user }) {
                       </div>
                       <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
                         <StateBadge state={trip.state} />
-                        <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.agent_name}</span>
+                        <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.trip_id} · {trip.agent_ids?.length || 1} passenger{(trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
                         <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
                         <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{trip.custom_dropoff}</span>
                         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
@@ -11852,7 +12036,7 @@ function AdminContacts({ state, dispatch, user, call }) {
       setConversations([]);
     }
   }, [user.id, state.users]);
-  useEffect(() => { loadConversations(); }, [loadConversations]);
+  useEffect(() => { loadConversations(); }, [loadConversations, state._dmVersion]);
 
   // Directory now includes admins too, per explicit decision — excluding
   // the current admin themselves, since messaging/calling yourself isn't
@@ -11868,6 +12052,14 @@ function AdminContacts({ state, dispatch, user, call }) {
     setSelectedId(u.id);
     setQuery("");
     setLoadingDm(true);
+    // Mark all unread DIRECT_MESSAGE notifications for this admin as read
+    // the moment they open a conversation — same as MessagesTab (agents/
+    // drivers) does on mount. Without this the Contacts badge and the
+    // AlertsTab DIRECT_MESSAGE entry persist forever.
+    const dmNotifs = state.notifications.filter(
+      n => n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.includes(user.id)
+    );
+    dmNotifs.forEach(n => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {}));
     try {
       const msgs = await fetchDirectMessages(user.id, u.id);
       setDmMessages(msgs);
@@ -11877,6 +12069,15 @@ function AdminContacts({ state, dispatch, user, call }) {
       setLoadingDm(false);
     }
   };
+
+  // Reload the open conversation thread whenever a new DM arrives
+  // (state._dmVersion increments on every direct_messages realtime event).
+  // Without this, a new message from the other person only appears after
+  // the admin closes and reopens the conversation.
+  useEffect(() => {
+    if (!selectedId || !supabase) return;
+    fetchDirectMessages(user.id, selectedId).then(setDmMessages).catch(() => {});
+  }, [state._dmVersion, selectedId, user.id]);
 
   const send = async () => {
     if (!text.trim() || !selected) return;
