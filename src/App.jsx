@@ -9739,7 +9739,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v5-fastest-traffic";
+const _TOMTOM_CACHE_VERSION = "v6-debounce-race-fix";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
@@ -9756,10 +9756,37 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
     if (!isOutbound || !coords || coords.length <= 1 || !TOMTOM_API_KEY) return;
     if (_tomtomSortCache.has(fingerprint)) { setSorted(_tomtomSortCache.get(fingerprint)); return; }
     let cancelled = false;
+    // Debounce: wait briefly before firing the actual TomTom call, so a burst
+    // of renders with different intermediate coords arrays (e.g. auto-merge
+    // folding in 3 agents one at a time) only results in ONE real request —
+    // for the final, settled coords — instead of one request per intermediate
+    // state, most of which would be immediately stale.
+    const debounceHandle = setTimeout(() => {
+      if (cancelled) return;
+    // Snapshot the coord count THIS effect run is actually requesting for.
+    // Multiple trips/components can independently trigger overlapping TomTom
+    // calls while the driver's route is being built up passenger-by-passenger
+    // (e.g. auto-merge folding agents in one at a time) — each intermediate
+    // render fires its own effect with a different-length coords array before
+    // the final state settles. Without this check, a STALE response computed
+    // for an earlier, incomplete coordinate set (e.g. 2 dropoffs) can resolve
+    // AFTER a newer request for the final set (e.g. 3 dropoffs) and silently
+    // overwrite the correct cached result with one based on missing data —
+    // confirmed in production: a 3-dropoff trip's cache got polluted by a
+    // 2-entry optimizedWaypoints response from an intermediate render.
+    const requestedCount = coords.length;
     setLoading(true);
     setTomtomError(null);
     tomtomOptimalDropoffOrder(anchorCoord, coords).then(result => {
       if (cancelled) return;
+      if (result && result.length !== requestedCount) {
+        // Response doesn't match what THIS call actually asked for — discard
+        // rather than cache/apply, and don't overwrite a possibly-correct
+        // existing cache entry from a more complete concurrent call.
+        console.warn(`[TomTom] stale/mismatched response discarded: requested ${requestedCount} dropoffs, got ${result.length}.`);
+        setLoading(false);
+        return;
+      }
       if (!result) setTomtomError("TomTom returned no result — using distance estimate instead");
       const final = result || sortDropoffCoordsByProximity(coords, anchorCoord);
       _tomtomSortCache.set(fingerprint, final);
@@ -9768,7 +9795,8 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
       if (cancelled) return;
       setTomtomError(e.message || "TomTom request failed");
     }).finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    }, 400); // 400ms debounce — long enough to absorb a burst of intermediate renders
+    return () => { cancelled = true; clearTimeout(debounceHandle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprint]);
   return [sorted, loading, tomtomError];
