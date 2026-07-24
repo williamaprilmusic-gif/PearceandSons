@@ -9,9 +9,9 @@ export default defineConfig({
       registerType: 'autoUpdate',
       includeAssets: ['icon-192.png', 'icon-512.png', 'icon-192-maskable.png', 'icon-512-maskable.png'],
       manifest: {
-        name: 'TransitOS',
-        short_name: 'TransitOS',
-        description: 'Corporate Transport Operations Platform',
+        name: 'Pearce & Sons — Staff Transport',
+        short_name: 'Pearce & Sons',
+        description: 'Pearce & Sons staff transport booking and dispatch platform',
         start_url: '/',
         display: 'standalone',
         background_color: '#0A0C0F',
@@ -20,8 +20,6 @@ export default defineConfig({
         icons: [
           { src: 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
           { src: 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
-          { src: 'icon-192-maskable.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
-          { src: 'icon-512-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
       },
       workbox: {
