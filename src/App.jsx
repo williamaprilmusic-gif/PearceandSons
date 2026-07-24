@@ -12680,11 +12680,10 @@ function AdminTickets({ state, dispatch, user }) {
 
 function AdminNotifs({ state, dispatch, onJumpToTrip }) {
   const [filterDate, setFilterDate] = useState(""); // "" = show all, else YYYY-MM-DD
-  // Multi-select delete for alerts — genuinely new feature, per explicit
-  // request (distinct from CLEAR ALL above, which only ever marks read).
   const [selectMode, setSelectMode] = useState(false);
   const [selectedNotifIds, setSelectedNotifIds] = useState(new Set());
   const [confirmingDeleteNotifs, setConfirmingDeleteNotifs] = useState(false);
+  const [confirmingDeleteAll, setConfirmingDeleteAll] = useState(false);
   const [deletingNotifs, setDeletingNotifs] = useState(false);
   const toggleNotifSelect = (id) => {
     setSelectedNotifIds(prev => {
@@ -12693,7 +12692,7 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
       return next;
     });
   };
-  const exitSelectMode = () => { setSelectMode(false); setSelectedNotifIds(new Set()); setConfirmingDeleteNotifs(false); };
+  const exitSelectMode = () => { setSelectMode(false); setSelectedNotifIds(new Set()); setConfirmingDeleteNotifs(false); setConfirmingDeleteAll(false); };
   const deleteSelectedNotifs = async () => {
     setDeletingNotifs(true);
     try {
@@ -12705,10 +12704,20 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
       setDeletingNotifs(false);
     }
   };
+  const deleteAllNotifs = async () => {
+    setDeletingNotifs(true);
+    try {
+      // Delete ALL visible notifications (filtered view or all)
+      const idsToDelete = adminNotifs.map(n => n.id);
+      await dispatch({ type: "NOTIF/DELETE_SELECTED", ids: idsToDelete, admin: true });
+      exitSelectMode();
+    } catch (e) {
+      console.warn("[AdminNotifs] delete all failed:", e.message);
+    } finally {
+      setDeletingNotifs(false);
+    }
+  };
   const adminNotifsAll = state.notifications.filter(n => !n.for_user_ids?.length && (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length));
-  // Filtered by calendar day (local time) using the raw epoch timestamp —
-  // n.ts itself is a locale-formatted display string (en-ZA), not
-  // machine-parseable, so ts_epoch is what date filtering actually uses.
   const adminNotifs = filterDate
     ? adminNotifsAll.filter(n => {
         if (n.ts_epoch == null) return false;
@@ -12719,6 +12728,7 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
     : adminNotifsAll;
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
+  const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
   const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "✗", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
   return (
     <div className="pad">
@@ -12735,7 +12745,22 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
           {adminNotifsAll.length > 0 && (
             <Button title={selectMode ? "CANCEL" : "SELECT"} variant="ghost" size="sm" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))} />
           )}
-          {unread > 0 && !selectMode && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+          {selectMode && adminNotifs.length > 0 && (
+            <Button title={allSelected ? "DESELECT ALL" : "SELECT ALL"} variant="ghost" size="sm"
+              onClick={() => setSelectedNotifIds(allSelected ? new Set() : new Set(adminNotifs.map(n => n.id)))} />
+          )}
+          {adminNotifs.length > 0 && !selectMode && (
+            confirmingDeleteAll ? (
+              <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span style={{ fontSize: 11, color: COLORS.chalk }}>Delete all {adminNotifs.length}?</span>
+                <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingDeleteAll(false)} />
+                <Button title={deletingNotifs ? "DELETING…" : `DELETE ALL ${adminNotifs.length}`} variant="danger" size="sm" onClick={deleteAllNotifs} disabled={deletingNotifs} loading={deletingNotifs} />
+              </div>
+            ) : (
+              <Button title="🗑 DELETE ALL" variant="ghost" size="sm" onClick={() => setConfirmingDeleteAll(true)} />
+            )
+          )}
+          {unread > 0 && !selectMode && !confirmingDeleteAll && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
         </div>
       </div>
       {selectMode && selectedNotifIds.size > 0 && (
