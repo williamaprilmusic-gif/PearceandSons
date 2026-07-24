@@ -3889,11 +3889,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const allForDriver = (driverTripsRaw || []).map(r => {
           const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
           const extra = (r.id === action.trip_id ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
-          const firstDrop = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : [];
-          const extraDrop = (r.id === action.trip_id ? newExtraDropoffs : (r.extradropoffs || [])).map(d => ({ lat: d.lat, lng: d.lng }));
+          // Build dropoff coords with agent_id so buildDropoffSequence can sort them
+          // correctly per-agent. For the trip being modified, use the newly updated
+          // extradropoffs (which include the just-added agent's dropoff coord).
+          const thisExtraDropoffs = r.id === action.trip_id ? newExtraDropoffs : (r.extradropoffs || []);
+          const dropoffCoords = (() => {
+            const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+            const ed = thisExtraDropoffs.map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+            return ed.length > 0 ? [...fd, ...ed] : fd;
+          })();
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: extraDrop.length > 0 ? [...firstDrop, ...extraDrop] : firstDrop,
+            dropoff_sequence_coords: dropoffCoords,
             direction: r.direction,
           };
         });
@@ -4885,6 +4892,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       must(await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", primaryId));
       if (secondaryIds.length) {
+        // Clear driver_status.currenttripid for any driver whose currenttripid
+        // references a secondary trip being deleted — the FK constraint
+        // "driver_status_currenttripid_fkey" blocks the delete otherwise.
+        // The primary trip will become the driver's current trip after the merge.
+        await supabase.from("driver_status")
+          .update({ currenttripid: primaryId })
+          .in("currenttripid", secondaryIds);
         must(await supabase.from("trips").delete().in("id", secondaryIds));
         await supabase.from("notifications").delete().in("tripid", secondaryIds);
       }
