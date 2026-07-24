@@ -1354,7 +1354,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
     if (coords.length < 2) return null;
     const locations = coords.map(c => `${c.lat},${c.lng}`).join(":");
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&routeType=shortest&traffic=false&travelMode=car`;
+      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car`;
     const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
@@ -1378,7 +1378,7 @@ async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
     const allWaypoints = [anchorCoord, ...valid, endAnchor];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=shortest&traffic=false&travelMode=car`;
+      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
     const data = await res.json();
@@ -9739,7 +9739,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v4-providedindex-fix";
+const _TOMTOM_CACHE_VERSION = "v5-fastest-traffic";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
