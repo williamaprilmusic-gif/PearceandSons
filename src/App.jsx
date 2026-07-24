@@ -324,7 +324,19 @@ function companyById(state, id) {
 // so route math never breaks on an empty company list (e.g. right after
 // a fresh install, before any company has been added yet).
 function defaultCompanyAnchor(state) {
-  const co = (state?.companies || []).find(c => c.active !== false);
+  const companies = state?.companies || [];
+  // Look specifically for "Pearce and Sons" — the actual transport operator
+  // whose office is the real dispatch anchor point. The companies table also
+  // holds CLIENT companies (e.g. hotels, corporate accounts whose staff get
+  // shuttled) — picking just the first active row could match any of those
+  // instead of the operator's own address, which is wrong for route sequencing
+  // (dropoffs need to be ordered from where the driver actually starts, not
+  // from an arbitrary client's office).
+  const pearce = companies.find(c => c.active !== false && /pearce/i.test(c.name || ""));
+  if (pearce?.address?.lat != null) return pearce.address;
+  // Fall back to the first active company if "Pearce and Sons" isn't found
+  // (e.g. renamed, or a fresh install before it's been added yet).
+  const co = companies.find(c => c.active !== false);
   if (co?.address?.lat != null) return co.address;
   return { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
 }
