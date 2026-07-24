@@ -736,6 +736,16 @@ function tripNounCap(trip) {
   return n.charAt(0).toUpperCase() + n.slice(1);
 }
 
+// Generic route label for agent-facing views — "Home → Work" / "Work → Home"
+// instead of the real street address, per explicit privacy requirement:
+// agents should not see any address (their own or anyone else's) on their
+// side of the app for either direction. Admin- and driver-facing views are
+// unaffected — they still show real addresses, since drivers need them for
+// navigation and admins need them for dispatch.
+function agentRouteLabel(direction) {
+  return direction === "INBOUND" ? "Home → Work" : "Work → Home";
+}
+
 function formatTripDateForDriver(dateStr) {
   if (!dateStr) return "—";
   const [y, m, d] = dateStr.split("/").map(Number);
@@ -865,6 +875,37 @@ function buildPickupSequence(trips, driverStartCoord) {
     remaining = remaining.filter(r => r !== best);
   }
   return ordered;
+}
+
+// TomTom-aware pickup sequencing — same fix applied to dropoffs (see
+// tomtomOptimalStopOrder), now covering INBOUND pickup order too. A
+// merged multi-agent trip's pickup point is a single entry here (all its
+// agents share one pickup location), so this operates over one coord per
+// TRIP, same shape buildPickupSequence already expects. Falls back to the
+// existing haversine buildPickupSequence if TomTom is unavailable or fails
+// — this function is ONLY used at async (Supabase) call sites; the local/
+// demo reducer keeps calling the synchronous buildPickupSequence directly,
+// since a reducer can't await a network call.
+async function buildPickupSequenceTomTom(trips, driverStartCoord) {
+  const start = driverStartCoord || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
+  const haversineResult = buildPickupSequence(trips, driverStartCoord);
+  if (trips.length <= 1) return haversineResult;
+  const coords = trips.map(t => {
+    const c = t.pickup_sequence_coords?.[0] || start;
+    return { lat: c.lat, lng: c.lng, trip_id: t.trip_id };
+  });
+  const tomtomResult = await tomtomOptimalStopOrder(start, coords);
+  if (!tomtomResult) return haversineResult;
+  // Map the TomTom-ordered coords back to their trip objects, preserving
+  // the same { trip, coord } shape buildPickupSequence returns.
+  const byTripId = new Map(trips.map(t => [t.trip_id, t]));
+  const reordered = tomtomResult
+    .map(c => {
+      const trip = byTripId.get(c.trip_id);
+      return trip ? { trip, coord: { lat: c.lat, lng: c.lng } } : null;
+    })
+    .filter(Boolean);
+  return reordered.length === trips.length ? reordered : haversineResult;
 }
 
 // Nearest-neighbour route through all drop-offs, continuing the chain
@@ -1367,13 +1408,15 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
   }
 }
 
-async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
-  if (!TOMTOM_API_KEY || !anchorCoord || dropCoords.length <= 1) return null;
-  const valid = dropCoords.filter(c => c?.lat != null && c?.lng != null);
+async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
+  if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
+  const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
   if (valid.length <= 1) return null;
   try {
-    // anchor + all dropoffs + anchor again as end → all dropoffs are "supporting points"
-    // that TomTom can freely reorder with computeBestOrder=true.
+    // anchor + all stops + anchor again as end → all stops are "supporting points"
+    // that TomTom can freely reorder with computeBestOrder=true. Works for
+    // both pickup and dropoff sequencing — the math is identical, only the
+    // caller's anchor point and coordinate set differ.
     const endAnchor = { lat: anchorCoord.lat + 0.00001, lng: anchorCoord.lng + 0.00001 };
     const allWaypoints = [anchorCoord, ...valid, endAnchor];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
@@ -1403,7 +1446,7 @@ async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
       .filter(Boolean);
     if (reordered.length !== valid.length) return null;
     // Append any invalid (null-coord) entries at the end unchanged.
-    const invalid = dropCoords.filter(c => c?.lat == null || c?.lng == null);
+    const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
     return [...reordered, ...invalid];
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
@@ -3945,7 +3988,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = buildPickupSequence(allForDriver, null);
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -4036,7 +4079,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = buildPickupSequence(allForDriver, null);
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -4128,7 +4171,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = buildPickupSequence(allForDriver, null);
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -4853,7 +4896,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const acCompanyAnchor = await fetchCompanyAnchor();
-        const acOrdered = buildPickupSequence(acAllForDriver, null);
+        const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor);
         const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
         const acSeqMap = {}, acDropMap = {};
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
@@ -5090,7 +5133,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
           });
           const mergeAnchor = await fetchCompanyAnchor();
-          const mergeOrdered = buildPickupSequence(allForDriverMerge, null);
+          const mergeOrdered = await buildPickupSequenceTomTom(allForDriverMerge, mergeAnchor);
           const mergeDropOrdered = buildDropoffSequence(allForDriverMerge, dropoffAnchor(allForDriverMerge, mergeOrdered, mergeAnchor));
           const mergeSeqMap = {}, mergeDropMap = {};
           mergeOrdered.forEach((o, i) => { mergeSeqMap[o.trip.trip_id] = i + 1; });
@@ -5144,7 +5187,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         };
       });
       const startAnchor = await fetchCompanyAnchor();
-      const ordered = buildPickupSequence(allForDriver, null);
+      const ordered = await buildPickupSequenceTomTom(allForDriver, startAnchor);
       const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, startAnchor));
       const seqMap = {}, dropMap = {};
       ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -5213,6 +5256,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
+      // Server-side enforcement of the "start trip" 2-hour window — the
+      // client already checks this before calling, but this guards
+      // against a request reaching the backend directly (bypassing that
+      // UI check) or a stale client. Only enforced when the trip actually
+      // has a scheduled time recorded.
+      if (tripRow.scheduledtime != null) {
+        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+        const windowOpensAt = tripRow.scheduledtime - TWO_HOURS_MS;
+        if (Date.now() < windowOpensAt) {
+          throw new Error("Start trip denied — trips can only be started within 2 hours of the scheduled time.");
+        }
+      }
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
@@ -5826,11 +5881,11 @@ function useAppStore() {
 
     // Backstop polling — Supabase realtime subscriptions can silently
     // drop on mobile (network switch, device sleep, background throttling).
-    // A 60-second interval ensures the app stays in sync even when the
+    // A 30-second interval ensures the app stays in sync even when the
     // WebSocket has quietly died, at the cost of one lightweight DB read
-    // per minute. New bookings, messages, calls and so on all arrive
+    // every 30s. New bookings, messages, calls and so on all arrive
     // within one polling cycle at worst.
-    const pollInterval = setInterval(refetch, 60000);
+    const pollInterval = setInterval(refetch, 30000);
 
     // Also refetch immediately whenever the tab/app comes back to the
     // foreground — a driver returning from Maps or an admin switching
@@ -6432,6 +6487,19 @@ function expandDateRange(startStr, endStr) {
   return days;
 }
 
+// Adds N days to a date string in the app's date format (en-ZA locale,
+// which renders as YYYY/MM/DD — same format scheduled_date is stored and
+// compared in throughout the app). Used to roll a return leg's date
+// forward when its time is earlier than the outbound leg's time — e.g.
+// outbound 19:00 today + return 05:00 means the return is actually
+// tomorrow morning, not later the same day.
+function addDaysToDateStr(dateStr, days) {
+  const d = new Date(`${dateStr.replace(/\//g, "-")}T00:00:00`);
+  if (isNaN(d)) return dateStr;
+  d.setDate(d.getDate() + days);
+  return d.toLocaleDateString("en-ZA");
+}
+
 function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
   const homeAddr = user.home_address;
   const workLocation = companyById(state, user.branch_id);
@@ -6565,13 +6633,22 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
         for (let i = 0; i < weekDates.length; i++) {
           await bookLeg(buildLeg(form.direction, weekDates[i], form.time, weekGroupId, i + 1));
           if (form.wantsReturn) {
-            await bookLeg(buildLeg(returnDirection, weekDates[i], form.returnTime, weekGroupId, i + 1));
+            // If the return time is earlier than the outbound time, the
+            // return leg actually falls on the FOLLOWING calendar day —
+            // e.g. outbound 19:00 + return 05:00 means the return trip is
+            // the next morning, not later the same evening. Without this,
+            // an overnight return got booked (and dispatched) for the
+            // wrong day entirely.
+            const returnDate = form.returnTime < form.time ? addDaysToDateStr(weekDates[i], 1) : weekDates[i];
+            await bookLeg(buildLeg(returnDirection, returnDate, form.returnTime, weekGroupId, i + 1));
           }
         }
       } else {
         await bookLeg(buildLeg(form.direction, form.date, form.time));
         if (form.wantsReturn) {
-          await bookLeg(buildLeg(returnDirection, form.date, form.returnTime));
+          // Same overnight-return rollover as the week-booking path above.
+          const returnDate = form.returnTime < form.time ? addDaysToDateStr(form.date, 1) : form.date;
+          await bookLeg(buildLeg(returnDirection, returnDate, form.returnTime));
         }
       }
       setTab("trips");
@@ -6633,8 +6710,8 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
         <SectionHeader label="Direction" />
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           {[
-            { id: "INBOUND", label: "Inbound", desc: "Home → Work", from: homeAddr?.label, to: workLocation?.label },
-            { id: "OUTBOUND", label: "Outbound", desc: "Work → Home", from: workLocation?.label, to: homeAddr?.label },
+            { id: "INBOUND", label: "Inbound", desc: "Home → Work" },
+            { id: "OUTBOUND", label: "Outbound", desc: "Work → Home" },
           ].map(opt => {
             const sel = form.direction === opt.id;
             return (
@@ -6644,7 +6721,6 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 12, fontWeight: 700, color: sel ? COLORS.ink : COLORS.chalk }}>{opt.label}</div>
                   <div style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost, marginTop: 2 }}>{opt.desc}</div>
-                  {canBook && <div style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost, marginTop: 4 }}>{opt.from} → {opt.to}</div>}
                 </div>
                 {sel && <span style={{ color: COLORS.ink }}>✓</span>}
               </div>
@@ -6687,7 +6763,14 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
             <Button title="YES, BOOK RETURN" size="sm" variant={form.wantsReturn ? "amber" : "ghost"} onClick={() => set("wantsReturn", true)} style={{ flex: 1 }} />
           </div>
           {form.wantsReturn && (
-            <TextField label={`Return time (${returnDirection === "OUTBOUND" ? "Work → Home" : "Home → Work"})`} type="time" value={form.returnTime} onChange={e => set("returnTime", e.target.value)} />
+            <>
+              <TextField label={`Return time (${returnDirection === "OUTBOUND" ? "Work → Home" : "Home → Work"})`} type="time" value={form.returnTime} onChange={e => set("returnTime", e.target.value)} />
+              {form.returnTime < form.time && (
+                <div style={{ fontSize: 10, color: COLORS.amber, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "6px 10px" }}>
+                  🌙 Since {form.returnTime} is earlier than {form.time}, this return trip will be booked for the FOLLOWING day.
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -6760,8 +6843,6 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
 
   const driverUser = state.users.find(u => u.id === trip.driver_id);
   const driverStatus = state.driver_status.find(d => d.driver_id === trip.driver_id);
-  const pickupCoord = trip.pickup_sequence_coords?.[0] ?? null;
-  const dropCoord = myDropoffCoord;
   // Was previously always the trip's PRIMARY agent (agent_ids[0]), which
   // misattributed every message sent by a secondary agent on a
   // multi-passenger trip to the primary agent's identity instead of
@@ -6832,8 +6913,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
 
       <Card>
         <SectionHeader label="Route" />
-        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ PICKUP: </span>{trip.custom_pickup}</div>
-        <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{myDropoffCoord?.label || trip.custom_dropoff}</div>
+        <div style={{ fontSize: 13, fontWeight: 700 }}>{agentRouteLabel(trip.direction)}</div>
         {trip.est_distance_km && <div style={{ fontSize: 10, color: COLORS.teal }}>Est. distance: {(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
         {trip.driver_route_km != null && (
           <div style={{ fontSize: 10, color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, marginTop: 2 }}>
@@ -6841,12 +6921,6 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
             {trip.driver_route_cap_km != null && ` (company policy cap: ${trip.driver_route_cap_km.toFixed(0)} km)`}
           </div>
         )}
-        <SectionHeader label="Pickup Location" />
-        {pickupCoord ? <GpsBlock coord={pickupCoord} /> : <span style={{ fontSize: 10, color: COLORS.ghost }}>Coordinates pending</span>}
-        {pickupCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
-        <SectionHeader label="Drop-off Location" />
-        {dropCoord ? <GpsBlock coord={dropCoord} /> : <span style={{ fontSize: 10, color: COLORS.ghost }}>Coordinates pending</span>}
-        {dropCoord && <Button title="🧭 WAZE" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoord.lat, dropCoord.lng, myDropoffCoord?.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
       </Card>
 
       {driverUser && (
@@ -6974,15 +7048,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
               </div>
               <StateBadge state={t.state} />
             </div>
-            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
-            <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{
-              // Show this agent's own dropoff, not the primary's — OUTBOUND trips
-              // each have a different home address per agent.
-              (t.dropoff_sequence_coords?.find(c => c.agent_id === user.id)
-                ?? (t.agent_ids[0] === user.id ? t.dropoff_sequence_coords?.[0] : null)
-                ?? (t.direction === "OUTBOUND" && state.users.find(u => u.id === user.id)?.home_address)
-              )?.label || t.custom_dropoff
-            }</div>
+            <div style={{ fontSize: 12, fontWeight: 600 }}>{agentRouteLabel(t.direction)}</div>
             <div style={{ display: "flex", gap: 10 }}>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
@@ -7186,7 +7252,7 @@ function HelpTab({ state, user, dispatch }) {
               <option value="">— Select a trip —</option>
               {allMyTrips.map(t => (
                 <option key={t.trip_id} value={t.trip_id}>
-                  {t.trip_id} · {t.scheduled_date} {t.scheduled_time} · {t.custom_pickup} → {t.custom_dropoff}
+                  {t.trip_id} · {t.scheduled_date} {t.scheduled_time} · {agentRouteLabel(t.direction)}
                 </option>
               ))}
             </select>
@@ -8503,6 +8569,21 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const totalPassengers = active.reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
   const full = load >= myCapacity;
   const [chatWith, setChatWith] = useState(null); // { trip, otherUser } | null
+  // Which trip cards are expanded — collapsed by default so a driver with
+  // several assigned trips sees a compact scannable list instead of every
+  // trip's full passenger/dropoff/GPS/action-button detail all at once.
+  // A trip needing the driver's action (ASSIGNED, awaiting accept) starts
+  // expanded automatically so it isn't accidentally missed behind a collapse.
+  const [expandedTripIds, setExpandedTripIds] = useState(() => new Set(
+    active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted).map(t => t.trip_id)
+  ));
+  const toggleTripExpanded = (tripId) => {
+    setExpandedTripIds(prev => {
+      const next = new Set(prev);
+      if (next.has(tripId)) next.delete(tripId); else next.add(tripId);
+      return next;
+    });
+  };
 
   return (
     <div className="pad">
@@ -8538,12 +8619,28 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             pickupLabel: coord?.label || trip.custom_pickup, coord, pickedUp,
           };
         });
+        const isExpanded = expandedTripIds.has(trip.trip_id);
         return (
           <Card key={trip.trip_id}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</span>
-              <StateBadge state={trip.state} />
+            <div onClick={() => toggleTripExpanded(trip.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</span>
+                <span style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 700 }}>
+                  {passengers.length > 1 ? `${passengers.length} passengers` : passengers[0]?.name || "1 passenger"}
+                </span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <StateBadge state={trip.state} />
+                <span style={{ fontSize: 12, color: COLORS.ghost }}>{isExpanded ? "▲" : "▼"}</span>
+              </div>
             </div>
+            {!isExpanded && (
+              <div style={{ fontSize: 10, color: COLORS.ghost }}>
+                📅 {formatTripDateForDriver(trip.scheduled_date)} — {trip.scheduled_time}
+              </div>
+            )}
+            {isExpanded && (
+              <>
             <div style={{ display: "flex", alignItems: "center", gap: 8, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "8px 10px" }}>
               <span style={{ fontSize: 15 }}>📅</span>
               <div>
@@ -8618,6 +8715,8 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
               {pickupCoord && <Button title="WAZE ↗" variant="waze" style={{ flex: 1 }} onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
               {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state) && <Button title="NAV →" variant="amber" onClick={() => setTab("navigate")} />}
             </div>
+              </>
+            )}
           </Card>
         );
       })}
@@ -8892,6 +8991,31 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const [startTripError, setStartTripError] = useState(null);
   const handleStartTrip = async () => {
     setStartTripError(null);
+    // A driver may only start a trip within 2 hours of its scheduled time,
+    // on the scheduled day itself — per explicit requirement. Checked
+    // against the EARLIEST scheduled trip in this batch (a driver's
+    // several active trips for the day are started together as one
+    // route), so the restriction is based on whichever pickup comes
+    // first. Trips already IN_TRANSIT or DRIVER_CONFIRMED with a route
+    // already recorded are unaffected — this only gates the initial
+    // "start trip" action itself.
+    const earliestScheduled = myActiveTrips
+      .map(t => t.scheduled_time_epoch)
+      .filter(Boolean)
+      .sort((a, b) => a - b)[0];
+    if (earliestScheduled != null) {
+      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+      const now = Date.now();
+      const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
+      if (now < windowOpensAt) {
+        const minutesEarly = Math.ceil((windowOpensAt - now) / 60000);
+        const hrs = Math.floor(minutesEarly / 60);
+        const mins = minutesEarly % 60;
+        const waitStr = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
+        setStartTripError(`Start trip denied — trips can only be started within 2 hours of the scheduled time. Try again in ${waitStr}.`);
+        return;
+      }
+    }
     try {
       for (const trip of myActiveTrips) {
         if (trip.state === TRIP_STATE.ASSIGNED) {
@@ -9049,6 +9173,19 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
               {s.scheduled_time && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, whiteSpace: "nowrap" }}>🕐 {s.scheduled_time}</div>}
             </div>
           ))}
+          {(() => {
+            const earliestScheduled = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0];
+            if (earliestScheduled == null) return null;
+            const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+            const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
+            if (Date.now() >= windowOpensAt) return null;
+            const opensAtLabel = new Date(windowOpensAt).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
+            return (
+              <div style={{ fontSize: 10, color: COLORS.amber, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "6px 10px" }}>
+                🔒 Trips can only be started within 2 hours of the scheduled time — opens at {opensAtLabel}.
+              </div>
+            );
+          })()}
           <Button title="▶ START TRIP — OPEN WAZE" variant="amber" full onClick={handleStartTrip} style={{ padding: 18, fontSize: 15, letterSpacing: 2 }} />
           <div style={{ fontSize: 9, color: COLORS.ghost }}>🧭 Opens Waze immediately, navigating to your first pickup</div>
         </Card>
@@ -9767,7 +9904,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v7-real-company-anchor";
+const _TOMTOM_CACHE_VERSION = "v8-pickup-tomtom-sequencing";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
@@ -9805,7 +9942,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
     const requestedCount = coords.length;
     setLoading(true);
     setTomtomError(null);
-    tomtomOptimalDropoffOrder(anchorCoord, coords).then(result => {
+    tomtomOptimalStopOrder(anchorCoord, coords).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
