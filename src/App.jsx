@@ -4988,6 +4988,113 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", action.driver_id).single();
       if (!tripRow || !driverRow) throw new Error("Trip or driver not found");
+      // Auto-merge: if this driver already has an ACTIVE trip on the SAME
+      // DAY (assigned via a previous single dispatch, not necessarily
+      // through the multi-select DISPATCH_MULTI flow), fold this trip's
+      // agent(s) into that existing trip instead of creating a second,
+      // separate trip card for the same driver/day. This makes assigning
+      // trips one at a time produce the exact same merged result as
+      // selecting them together and dispatching via DISPATCH_MULTI —
+      // per explicit requirement, the driver should end up with ONE
+      // trip listing all their passengers, not several trip cards that
+      // merely happen to be sequenced together.
+      if (tripRow.status === TRIP_STATE.UNASSIGNED_BOOKING) {
+        const { data: existingActiveTrips } = await supabase.from("trips").select("*")
+          .eq("driverid", action.driver_id)
+          .eq("scheduleddate", tripRow.scheduleddate)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+          .neq("id", action.trip_id)
+          .order("id", { ascending: true })
+          .limit(1);
+        const mergeTargetTrip = existingActiveTrips?.[0];
+        if (mergeTargetTrip) {
+          // Delegate to DISPATCH_MULTI's merge logic: treat mergeTargetTrip
+          // as primary, this trip as the one being folded in. DISPATCH_MULTI
+          // requires the primary to be UNASSIGNED_BOOKING, but here the
+          // primary is already DRIVER_CONFIRMED/etc — so we inline the same
+          // fold-in-agents step rather than calling DISPATCH_MULTI directly.
+          const newExtraAgentIds = [...(mergeTargetTrip.extraagentids || [])];
+          const newExtraPickups = [...(mergeTargetTrip.extrapickups || [])];
+          const newExtraDropoffs = [...(mergeTargetTrip.extradropoffs || [])];
+          if (tripRow.agentid) {
+            newExtraAgentIds.push(tripRow.agentid);
+            newExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid });
+            newExtraDropoffs.push({ lat: tripRow.dropofflat, lng: tripRow.dropofflng, label: tripRow.dropofflocation, agent_id: tripRow.agentid });
+          }
+          for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
+            const aid = tripRow.extraagentids[i];
+            newExtraAgentIds.push(aid);
+            newExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid });
+            const extraDrop = tripRow.extradropoffs?.[i];
+            if (extraDrop) newExtraDropoffs.push(extraDrop);
+          }
+          // Capacity check before merging
+          const mergedSeats = 1 + newExtraAgentIds.length;
+          const mergeCapacity = driverRow.capacity || DRIVER_CAPACITY;
+          if (mergedSeats > mergeCapacity) {
+            throw new Error(`Driver doesn't have room — merging would need ${mergedSeats} seats, vehicle holds ${mergeCapacity}.`);
+          }
+          must(await supabase.from("trips").update({
+            extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs,
+          }).eq("id", mergeTargetTrip.id));
+          // Clear the now-absorbed trip's driver reference before deleting,
+          // and clear any driver_status pointing at it.
+          await supabase.from("driver_status").update({ currenttripid: mergeTargetTrip.id }).eq("currenttripid", action.trip_id);
+          must(await supabase.from("trips").delete().eq("id", action.trip_id));
+          await supabase.from("notifications").delete().eq("tripid", action.trip_id);
+          const mergedInAgents = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+          for (const aid of mergedInAgents) {
+            await insertNotification({
+              type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+              message: `Your trip has been combined with ${mergeTargetTrip.agentname}'s trip (${mergeTargetTrip.id}) for shared transport.`,
+              trip_id: mergeTargetTrip.id, ts: nowEpoch(), read: false,
+            });
+          }
+          await logAuditAction({
+            actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
+            tripId: mergeTargetTrip.id, details: `Auto-merged trip ${action.trip_id} into existing trip ${mergeTargetTrip.id} for the same driver/day`,
+          });
+          // Recompute pickup/dropoff sequencing across the driver's full
+          // updated route. NOTE: we do NOT recurse back through
+          // TRIP/ASSIGN_DRIVER for mergeTargetTrip — its status is already
+          // DRIVER_CONFIRMED (or further along), and assertTripTransition
+          // would reject a DRIVER_CONFIRMED → DRIVER_CONFIRMED self-transition
+          // as illegal. Instead, inline just the sequencing recompute here.
+          const { data: mergedTripFresh } = await supabase.from("trips").select("*").eq("id", mergeTargetTrip.id).single();
+          const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+          const allForDriverMerge = (driverTripsAfterMerge || []).map(r => {
+            const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+            const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
+            const dropoffCoords = (() => {
+              const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+              const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+              return ed.length > 0 ? [...fd, ...ed] : fd;
+            })();
+            return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
+          });
+          const mergeAnchor = { lat: -33.9249, lng: 18.4241 };
+          const mergeOrdered = buildPickupSequence(allForDriverMerge, null);
+          const mergeDropOrdered = buildDropoffSequence(allForDriverMerge, dropoffAnchor(allForDriverMerge, mergeOrdered, mergeAnchor));
+          const mergeSeqMap = {}, mergeDropMap = {};
+          mergeOrdered.forEach((o, i) => { mergeSeqMap[o.trip.trip_id] = i + 1; });
+          mergeDropOrdered.forEach((t, i) => { mergeDropMap[t.trip_id] = i + 1; });
+          const mergeHaversineKm = computeDriverRouteDistanceKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
+          const mergeTomtomKm = await tomtomRealRouteKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
+          const mergeRouteKm = mergeTomtomKm ?? mergeHaversineKm;
+          const mergeTotalSeats = allForDriverMerge.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+          const mergePolicyCap = companyPolicyDistanceCapKm(mergeTotalSeats);
+          for (const r of (driverTripsAfterMerge || [])) {
+            await supabase.from("trips").update({
+              pickupordernum: mergeSeqMap[r.id] ?? null,
+              dropsequencenum: mergeDropMap[r.id] ?? null,
+              driverroutekm: mergeRouteKm, driverroutecapkm: mergePolicyCap,
+              driverrouteexceedspolicy: mergeRouteKm > mergePolicyCap,
+            }).eq("id", r.id);
+          }
+          await refetch();
+          return;
+        }
+      }
       const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
       // Seat-based load: sum passengers (primary + extra agents) across the
       // driver's active trips ON THE SAME DATE as the trip being assigned
