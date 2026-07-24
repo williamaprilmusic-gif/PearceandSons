@@ -4554,6 +4554,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const ownerIds = [cancelRow.agentid, ...(cancelRow.extraagentids || [])].filter(Boolean);
         if (!ownerIds.includes(action.agent_id)) throw new Error("You can only cancel your own bookings.");
       }
+      // Clear ANY driver_status row referencing this trip_id before deleting —
+      // not just the trip's own driverid. An orphaned currenttripid reference
+      // can persist from an earlier assign/unassign cycle even after the
+      // trip's driverid field itself was cleared, and the FK constraint
+      // blocks the delete regardless of which driver still points at it.
+      await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
       must(await supabase.from("trips").delete().eq("id", action.trip_id));
       await supabase.from("notifications").delete().eq("tripid", action.trip_id);
       await refetch();
@@ -4574,6 +4580,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           results.push({ trip_id: tripId, ok: false, reason: "No longer unassigned — already dispatched" });
           continue;
         }
+        // Clear any orphaned driver_status reference before deleting.
+        await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", tripId);
         const { error: bdDelErr } = await supabase.from("trips").delete().eq("id", tripId);
         if (bdDelErr) { results.push({ trip_id: tripId, ok: false, reason: bdDelErr.message }); continue; }
         await logAuditAction({
@@ -4605,6 +4613,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         await supabase.from("trip_delays").delete().eq("tripid", tripId);
         await supabase.from("messages").delete().eq("tripid", tripId);
         await supabase.from("audit_logs").delete().eq("tripid", tripId);
+        // Clear any orphaned driver_status reference before deleting.
+        await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", tripId);
         const { error: bdcDelErr } = await supabase.from("trips").delete().eq("id", tripId);
         if (bdcDelErr) { resultsCompleted.push({ trip_id: tripId, ok: false, reason: bdcDelErr.message }); continue; }
         await logAuditAction({
@@ -4664,6 +4674,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           updatedat: new Date(nowTs).toISOString(),
         }).eq("driverid", tripRow.driverid);
       }
+      // Safety net: also clear ANY OTHER driver_status row that might still
+      // reference this trip_id as currenttripid (e.g. left over from an
+      // earlier reassignment that didn't fully clean up) — the FK
+      // constraint blocks the delete regardless of which driver row it is.
+      await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
       must(await supabase.from("trips").delete().eq("id", action.trip_id));
       await refetch();
       return;
@@ -4741,6 +4756,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
               updatedat: new Date(acNowTs).toISOString(),
             }).eq("driverid", acTripRow.driverid);
           }
+          // Safety net: clear ANY other driver_status row still pointing at
+          // this trip_id, regardless of which driver it belongs to.
+          await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
           must(await supabase.from("trips").delete().eq("id", action.trip_id));
         }
         if (acIsLate && acTripRow.driverid) {
