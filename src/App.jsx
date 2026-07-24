@@ -9269,8 +9269,51 @@ function AdminDashboard({ state, user }) {
     active: trips.filter(t => [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)).length,
     done: trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length,
   };
+
+  // Emergency backup — exports ALL non-completed trips currently loaded in
+  // the browser to a CSV file on the user's device. Reads from in-memory
+  // state only, so it works even if the server is completely unreachable.
+  // Includes today's active trips + all future bookings.
+  const [backingUp, setBackingUp] = React.useState(false);
+  const doBackup = () => {
+    setBackingUp(true);
+    try {
+      const backupTrips = state.trips.filter(t =>
+        t.state !== TRIP_STATE.ARCHIVED_COMPLETED &&
+        t.state !== TRIP_STATE.ARCHIVED_CANCELLED
+      );
+      const dateTag = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      exportTripsToCsv(
+        backupTrips,
+        state.users,
+        state.driver_status,
+        `BACKUP_${dateTag}`,
+        {}, {}
+      );
+    } finally {
+      setBackingUp(false);
+    }
+  };
+
   return (
     <div className="pad">
+      {/* Emergency backup panel — always visible at the top of the dashboard */}
+      <div style={{ background: "rgba(245,166,35,.06)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 6, padding: "10px 14px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>🛡 EMERGENCY BACKUP</div>
+          <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>
+            Saves all upcoming &amp; active trips to a CSV on your device — works offline, no server needed.
+          </div>
+        </div>
+        <Button
+          title={backingUp ? "SAVING…" : `⬇ BACKUP (${state.trips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED && t.state !== TRIP_STATE.ARCHIVED_CANCELLED).length} trips)`}
+          variant="ghost"
+          size="sm"
+          onClick={doBackup}
+          disabled={backingUp}
+          style={{ flexShrink: 0, borderColor: COLORS.amber, color: COLORS.amber }}
+        />
+      </div>
       {isViewer && (
         <div style={{ fontSize: 10, color: COLORS.ghost }}>Showing today's trips only ({todayStr}). Full trip history is available under History.</div>
       )}
