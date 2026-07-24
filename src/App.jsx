@@ -11289,10 +11289,15 @@ function AdminDispatch({ state, dispatch }) {
                   </span>
                 )}
                 <CapacityBar load={load} capacity={driverCapacityDispatch} />
+                {sel && !overCapacity && (
+                  <Button
+                    title={isWeekBookingSelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"}
+                    variant="amber" full onClick={(e) => { e.stopPropagation(); handleDispatch(); }}
+                  />
+                )}
               </div>
             );
           })}
-          {selectedDriverId && !overCapacity && <Button title={isWeekBookingSelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"} variant="amber" full onClick={handleDispatch} />}
         </>
       )}
     </div>
@@ -11690,6 +11695,19 @@ function AdminLiveMap({ state, user }) {
 
 
 function AdminDrivers({ state, user }) {
+  // Which trip cards are expanded, per driver. Collapsed by default —
+  // a driver with several active trips otherwise dumps a wall of detail
+  // (pickup, dropoffs, Waze buttons) for every single one at once. Keyed
+  // by trip_id so expansion state persists correctly even as the trips
+  // list itself re-sorts/refreshes underneath.
+  const [expandedTripIds, setExpandedTripIds] = useState(new Set());
+  const toggleTripExpanded = (tripId) => {
+    setExpandedTripIds(prev => {
+      const next = new Set(prev);
+      if (next.has(tripId)) next.delete(tripId); else next.add(tripId);
+      return next;
+    });
+  };
   // Same "full" question the Dashboard asks — whether a driver is at
   // capacity RIGHT NOW (today), not across every date they happen to
   // have any assignment on (a driver booked solid on 4 different future
@@ -11762,21 +11780,32 @@ function AdminDrivers({ state, user }) {
                 <SectionHeader label="Active Route" />
                 {activeTrips.map(trip => {
                   const pickupCoord = trip.pickup_sequence_coords?.[0];
+                  const isExpanded = expandedTripIds.has(trip.trip_id);
                   return (
-                    <div key={trip.trip_id} style={{ display: "flex", gap: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
-                      <div style={{ width: 26, height: 26, borderRadius: 4, border: "1px solid rgba(29,185,84,.3)", background: "rgba(29,185,84,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                        <span style={{ fontSize: 11, color: COLORS.green, fontWeight: 800 }}>{trip.pickup_order_num}</span>
-                      </div>
-                      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 4 }}>
-                        <StateBadge state={trip.state} />
-                        <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.trip_id} · {trip.agent_ids?.length || 1} passenger{(trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
-                        <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
-                        {/* Per-agent dropoffs with TomTom road-optimal ordering */}
-                        <AdminTripDropoffs trip={trip} state={state} />
-                        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-                          {pickupCoord && <Button title="🧭 PICKUP" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
+                    <div key={trip.trip_id} style={{ paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
+                      <div
+                        onClick={() => toggleTripExpanded(trip.trip_id)}
+                        style={{ display: "flex", gap: 12, alignItems: "center", cursor: "pointer" }}
+                      >
+                        <div style={{ width: 26, height: 26, borderRadius: 4, border: "1px solid rgba(29,185,84,.3)", background: "rgba(29,185,84,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                          <span style={{ fontSize: 11, color: COLORS.green, fontWeight: 800 }}>{trip.pickup_order_num}</span>
                         </div>
+                        <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 2 }}>
+                          <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.trip_id} · {trip.agent_ids?.length || 1} passenger{(trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
+                          <StateBadge state={trip.state} />
+                        </div>
+                        <span style={{ fontSize: 12, color: COLORS.ghost, flexShrink: 0 }}>{isExpanded ? "▲" : "▼"}</span>
                       </div>
+                      {isExpanded && (
+                        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 8, paddingLeft: 38 }}>
+                          <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
+                          {/* Per-agent dropoffs with TomTom road-optimal ordering */}
+                          <AdminTripDropoffs trip={trip} state={state} />
+                          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                            {pickupCoord && <Button title="🧭 PICKUP" variant="waze" size="sm" onClick={(e) => { e.stopPropagation(); smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual); }} />}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
