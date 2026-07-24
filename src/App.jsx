@@ -1288,6 +1288,54 @@ async function tomtomGeocodeAddress(address) {
   }
 }
 
+// Use TomTom Routing API to sort an array of dropoff coords into the optimal
+// road-distance order starting from an anchor (company location for OUTBOUND).
+// Returns the re-ordered coords array, or null if TomTom is unavailable/fails.
+// Falls back to haversine nearest-neighbour in the caller when this returns null.
+//
+// TomTom /calculateRoute with computeBestOrder=true reorders INTERMEDIATE waypoints
+// (it always fixes the first and last locations as start/end). To allow ALL dropoff
+// stops to be freely reordered, we append the anchor again as the final destination,
+// making it a "leave company → visit all homes in best order → return to company"
+// route. This is only used to determine ordering — not as actual navigation.
+//
+// With 3 dropoffs and anchor repeated: anchor:d1:d2:d3:anchor
+//   TomTom fixes: anchor (start) and anchor (end) — all of d1,d2,d3 are free.
+//   optimizedWaypoints returns d1,d2,d3 in optimal road order.
+async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
+  if (!TOMTOM_API_KEY || !anchorCoord || dropCoords.length <= 1) return null;
+  const valid = dropCoords.filter(c => c?.lat != null && c?.lng != null);
+  if (valid.length <= 1) return null;
+  try {
+    // anchor + all dropoffs + anchor again as end → all dropoffs are "supporting points"
+    // that TomTom can freely reorder with computeBestOrder=true.
+    const allWaypoints = [anchorCoord, ...valid, anchorCoord];
+    const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
+    const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
+      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=shortest&traffic=false&travelMode=car`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
+    const data = await res.json();
+    // optimizedWaypoints contains ALL waypoints in their new order, each with
+    // providedIndex referring to the original allWaypoints array position.
+    // Index 0 = first anchor (fixed start), indices 1..N = dropoffs (reordered),
+    // index N+1 = last anchor (fixed end). We extract only indices 1..N.
+    const optimized = data.routes?.[0]?.optimizedWaypoints;
+    if (!optimized || optimized.length < valid.length) return null;
+    const reordered = optimized
+      .filter(w => w.providedIndex > 0 && w.providedIndex <= valid.length)
+      .map(w => valid[w.providedIndex - 1])
+      .filter(Boolean);
+    if (reordered.length !== valid.length) return null;
+    // Append any invalid (null-coord) entries at the end unchanged.
+    const invalid = dropCoords.filter(c => c?.lat == null || c?.lng == null);
+    return [...reordered, ...invalid];
+  } catch (e) {
+    console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
+    return null;
+  }
+}
+
 async function nominatimSearch(query) {
   if (!query || query.trim().length < 2) return [];
   try {
@@ -7989,6 +8037,85 @@ function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
   );
 }
 
+// Sub-component: renders the dropoff section of a driver trip card using TomTom
+// optimal road ordering (with haversine fallback). Extracted so that
+// useSortedDropoffs (a hook) can be called per-trip inside a .map() safely.
+// Sub-component: renders the dropoff stops on the AdminDrivers active route card
+// with TomTom road-optimal ordering. Extracted so useSortedDropoffs can be called
+// per-trip inside activeTrips.map() without violating hook rules.
+function AdminTripDropoffs({ trip, state }) {
+  let dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
+    ? trip.dropoff_sequence_coords : [];
+  if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+    const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+    const derived = [...dropCoords];
+    (trip.agent_ids || []).forEach(aid => {
+      if (covered.has(aid)) return;
+      const u = state.users.find(x => x.id === aid);
+      if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
+    });
+    dropCoords = derived;
+  }
+  const anchor = defaultCompanyAnchor(state);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  const finalCoords = sorted || dropCoords;
+  if (finalCoords.length <= 1) return (
+    <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
+  );
+  return (
+    <>
+      {finalCoords.map((dc, dci) => {
+        const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
+        return (
+          <div key={dci} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 10 }}>
+              <span style={{ color: COLORS.red }}>◎ </span>
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.ghost }}>D{dci + 1} </span>
+              {dropAgent ? `${dropAgent.name.split(" ")[0]}: ` : ""}
+              {dc.label || trip.custom_dropoff}
+            </span>
+            {dc.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(dc.lat, dc.lng, dc.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function DriverTripDropoffs({ trip, state }) {
+  let dropCoords = trip.dropoff_sequence_coords || [];
+  if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+    const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+    const derived = [...dropCoords];
+    (trip.agent_ids || []).forEach(aid => {
+      if (covered.has(aid)) return;
+      const u = state.users.find(x => x.id === aid);
+      if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
+    });
+    dropCoords = derived;
+  }
+  const anchor = defaultCompanyAnchor(state);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  const finalCoords = (sorted || dropCoords);
+  if (finalCoords.length > 1) return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({finalCoords.length})</span>
+      {finalCoords.map((dc, dci) => {
+        const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
+        return (
+          <div key={dci} style={{ fontSize: 11 }}>
+            <span style={{ color: COLORS.red }}>◎ </span>
+            <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{dci + 1} </span>
+            {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
+            {dc.label || trip.custom_dropoff}
+          </div>
+        );
+      })}
+    </div>
+  );
+  return <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{finalCoords[0]?.label || trip.custom_dropoff}</div>;
+}
+
 function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
@@ -8076,43 +8203,8 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                 )}
               </div>
             ))}
-            {/* Drop-off: for OUTBOUND multi-agent trips each passenger has their own home address.
-                For old trips (no extradropoffs stored), derive from each agent's home_address.
-                Sorted nearest-to-furthest from company so the driver sees stops in route order. */}
-            {(() => {
-              let dropCoords = trip.dropoff_sequence_coords || [];
-              if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
-                const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
-                const derived = [...dropCoords];
-                (trip.agent_ids || []).forEach(aid => {
-                  if (covered.has(aid)) return;
-                  const u = state.users.find(x => x.id === aid);
-                  if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
-                });
-                dropCoords = derived;
-              }
-              if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
-                const anchor = defaultCompanyAnchor(state);
-                dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
-              }
-              if (dropCoords.length > 1) return (
-                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                  <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({dropCoords.length})</span>
-                  {dropCoords.map((dc, dci) => {
-                    const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
-                    return (
-                      <div key={dci} style={{ fontSize: 11 }}>
-                        <span style={{ color: COLORS.red }}>◎ </span>
-                        <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{dci + 1} </span>
-                        {dropAgent ? <span style={{ color: COLORS.ghost, fontSize: 9 }}>{dropAgent.name.split(" ")[0]}: </span> : null}
-                        {dc.label || trip.custom_dropoff}
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-              return <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{dropCoords[0]?.label || trip.custom_dropoff}</div>;
-            })()}
+            {/* Drop-off: per-agent for OUTBOUND — uses TomTom road-optimal ordering */}
+            <DriverTripDropoffs trip={trip} state={state} />
             {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
             {trip.driver_route_km != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
@@ -8368,6 +8460,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     }
     // Sort OUTBOUND stops nearest-to-furthest from company so the nav shows
     // them in the correct driving order (same order as dispatch-time sequencing).
+    // Uses haversine here (sync); TomTom optimal order is applied via
+    // useSortedDropoffs in the display layer for trip cards and admin views.
     if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
       const anchor = defaultCompanyAnchor(state);
       dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
@@ -9181,6 +9275,68 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
   );
 }
 
+// Shared component: renders a sorted list of dropoff stops with D1/D2/D3 labels,
+// per-agent name prefixes, Waze buttons, and a "from profile" asterisk for derived
+// coords. Uses TomTom routing for road-optimal ordering when available, haversine
+// nearest-neighbour otherwise.
+function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
+  const [sorted] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id);
+  const finalCoords = sorted || coords || [];
+  if (finalCoords.length === 0) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{finalCoords.length > 1 ? "S" : ""}: </span>
+      {finalCoords.map((c, i) => {
+        const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
+        const label = c.label || trip.custom_dropoff;
+        return (
+          <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            {finalCoords.length > 1 && <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{i + 1}</span>}
+            {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
+            <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
+            {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
+          </span>
+        );
+      })}
+      {finalCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
+    </div>
+  );
+}
+
+// Hook: resolves the optimal OUTBOUND dropoff order using TomTom routing when
+// available, falling back to haversine nearest-neighbour when TomTom is not
+// configured or the API call fails. The result is cached by trip_id + coord
+// fingerprint so the API is only called once per unique set of stops.
+// Returns [sortedCoords, loading] — loading is true briefly on first render
+// while TomTom is in flight; callers show haversine order during that window.
+const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
+function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
+  const isOutbound = direction === "OUTBOUND";
+  // Stable key: trip_id + sorted lat/lng fingerprint of the coord set.
+  const fingerprint = tripId + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  const [sorted, setSorted] = React.useState(() => {
+    if (!isOutbound || !coords || coords.length <= 1) return coords;
+    if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
+    return sortDropoffCoordsByProximity(coords, anchorCoord); // haversine until TomTom responds
+  });
+  const [loading, setLoading] = React.useState(false);
+  React.useEffect(() => {
+    if (!isOutbound || !coords || coords.length <= 1 || !TOMTOM_API_KEY) return;
+    if (_tomtomSortCache.has(fingerprint)) { setSorted(_tomtomSortCache.get(fingerprint)); return; }
+    let cancelled = false;
+    setLoading(true);
+    tomtomOptimalDropoffOrder(anchorCoord, coords).then(result => {
+      if (cancelled) return;
+      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord);
+      _tomtomSortCache.set(fingerprint, final);
+      setSorted(final);
+    }).finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fingerprint]);
+  return [sorted, loading];
+}
+
 function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
   const [open, setOpen] = useState(!!initiallyOpen);
   const [addingAgent, setAddingAgent] = useState(false);
@@ -9409,22 +9565,12 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
               allDropCoords = sortDropoffCoordsByProximity(allDropCoords, anchor);
             }
             return (
-              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{allDropCoords.length > 1 ? "S" : ""}: </span>
-                {allDropCoords.map((c, i) => {
-                  const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
-                  const label = c.label || trip.custom_dropoff;
-                  return (
-                    <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                      {allDropCoords.length > 1 && <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{i + 1}</span>}
-                      {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
-                      <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
-                      {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
-                    </span>
-                  );
-                })}
-                {allDropCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
-              </div>
+              <DropoffSequenceDisplay
+                coords={allDropCoords}
+                trip={trip}
+                state={state}
+                anchor={defaultCompanyAnchor(state)}
+              />
             );
           })()}
 
@@ -11137,27 +11283,6 @@ function AdminDrivers({ state, user }) {
                 <SectionHeader label="Active Route" />
                 {activeTrips.map(trip => {
                   const pickupCoord = trip.pickup_sequence_coords?.[0];
-                  // For OUTBOUND multi-agent trips, collect all per-agent dropoffs.
-                  // For old trips (no extradropoffs stored), derive from home_address.
-                  // Sorted nearest-to-furthest from company for correct display order.
-                  let dropCoords = trip.dropoff_sequence_coords && trip.dropoff_sequence_coords.length > 0
-                    ? trip.dropoff_sequence_coords
-                    : [];
-                  if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
-                    const covered = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
-                    const derived = [...dropCoords];
-                    (trip.agent_ids || []).forEach(aid => {
-                      if (covered.has(aid)) return;
-                      const u = state.users.find(x => x.id === aid);
-                      if (u?.home_address?.lat != null) derived.push({ lat: u.home_address.lat, lng: u.home_address.lng, label: u.home_address.label, agent_id: aid });
-                    });
-                    dropCoords = derived;
-                  }
-                  if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
-                    const anchor = defaultCompanyAnchor(state);
-                    dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
-                  }
-                  const hasMultipleDropoffs = dropCoords.length > 1;
                   return (
                     <div key={trip.trip_id} style={{ display: "flex", gap: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.wire}` }}>
                       <div style={{ width: 26, height: 26, borderRadius: 4, border: "1px solid rgba(29,185,84,.3)", background: "rgba(29,185,84,.15)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
@@ -11167,22 +11292,10 @@ function AdminDrivers({ state, user }) {
                         <StateBadge state={trip.state} />
                         <span style={{ fontSize: 11, fontWeight: 700 }}>{trip.trip_id} · {trip.agent_ids?.length || 1} passenger{(trip.agent_ids?.length || 1) !== 1 ? "s" : ""}</span>
                         <span style={{ fontSize: 10 }}><span style={{ color: COLORS.green }}>◉ </span>{trip.custom_pickup}</span>
-                        {hasMultipleDropoffs ? (
-                          dropCoords.map((dc, dci) => {
-                            const dropAgent = dc.agent_id ? state.users.find(u => u.id === dc.agent_id) : null;
-                            return (
-                              <div key={dci} style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span><span style={{ fontSize: 9, fontWeight: 700, color: COLORS.ghost }}>D{dci + 1} </span>{dropAgent ? `${dropAgent.name.split(" ")[0]}: ` : ""}{dc.label || trip.custom_dropoff}</span>
-                                {dc.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(dc.lat, dc.lng, dc.label || trip.custom_dropoff, trip.dropoff_is_manual)} />}
-                              </div>
-                            );
-                          })
-                        ) : (
-                          <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{trip.custom_dropoff}</span>
-                        )}
+                        {/* Per-agent dropoffs with TomTom road-optimal ordering */}
+                        <AdminTripDropoffs trip={trip} state={state} />
                         <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
                           {pickupCoord && <Button title="🧭 PICKUP" variant="waze" size="sm" onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
-                          {!hasMultipleDropoffs && dropCoords[0] && <Button title="🧭 DROP" variant="waze" size="sm" onClick={() => smartOpenWaze(dropCoords[0].lat, dropCoords[0].lng, trip.custom_dropoff, trip.dropoff_is_manual)} />}
                         </div>
                       </div>
                     </div>
