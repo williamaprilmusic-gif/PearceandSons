@@ -1288,6 +1288,26 @@ async function tomtomGeocodeAddress(address) {
   }
 }
 
+// Reverse-geocode a GPS coordinate to a human-readable address using TomTom.
+// Used to record the actual street address where each agent was picked up/dropped off.
+// Returns a label string or null if TomTom is unavailable/fails.
+async function tomtomReverseGeocode(lat, lng) {
+  if (!TOMTOM_API_KEY || lat == null || lng == null) return null;
+  try {
+    const url = `https://api.tomtom.com/search/2/reverseGeocode/${lat},${lng}.json` +
+      `?key=${TOMTOM_API_KEY}&returnSpeedLimit=false&returnRoadUse=false`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const addr = data.addresses?.[0]?.address;
+    if (!addr) return null;
+    return addr.freeformAddress || `${addr.streetName || ""} ${addr.streetNumber || ""}, ${addr.municipality || ""}`.trim();
+  } catch (e) {
+    console.warn("[TomTom] reverse geocode failed:", e.message);
+    return null;
+  }
+}
+
 // Use TomTom Routing API to sort an array of dropoff coords into the optimal
 // road-distance order starting from an anchor (company location for OUTBOUND).
 // Returns the re-ordered coords array, or null if TomTom is unavailable/fails.
@@ -2439,6 +2459,58 @@ function appReducer(state, action) {
         trip_id: action.trip_id, ts: nowTs, read: false,
       }] : [];
       return { ...state, trips: newTrips, notifications: [...notifs, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/CONFIRM_AGENT_DROPOFF": {
+      // Records the GPS location and timestamp for one specific agent's
+      // dropoff — called once per agent as the driver drops them off at
+      // their individual stop. This is the dropoff equivalent of
+      // CONFIRM_AGENT_PICKUP: each agent gets their own location stamped
+      // separately rather than all at once when the trip completes.
+      // When ALL agents are confirmed dropped off, TRIP/COMPLETE fires.
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: Date.now() };
+      const newDropoffLocations = { ...(trip.dropoff_locations || {}) };
+      if (action.driver_coord) {
+        newDropoffLocations[action.agent_id] = {
+          lat: action.driver_coord.lat,
+          lng: action.driver_coord.lng,
+          label: action.dropoff_label || null,
+        };
+      }
+      const newCompletedDropoffs = [...new Set([...(trip.completed_dropoffs || []), action.agent_id])];
+      const allDroppedOff = trip.agent_ids.every(id => newCompletedDropoffs.includes(id));
+      if (allDroppedOff) {
+        // All agents dropped — complete the trip
+        const drvStatus = state.driver_status.find(d => d.driver_id === trip.driver_id);
+        const completeNowTs = Date.now();
+        const newTrips = state.trips.map(t =>
+          t.trip_id === action.trip_id
+            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km,
+                completed_dropoffs: newCompletedDropoffs, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations }
+            : t
+        );
+        const remaining = newTrips.filter(t =>
+          t.driver_id === trip.driver_id &&
+          [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+        );
+        const newDriverStatus = state.driver_status.map(d =>
+          d.driver_id === trip.driver_id
+            ? { ...d, state: remaining.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remaining[0]?.trip_id || null }
+            : d
+        );
+        return { ...state, trips: newTrips, driver_status: newDriverStatus };
+      }
+      // Not all dropped yet — just update locations and timestamps
+      return {
+        ...state,
+        trips: state.trips.map(t =>
+          t.trip_id === action.trip_id
+            ? { ...t, completed_dropoffs: newCompletedDropoffs, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations }
+            : t
+        ),
+      };
     }
 
     case "TRIP/MARK_NO_SHOW": {
@@ -5102,17 +5174,91 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // moment, distinct from intransitat (which only marks when the
       // LAST passenger on the trip was picked up).
       const newPickupTimestamps = { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: nowTs };
-      // Driver's location at the moment of confirming THIS pickup —
-      // per explicit requirement, saved for trip detail + CSV.
-      const newPickupLocations = action.driver_coord
-        ? { ...(tripRow.pickuplocations || {}), [action.agent_id]: { lat: action.driver_coord.lat, lng: action.driver_coord.lng } }
-        : (tripRow.pickuplocations || {});
+      // Driver's GPS at the moment of confirming THIS pickup — saved as
+      // lat/lng AND reverse-geocoded to a readable address label so the
+      // CSV shows a real street address, not just coordinates.
+      let newPickupLocations = tripRow.pickuplocations || {};
+      if (action.driver_coord) {
+        const pickupLabel = await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng);
+        newPickupLocations = {
+          ...newPickupLocations,
+          [action.agent_id]: {
+            lat: action.driver_coord.lat,
+            lng: action.driver_coord.lng,
+            label: pickupLabel || null,
+          },
+        };
+      }
       must(await supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, pickuplocations: newPickupLocations, updatedat: nowTs }).eq("id", action.trip_id));
       if (allPickedUp) {
         await insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`, trip_id: action.trip_id, ts: nowTs, read: false,
         });
+      }
+      await refetch();
+      return;
+    }
+    case "TRIP/CONFIRM_AGENT_DROPOFF": {
+      // Per-agent dropoff confirmation — records GPS + reverse-geocoded address
+      // for this specific agent. When all agents are confirmed, completes the trip.
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      const nowTs = nowEpoch();
+      // Reverse-geocode the driver's GPS to get a readable street address
+      const dropoffLabel = action.driver_coord
+        ? (action.dropoff_label || await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
+        : null;
+      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: nowTs };
+      const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
+      if (action.driver_coord) {
+        newDropoffLocations[action.agent_id] = {
+          lat: action.driver_coord.lat,
+          lng: action.driver_coord.lng,
+          label: dropoffLabel || null,
+        };
+      }
+      const newCompletedDropoffs = [...new Set([...(tripRow.completeddropoffs || []), action.agent_id])];
+      const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.includes(id));
+      if (allDroppedOff) {
+        // All agents dropped off — complete the trip
+        assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
+        must(await supabase.from("trips").update({
+          status: TRIP_STATE.ARCHIVED_COMPLETED,
+          completedat: nowTs,
+          actualdistancekm: tripRow.estdistancekm,
+          completeddropoffs: newCompletedDropoffs,
+          dropofftimestamps: newDropoffTimestamps,
+          dropofflocations: newDropoffLocations,
+          updatedat: nowTs,
+        }).eq("id", action.trip_id));
+        // Update driver state
+        const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+        const stillBusy = (remaining || []).filter(r => r.id !== action.trip_id);
+        must(await supabase.from("driver_status").update({
+          state: stillBusy.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY,
+          currenttripid: stillBusy[0]?.id || null,
+          updatedat: new Date(nowTs).toISOString(),
+        }).eq("driverid", tripRow.driverid));
+        // Notify agents
+        const agentNotifs = tripAgentIds.map(aid => ({
+          type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+          message: "Your trip has been completed and archived.",
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        }));
+        await insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id} archived.`, trip_id: action.trip_id, ts: nowTs, read: false });
+        for (const n of agentNotifs) await insertNotification(n);
+      } else {
+        // Partial — just save this agent's dropoff
+        must(await supabase.from("trips").update({
+          completeddropoffs: newCompletedDropoffs,
+          dropofftimestamps: newDropoffTimestamps,
+          dropofflocations: newDropoffLocations,
+          updatedat: nowTs,
+        }).eq("id", action.trip_id));
       }
       await refetch();
       return;
@@ -5208,9 +5354,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const tripAgentIdsForDrop = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}) };
       const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
+      // Reverse-geocode the driver's GPS position at drop-off time once,
+      // then stamp it for every agent on the trip (they all exit at the same spot).
+      const dropoffLabel = action.driver_coord
+        ? await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng)
+        : null;
       tripAgentIdsForDrop.forEach(id => {
         newDropoffTimestamps[id] = nowTs;
-        if (action.driver_coord) newDropoffLocations[id] = { lat: action.driver_coord.lat, lng: action.driver_coord.lng };
+        if (action.driver_coord) newDropoffLocations[id] = {
+          lat: action.driver_coord.lat,
+          lng: action.driver_coord.lng,
+          label: dropoffLabel || null,
+        };
       });
       must(await supabase.from("trips").update({
         status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: tripRow.estdistancekm,
@@ -8532,7 +8687,16 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       }
     });
   });
-  Object.values(dropoffGroups).forEach(group => { group.done = group.trip_ids.every(id => state.trips.find(t => t.trip_id === id)?.state === TRIP_STATE.ARCHIVED_COMPLETED); });
+  Object.values(dropoffGroups).forEach(group => {
+    // A stop is "done" when every passenger assigned to it has been confirmed
+    // dropped off (appears in completed_dropoffs), not when the trip is
+    // ARCHIVED_COMPLETED — because the trip only completes after the LAST stop,
+    // so checking trip state would leave all earlier stops showing as undone.
+    group.done = group.passengers.every(p => {
+      const t = state.trips.find(x => x.trip_id === p.trip_id);
+      return t && (t.completed_dropoffs || []).includes(p.id);
+    });
+  });
   const dropStops = sortDropoffsByProximity(Object.values(dropoffGroups), lastPickupCoord);
   const curDrop = allPickedUp ? dropStops.find(s => !s.done) : null;
   const curDropIdx = allPickedUp ? dropStops.findIndex(s => !s.done) : -1;
@@ -8628,25 +8792,37 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   };
   const confirmDropoff = async (group) => {
     try {
-      // Captured ONCE before the loop, not per-trip — a "group" here can
-      // be several merged trips being dropped at the same physical stop
-      // at the same moment, so one GPS read covers all of them.
+      // Captured ONCE before the loop — the driver is at one physical stop
+      // so one GPS read covers all passengers being dropped here.
       const driverCoord = await getFreshDriverCoord();
+      // Dispatch per-agent dropoff confirmation for each passenger in this group.
+      // This records each agent's individual GPS location + timestamp, and only
+      // completes the trip when ALL agents across ALL dropoff stops are confirmed.
       for (const tid of group.trip_ids) {
         const t = state.trips.find(x => x.trip_id === tid);
-        if (t && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+        if (!t) continue;
+        // Find which agents in this trip are at THIS specific dropoff stop
+        const agentsAtThisStop = (group.passengers || [])
+          .filter(p => p.trip_id === tid)
+          .map(p => p.id);
+        // If no passengers mapped to this trip (legacy grouped trip), fall back
+        // to confirming all remaining unconfirmed agents on this trip
+        const agentsToDrop = agentsAtThisStop.length > 0
+          ? agentsAtThisStop
+          : (t.agent_ids || []).filter(id => !(t.completed_dropoffs || []).includes(id));
+        for (const aid of agentsToDrop) {
+          if ((t.completed_dropoffs || []).includes(aid)) continue; // already done
           try {
-            await dispatch({ type: "TRIP/COMPLETE", trip_id: tid, driver_coord: driverCoord });
-          } catch (perTripErr) {
-            // The LOCAL copy of this trip's state can be briefly stale
-            // relative to what's actually in the database (e.g. right
-            // after a different action partially failed) — if the
-            // backend rejects this specifically because the trip is
-            // ALREADY completed, that's not a real problem: the driver
-            // wanted it done, and it's done. Only genuinely surface
-            // errors that aren't this specific, already-handled case.
-            if (!/ARCHIVED_COMPLETED.*ARCHIVED_COMPLETED/.test(perTripErr.message || "")) {
-              throw perTripErr;
+            await dispatch({
+              type: "TRIP/CONFIRM_AGENT_DROPOFF",
+              trip_id: tid,
+              agent_id: aid,
+              driver_coord: driverCoord,
+              dropoff_label: group.label || null,
+            });
+          } catch (perAgentErr) {
+            if (!/ARCHIVED_COMPLETED.*ARCHIVED_COMPLETED/.test(perAgentErr.message || "")) {
+              throw perAgentErr;
             }
           }
         }
@@ -9542,6 +9718,18 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
                     {agentDropoff && agentDropoff.label && agentDropoff.label !== (pickup?.label) && (
                       <div style={{ fontSize: 9, color: COLORS.red }}>◎ {agentDropoff.label}</div>
                     )}
+                    {/* Actual GPS pickup address — recorded when driver taps PICKED UP */}
+                    {trip.pickup_locations?.[p.id]?.label && (
+                      <div style={{ fontSize: 9, color: COLORS.green, marginTop: 1 }}>
+                        📍 Picked up at: {trip.pickup_locations[p.id].label}
+                      </div>
+                    )}
+                    {/* Actual GPS dropoff address — recorded when driver taps DROPPED OFF */}
+                    {trip.dropoff_locations?.[p.id]?.label && (
+                      <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 1 }}>
+                        📍 Dropped off at: {trip.dropoff_locations[p.id].label}
+                      </div>
+                    )}
                   </div>
                   {pickup?.lat && <Button title="🧭 P" variant="waze" size="sm" onClick={() => smartOpenWaze(pickup.lat, pickup.lng, pickup.label, trip.pickup_is_manual)} />}
                   {agentDropoff?.lat && agentDropoff.label !== pickup?.label && (
@@ -9695,8 +9883,8 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     // Timestamps (epoch → readable)
     "Booked At", "Driver Confirmed At", "In Transit At", "Completed At", "Cancelled At",
     // Per-agent timing & GPS (driver's location at moment of pickup/dropoff)
-    "Agent Picked Up At", "GPS at Pickup (lat,lng)",
-    "Agent Dropped Off At", "GPS at Dropoff (lat,lng)",
+    "Agent Picked Up At", "Actual Pickup Address", "GPS at Pickup (lat,lng)",
+    "Agent Dropped Off At", "Actual Dropoff Address", "GPS at Dropoff (lat,lng)",
     // Operational
     "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note",
   ];
@@ -9806,8 +9994,10 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         t.cancelled_at || "",
         // Per-agent timing & GPS
         fmtTs(aid != null ? t.pickup_timestamps?.[aid] : null),
+        aid != null ? (t.pickup_locations?.[aid]?.label || "") : "",
         fmtCoord(aid != null ? t.pickup_locations?.[aid] : null),
         fmtTs(aid != null ? t.dropoff_timestamps?.[aid] : null),
+        aid != null ? (t.dropoff_locations?.[aid]?.label || "") : "",
         fmtCoord(aid != null ? t.dropoff_locations?.[aid] : null),
         // Operational
         (t.no_shows || []).length === 0 ? "" : t.no_shows.map(ns => {
