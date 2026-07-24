@@ -1302,6 +1302,39 @@ async function tomtomGeocodeAddress(address) {
 // With 3 dropoffs and anchor repeated: anchor:d1:d2:d3:anchor
 //   TomTom fixes: anchor (start) and anchor (end) — all of d1,d2,d3 are free.
 //   optimizedWaypoints returns d1,d2,d3 in optimal road order.
+// Use TomTom Routing API to get the actual driving distance (km) for a
+// sequence of coordinates: startAnchor → each ordered pickup → each ordered dropoff.
+// Returns null if TomTom is unavailable or the call fails; caller falls back
+// to haversine estimate in that case.
+async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
+  if (!TOMTOM_API_KEY || !startAnchor) return null;
+  try {
+    // Build the full waypoint list
+    const coords = [startAnchor];
+    for (const p of orderedPickups) {
+      if (p.coord?.lat != null) coords.push(p.coord);
+    }
+    for (const t of orderedDropoffs) {
+      for (const c of (t.dropoff_sequence_coords || [t.dropoff_sequence_coords?.[0]]).filter(Boolean)) {
+        if (c?.lat != null) coords.push(c);
+      }
+    }
+    if (coords.length < 2) return null;
+    const locations = coords.map(c => `${c.lat},${c.lng}`).join(":");
+    const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
+      `?key=${TOMTOM_API_KEY}&routeType=shortest&traffic=false&travelMode=car`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const metres = data.routes?.[0]?.summary?.lengthInMeters;
+    if (metres == null) return null;
+    return metres / 1000; // → km
+  } catch (e) {
+    console.warn("[TomTom] real route km failed:", e.message);
+    return null;
+  }
+}
+
 async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
   if (!TOMTOM_API_KEY || !anchorCoord || dropCoords.length <= 1) return null;
   const valid = dropCoords.filter(c => c?.lat != null && c?.lng != null);
@@ -3799,7 +3832,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmAdd = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const haversineKmAdd = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const tomtomKmAdd = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const routeDistanceKmAdd = tomtomKmAdd ?? haversineKmAdd;
         const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
         const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
         for (const t of driverTripsRaw || []) {
@@ -3888,7 +3923,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmRem = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const haversineKmRem = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const tomtomKmRem = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const routeDistanceKmRem = tomtomKmRem ?? haversineKmRem;
         const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
         const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
         for (const t of driverTripsRaw || []) {
@@ -3978,7 +4015,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const routeDistanceKmReloc = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const haversineKmReloc = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
+        const tomtomKmReloc = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const routeDistanceKmReloc = tomtomKmReloc ?? haversineKmReloc;
         const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
         const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
         for (const t of driverTripsRaw || []) {
@@ -4683,7 +4722,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
         acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
         const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const acRouteDistanceKm = computeDriverRouteDistanceKm({ lat: -33.9249, lng: 18.4241 }, acOrdered, acDropOrdered);
+        const acAnchor = { lat: -33.9249, lng: 18.4241 };
+        const acHaversineKm = computeDriverRouteDistanceKm(acAnchor, acOrdered, acDropOrdered);
+        const acTomtomKm = await tomtomRealRouteKm(acAnchor, acOrdered, acDropOrdered);
+        const acRouteDistanceKm = acTomtomKm ?? acHaversineKm;
         const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
         const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
         for (const t of acDriverTripsRaw || []) {
@@ -4857,11 +4899,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const seqMap = {}, dropMap = {};
       ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
       dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
-      // Total route distance across ALL the driver's active trips, from
-      // the SAME ordered sequences just built above — matches the local
-      // reducer's approach (see its comment for the full rationale).
+      // Total route distance — try TomTom for real road distance first,
+      // fall back to haversine × 1.35 if TomTom is unavailable.
       const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-      const routeDistanceKm = computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
+      const haversineKmEstimate = computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
+      const tomtomKm = await tomtomRealRouteKm(startAnchor, ordered, dropOrdered);
+      const routeDistanceKm = tomtomKm ?? haversineKmEstimate;
+      console.log(`[ASSIGN_DRIVER] route: TomTom=${tomtomKm?.toFixed(1) ?? "n/a"} km, haversine estimate=${haversineKmEstimate.toFixed(1)} km, using=${routeDistanceKm.toFixed(1)} km`);
       const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
       const exceedsPolicy = routeDistanceKm > policyCapKm;
       const nowTs = nowEpoch();
