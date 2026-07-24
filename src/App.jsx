@@ -9582,25 +9582,33 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // coords. Uses TomTom routing for road-optimal ordering when available, haversine
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
-  const [sorted] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id);
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id);
   const finalCoords = sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-      <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{finalCoords.length > 1 ? "S" : ""}: </span>
-      {finalCoords.map((c, i) => {
-        const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
-        const label = c.label || trip.custom_dropoff;
-        return (
-          <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-            {finalCoords.length > 1 && <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{i + 1}</span>}
-            {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
-            <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
-            {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
-          </span>
-        );
-      })}
-      {finalCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{finalCoords.length > 1 ? "S" : ""}: </span>
+        {loading && finalCoords.length > 1 && (
+          <span style={{ fontSize: 8, color: COLORS.amber, fontStyle: "italic" }}>⟳ optimizing route order…</span>
+        )}
+        {finalCoords.map((c, i) => {
+          const agentUser = c.agent_id ? state.users.find(u => u.id === c.agent_id) : null;
+          const label = c.label || trip.custom_dropoff;
+          return (
+            <span key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              {finalCoords.length > 1 && <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700 }}>D{i + 1}</span>}
+              {agentUser && <span style={{ fontSize: 9, color: COLORS.ghost }}>{agentUser.name.split(" ")[0]}:</span>}
+              <span style={{ color: c._derived ? COLORS.amber : COLORS.red, fontSize: 10 }}>{label || `[${c.lat?.toFixed(4)},${c.lng?.toFixed(4)}]`}{c._derived ? " *" : ""}</span>
+              {c.lat && <Button title="🧭" variant="waze" size="sm" onClick={() => smartOpenWaze(c.lat, c.lng, label, trip.dropoff_is_manual)} />}
+            </span>
+          );
+        })}
+        {finalCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
+      </div>
+      {tomtomError && finalCoords.length > 1 && (
+        <span style={{ fontSize: 8, color: COLORS.red }}>⚠ Route optimization: {tomtomError} (showing straight-line estimate)</span>
+      )}
     </div>
   );
 }
@@ -9611,32 +9619,42 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // fingerprint so the API is only called once per unique set of stops.
 // Returns [sortedCoords, loading] — loading is true briefly on first render
 // while TomTom is in flight; callers show haversine order during that window.
+// Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
+// so any cached TomTom results computed against the OLD anchor are invalidated
+// and re-fetched against the corrected one, instead of silently persisting.
+const _TOMTOM_CACHE_VERSION = "v2-pearce-anchor-fix";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
-  // Stable key: trip_id + sorted lat/lng fingerprint of the coord set.
-  const fingerprint = tripId + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  // Stable key: cache version + trip_id + sorted lat/lng fingerprint of the coord set.
+  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
   const [sorted, setSorted] = React.useState(() => {
     if (!isOutbound || !coords || coords.length <= 1) return coords;
     if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
     return sortDropoffCoordsByProximity(coords, anchorCoord); // haversine until TomTom responds
   });
   const [loading, setLoading] = React.useState(false);
+  const [tomtomError, setTomtomError] = React.useState(null);
   React.useEffect(() => {
     if (!isOutbound || !coords || coords.length <= 1 || !TOMTOM_API_KEY) return;
     if (_tomtomSortCache.has(fingerprint)) { setSorted(_tomtomSortCache.get(fingerprint)); return; }
     let cancelled = false;
     setLoading(true);
+    setTomtomError(null);
     tomtomOptimalDropoffOrder(anchorCoord, coords).then(result => {
       if (cancelled) return;
+      if (!result) setTomtomError("TomTom returned no result — using distance estimate instead");
       const final = result || sortDropoffCoordsByProximity(coords, anchorCoord);
       _tomtomSortCache.set(fingerprint, final);
       setSorted(final);
+    }).catch(e => {
+      if (cancelled) return;
+      setTomtomError(e.message || "TomTom request failed");
     }).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprint]);
-  return [sorted, loading];
+  return [sorted, loading, tomtomError];
 }
 
 function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
