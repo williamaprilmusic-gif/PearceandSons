@@ -1374,7 +1374,18 @@ async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
   try {
     // anchor + all dropoffs + anchor again as end → all dropoffs are "supporting points"
     // that TomTom can freely reorder with computeBestOrder=true.
-    const allWaypoints = [anchorCoord, ...valid, anchorCoord];
+    //
+    // IMPORTANT: the "end" anchor must NOT be byte-identical to the start
+    // anchor coordinate. TomTom's API silently deduplicates two waypoints
+    // that resolve to the exact same lat/lng, collapsing our N+2 waypoint
+    // request down to fewer entries in optimizedWaypoints — which breaks
+    // our index-based mapping back to the original dropoff array (confirmed
+    // in production: a 4-waypoint request returned only 3 optimizedWaypoints
+    // entries). Offsetting the end anchor by ~1 metre (0.00001°, invisible
+    // on any map/route) keeps it numerically distinct so TomTom treats it
+    // as a real 5th waypoint and returns the full, correctly-indexed set.
+    const endAnchor = { lat: anchorCoord.lat + 0.00001, lng: anchorCoord.lng + 0.00001 };
+    const allWaypoints = [anchorCoord, ...valid, endAnchor];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=shortest&traffic=false&travelMode=car`;
@@ -1386,7 +1397,10 @@ async function tomtomOptimalDropoffOrder(anchorCoord, dropCoords) {
     // Index 0 = first anchor (fixed start), indices 1..N = dropoffs (reordered),
     // index N+1 = last anchor (fixed end). We extract only indices 1..N.
     const optimized = data.routes?.[0]?.optimizedWaypoints;
-    if (!optimized || optimized.length < valid.length) return null;
+    if (!optimized || optimized.length < valid.length) {
+      console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected at least ${valid.length}. Falling back to haversine.`);
+      return null;
+    }
     const reordered = optimized
       .filter(w => w.providedIndex > 0 && w.providedIndex <= valid.length)
       .map(w => valid[w.providedIndex - 1])
@@ -9622,7 +9636,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v2-pearce-anchor-fix";
+const _TOMTOM_CACHE_VERSION = "v3-anchor-dedupe-fix";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
