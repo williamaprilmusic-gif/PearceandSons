@@ -3621,6 +3621,24 @@ function must(res) {
   return res;
 }
 
+// Fetches the real "Pearce and Sons" company address from Supabase to use
+// as the driver-route starting anchor — used by every dispatch/sequencing
+// action below instead of a hardcoded placeholder coordinate. Matches
+// defaultCompanyAnchor's client-side name lookup (not just "first active
+// company", which could pick an unrelated client company like a hotel).
+// Falls back to Cape Town CBD only if no matching company row exists at all.
+async function fetchCompanyAnchor() {
+  try {
+    const { data } = await supabase.from("companies").select("*").eq("active", true);
+    const pearce = (data || []).find(c => /pearce/i.test(c.name || ""));
+    const co = pearce || (data || [])[0];
+    if (co?.addresslat != null) return { lat: co.addresslat, lng: co.addresslng };
+  } catch (e) {
+    console.warn("[fetchCompanyAnchor] failed, using CBD fallback:", e.message);
+  }
+  return { lat: -33.9249, lng: 18.4241 }; // last-resort fallback only
+}
+
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
     case "AUTH/LOGIN": {
@@ -3926,7 +3944,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             direction: r.direction,
           };
         });
-        const supaCo = { lat: -33.9249, lng: 18.4241 };
+        const supaCo = await fetchCompanyAnchor();
         const ordered = buildPickupSequence(allForDriver, null);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
@@ -4017,7 +4035,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             direction: r.direction,
           };
         });
-        const supaCo = { lat: -33.9249, lng: 18.4241 };
+        const supaCo = await fetchCompanyAnchor();
         const ordered = buildPickupSequence(allForDriver, null);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
@@ -4109,7 +4127,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             direction: r.direction,
           };
         });
-        const supaCo = { lat: -33.9249, lng: 18.4241 };
+        const supaCo = await fetchCompanyAnchor();
         const ordered = buildPickupSequence(allForDriver, null);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
@@ -4834,16 +4852,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             direction: r.direction,
           };
         });
-        const acSupaCo = { lat: -33.9249, lng: 18.4241 };
+        const acCompanyAnchor = await fetchCompanyAnchor();
         const acOrdered = buildPickupSequence(acAllForDriver, null);
-        const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acSupaCo));
+        const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
         const acSeqMap = {}, acDropMap = {};
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
         acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
         const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const acAnchor = { lat: -33.9249, lng: 18.4241 };
-        const acHaversineKm = computeDriverRouteDistanceKm(acAnchor, acOrdered, acDropOrdered);
-        const acTomtomKm = await tomtomRealRouteKm(acAnchor, acOrdered, acDropOrdered);
+        const acHaversineKm = computeDriverRouteDistanceKm(acCompanyAnchor, acOrdered, acDropOrdered);
+        const acTomtomKm = await tomtomRealRouteKm(acCompanyAnchor, acOrdered, acDropOrdered);
         const acRouteDistanceKm = acTomtomKm ?? acHaversineKm;
         const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
         const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
@@ -5072,7 +5089,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             })();
             return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
           });
-          const mergeAnchor = { lat: -33.9249, lng: 18.4241 };
+          const mergeAnchor = await fetchCompanyAnchor();
           const mergeOrdered = buildPickupSequence(allForDriverMerge, null);
           const mergeDropOrdered = buildDropoffSequence(allForDriverMerge, dropoffAnchor(allForDriverMerge, mergeOrdered, mergeAnchor));
           const mergeSeqMap = {}, mergeDropMap = {};
@@ -5126,7 +5143,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           direction: r.direction,
         };
       });
-      const startAnchor = { lat: -33.9249, lng: 18.4241 }; // same fallback buildPickupSequence(..., null) uses internally
+      const startAnchor = await fetchCompanyAnchor();
       const ordered = buildPickupSequence(allForDriver, null);
       const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, startAnchor));
       const seqMap = {}, dropMap = {};
@@ -8475,7 +8492,15 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const active = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
-  const load = active.length;
+  // Seats used = sum of PASSENGERS across active trips, not trip-record count.
+  // A merged trip (several agents combined into one trip via DISPATCH_MULTI
+  // or the auto-merge in TRIP/ASSIGN_DRIVER) is still exactly one trip
+  // record but occupies as many seats as it has agent_ids — using
+  // active.length here undercounts every merged trip down to "1 seat"
+  // regardless of how many actual passengers are aboard. Matches
+  // getDriverLoad's seat-counting logic used everywhere else in the app.
+  const load = active.reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
+  const totalPassengers = active.reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
   const full = load >= myCapacity;
   const [chatWith, setChatWith] = useState(null); // { trip, otherUser } | null
 
@@ -8495,7 +8520,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
         <CapacityBar load={load} capacity={myCapacity} />
       </Card>
 
-      <SectionHeader label={`Assigned Passengers (${active.length})`} />
+      <SectionHeader label={`Assigned Passengers (${totalPassengers})`} />
       {active.length === 0 ? <Empty icon="⊟" text="No assigned trips" /> : active.map(trip => {
         const pickupCoord = trip.pickup_sequence_coords?.[0];
         // A trip can carry multiple agents (extraagentids) — resolve every
@@ -9357,7 +9382,10 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     return priorDay ? priorDay.state === TRIP_STATE.ARCHIVED_COMPLETED : false;
   });
   const activeTrips = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
-  const load = activeTrips.length;
+  // Seats used = sum of passengers across active trips, not trip-record
+  // count — a merged trip is one record but can hold several agents.
+  // See DriverTripsTab's identical fix for the full rationale.
+  const load = activeTrips.reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
   const myAppCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const full = load >= myAppCapacity;
   const call = useWebRTCCall(user);
@@ -9739,7 +9767,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v6-debounce-race-fix";
+const _TOMTOM_CACHE_VERSION = "v7-real-company-anchor";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
