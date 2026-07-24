@@ -5255,32 +5255,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "NOTIF/DELETE_SELECTED": {
-      // Genuinely NEW capability, distinct from NOTIF/MARK_ALL_READ
-      // below (which only ever marks read, never removes) — per
-      // explicit request. Same ownership scoping as MARK_ALL_READ,
-      // combined with an explicit id list, so only the caller's OWN
-      // selected notifications are ever actually deleted — a forged
-      // id list can't reach anyone else's rows.
+      // Deletes notifications by ID. For agents/drivers: scoped to their own userid.
+      // For admins: delete by ID only — no userid constraint. This handles:
+      // (1) admin broadcast rows (userid=null) — would fail .eq("userid", admin_id)
+      // (2) orphaned notifications from deleted agents (userid=old_agent_id) that
+      //     still appear in admin views — the userid mismatch meant the scoped
+      //     delete matched 0 rows silently, leaving them stuck forever.
+      // Security: admins can only see/select IDs that fetchAllFromSupabase returns
+      // to them, so deleting by ID alone is safe.
       if (!action.ids || action.ids.length === 0) return;
-      let delQ = supabase.from("notifications").delete().in("id", action.ids);
-      if (action.user_id != null) {
-        delQ = delQ.eq("userid", action.user_id);
-      } else if (action.admin) {
-        delQ = delQ.is("userid", null);
-      }
-      // Try scoped delete first (adds userid filter as extra safety); if
-      // Supabase RLS blocks that specific combination (e.g. admin broadcast
-      // rows where userid IS NULL but the policy requires a non-null match),
-      // fall back to deleting purely by the notification IDs, which are
-      // already pre-filtered on the client by the caller's own notification
-      // list — a user can never submit IDs they didn't receive.
-      const scopedRes = await delQ;
-      if (scopedRes?.error) {
-        // Scoped delete failed — retry with id-only (no userid constraint).
-        // This handles the case where admin broadcast rows (userid=null) are
-        // blocked by RLS policies that don't allow IS NULL userid matching.
-        const fallbackQ = supabase.from("notifications").delete().in("id", action.ids);
-        must(await fallbackQ);
+      if (action.admin) {
+        // Admin path: delete purely by ID — no userid filter.
+        must(await supabase.from("notifications").delete().in("id", action.ids));
+      } else {
+        // Agent/driver path: scope to their own userid for safety.
+        const scopedRes = await supabase.from("notifications").delete()
+          .in("id", action.ids)
+          .eq("userid", action.user_id);
+        if (scopedRes?.error) {
+          // RLS or other error — fall back to id-only
+          must(await supabase.from("notifications").delete().in("id", action.ids));
+        }
       }
       await refetch();
       return;
