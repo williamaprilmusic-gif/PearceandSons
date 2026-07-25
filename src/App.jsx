@@ -1684,6 +1684,24 @@ function appReducer(state, action) {
       return { ...state, users: usersAfterLogout, active_user_id: null, driver_status: driverStatusAfterLogout };
     }
 
+    case "TRIP/SET_DRIVER_AVAILABILITY": {
+      // A driver manually marking themselves unavailable (going off-shift,
+      // on a break, etc) — separate from `state` (AVAILABLE/BUSY), which
+      // the app recomputes automatically based on trip assignment. If this
+      // were folded into `state` instead, the driver would get silently
+      // flipped back to AVAILABLE the moment their last active trip
+      // completed, defeating the point of a manual toggle. Admins need to
+      // see this flag distinctly when assigning agents, per explicit
+      // requirement.
+      if (!action.driver_id) return state;
+      return {
+        ...state,
+        driver_status: state.driver_status.map(d =>
+          d.driver_id === action.driver_id ? { ...d, is_unavailable: !!action.unavailable } : d
+        ),
+      };
+    }
+
     case "ADMIN/DELETE_USERS": {
       // Batch delete, processed per-user rather than all-or-nothing —
       // mirrors the bulk-import pattern: one blocked user (has active
@@ -3399,7 +3417,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -3900,6 +3918,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       activeUserRef.current = null;
       persistActiveUserId(null);
+      await refetch();
+      return;
+    }
+    case "TRIP/SET_DRIVER_AVAILABILITY": {
+      // Manual availability toggle — a driver can only set their OWN
+      // availability (checked against activeUserRef, not trusting
+      // whatever driver_id the client sent), independent of the
+      // AVAILABLE/BUSY state the app recomputes automatically from trip
+      // assignment. Requires the `driver_status` table to have an
+      // `isunavailable` boolean column (nullable, default false):
+      //   ALTER TABLE driver_status ADD COLUMN IF NOT EXISTS isunavailable boolean DEFAULT false;
+      if (!action.driver_id || action.driver_id !== activeUserRef.current) {
+        throw new Error("You can only change your own availability.");
+      }
+      must(await supabase.from("driver_status").update({ isunavailable: !!action.unavailable }).eq("driverid", action.driver_id));
       await refetch();
       return;
     }
@@ -9741,7 +9774,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   );
 }
 
-function DriverHistoryTab({ myTrips }) {
+function DriverHistoryTab({ myTrips, state }) {
   // Calendar-month archive: this month's completed trips live at the
   // top; the previous month sits under an ARCHIVE header — the ONE
   // month of archive the app holds. On the 1st, buckets roll over and
@@ -9751,18 +9784,73 @@ function DriverHistoryTab({ myTrips }) {
   const done = myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
   const thisMonth = done.filter(t => tripArchiveBucket(t) === "CURRENT");
   const archived = done.filter(t => tripArchiveBucket(t) === "ARCHIVE");
-  const TripCard = ({ t }) => (
-    <Card key={t.trip_id}>
-      <div style={{ display: "flex", justifyContent: "space-between" }}>
-        <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
-        <StateBadge state={t.state} />
-      </div>
-      <div style={{ fontSize: 11 }}>{t.agent_ids?.length || 1} passenger{(t.agent_ids?.length || 1) !== 1 ? "s" : ""}</div>
-      <div style={{ fontSize: 10, color: COLORS.ghost }}>{t.custom_pickup} → {t.custom_dropoff}</div>
-      {t.actual_distance_km && <div style={{ fontSize: 9, color: COLORS.teal }}>Distance: {(t.actual_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
-      <div style={{ fontSize: 9, color: COLORS.dim }}>{t.completed_at}</div>
-    </Card>
-  );
+  // Collapsed by default — a driver with weeks of trip history otherwise
+  // gets a long wall of every passenger's full pickup/dropoff detail for
+  // every single completed trip all at once.
+  const [expandedIds, setExpandedIds] = useState(new Set());
+  const toggleExpanded = (tripId) => {
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(tripId)) next.delete(tripId); else next.add(tripId);
+      return next;
+    });
+  };
+  const TripCard = ({ t }) => {
+    const isExpanded = expandedIds.has(t.trip_id);
+    // Per-passenger addresses — t.custom_pickup/custom_dropoff is a single
+    // generic trip-level label (whatever the PRIMARY agent's own pickup/
+    // dropoff happened to be), which is wrong for a merged multi-passenger
+    // trip where each agent has their own home address. Build the real
+    // per-agent list the same way the trip detail view and CSV export do.
+    const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
+    const passengerLines = agentIds.map((aid, aidIdx) => {
+      const agentUser = aid != null ? state?.users?.find(u => u.id === aid) : null;
+      const pickupCoord = aid != null
+        ? (t.pickup_sequence_coords?.find(p => p.agent_id === aid) || t.pickup_sequence_coords?.[aidIdx] || t.pickup_sequence_coords?.[0])
+        : t.pickup_sequence_coords?.[0];
+      const dropCoord = aid != null
+        ? (t.dropoff_sequence_coords?.find(d => d.agent_id === aid) || t.dropoff_sequence_coords?.[aidIdx] || t.dropoff_sequence_coords?.[0])
+        : t.dropoff_sequence_coords?.[0];
+      const pickupLabel = pickupCoord?.label || t.custom_pickup || "—";
+      const dropLabel = dropCoord?.label
+        || (t.direction === "OUTBOUND" && agentUser?.home_address?.label)
+        || t.custom_dropoff || "—";
+      return { name: agentUser?.name || t.agent_name || "Agent", pickupLabel, dropLabel };
+    });
+    // Full multi-stop route total — route_total_km/driver_route_km is the
+    // driver's ENTIRE run (first pickup through last drop-off across every
+    // passenger on this trip), which is what "kms driven" should mean here.
+    // actual_distance_km is a single-leg figure and understates a merged
+    // trip's real distance.
+    const fullRouteKm = t.route_total_km ?? t.driver_route_km ?? t.actual_distance_km;
+    return (
+      <Card key={t.trip_id}>
+        <div onClick={() => toggleExpanded(t.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
+            <span style={{ fontSize: 11 }}>{agentIds.length} passenger{agentIds.length !== 1 ? "s" : ""}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <StateBadge state={t.state} />
+            <span style={{ fontSize: 12, color: COLORS.ghost }}>{isExpanded ? "▲" : "▼"}</span>
+          </div>
+        </div>
+        {!isExpanded && <div style={{ fontSize: 9, color: COLORS.dim }}>{t.completed_at}</div>}
+        {isExpanded && (
+          <>
+            {passengerLines.map((p, i) => (
+              <div key={i} style={{ fontSize: 10, color: COLORS.ghost, marginTop: i > 0 ? 4 : 0 }}>
+                <span style={{ color: COLORS.chalk, fontWeight: 600 }}>{p.name}: </span>
+                {p.pickupLabel} → {p.dropLabel}
+              </div>
+            ))}
+            {fullRouteKm != null && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 4 }}>Full route: {(fullRouteKm * (t.route_total_km != null || t.driver_route_km != null ? 1 : ROAD_FACTOR)).toFixed(1)} km</div>}
+            <div style={{ fontSize: 9, color: COLORS.dim, marginTop: 4 }}>{t.completed_at}</div>
+          </>
+        )}
+      </Card>
+    );
+  };
   return (
     <div className="pad">
       <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>TRIP HISTORY</div>
@@ -9805,6 +9893,20 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
         <div style={{ fontSize: 10, color: COLORS.ghost }}>{myStatus?.phone}</div>
         <StateBadge state={full ? "FULLY_BOOKED" : (myStatus?.state || DRIVER_STATE.AVAILABLE)} />
         <CapacityBar load={load} capacity={myCapacity} />
+      </Card>
+      <Card>
+        <SectionHeader label="Availability" />
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 8 }}>
+          {myStatus?.is_unavailable
+            ? "You're marked unavailable — admins won't assign you new trips until you switch back."
+            : "You're marked available — admins can assign you new trips."}
+        </div>
+        <Button
+          title={myStatus?.is_unavailable ? "✓ SWITCH TO AVAILABLE" : "✕ MARK MYSELF UNAVAILABLE"}
+          variant={myStatus?.is_unavailable ? "green" : "danger"}
+          full
+          onClick={() => dispatch({ type: "TRIP/SET_DRIVER_AVAILABILITY", driver_id: user.id, unavailable: !myStatus?.is_unavailable }).catch(() => {}) /* failure already toasted by the wrapper */}
+        />
       </Card>
       <Card body={false}>
         {[["Total Trips", myTrips.length], ["Completed", myTrips.filter(t => t.state === "ARCHIVED_COMPLETED").length], ["Active", load]].map(([l, v]) => (
@@ -9945,7 +10047,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
         {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} />}
         {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
-        {tab === "history" && <DriverHistoryTab myTrips={myTrips} />}
+        {tab === "history" && <DriverHistoryTab myTrips={myTrips} state={state} />}
         {tab === "alerts" && <AlertsTab state={state} user={user} dispatch={dispatch} />}
         {tab === "me" && <DriverProfileTab user={user} myStatus={myStatus} myTrips={myTrips} dispatch={dispatch} load={load} />}
       </div>
@@ -10382,6 +10484,26 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   return [sorted, loading, tomtomError];
 }
 
+// Actual real-time visiting order — ranks every agent on a trip by their
+// genuine pickup_timestamps/dropoff_timestamps value (1st confirmed = 1,
+// 2nd = 2, etc). Distinct from pickup_order_num/drop_sequence_num, which
+// are the PLANNED order computed at dispatch time — this is what the
+// driver actually did, which can differ from the plan (a driver may
+// deviate from the suggested route, or a no-show may shift who's
+// genuinely picked up first).
+function actualPickupOrderFor(trip, agentId) {
+  if (agentId == null || !trip.pickup_timestamps?.[agentId]) return null;
+  const ranked = Object.entries(trip.pickup_timestamps).sort((a, b) => a[1] - b[1]);
+  const idx = ranked.findIndex(([id]) => String(id) === String(agentId));
+  return idx >= 0 ? idx + 1 : null;
+}
+function actualDropOrderFor(trip, agentId) {
+  if (agentId == null || !trip.dropoff_timestamps?.[agentId]) return null;
+  const ranked = Object.entries(trip.dropoff_timestamps).sort((a, b) => a[1] - b[1]);
+  const idx = ranked.findIndex(([id]) => String(id) === String(agentId));
+  return idx >= 0 ? idx + 1 : null;
+}
+
 function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
   const [open, setOpen] = useState(!!initiallyOpen);
   const [addingAgent, setAddingAgent] = useState(false);
@@ -10551,13 +10673,13 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
                     {/* Actual GPS pickup address — recorded when driver taps PICKED UP */}
                     {trip.pickup_locations?.[p.id]?.label && (
                       <div style={{ fontSize: 9, color: COLORS.green, marginTop: 1 }}>
-                        📍 Picked up at: {trip.pickup_locations[p.id].label}
+                        📍 Picked up {actualPickupOrderFor(trip, p.id) ? `(#${actualPickupOrderFor(trip, p.id)} of the run) ` : ""}at: {trip.pickup_locations[p.id].label}
                       </div>
                     )}
                     {/* Actual GPS dropoff address — recorded when driver taps DROPPED OFF */}
                     {trip.dropoff_locations?.[p.id]?.label && (
                       <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 1 }}>
-                        📍 Dropped off at: {trip.dropoff_locations[p.id].label}
+                        📍 Dropped off {actualDropOrderFor(trip, p.id) ? `(#${actualDropOrderFor(trip, p.id)} of the run) ` : ""}at: {trip.dropoff_locations[p.id].label}
                       </div>
                     )}
                   </div>
@@ -10704,8 +10826,10 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     "Pickup Address", "Booked Pickup Coord (lat,lng)",
     // Dropoff (per agent)
     "Drop-off Address", "Booked Dropoff Coord (lat,lng)",
-    // Dispatch sequencing
+    // Dispatch sequencing (PLANNED order, computed at dispatch time)
     "Pickup Order #", "Drop Sequence #",
+    // Actual sequencing (REAL order the driver visited them in, from timestamps)
+    "Actual Pickup Order #", "Actual Drop Order #",
     // Financials
     "Est. Distance (km)", "Actual Distance (km)", "Long Distance",
     // Driver route
@@ -10801,9 +10925,12 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         // Dropoff
         agentDropoffLabel,
         fmtCoord(agentDropoffLatLng),
-        // Sequencing
+        // Sequencing — planned (dispatch time)
         t.pickup_order_num || "",
         t.drop_sequence_num || "",
+        // Sequencing — actual (real order the driver visited them, from timestamps)
+        actualPickupOrderFor(t, aid) || "",
+        actualDropOrderFor(t, aid) || "",
         // Financials
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
         t.actual_distance_km != null ? (t.actual_distance_km * ROAD_FACTOR).toFixed(1) : "",
@@ -11669,7 +11796,10 @@ function AdminDispatch({ state, dispatch }) {
   const displayedDrivers = driverSearch.trim().length >= 1
     ? availableDrivers.filter(({ u, ds }) => {
         const q = driverSearch.trim().toLowerCase();
-        return (u?.name || "").toLowerCase().includes(q) || (ds.vehicle || "").toLowerCase().includes(q);
+        return (u?.name || "").toLowerCase().includes(q) ||
+          (ds.vehicle || "").toLowerCase().includes(q) ||
+          (u?.home_address?.area || "").toLowerCase().includes(q) ||
+          (u?.home_address?.label || "").toLowerCase().includes(q);
       })
     : availableDrivers;
 
@@ -11818,7 +11948,7 @@ function AdminDispatch({ state, dispatch }) {
             )}
           </div>
           {availableDrivers.length > 1 && (
-            <TextField label="Search drivers by name or vehicle" value={driverSearch} onChange={e => setDriverSearch(e.target.value)} placeholder="e.g. Sipho or Hiace" />
+            <TextField label="Search drivers by name, vehicle, or area" value={driverSearch} onChange={e => setDriverSearch(e.target.value)} placeholder="e.g. Sipho, Hiace, or Milnerton" />
           )}
           {availableDrivers.length === 0 ? (
             <Empty icon="◉" text="No drivers available — all fully booked" />
@@ -11841,13 +11971,15 @@ function AdminDispatch({ state, dispatch }) {
             const sel = selectedDriverId === ds.driver_id;
             const declined = selectedTrips.some(t => t.declinedBy?.includes(ds.driver_id));
             const isNearest = ds.driver_id === nearestDriverId;
+            const isUnavailable = !!ds.is_unavailable;
             return (
-              <div key={ds.driver_id} onClick={() => !declined && !overCapacity && setSelectedDriverId(ds.driver_id)}
-                style={{ cursor: (declined || overCapacity) ? "not-allowed" : "pointer", opacity: declined ? .35 : 1, background: sel ? COLORS.amber : COLORS.card, border: `1px solid ${sel ? COLORS.amber2 : isNearest ? COLORS.green : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 8 }}>
+              <div key={ds.driver_id} onClick={() => !declined && !overCapacity && !isUnavailable && setSelectedDriverId(ds.driver_id)}
+                style={{ cursor: (declined || overCapacity || isUnavailable) ? "not-allowed" : "pointer", opacity: (declined || isUnavailable) ? .35 : 1, background: sel ? COLORS.amber : COLORS.card, border: `1px solid ${sel ? COLORS.amber2 : isNearest ? COLORS.green : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 8 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <span style={{ fontSize: 13, fontWeight: 700, fontFamily: FONTS.head, color: sel ? COLORS.ink : COLORS.chalk }}>{u?.name}</span>
                   <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                    {isNearest && !sel && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, border: `1px solid ${COLORS.green}`, padding: "2px 5px", borderRadius: 2 }}>NEAREST</span>}
+                    {isUnavailable && <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>UNAVAILABLE</span>}
+                    {isNearest && !sel && !isUnavailable && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, border: `1px solid ${COLORS.green}`, padding: "2px 5px", borderRadius: 2 }}>NEAREST</span>}
                     {declined && <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>DECLINED</span>}
                     {sel && <span style={{ color: COLORS.ink }}>✓</span>}
                   </div>
@@ -12353,7 +12485,12 @@ function AdminDrivers({ state, user }) {
                   <div style={{ fontSize: 10, color: COLORS.teal, marginTop: 2 }}>🏠 Lives in {driverUser.home_address.area || driverUser.home_address.label}</div>
                 )}
               </div>
-              <StateBadge state={full ? "FULLY_BOOKED" : ds.state} />
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                <StateBadge state={full ? "FULLY_BOOKED" : ds.state} />
+                {ds.is_unavailable && (
+                  <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>UNAVAILABLE</span>
+                )}
+              </div>
             </div>
             <CapacityBar load={load} capacity={driverCapacityList} />
             {activeTrips.length > 0 ? (
