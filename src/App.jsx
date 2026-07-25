@@ -2736,9 +2736,18 @@ function appReducer(state, action) {
 
     case "TRIP/SEND_CHAT":
     case "CHAT/SEND": {
+      // recipient_id distinguishes conversations on a merged multi-agent
+      // trip — without it, the driver's OWN messages (sender_id = driver,
+      // no recipient tag) would match every conversation they open on
+      // that trip, since the old filter only ever checked sender_id
+      // against both parties, never which conversation a message
+      // actually belonged to. Requires the `messages` table to have a
+      // `recipientid` column (bigint, nullable) — see migration note on
+      // the Supabase handler's identical case.
       const msg = {
         id: mkId(), sender_id: action.sender_id, sender_name: action.sender_name,
-        sender_role: action.sender_role, text: action.text, ts: now(),
+        sender_role: action.sender_role, recipient_id: action.recipient_id ?? null,
+        text: action.text, ts: now(),
       };
       const newTrips = state.trips.map(t =>
         t.trip_id === action.trip_id
@@ -2824,16 +2833,19 @@ function appReducer(state, action) {
       // Genuinely NEW capability, distinct from NOTIF/MARK_ALL_READ
       // below (which only ever marks read, never removes) — per
       // explicit request, admins/agents/drivers can select several
-      // alerts and delete them together. Same ownership scoping as
-      // MARK_ALL_READ: user_id = only that user's own notifications,
-      // admin = only the admin-broadcast ones — action.ids is filtered
-      // against this scope before anything is removed, so a forged or
-      // malformed id list can never be used to delete a notification
-      // that doesn't actually belong to the caller.
+      // alerts and delete them together. user_id = only that user's own
+      // notifications. admin = delete by ID only, no further scoping —
+      // matches the Supabase handler's identical approach: admins can
+      // only ever select IDs that were already shown to them in their own
+      // notification list (adminNotifsAll), so deleting by ID alone is
+      // safe. The OLD narrower admin filter here (broadcast-only) meant a
+      // targeted admin notification (e.g. TRIP_UPDATED sent to specific
+      // non-Viewer admins) selected for deletion would silently fail to
+      // delete — the exact same bug class as the CLEAR ALL fix.
       const idsToDelete = new Set(action.ids || []);
       const matchesDel = (n) => action.user_id != null
         ? n.for_user_ids?.includes(action.user_id)
-        : (action.admin ? (!n.for_user_ids?.length && (!n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN))) : true);
+        : true; // admin (or no scope): id membership alone is the check
       return { ...state, notifications: state.notifications.filter(n => !(idsToDelete.has(n.id) && matchesDel(n))) };
     }
 
@@ -2841,11 +2853,19 @@ function appReducer(state, action) {
       // Scoped to the caller — previously this marked EVERY user's
       // notifications read (fine when only admins triggered it, but wrong
       // once agents and drivers do: one person's "clear" would silently
-      // clear everyone's). user_id = mark that user's; admin = mark the
-      // admin-role broadcast notifications.
+      // clear everyone's). user_id = mark that user's; admin = mark every
+      // admin-relevant notification, whether it's a broadcast (no
+      // for_user_ids) OR specifically targeted at this admin's own
+      // actor_id (e.g. TRIP_UPDATED sent to non-Viewer admins by name) —
+      // previously only broadcasts were cleared here, leaving targeted
+      // admin notifications stuck unread forever even after CLEAR ALL,
+      // since nothing else ever marked them read either.
       const matches = (n) => action.user_id != null
         ? n.for_user_ids?.includes(action.user_id)
-        : (action.admin ? (!n.for_user_ids?.length && (!n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN))) : true);
+        : (action.admin
+            ? (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length) &&
+              (!n.for_user_ids?.length || n.for_user_ids.includes(action.actor_id))
+            : true);
       return { ...state, notifications: state.notifications.map(n => matches(n) ? { ...n, read: true } : n) };
     }
 
@@ -2859,6 +2879,14 @@ function appReducer(state, action) {
       // active for this trip", not "a reminder was sent once".
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip || trip.reminder_sent) return state;
+      // IMPORTANT: last_reminder_at must be a real epoch NUMBER (Date.now()),
+      // not now() — now() returns a locale-formatted display STRING
+      // ("25/07/2026, 14:30"), and CHECK_UPCOMING_REMINDERS does arithmetic
+      // (nowMs - lastAt < ONE_HOUR_MS) against this value. A string there
+      // coerces to NaN in subtraction, which makes "< ONE_HOUR_MS" always
+      // false — silently breaking the hourly throttle entirely and firing
+      // a reminder on every 5-minute poll instead of once per hour.
+      const sendReminderEpochTs = Date.now();
       const sendReminderNowTs = now();
       const newTrips = state.trips.map(t =>
         // last_reminder_at set to NOW, not null — the notification below IS
@@ -2866,7 +2894,7 @@ function appReducer(state, action) {
         // again until a full hour after this click (otherwise, clicking
         // REMIND while already inside the 2-hour window sends a second,
         // near-duplicate reminder within the next ~5-minute poll cycle).
-        t.trip_id === action.trip_id ? { ...t, reminder_sent: true, last_reminder_at: sendReminderNowTs } : t
+        t.trip_id === action.trip_id ? { ...t, reminder_sent: true, last_reminder_at: sendReminderEpochTs } : t
       );
       const notif = {
         id: mkId(), type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT],
@@ -3409,7 +3437,7 @@ async function fetchAllFromSupabase() {
 
   const chatByTrip = {};
   for (const m of chatRes.data) {
-    (chatByTrip[m.tripid] ||= []).push({ id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole, text: m.content, ts: epochToDisplay(m.timestamp) });
+    (chatByTrip[m.tripid] ||= []).push({ id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole, recipient_id: m.recipientid ?? null, text: m.content, ts: epochToDisplay(m.timestamp) });
   }
   // The real notifications table is one row per (notification, user) —
   // for_roles-only broadcasts are written as a single row with userid=null
@@ -5065,7 +5093,37 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (extraDrop) newExtraDropoffs.push(extraDrop);
         }
       }
-      must(await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", primaryId));
+      // Optimistic-concurrency write, same pattern as the auto-merge fix in
+      // TRIP/ASSIGN_DRIVER: conditioned on primaryRow.updatedat still
+      // matching what was read above. Narrower race window than the
+      // auto-merge case (requires two admins to select the exact same
+      // overlapping bookings within the same instant, not just any
+      // routine single-agent assignment), and the status guards above
+      // already catch the common sequential-race case with a clear error
+      // — this closes the remaining true-simultaneous edge case too.
+      //
+      // IMPORTANT: primaryRow is UNASSIGNED_BOOKING by the check above,
+      // meaning it may be a freshly-booked trip that has NEVER been
+      // updated — trips.insert() doesn't set updatedat explicitly, so
+      // this is commonly NULL here. Supabase/PostgREST's .eq(col, null)
+      // is NOT guaranteed to match NULL rows (confirmed: .neq() explicitly
+      // documents it excludes NULL rows unless you use .is() instead —
+      // the same asymmetry applies to .eq()). Using .eq("updatedat", null)
+      // unconditionally would make this condition fail to match ANY row
+      // whenever updatedat is null, breaking every single ordinary
+      // combine-and-dispatch action, not just the rare race case. Branch
+      // on whether the value is null and use .is() vs .eq() accordingly.
+      let multiUpdateQuery = supabase.from("trips").update({
+        extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs,
+        updatedat: nowEpoch(),
+      }).eq("id", primaryId);
+      multiUpdateQuery = primaryRow.updatedat == null
+        ? multiUpdateQuery.is("updatedat", null)
+        : multiUpdateQuery.eq("updatedat", primaryRow.updatedat);
+      const { data: multiWriteResult } = await multiUpdateQuery.select("id");
+      if (!multiWriteResult || multiWriteResult.length === 0) {
+        throw new Error("This booking was just modified by another action — please refresh and try combining again.");
+      }
       if (secondaryIds.length) {
         // Clear driver_status.currenttripid for any driver whose currenttripid
         // references a secondary trip being deleted — the FK constraint
@@ -5169,9 +5227,55 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (mergedSeats > mergeCapacity) {
             throw new Error(`Driver doesn't have room — merging would need ${mergedSeats} seats, vehicle holds ${mergeCapacity}.`);
           }
-          must(await supabase.from("trips").update({
+          // Optimistic-concurrency write: the UPDATE is conditioned on
+          // mergeTargetTrip.updatedat still matching what we just read. If
+          // a concurrent write changed the row in between (e.g. another
+          // admin merged a different booking into the same driver a moment
+          // earlier), .eq("updatedat", ...) matches ZERO rows and the write
+          // is a no-op — detected below via the returned row count, rather
+          // than silently overwriting whatever the other write did. Reuses
+          // the trips table's existing `updatedat` column (already
+          // maintained on every write elsewhere) instead of requiring a
+          // schema migration for a dedicated version column.
+          const mergeNowTs = nowEpoch();
+          const { data: mergeWriteResult } = await supabase.from("trips").update({
             extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs,
-          }).eq("id", mergeTargetTrip.id));
+            updatedat: mergeNowTs,
+          }).eq("id", mergeTargetTrip.id).eq("updatedat", mergeTargetTrip.updatedat).select("id");
+          if (!mergeWriteResult || mergeWriteResult.length === 0) {
+            // Someone else modified mergeTargetTrip between our SELECT and
+            // this UPDATE — re-fetch it fresh and retry the merge ONE time
+            // against current data, rather than silently dropping the
+            // agent(s) being merged in or surfacing a confusing error for
+            // what's actually a routine, recoverable race.
+            const { data: freshMergeTarget } = await supabase.from("trips").select("*").eq("id", mergeTargetTrip.id).maybeSingle();
+            if (!freshMergeTarget) {
+              throw new Error("The trip you're merging into no longer exists — it may have just been cancelled or reassigned. Please try again.");
+            }
+            const retryExtraAgentIds = [...(freshMergeTarget.extraagentids || [])];
+            const retryExtraPickups = [...(freshMergeTarget.extrapickups || [])];
+            const retryExtraDropoffs = [...(freshMergeTarget.extradropoffs || [])];
+            if (tripRow.agentid) {
+              retryExtraAgentIds.push(tripRow.agentid);
+              retryExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid });
+              retryExtraDropoffs.push({ lat: tripRow.dropofflat, lng: tripRow.dropofflng, label: tripRow.dropofflocation, agent_id: tripRow.agentid });
+            }
+            for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
+              const aid = tripRow.extraagentids[i];
+              retryExtraAgentIds.push(aid);
+              retryExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid });
+              const retryExtraDrop = tripRow.extradropoffs?.[i];
+              if (retryExtraDrop) retryExtraDropoffs.push(retryExtraDrop);
+            }
+            const retrySeats = 1 + retryExtraAgentIds.length;
+            if (retrySeats > mergeCapacity) {
+              throw new Error(`Driver doesn't have room — merging would need ${retrySeats} seats, vehicle holds ${mergeCapacity}. (Another change was made to this driver's trip moments ago — please recheck and retry.)`);
+            }
+            must(await supabase.from("trips").update({
+              extraagentids: retryExtraAgentIds, extrapickups: retryExtraPickups, extradropoffs: retryExtraDropoffs,
+              updatedat: nowEpoch(),
+            }).eq("id", freshMergeTarget.id));
+          }
           // Clear the now-absorbed trip's driver reference before deleting,
           // and clear any driver_status pointing at it.
           await supabase.from("driver_status").update({ currenttripid: mergeTargetTrip.id }).eq("currenttripid", action.trip_id);
@@ -5195,7 +5299,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // DRIVER_CONFIRMED (or further along), and assertTripTransition
           // would reject a DRIVER_CONFIRMED → DRIVER_CONFIRMED self-transition
           // as illegal. Instead, inline just the sequencing recompute here.
-          const { data: mergedTripFresh } = await supabase.from("trips").select("*").eq("id", mergeTargetTrip.id).single();
           const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
           const allForDriverMerge = (driverTripsAfterMerge || []).map(r => {
             const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
@@ -5722,9 +5825,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
     case "TRIP/SEND_CHAT":
     case "CHAT/SEND": {
+      // recipientid distinguishes separate conversations on a merged
+      // multi-agent trip. REQUIRES a schema migration — the `messages`
+      // table needs a `recipientid` bigint nullable column:
+      //   ALTER TABLE messages ADD COLUMN IF NOT EXISTS recipientid bigint;
+      // Without recipientid, a driver's own messages (sender=driver, no
+      // recipient tag) matched EVERY conversation they opened on that
+      // trip, since the read-side filter only checked sender_id against
+      // both parties — a message meant for Agent A would visibly leak
+      // into a separate chat with Agent B on the same trip.
       must(await supabase.from("messages").insert({
         tripid: action.trip_id, senderid: action.sender_id, sendername: action.sender_name,
-        senderrole: action.sender_role, content: action.text, timestamp: nowEpoch(),
+        senderrole: action.sender_role, recipientid: action.recipient_id ?? null,
+        content: action.text, timestamp: nowEpoch(),
       }));
       await refetch();
       return;
@@ -5846,8 +5959,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (action.user_id != null) {
         must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.user_id));
       } else if (action.admin) {
-        // Admin-role broadcasts are stored with userid null.
+        // Two separate updates: broadcasts (userid IS NULL) AND anything
+        // specifically targeted at this admin's own actor_id. Previously
+        // only the broadcast case was cleared here — a targeted admin
+        // notification (e.g. TRIP_UPDATED sent by name to non-Viewer
+        // admins) has a real, non-null userid, so it never matched the
+        // old .is("userid", null)-only query and stayed unread forever,
+        // even though it still counted toward the sidebar's badge number
+        // (which counts by for_roles/ADMIN, not by the userid column) —
+        // this is exactly why the badge count never fully cleared.
         must(await supabase.from("notifications").update({ isread: true }).is("userid", null));
+        if (action.actor_id != null) {
+          must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.actor_id));
+        }
       }
       // else: no scope provided — no-op rather than marking everything read
       await refetch();
@@ -6579,6 +6703,9 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
             {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
             {["ASSIGNED", "DRIVER_CONFIRMED"].includes(t.state) && !t.reminder_sent && (
               <Button title="⏰ REMIND" variant="ghost" size="sm" onClick={e => { e.stopPropagation(); dispatch({ type: "TRIP/SEND_REMINDER", trip_id: t.trip_id }).catch(() => {}); /* failure already toasted by the wrapper */ }} />
+            )}
+            {["ASSIGNED", "DRIVER_CONFIRMED"].includes(t.state) && t.reminder_sent && (
+              <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ Reminders on</span>
             )}
           </div>
         </div>
@@ -8335,6 +8462,21 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notifClickHandlerRef]);
   const myTrips = state.trips.filter(t => t.agent_ids.includes(user.id));
+  // Periodic check for enabled-but-not-yet-fired reminders — see
+  // TRIP/CHECK_UPCOMING_REMINDERS. Previously only DriverApp and AdminApp
+  // ran this poll, meaning an agent's own reminder (which they themselves
+  // enabled by tapping REMIND) would only ever fire if a driver or admin
+  // happened to have the app open at the right moment — often not true,
+  // especially overnight. Every logged-in session now shares the load.
+  useEffect(() => {
+    if (!supabase) return;
+    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+    const intervalId = setInterval(() => {
+      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+    }, 5 * 60 * 1000);
+    return () => clearInterval(intervalId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id) && !n.read);
   // Home-screen cards say "Tap to view details" — so land on THAT trip's
   // detail view, not just the trips list (which is what happened before:
@@ -8540,15 +8682,30 @@ function DmThreadModal({ currentUser, counterpart, dispatch, onClose, dmVersion 
 function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
   const [text, setText] = useState("");
   const allMsgs = trip.chat_messages || [];
-  // A message belongs to this specific conversation if it was sent by
-  // either party in this pair — keeps a driver's separate conversations
-  // with two different agents on the same trip from bleeding together.
-  const msgs = allMsgs.filter(m => m.sender_id === currentUser.id || m.sender_id === otherUser.id);
+  // A message belongs to THIS specific conversation only if it was
+  // exchanged between exactly these two people — checked both ways
+  // (either party could be sender or recipient). Older messages sent
+  // before recipient_id existed have recipient_id == null; for those,
+  // fall back to the old sender-only check so existing chat history
+  // doesn't just disappear, but any message sent going forward is
+  // correctly scoped to its actual conversation. This is what actually
+  // fixes the bug: previously a driver's own messages (no recipient
+  // concept at all) matched EVERY conversation they opened on a trip,
+  // so a message meant for Agent A visibly leaked into a separate chat
+  // opened with Agent B on the same merged trip.
+  const msgs = allMsgs.filter(m => {
+    if (m.recipient_id != null) {
+      return (m.sender_id === currentUser.id && m.recipient_id === otherUser.id) ||
+             (m.sender_id === otherUser.id && m.recipient_id === currentUser.id);
+    }
+    // Legacy message with no recipient tag — best-effort old behavior.
+    return m.sender_id === currentUser.id || m.sender_id === otherUser.id;
+  });
 
   const send = async () => {
     if (!text.trim()) return;
     try {
-      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: currentUser.id, sender_name: currentUser.name, sender_role: currentUser.role, text: text.trim() });
+      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: currentUser.id, sender_name: currentUser.name, sender_role: currentUser.role, recipient_id: otherUser.id, text: text.trim() });
       setText("");
     } catch (e) {
       console.warn("[Chat] send failed:", e.message);
@@ -9822,6 +9979,13 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   const [agentSearch, setAgentSearch] = useState("");
   const [mode, setMode] = useState("street");
   const [companyId, setCompanyId] = useState((state.companies || [])[0]?.id || "");
+  // Separate company selection for the OUTBOUND dropoff selector below —
+  // previously shared companyId with the pickup selector, so an admin
+  // choosing "Company" mode for BOTH pickup and dropoff (with different
+  // companies for each) would silently have one selection overwrite the
+  // other, since both LocationSelector instances were driven by the same
+  // state variable.
+  const [dropCompanyId, setDropCompanyId] = useState((state.companies || [])[0]?.id || "");
   const [streetValue, setStreetValue] = useState("");
   const [streetArea, setStreetArea] = useState("");
   const [streetCoord, setStreetCoord] = useState(null);
@@ -9871,9 +10035,10 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
     }
   };
 
+  const selectedDropCompany = companyById(state, dropCompanyId) || { address: "", lat: null, lng: null };
   const canSave = agentId &&
     (mode === "company" || (streetValue && confirmed)) &&
-    (!isOutbound || dropStreetValue && dropConfirmed);
+    (!isOutbound || dropMode === "company" || (dropStreetValue && dropConfirmed));
 
   const [saveError, setSaveError] = useState(null);
   const save = async () => {
@@ -9882,9 +10047,15 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
     setSaveError(null);
     const pickupLabel = mode === "company" ? selectedCompany.address : streetValue;
     const pickupCoord = mode === "company" ? { lat: selectedCompany.lat, lng: selectedCompany.lng } : streetCoord;
-    // For OUTBOUND pass per-agent dropoff; for INBOUND the trip's shared dropoff is used by default.
-    const dropoffLabel = isOutbound ? dropStreetValue : null;
-    const dropoffCoord = isOutbound && dropStreetCoord ? dropStreetCoord : null;
+    // For OUTBOUND pass per-agent dropoff; for INBOUND the trip's shared
+    // dropoff is used by default. "Company" mode for the dropoff was
+    // previously a dead end — selecting a company here never actually
+    // fed into dropoffLabel/dropoffCoord, since only the street-mode
+    // handler ever wrote dropStreetValue/dropStreetCoord/dropConfirmed.
+    const dropoffLabel = isOutbound ? (dropMode === "company" ? selectedDropCompany.address : dropStreetValue) : null;
+    const dropoffCoord = isOutbound
+      ? (dropMode === "company" ? { lat: selectedDropCompany.lat, lng: selectedDropCompany.lng } : dropStreetCoord)
+      : null;
     try {
       await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, pickup_label: pickupLabel, pickup_coord: pickupCoord, dropoff_label: dropoffLabel, dropoff_coord: dropoffCoord });
       onClose();
@@ -9932,7 +10103,7 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
           {isOutbound && (
             <>
               <SectionHeader label="Drop-off Location (this agent's home)" />
-              <LocationSelector mode={dropMode} setMode={setDropMode} companyId={companyId} setCompanyId={setCompanyId} state={state}
+              <LocationSelector mode={dropMode} setMode={setDropMode} companyId={dropCompanyId} setCompanyId={setDropCompanyId} state={state}
                 streetValue={dropStreetValue} streetCoord={dropConfirmed ? dropStreetCoord : null}
                 onStreetChange={({ street, coord, confirmed: c }) => { setDropStreetValue(street); setDropStreetCoord(coord); setDropConfirmed(!!c); }} />
             </>
@@ -12721,7 +12892,16 @@ function CompanyManagerPanel({ state, dispatch, onClose }) {
       <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ADDRESS</span>
       <StreetInput value={value.street} placeholder="e.g. 65 Voortrekker Road, Maitland"
         preConfirmed={value.coord ? { label: value.street, area: value.area, lat: value.coord.lat, lng: value.coord.lng } : null}
-        onChange={({ street, area, coord }) => onChange({ ...value, street, area, coord })} />
+        onChange={({ street, area, coord, confirmed }) => onChange({ ...value, street, area,
+          // Only replace the existing coord when the user actually
+          // confirmed a NEW selection from search results — StreetInput
+          // fires onChange with coord:null on every keystroke while
+          // typing (before a result is picked), which previously wiped
+          // the company's real GPS coordinates the instant an admin
+          // clicked into this field at all, even to save an unrelated
+          // change like the company name. Keeping the prior coord until
+          // a genuinely new one is confirmed prevents that.
+          coord: confirmed ? coord : value.coord })} />
       <span style={{ fontSize: 8, color: COLORS.dim }}>Pick from the search results so the coordinates are set, not just typed text.</span>
     </div>
   );
@@ -13491,7 +13671,7 @@ function AdminTickets({ state, dispatch, user }) {
 }
 
 
-function AdminNotifs({ state, dispatch, onJumpToTrip }) {
+function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const [filterDate, setFilterDate] = useState(""); // "" = show all, else YYYY-MM-DD
   const [selectMode, setSelectMode] = useState(false);
   const [selectedNotifIds, setSelectedNotifIds] = useState(new Set());
@@ -13530,7 +13710,10 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
       setDeletingNotifs(false);
     }
   };
-  const adminNotifsAll = state.notifications.filter(n => !n.for_user_ids?.length && (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length));
+  const adminNotifsAll = state.notifications.filter(n =>
+    (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length) &&
+    (!n.for_user_ids?.length || n.for_user_ids.includes(user.id))
+  );
   const adminNotifs = filterDate
     ? adminNotifsAll.filter(n => {
         if (n.ts_epoch == null) return false;
@@ -13573,7 +13756,7 @@ function AdminNotifs({ state, dispatch, onJumpToTrip }) {
               <Button title="🗑 DELETE ALL" variant="ghost" size="sm" onClick={() => setConfirmingDeleteAll(true)} />
             )
           )}
-          {unread > 0 && !selectMode && !confirmingDeleteAll && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true }).catch(() => {})} />}
+          {unread > 0 && !selectMode && !confirmingDeleteAll && <Button title={`CLEAR ALL${filterDate ? ` (${unread})` : ""}`} variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", admin: true, actor_id: user.id }).catch(() => {})} />}
         </div>
       </div>
       {selectMode && selectedNotifIds.size > 0 && (
@@ -13643,7 +13826,11 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
   const [drawerOpen, setDrawerOpen] = useState(false);
   const isNarrow = useIsNarrowScreen();
-  const notifCount = state.notifications.filter(n => !n.read && n.for_roles?.includes(ROLE.ADMIN)).length;
+  const notifCount = state.notifications.filter(n =>
+    !n.read &&
+    (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length) &&
+    (!n.for_user_ids?.length || n.for_user_ids.includes(user.id))
+  ).length;
   const call = useWebRTCCall(user);
 
   // Client-side half of the late-start warning, per explicit decision
@@ -13754,7 +13941,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
-      {tab === "notifs" && <AdminNotifs state={scopedState} dispatch={dispatch} onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }} />}
+      {tab === "notifs" && <AdminNotifs state={scopedState} user={user} dispatch={dispatch} onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }} />}
     </div>
   );
 
