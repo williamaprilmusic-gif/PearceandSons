@@ -10987,7 +10987,7 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         // People
         aid != null ? userName(aid) : (t.agent_name || ""),
         aid != null ? userStaffNum(aid) : "",
-        t.phone || agentUser?.phone || "",
+        agentUser?.phone || t.phone || "",
         userName(t.driver_id),
         driverVehicle(t.driver_id),
         // Pickup
