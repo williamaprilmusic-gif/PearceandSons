@@ -5224,6 +5224,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           .limit(1);
         const mergeTargetTrip = existingActiveTrips?.[0];
         if (mergeTargetTrip) {
+          // Reject if this trip's agent(s) are already on the merge
+          // target — same duplicate check TRIP/DISPATCH_MULTI already has
+          // for its combine flow, which this auto-merge path was missing
+          // entirely. Without it, re-assigning (or a stale/retried
+          // ASSIGN_DRIVER call) could silently push the same agent onto
+          // the merged trip a second time, showing them twice in the
+          // passenger list and inflating the seat/passenger count.
+          const existingMergeAgentIds = new Set([mergeTargetTrip.agentid, ...(mergeTargetTrip.extraagentids || [])].filter(Boolean));
+          const incomingAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+          const dupeAgentId = incomingAgentIds.find(aid => existingMergeAgentIds.has(aid));
+          if (dupeAgentId != null) {
+            const { data: dupeUserRow } = await supabase.from("users").select("fullname").eq("id", dupeAgentId).maybeSingle();
+            throw new Error(`${dupeUserRow?.fullname || dupeAgentId} is already on this driver's trip — can't add them again.`);
+          }
           // Delegate to DISPATCH_MULTI's merge logic: treat mergeTargetTrip
           // as primary, this trip as the one being folded in. DISPATCH_MULTI
           // requires the primary to be UNASSIGNED_BOOKING, but here the
@@ -5274,6 +5288,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             const { data: freshMergeTarget } = await supabase.from("trips").select("*").eq("id", mergeTargetTrip.id).maybeSingle();
             if (!freshMergeTarget) {
               throw new Error("The trip you're merging into no longer exists — it may have just been cancelled or reassigned. Please try again.");
+            }
+            // Same duplicate-agent check as the primary path above — the
+            // retry rebuilds the merge from fresh data, so it needs its
+            // own check rather than relying on the earlier one (which ran
+            // against the now-stale mergeTargetTrip snapshot).
+            const freshExistingAgentIds = new Set([freshMergeTarget.agentid, ...(freshMergeTarget.extraagentids || [])].filter(Boolean));
+            const retryDupeAgentId = incomingAgentIds.find(aid => freshExistingAgentIds.has(aid));
+            if (retryDupeAgentId != null) {
+              const { data: retryDupeUserRow } = await supabase.from("users").select("fullname").eq("id", retryDupeAgentId).maybeSingle();
+              throw new Error(`${retryDupeUserRow?.fullname || retryDupeAgentId} is already on this driver's trip — can't add them again.`);
             }
             const retryExtraAgentIds = [...(freshMergeTarget.extraagentids || [])];
             const retryExtraPickups = [...(freshMergeTarget.extrapickups || [])];
