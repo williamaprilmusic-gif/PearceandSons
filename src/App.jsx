@@ -952,10 +952,20 @@ function buildDropoffSequence(trips, lastPickupCoord) {
 // work, and using the company coord for pure-inbound sets (single work
 // dropoff) is harmless. Otherwise fall back to the last pickup coord,
 // which is correct for pure-inbound routes with multiple home pickups.
+// The dropoff chain must always continue from wherever the driver actually
+// IS — the last pickup stop — for BOTH directions, per explicit
+// requirement: "the shortest route/kms" only comes from a single
+// continuous nearest-neighbour chain (driver's start -> pickup 1 -> pickup
+// 2 -> ... -> dropoff 1 -> dropoff 2 -> ...), never by resetting to a
+// fixed anchor partway through. OUTBOUND previously anchored dropoffs
+// from companyCoord instead of the last pickup — meaning a driver who'd
+// already picked everyone up near, say, the eastern suburbs would have
+// their dropoff route recalculated as if starting fresh from the company
+// office, which can send them the LONG way around instead of continuing
+// on from where they actually are.
 function dropoffAnchor(allForDriver, pickupOrdered, companyCoord) {
-  const hasOutbound = allForDriver.some(t => t.direction === "OUTBOUND");
-  if (hasOutbound) return companyCoord;
-  return pickupOrdered[pickupOrdered.length - 1]?.coord ?? companyCoord;
+  const lastPickup = pickupOrdered[pickupOrdered.length - 1]?.coord;
+  return lastPickup ?? companyCoord;
 }
 
 // Nearest-neighbour route through all not-yet-done dropoffs, continuing
@@ -1440,7 +1450,20 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
       console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${valid.length}. Falling back to haversine.`);
       return null;
     }
-    const reordered = optimized
+    // CRITICAL: optimizedWaypoints from the API is consistently ordered by
+    // providedIndex (0,1,2,...) — it is NOT already in visiting order. The
+    // actual optimal sequence is given by each entry's optimizedIndex
+    // field. Sorting by optimizedIndex BEFORE mapping to coordinates is
+    // what actually applies TomTom's computed reordering — without this
+    // sort, .map(w => valid[w.providedIndex]) just reconstructs the
+    // original input order (since the array itself is providedIndex-
+    // ordered), silently discarding every genuine reorder TomTom returns.
+    // Confirmed in production: a request with providedIndex/optimizedIndex
+    // pairs (0,0) (1,2) (2,1) — a real, valid reordering (visit index 0,
+    // then 2, then 1) — was being flattened straight back to [0,1,2] by
+    // this bug, always matching the un-optimized input order.
+    const reordered = [...optimized]
+      .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
       .filter(w => w.providedIndex >= 0 && w.providedIndex < valid.length)
       .map(w => valid[w.providedIndex])
       .filter(Boolean);
@@ -10209,7 +10232,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v8-pickup-tomtom-sequencing";
+const _TOMTOM_CACHE_VERSION = "v9-optimizedindex-sort-fix";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
   const isOutbound = direction === "OUTBOUND";
