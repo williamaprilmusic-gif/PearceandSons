@@ -1138,7 +1138,7 @@ function getDriverLoad(state, driver_id, scheduledDate) {
   // silently fall back to the old, wrong all-dates behavior; pass the
   // trip's own scheduled_date when checking whether it can be assigned.
   return state.trips
-    .filter(t => t.driver_id === driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED && t.scheduled_date === scheduledDate)
+    .filter(t => t.driver_id === driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.scheduled_date === scheduledDate)
     .reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
 }
 
@@ -1773,7 +1773,7 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return { ...state, _error: "Trip not found" };
       if (trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is already on this trip" };
-      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot add a passenger to a completed trip" };
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot add a passenger to a completed or cancelled trip" };
       // Use the ASSIGNED driver's own capacity once one exists — an
       // unassigned booking has no specific driver's vehicle to check
       // against yet, so it falls back to the fleet default.
@@ -1795,7 +1795,7 @@ function appReducer(state, action) {
 
       let newTrips;
       if (trip.driver_id) {
-        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
         const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
@@ -1818,7 +1818,7 @@ function appReducer(state, action) {
         const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
         newTrips = state.trips.map(t => {
           if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapAdd[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAdd, driver_route_cap_km: policyCapKmAdd, driver_route_exceeds_policy: exceedsPolicyAdd };
-          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapAdd[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAdd, driver_route_cap_km: policyCapKmAdd, driver_route_exceeds_policy: exceedsPolicyAdd };
+          if (t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapAdd[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAdd, driver_route_cap_km: policyCapKmAdd, driver_route_exceeds_policy: exceedsPolicyAdd };
           return t;
         });
       } else {
@@ -1838,7 +1838,7 @@ function appReducer(state, action) {
       if (!trip) return { ...state, _error: "Trip not found" };
       if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is not on this trip" };
       if (trip.agent_ids.length <= 1) return { ...state, _error: "Cannot remove the last passenger — cancel or reassign the trip instead" };
-      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot remove a passenger from a completed trip" };
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot remove a passenger from a completed or cancelled trip" };
 
       const newAgentIds = trip.agent_ids.filter(id => id !== action.agent_id);
       // Same index-0 fallback RELOCATE_AGENT uses: on trips created before
@@ -1860,7 +1860,7 @@ function appReducer(state, action) {
 
       let newTripsRemove;
       if (trip.driver_id) {
-        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
         const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoords, completed_pickups: newCompletedPickups, agent_name: newAgentName };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
@@ -1877,7 +1877,7 @@ function appReducer(state, action) {
         const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
         newTripsRemove = state.trips.map(t => {
           if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapRem[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmRem, driver_route_cap_km: policyCapKmRem, driver_route_exceeds_policy: exceedsPolicyRem };
-          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapRem[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmRem, driver_route_cap_km: policyCapKmRem, driver_route_exceeds_policy: exceedsPolicyRem };
+          if (t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapRem[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmRem, driver_route_cap_km: policyCapKmRem, driver_route_exceeds_policy: exceedsPolicyRem };
           return t;
         });
       } else {
@@ -1914,7 +1914,7 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return { ...state, _error: "Trip not found" };
       if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "Agent is not on this trip" };
-      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot relocate a passenger on a completed trip" };
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot relocate a passenger on a completed or cancelled trip" };
 
       const newCoord = { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id };
       const newPickupCoords = trip.pickup_sequence_coords.map((c, i) => {
@@ -1924,7 +1924,7 @@ function appReducer(state, action) {
 
       let newTripsRelocate;
       if (trip.driver_id) {
-        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
         const updatedTrip = { ...trip, pickup_sequence_coords: newPickupCoords };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
@@ -1941,7 +1941,7 @@ function appReducer(state, action) {
         const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
         newTripsRelocate = state.trips.map(t => {
           if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapReloc[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmReloc, driver_route_cap_km: policyCapKmReloc, driver_route_exceeds_policy: exceedsPolicyReloc };
-          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapReloc[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmReloc, driver_route_cap_km: policyCapKmReloc, driver_route_exceeds_policy: exceedsPolicyReloc };
+          if (t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMapReloc[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmReloc, driver_route_cap_km: policyCapKmReloc, driver_route_exceeds_policy: exceedsPolicyReloc };
           return t;
         });
       } else {
@@ -2280,7 +2280,7 @@ function appReducer(state, action) {
       catch (e) { return { ...state, _error: e.message }; }
 
       const existingAssigned = state.trips.filter(
-        t => t.driver_id === action.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED && t.trip_id !== action.trip_id
+        t => t.driver_id === action.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.trip_id !== action.trip_id
       );
       const allForDriver = [...existingAssigned, { ...trip, driver_id: action.driver_id }];
       const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
@@ -2312,7 +2312,7 @@ function appReducer(state, action) {
             driver_route_km: routeDistanceKm, driver_route_cap_km: policyCapKm, driver_route_exceeds_policy: exceedsPolicy,
           };
         }
-        if (t.driver_id === action.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+        if (t.driver_id === action.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) {
           return {
             ...t,
             pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num,
@@ -2403,7 +2403,7 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return { ...state, _error: "Trip not found" };
       if (!trip.driver_id) return { ...state, _error: "This trip has no driver assigned." };
-      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Cannot remove the driver from a completed trip." };
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot remove the driver from a completed or cancelled trip." };
       const removedDriverId = trip.driver_id;
       const newTrips = state.trips.map(t => t.trip_id === action.trip_id
         ? { ...t, state: TRIP_STATE.UNASSIGNED_BOOKING, driver_id: null, pickup_order_num: null, drop_sequence_num: null, driverAccepted: false }
@@ -2790,6 +2790,36 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, notifications: [...newNotifs, ...state.notifications], _error: null };
     }
 
+    case "TRIP/RECORD_ROUTE": {
+      // Demo/fallback-mode equivalent of the Supabase handler's case —
+      // same 2-hour start-trip enforcement, and records route_total_km
+      // (the field name this app-side state actually reads) across every
+      // trip in the batch. Previously this action had no local reducer
+      // case at all and silently no-opped via the switch's default,
+      // meaning demo mode had no server-side enforcement whatsoever and
+      // route_total_km was never populated.
+      const { trips: rrTrips, driver_coord: rrDriverCoord } = action;
+      if (!rrTrips || rrTrips.length === 0) return state;
+      const rrEarliestScheduled = rrTrips
+        .map(t => t.scheduled_time_epoch)
+        .filter(Boolean)
+        .sort((a, b) => a - b)[0];
+      if (rrEarliestScheduled != null) {
+        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+        const windowOpensAt = rrEarliestScheduled - TWO_HOURS_MS;
+        if (Date.now() < windowOpensAt) {
+          return { ...state, _error: "Start trip denied — trips can only be started within 2 hours of the scheduled time." };
+        }
+      }
+      const { totalRoadKm: rrTotalRoadKm } = computeOptimalRoute(rrTrips, rrDriverCoord);
+      const rrTripIds = new Set(rrTrips.map(t => t.trip_id));
+      return {
+        ...state,
+        trips: state.trips.map(t => rrTripIds.has(t.trip_id) ? { ...t, route_total_km: rrTotalRoadKm } : t),
+        _error: null,
+      };
+    }
+
     case "NOTIF/DELETE_SELECTED": {
       // Genuinely NEW capability, distinct from NOTIF/MARK_ALL_READ
       // below (which only ever marks read, never removes) — per
@@ -2820,18 +2850,62 @@ function appReducer(state, action) {
     }
 
     case "TRIP/SEND_REMINDER": {
+      // Per explicit requirement: clicking REMIND doesn't send a single
+      // one-off notification — it ENABLES recurring reminders for this
+      // trip. Once enabled, TRIP/CHECK_UPCOMING_REMINDERS (run on the
+      // same periodic timer as CHECK_LATE_START) automatically re-notifies
+      // the agent every hour starting 2 hours before the scheduled time,
+      // right up until the trip. reminder_sent now means "reminders are
+      // active for this trip", not "a reminder was sent once".
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip || trip.reminder_sent) return state;
+      const sendReminderNowTs = now();
       const newTrips = state.trips.map(t =>
-        t.trip_id === action.trip_id ? { ...t, reminder_sent: true } : t
+        // last_reminder_at set to NOW, not null — the notification below IS
+        // the first reminder, so the next automatic one shouldn't fire
+        // again until a full hour after this click (otherwise, clicking
+        // REMIND while already inside the 2-hour window sends a second,
+        // near-duplicate reminder within the next ~5-minute poll cycle).
+        t.trip_id === action.trip_id ? { ...t, reminder_sent: true, last_reminder_at: sendReminderNowTs } : t
       );
       const notif = {
         id: mkId(), type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT],
         for_user_ids: [...trip.agent_ids],
         message: `Reminder: your trip from ${trip.custom_pickup} departs at ${trip.scheduled_time}.`,
-        trip_id: action.trip_id, ts: now(), read: false,
+        trip_id: action.trip_id, ts: sendReminderNowTs, read: false,
       };
       return { ...state, trips: newTrips, notifications: [notif, ...state.notifications] };
+    }
+
+    case "TRIP/CHECK_UPCOMING_REMINDERS": {
+      // Periodic check (same cadence as CHECK_LATE_START) — for every
+      // trip with reminders enabled (reminder_sent === true) that's
+      // within 2 hours of its scheduled time, fires an hourly reminder
+      // notification. Local/demo reducer version — see the Supabase
+      // handler's case for the real persisted equivalent.
+      const nowMs = Date.now();
+      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+      const ONE_HOUR_MS = 60 * 60 * 1000;
+      let anyFired = false;
+      const newNotifs = [];
+      const newTrips = state.trips.map(t => {
+        if (!t.reminder_sent || !t.scheduled_time_epoch) return t;
+        if (t.state === TRIP_STATE.ARCHIVED_COMPLETED || t.state === TRIP_STATE.ARCHIVED_CANCELLED) return t;
+        const timeUntil = t.scheduled_time_epoch - nowMs;
+        if (timeUntil > TWO_HOURS_MS || timeUntil < 0) return t; // not yet in window, or trip already passed
+        const lastAt = t.last_reminder_at || 0;
+        if (nowMs - lastAt < ONE_HOUR_MS) return t; // already reminded within the last hour
+        anyFired = true;
+        newNotifs.push({
+          id: mkId(), type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT],
+          for_user_ids: [...t.agent_ids],
+          message: `Reminder: your trip from ${t.custom_pickup} departs at ${t.scheduled_time}.`,
+          trip_id: t.trip_id, ts: now(), read: false,
+        });
+        return { ...t, last_reminder_at: nowMs };
+      });
+      if (!anyFired) return state;
+      return { ...state, trips: newTrips, notifications: [...newNotifs, ...state.notifications] };
     }
 
     case "TRIP/CANCEL": {
@@ -2863,7 +2937,7 @@ function appReducer(state, action) {
       // how close to departure someone cancelled.
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return { ...state, _error: "Trip not found" };
-      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return { ...state, _error: "Completed trips can't be cancelled." };
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "This trip has already been completed or cancelled." };
       if (!trip.agent_ids.includes(action.agent_id)) return { ...state, _error: "You're not on this trip." };
 
       const cancellingAgent = state.users.find(u => u.id === action.agent_id);
@@ -2954,7 +3028,7 @@ function appReducer(state, action) {
 
       let newTripsAgentCancel;
       if (trip.driver_id) {
-        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+        const driverTrips = state.trips.filter(t => t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
         const updatedTrip = { ...trip, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoordsAC, completed_pickups: newCompletedPickups, agent_name: newAgentName };
         const allForDriver = driverTrips.map(t => t.trip_id === trip.trip_id ? updatedTrip : t);
         const ordered = buildPickupSequence(allForDriver, defaultCompanyAnchor(state));
@@ -2968,7 +3042,7 @@ function appReducer(state, action) {
         const exceedsPolicyAC = routeDistanceKmAC > policyCapKmAC;
         newTripsAgentCancel = state.trips.map(t => {
           if (t.trip_id === trip.trip_id) return { ...updatedTrip, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAC, driver_route_cap_km: policyCapKmAC, driver_route_exceeds_policy: exceedsPolicyAC };
-          if (t.driver_id === trip.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAC, driver_route_cap_km: policyCapKmAC, driver_route_exceeds_policy: exceedsPolicyAC };
+          if (t.driver_id === trip.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeDistanceKmAC, driver_route_cap_km: policyCapKmAC, driver_route_exceeds_policy: exceedsPolicyAC };
           return t;
         });
       } else {
@@ -3274,6 +3348,7 @@ function tripRowToApp(row, chatByTrip) {
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
     driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), declinedBy: row.declinedby || [], reminder_sent: row.remindersent,
+    last_reminder_at: row.lastreminderat || null,
     long_distance_flag: row.longdistanceflag || false, admin_note: row.adminnote || null,
     driver_route_km: row.driverroutekm != null ? Number(row.driverroutekm) : null,
     driver_route_cap_km: row.driverroutecapkm != null ? Number(row.driverroutecapkm) : null,
@@ -3939,7 +4014,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripRow) throw new Error("Trip not found");
       const currentAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (currentAgentIds.includes(action.agent_id)) throw new Error("Agent is already on this trip");
-      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot add a passenger to a completed trip");
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot add a passenger to a completed or cancelled trip");
       // Vehicle capacity is per-trip, using the ASSIGNED driver's own
       // capacity once one exists (a still-unassigned booking has no
       // specific driver's vehicle to check against, so it falls back
@@ -3968,7 +4043,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // sequencing continues from, re-sequence drop-offs too rather than
       // leaving dropsequencenum stale after a mid-route passenger add.
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
           const extra = (r.id === action.trip_id ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
@@ -4028,7 +4103,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const agentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (!agentIds.includes(action.agent_id)) throw new Error("Agent is not on this trip");
       if (agentIds.length <= 1) throw new Error("Cannot remove the last passenger — cancel or reassign the trip instead");
-      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot remove a passenger from a completed trip");
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot remove a passenger from a completed or cancelled trip");
 
       const newCompletedPickups = (tripRow.completedpickups || []).filter(id => id !== action.agent_id);
       const wasPrimary = tripRow.agentid === action.agent_id;
@@ -4065,7 +4140,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (rmErr) throw rmErr;
 
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const isThisTrip = r.id === action.trip_id;
           const first = (isThisTrip ? update.pickuplat ?? r.pickuplat : r.pickuplat) != null
@@ -4141,7 +4216,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripRow) throw new Error("Trip not found");
       const agentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (!agentIds.includes(action.agent_id)) throw new Error("Agent is not on this trip");
-      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot relocate a passenger on a completed trip");
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot relocate a passenger on a completed or cancelled trip");
 
       const isPrimary = tripRow.agentid === action.agent_id;
       const update = {};
@@ -4157,7 +4232,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (relErr) throw relErr;
 
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const isThisTrip = r.id === action.trip_id;
           const lat = isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat;
@@ -4763,7 +4838,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // way every other agent-initiated action already does).
       const { data: acTripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!acTripRow) throw new Error("Trip not found");
-      if (acTripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Completed trips can't be cancelled.");
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(acTripRow.status)) throw new Error("This trip has already been completed or cancelled.");
       const acAgentIds = [acTripRow.agentid, ...(acTripRow.extraagentids || [])].filter(Boolean);
       if (!acAgentIds.includes(action.agent_id)) throw new Error("You're not on this trip.");
 
@@ -4882,7 +4957,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (acErr) throw acErr;
 
       if (acTripRow.driverid) {
-        const { data: acDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", acTripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+        const { data: acDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", acTripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
         const acAllForDriver = (acDriverTripsRaw || []).map(r => {
           const isThisTrip = r.id === action.trip_id;
           const first = (isThisTrip ? acUpdate.pickuplat ?? r.pickuplat : r.pickuplat) != null
@@ -4963,7 +5038,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // over-capacity dispatch onto an already-loaded driver would persist
       // the merge and only then hit the delegated ASSIGN_DRIVER rejection,
       // leaving orphaned DB state. Checking first keeps it atomic.
-      const { data: driverExistingTrips } = await supabase.from("trips").select("extraagentids").eq("driverid", action.driver_id).eq("scheduleddate", primaryRow.scheduleddate).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+      const { data: driverExistingTrips } = await supabase.from("trips").select("extraagentids").eq("driverid", action.driver_id).eq("scheduleddate", primaryRow.scheduleddate).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
       const driverExistingSeats = (driverExistingTrips || []).reduce((s, r) => s + Math.max(1, 1 + (r.extraagentids?.length || 0)), 0);
       if (driverExistingSeats + totalSeats > dispatchMultiDriverCapacitySupa) {
         throw new Error(`Driver doesn't have room — ${driverExistingSeats}/${dispatchMultiDriverCapacitySupa} seats taken, these trips need ${totalSeats}.`);
@@ -5121,7 +5196,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // would reject a DRIVER_CONFIRMED → DRIVER_CONFIRMED self-transition
           // as illegal. Instead, inline just the sequencing recompute here.
           const { data: mergedTripFresh } = await supabase.from("trips").select("*").eq("id", mergeTargetTrip.id).single();
-          const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+          const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
           const allForDriverMerge = (driverTripsAfterMerge || []).map(r => {
             const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
             const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
@@ -5155,7 +5230,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           return;
         }
       }
-      const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED);
+      const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
       // Seat-based load: sum passengers (primary + extra agents) across the
       // driver's active trips ON THE SAME DATE as the trip being assigned
       // — not across all dates. Trips on different days never share a
@@ -5256,18 +5331,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
-      // Server-side enforcement of the "start trip" 2-hour window — the
-      // client already checks this before calling, but this guards
-      // against a request reaching the backend directly (bypassing that
-      // UI check) or a stale client. Only enforced when the trip actually
-      // has a scheduled time recorded.
-      if (tripRow.scheduledtime != null) {
-        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-        const windowOpensAt = tripRow.scheduledtime - TWO_HOURS_MS;
-        if (Date.now() < windowOpensAt) {
-          throw new Error("Start trip denied — trips can only be started within 2 hours of the scheduled time.");
-        }
-      }
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
@@ -5303,7 +5366,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
       if (!tripRow.driverid) throw new Error("This trip has no driver assigned.");
-      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Cannot remove the driver from a completed trip.");
+      if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot remove the driver from a completed or cancelled trip.");
       const removedDriverId = tripRow.driverid;
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({
@@ -5624,12 +5687,32 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/RECORD_ROUTE": {
+      // Server-side enforcement of the "start trip" 2-hour window — this
+      // is the actual moment a trip starts (Waze opens right after this
+      // succeeds), not TRIP/DRIVER_CONFIRM (accepting a trip assignment
+      // can legitimately happen hours or a day in advance and must NOT be
+      // blocked by this restriction — only genuinely starting navigation
+      // should be). The client already checks this before calling, but
+      // this guards against a request reaching the backend directly or a
+      // stale client. Checked against the EARLIEST scheduled trip in this
+      // batch, matching the client-side check.
+      const { trips: routeTrips, driver_coord } = action;
+      const earliestScheduled = routeTrips
+        .map(t => t.scheduled_time_epoch)
+        .filter(Boolean)
+        .sort((a, b) => a - b)[0];
+      if (earliestScheduled != null) {
+        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+        const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
+        if (Date.now() < windowOpensAt) {
+          throw new Error("Start trip denied — trips can only be started within 2 hours of the scheduled time.");
+        }
+      }
       // Computes the full optimized route (driver's current position ->
       // every pickup -> every drop-off, nearest-neighbour ordered) across
       // ALL of a driver's currently active trips, and writes the same
       // total distance onto every one of those trips — the total belongs
       // to the whole run, not any single trip's own pickup-to-dropoff leg.
-      const { trips: routeTrips, driver_coord } = action;
       const { totalRoadKm } = computeOptimalRoute(routeTrips, driver_coord);
       for (const t of routeTrips) {
         await supabase.from("trips").update({ routetotalkm: totalRoadKm }).eq("id", t.trip_id);
@@ -5686,6 +5769,42 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (anyFired) await refetch();
       return;
     }
+    case "TRIP/CHECK_UPCOMING_REMINDERS": {
+      // Periodic check — for every trip with reminders enabled
+      // (remindersent = true, set by the agent tapping REMIND) that's
+      // within 2 hours of its scheduled time, fires an hourly reminder
+      // notification. lastreminderat tracks the last fire so this never
+      // sends more than once per hour per trip, even though the check
+      // itself runs on the same 30s/60s polling cadence as everything
+      // else. No permission check — same rationale as CHECK_LATE_START,
+      // this is a periodic background check, not an admin action.
+      const nowMs = Date.now();
+      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+      const ONE_HOUR_MS = 60 * 60 * 1000;
+      const { data: reminderCandidates } = await supabase.from("trips").select("*")
+        .eq("remindersent", true)
+        .neq("status", TRIP_STATE.ARCHIVED_COMPLETED)
+        .neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+      if (!reminderCandidates || reminderCandidates.length === 0) return;
+      let curAnyFired = false;
+      for (const t of reminderCandidates) {
+        if (t.scheduledtime == null) continue;
+        const timeUntil = t.scheduledtime - nowMs;
+        if (timeUntil > TWO_HOURS_MS || timeUntil < 0) continue; // not yet in window, or already passed
+        const lastAt = t.lastreminderat || 0;
+        if (nowMs - lastAt < ONE_HOUR_MS) continue; // reminded within the last hour already
+        curAnyFired = true;
+        await supabase.from("trips").update({ lastreminderat: nowMs }).eq("id", t.id);
+        const tripAgentIds = [t.agentid, ...(t.extraagentids || [])].filter(Boolean);
+        await insertNotification({
+          type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+          message: `Reminder: your trip from ${t.pickuplocation} departs at ${t.scheduledtimestr || t.scheduledtime}.`,
+          trip_id: t.id, ts: nowMs, read: false,
+        });
+      }
+      if (curAnyFired) await refetch();
+      return;
+    }
     case "NOTIF/DELETE_SELECTED": {
       // Deletes notifications by ID. For agents/drivers: scoped to their own userid.
       // For admins: delete by ID only — no userid constraint. This handles:
@@ -5735,10 +5854,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/SEND_REMINDER": {
+      // Enables recurring reminders for this trip — see
+      // TRIP/CHECK_UPCOMING_REMINDERS for the periodic check that
+      // actually sends the hourly notifications from here on.
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow || tripRow.remindersent) return;
       const nowTs = nowEpoch();
-      must(await supabase.from("trips").update({ remindersent: true }).eq("id", action.trip_id));
+      // lastreminderat set to NOW, not null — the notification below IS the
+      // first reminder, so the automatic hourly check shouldn't fire again
+      // until a full hour after this click (see local reducer's identical
+      // fix for the duplicate-reminder scenario this prevents).
+      must(await supabase.from("trips").update({ remindersent: true, lastreminderat: nowTs }).eq("id", action.trip_id));
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
@@ -6424,7 +6550,7 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
         <div onClick={() => goToTrip(active)} style={{ cursor: "pointer", background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.3)", borderRadius: 4, padding: 14, display: "flex", flexDirection: "column", gap: 6 }}>
           <div style={{ fontWeight: 700, fontSize: 11 }}>▶ ACTIVE TRIP</div>
           <StateBadge state={active.state} />
-          <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 4 }}>{active.custom_pickup} → {active.custom_dropoff}</div>
+          <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 4 }}>{agentRouteLabel(active.direction)}</div>
           {active.pickup_order_num && <div style={{ fontSize: 11, color: COLORS.amber, fontWeight: 700 }}>You are pickup #{active.pickup_order_num}</div>}
           <div style={{ fontSize: 10, color: COLORS.dim }}>Tap to view details →</div>
         </div>
@@ -6447,8 +6573,7 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
             <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{t.trip_id}</span>
             <StateBadge state={t.state} />
           </div>
-          <div style={{ fontSize: 11 }}>{t.custom_pickup}</div>
-          <div style={{ fontSize: 10, color: COLORS.ghost }}>→ {t.custom_dropoff}</div>
+          <div style={{ fontSize: 11 }}>{agentRouteLabel(t.direction)}</div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4, flexWrap: "wrap" }}>
             <span style={{ fontSize: 9, color: COLORS.dim }}>{t.scheduled_date} · {t.scheduled_time}</span>
             {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
@@ -6881,7 +7006,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
         </div>
       )}
 
-      {trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (() => {
+      {![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state) && (() => {
         const scheduledDt = parseScheduledDateTime(trip.scheduled_date, trip.scheduled_time);
         const hoursUntil = scheduledDt ? (scheduledDt.getTime() - Date.now()) / 3600000 : null;
         const wouldBeLate = hoursUntil != null && hoursUntil < 2;
@@ -6914,13 +7039,6 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
       <Card>
         <SectionHeader label="Route" />
         <div style={{ fontSize: 13, fontWeight: 700 }}>{agentRouteLabel(trip.direction)}</div>
-        {trip.est_distance_km && <div style={{ fontSize: 10, color: COLORS.teal }}>Est. distance: {(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</div>}
-        {trip.driver_route_km != null && (
-          <div style={{ fontSize: 10, color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, marginTop: 2 }}>
-            {trip.driver_route_exceeds_policy ? "⚠ " : ""}Driver's total route (first pickup → last drop-off): {trip.driver_route_km.toFixed(1)} km
-            {trip.driver_route_cap_km != null && ` (company policy cap: ${trip.driver_route_cap_km.toFixed(0)} km)`}
-          </div>
-        )}
       </Card>
 
       {driverUser && (
@@ -7306,13 +7424,6 @@ function AgentProfileTab({ user, myTrips, dispatch }) {
         <div style={{ display: "flex", justifyContent: "center", marginTop: 6 }}><RoleBadge role={user.role} /></div>
         <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 4 }}>{user.id}</div>
       </Card>
-      {user.home_address && (
-        <Card>
-          <SectionHeader label="Home Address" />
-          <div style={{ fontSize: 11, fontWeight: 600 }}>🏠 {user.home_address.label}</div>
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>{user.home_address.lat?.toFixed(5)}, {user.home_address.lng?.toFixed(5)}</div>
-        </Card>
-      )}
       <Card body={false}>
         {[["Total Trips", myTrips.length], ["Completed", myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length], ["Active", myTrips.filter(t => [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)).length]].map(([l, v]) => (
           <div key={l} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 16px", borderBottom: `1px solid ${COLORS.wire}` }}>
@@ -8557,7 +8668,7 @@ function DriverTripDropoffs({ trip, state }) {
 function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
-  const active = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+  const active = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
   // Seats used = sum of PASSENGERS across active trips, not trip-record count.
   // A merged trip (several agents combined into one trip via DISPATCH_MULTI
   // or the auto-merge in TRIP/ASSIGN_DRIVER) is still exactly one trip
@@ -8577,6 +8688,27 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const [expandedTripIds, setExpandedTripIds] = useState(() => new Set(
     active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted).map(t => t.trip_id)
   ));
+  // The initializer above only runs once, at mount — a NEW trip assigned
+  // to this driver later (realtime push while they're already sitting on
+  // this tab) would otherwise render collapsed by default despite needing
+  // their action, silently defeating the auto-expand behavior for anything
+  // that arrives after the component's first render. This keeps watching
+  // for newly-ASSIGNED, not-yet-accepted trips and expands each one
+  // exactly once as it first appears, without re-collapsing a trip the
+  // driver deliberately collapsed themselves afterward.
+  const autoExpandedRef = useRef(new Set());
+  useEffect(() => {
+    const needsAction = active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted);
+    const toAdd = needsAction.filter(t => !autoExpandedRef.current.has(t.trip_id));
+    if (toAdd.length === 0) return;
+    toAdd.forEach(t => autoExpandedRef.current.add(t.trip_id));
+    setExpandedTripIds(prev => {
+      const next = new Set(prev);
+      toAdd.forEach(t => next.add(t.trip_id));
+      return next;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active.map(t => t.trip_id + ":" + t.state + ":" + t.driverAccepted).join(",")]);
   const toggleTripExpanded = (tripId) => {
     setExpandedTripIds(prev => {
       const next = new Set(prev);
@@ -9497,8 +9629,10 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   useEffect(() => {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     }, 5 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -9518,7 +9652,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     // reveal this one either — the whole point is sequential visibility.
     return priorDay ? priorDay.state === TRIP_STATE.ARCHIVED_COMPLETED : false;
   });
-  const activeTrips = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+  const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   // Seats used = sum of passengers across active trips, not trip-record
   // count — a merged trip is one record but can hold several agents.
   // See DriverTripsTab's identical fix for the full rationale.
@@ -9986,7 +10120,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
   const [delays, setDelays] = useState(null); // null = not loaded yet
   const driver = state.users.find(u => u.id === trip.driver_id);
   const passengers = trip.agent_ids.map(id => state.users.find(u => u.id === id)).filter(Boolean);
-  const canEdit = trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && dispatch != null;
+  const canEdit = ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state) && dispatch != null;
   // Use the assigned driver's own vehicle capacity, not the global default —
   // a driver with an 8-seat minibus would be incorrectly blocked at 4 seats
   // otherwise. Falls back to DRIVER_CAPACITY for unassigned trips (no driver
@@ -10216,7 +10350,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             );
           })()}
 
-          {canEdit && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED && (
+          {canEdit && (
             !confirmingCancel ? (
               <Button title={`✕ CANCEL ${tripNounCap(trip).toUpperCase()}`} variant="ghost" size="sm" onClick={() => setConfirmingCancel(true)} style={{ alignSelf: "flex-start" }} />
             ) : (
@@ -10290,7 +10424,7 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     // Dispatch sequencing
     "Pickup Order #", "Drop Sequence #",
     // Financials
-    "Est. Distance (km)", "Est. Cost (ZAR)", "Actual Distance (km)", "Long Distance",
+    "Est. Distance (km)", "Actual Distance (km)", "Long Distance",
     // Driver route
     "Driver Full Route (km)", "Driver Route Cap (km)", "Exceeds Policy",
     // Status
@@ -10389,7 +10523,6 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         t.drop_sequence_num || "",
         // Financials
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
-        t.est_cost_zar != null ? t.est_cost_zar.toFixed(2) : "",
         t.actual_distance_km != null ? (t.actual_distance_km * ROAD_FACTOR).toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
         // Driver route
@@ -11920,7 +12053,7 @@ function AdminDrivers({ state, user }) {
         const load = getDriverLoad(state, ds.driver_id, todayStr);
         const driverCapacityList = ds.capacity || DRIVER_CAPACITY;
         const full = load >= driverCapacityList;
-        const activeTrips = state.trips.filter(t => t.driver_id === ds.driver_id && t.state !== TRIP_STATE.ARCHIVED_COMPLETED).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+        const activeTrips = state.trips.filter(t => t.driver_id === ds.driver_id && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
         return (
           <Card key={ds.driver_id}>
             <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
@@ -11992,8 +12125,9 @@ function UserProfilePanel({ u, driverStatus, state }) {
   const branch = u.branch_id ? companyById(state, u.branch_id) : null;
   const campaign = u.campaign_id ? (state.campaigns || []).find(c => c.id === u.campaign_id) : null;
   const myTrips = state.trips.filter(t => t.agent_ids?.includes(u.id) || t.driver_id === u.id);
-  const activeTrips = myTrips.filter(t => t.state !== TRIP_STATE.ARCHIVED_COMPLETED);
+  const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   const completedTrips = myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
+  const cancelledTrips = myTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_CANCELLED);
 
   const Row = ({ label, children }) => (
     <div style={{ display: "flex", justifyContent: "space-between", gap: 12, padding: "6px 0", borderBottom: `1px solid ${COLORS.wire}` }}>
@@ -12048,6 +12182,7 @@ function UserProfilePanel({ u, driverStatus, state }) {
         <>
           <Row label="ACTIVE TRIPS (LIVE WINDOW)">{activeTrips.length}</Row>
           <Row label="COMPLETED TRIPS (LIVE WINDOW)">{completedTrips.length}</Row>
+          <Row label="CANCELLED TRIPS (LIVE WINDOW)">{cancelledTrips.length}</Row>
         </>
       )}
 
@@ -13520,8 +13655,10 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   useEffect(() => {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     }, 5 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
