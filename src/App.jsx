@@ -691,13 +691,29 @@ function haversineKm(lat1, lng1, lat2, lng2) {
 // Used for OUTBOUND trip display so the trip card always shows D1 (closest to
 // company) → D2 → D3 (furthest) regardless of agent array order.
 // Coords without lat/lng are pushed to the end.
-function sortDropoffCoordsByProximity(coords, anchorCoord) {
+function sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord) {
   if (!anchorCoord || coords.length <= 1) return coords;
   const valid = coords.filter(c => c?.lat != null && c?.lng != null);
   const invalid = coords.filter(c => c?.lat == null || c?.lng == null);
   if (valid.length <= 1) return [...valid, ...invalid];
+  // With a known driver home address, the LAST dropoff must be the one
+  // closest to home (per explicit requirement) — reserve it up front so
+  // the greedy chain below is built to genuinely finish there, rather
+  // than ending wherever plain nearest-neighbour-from-the-previous-stop
+  // happens to land, which can leave the driver furthest from home at
+  // the end of their run instead of closest to it.
+  let lastStop = null;
+  let chainPool = valid;
+  if (driverEndCoord?.lat != null) {
+    let bestHomeDist = Infinity;
+    for (const c of valid) {
+      const d = haversineKm(driverEndCoord.lat, driverEndCoord.lng, c.lat, c.lng);
+      if (d < bestHomeDist) { bestHomeDist = d; lastStop = c; }
+    }
+    chainPool = valid.filter(c => c !== lastStop);
+  }
   const ordered = [];
-  let remaining = [...valid];
+  let remaining = [...chainPool];
   let cur = anchorCoord;
   while (remaining.length) {
     let best = null, bestDist = Infinity;
@@ -709,6 +725,7 @@ function sortDropoffCoordsByProximity(coords, anchorCoord) {
     cur = { lat: best.lat, lng: best.lng };
     remaining = remaining.filter(c => c !== best);
   }
+  if (lastStop) ordered.push(lastStop);
   return [...ordered, ...invalid];
 }
 
@@ -1418,16 +1435,33 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
   }
 }
 
-async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
+async function tomtomOptimalStopOrder(anchorCoord, stopCoords, realEndAnchor) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
   const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
   if (valid.length <= 1) return null;
   try {
-    // anchor + all stops + anchor again as end → all stops are "supporting points"
+    // anchor + all stops + end anchor → all stops are "supporting points"
     // that TomTom can freely reorder with computeBestOrder=true. Works for
     // both pickup and dropoff sequencing — the math is identical, only the
     // caller's anchor point and coordinate set differ.
-    const endAnchor = { lat: anchorCoord.lat + 0.00001, lng: anchorCoord.lng + 0.00001 };
+    //
+    // The end anchor is either:
+    //   (a) the driver's REAL home address, when known — the route is then
+    //       genuinely optimized to end there, per explicit requirement
+    //       that the last dropoff should be the one closest to the
+    //       driver's home, not just whichever stop the greedy chain
+    //       happens to land on last; or
+    //   (b) a throwaway point ~1m from the start anchor, when no real end
+    //       point is known — this exists ONLY to stop TomTom silently
+    //       deduplicating an end waypoint that's byte-identical to the
+    //       start (confirmed in production: identical start/end waypoints
+    //       collapse into fewer effective waypoints and corrupt the
+    //       providedIndex/optimizedIndex mapping below). It has no
+    //       optimization effect of its own — the driver isn't actually
+    //       going there — it just needs to be numerically distinct.
+    const endAnchor = realEndAnchor?.lat != null
+      ? realEndAnchor
+      : { lat: anchorCoord.lat + 0.00001, lng: anchorCoord.lng + 0.00001 };
     const allWaypoints = [anchorCoord, ...valid, endAnchor];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
@@ -8810,7 +8844,16 @@ function AdminTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  // The route should genuinely end at (or nearest to) the driver's home
+  // address, per explicit requirement — not just wherever the greedy
+  // chain happens to land last.
+  const driverHomeCoord = trip.direction === "OUTBOUND"
+    ? (() => {
+        const driverUser = state.users.find(u => u.id === trip.driver_id);
+        return driverUser?.home_address?.lat != null ? { lat: driverUser.home_address.lat, lng: driverUser.home_address.lng } : null;
+      })()
+    : null;
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, driverHomeCoord);
   const finalCoords = sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
@@ -8848,7 +8891,16 @@ function DriverTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  // The route should genuinely end at (or nearest to) the driver's home
+  // address, per explicit requirement — not just wherever the greedy
+  // chain happens to land last.
+  const driverHomeCoord = trip.direction === "OUTBOUND"
+    ? (() => {
+        const driverUser = state.users.find(u => u.id === trip.driver_id);
+        return driverUser?.home_address?.lat != null ? { lat: driverUser.home_address.lat, lng: driverUser.home_address.lng } : null;
+      })()
+    : null;
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, driverHomeCoord);
   const finalCoords = (sorted || dropCoords);
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -9279,7 +9331,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     // useSortedDropoffs in the display layer for trip cards and admin views.
     if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
       const anchor = defaultCompanyAnchor(state);
-      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
+      const driverHomeCoord = user?.home_address?.lat != null ? { lat: user.home_address.lat, lng: user.home_address.lng } : null;
+      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor, driverHomeCoord);
     }
 
     if (dropCoords.length === 0) return;
@@ -10216,7 +10269,13 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // coords. Uses TomTom routing for road-optimal ordering when available, haversine
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
-  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id);
+  const driverHomeCoord = trip.direction === "OUTBOUND"
+    ? (() => {
+        const driverUser = state.users.find(u => u.id === trip.driver_id);
+        return driverUser?.home_address?.lat != null ? { lat: driverUser.home_address.lat, lng: driverUser.home_address.lng } : null;
+      })()
+    : null;
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, driverHomeCoord);
   const finalCoords = sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
@@ -10256,16 +10315,20 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v9-optimizedindex-sort-fix";
+const _TOMTOM_CACHE_VERSION = "v10-driver-home-endpoint";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
-function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
+function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord) {
   const isOutbound = direction === "OUTBOUND";
-  // Stable key: cache version + trip_id + sorted lat/lng fingerprint of the coord set.
-  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  // Stable key: cache version + trip_id + sorted lat/lng fingerprint of the
+  // coord set + the driver's end coord (if any) — a different driver (or a
+  // driver whose home address changes) needs a fresh optimization, not a
+  // cached result computed for someone else's home endpoint.
+  const endKey = driverEndCoord?.lat != null ? `${driverEndCoord.lat.toFixed(4)},${driverEndCoord.lng.toFixed(4)}` : "none";
+  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
   const [sorted, setSorted] = React.useState(() => {
     if (!isOutbound || !coords || coords.length <= 1) return coords;
     if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
-    return sortDropoffCoordsByProximity(coords, anchorCoord); // haversine until TomTom responds
+    return sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord); // haversine until TomTom responds
   });
   const [loading, setLoading] = React.useState(false);
   const [tomtomError, setTomtomError] = React.useState(null);
@@ -10294,7 +10357,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
     const requestedCount = coords.length;
     setLoading(true);
     setTomtomError(null);
-    tomtomOptimalStopOrder(anchorCoord, coords).then(result => {
+    tomtomOptimalStopOrder(anchorCoord, coords, driverEndCoord).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
@@ -10305,7 +10368,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId) {
         return;
       }
       if (!result) setTomtomError("TomTom returned no result — using distance estimate instead");
-      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord);
+      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord);
       _tomtomSortCache.set(fingerprint, final);
       setSorted(final);
     }).catch(e => {
@@ -10556,7 +10619,9 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             // admin sees them in the same order the driver will visit them.
             if (trip.direction === "OUTBOUND" && allDropCoords.length > 1) {
               const anchor = defaultCompanyAnchor(state);
-              allDropCoords = sortDropoffCoordsByProximity(allDropCoords, anchor);
+              const driverUser = state.users.find(u => u.id === trip.driver_id);
+              const driverHomeCoord = driverUser?.home_address?.lat != null ? { lat: driverUser.home_address.lat, lng: driverUser.home_address.lng } : null;
+              allDropCoords = sortDropoffCoordsByProximity(allDropCoords, anchor, driverHomeCoord);
             }
             return (
               <DropoffSequenceDisplay
