@@ -837,6 +837,15 @@ function computeOptimalRoute(trips, driverCurrentCoord) {
   const legs = [];
   let cur = start;
   let totalKm = 0;
+  // The driver's-current-position -> first-pickup leg is used ONLY to
+  // determine sequencing (which pickup is genuinely nearest to where the
+  // driver actually is right now) — it is deliberately EXCLUDED from the
+  // total distance. "Driver's full route" means first pickup through last
+  // drop-off, per explicit requirement, not however far the driver had to
+  // travel just to reach their first stop (which varies by where they
+  // happened to be standing when they tapped Start Trip, and isn't part
+  // of the passengers' actual journey).
+  let isFirstLeg = true;
 
   // Every individual pickup point across every trip (a multi-passenger
   // trip contributes one entry per agent, not one per trip) — matches
@@ -857,8 +866,9 @@ function computeOptimalRoute(trips, driverCurrentCoord) {
       if (d < bestDist) { bestDist = d; best = p; bestIdx = i; }
     });
     const roadKm = bestDist * ROAD_FACTOR;
-    legs.push({ from: cur, to: best.coord, km: roadKm, kind: "pickup", trip_id: best.trip_id, agent_id: best.agent_id });
-    totalKm += roadKm;
+    legs.push({ from: cur, to: best.coord, km: roadKm, kind: "pickup", trip_id: best.trip_id, agent_id: best.agent_id, excludedFromTotal: isFirstLeg });
+    if (!isFirstLeg) totalKm += roadKm;
+    isFirstLeg = false;
     cur = best.coord;
     pickupOrder.push(best);
     remainingPickups.splice(bestIdx, 1);
@@ -1056,9 +1066,17 @@ function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropof
   let total = 0;
   let cur = startAnchor;
   const isSameSpot = (a, b) => a && b && Math.abs(a.lat - b.lat) < 0.00001 && Math.abs(a.lng - b.lng) < 0.00001;
+  // The startAnchor -> first-pickup leg is excluded from the total —
+  // "driver's full route" means first pickup through last drop-off, per
+  // explicit requirement, not however far the driver has to travel from
+  // the company (or wherever) to reach their first stop. startAnchor is
+  // still used to determine which pickup is genuinely nearest for
+  // sequencing purposes, just not counted toward the distance total.
+  let isFirstPickupLeg = true;
   for (const p of orderedPickups) {
-    if (!p.coord || isSameSpot(cur, p.coord)) continue;
-    total += haversineKm(cur.lat, cur.lng, p.coord.lat, p.coord.lng);
+    if (!p.coord || isSameSpot(cur, p.coord)) { isFirstPickupLeg = false; continue; }
+    if (!isFirstPickupLeg) total += haversineKm(cur.lat, cur.lng, p.coord.lat, p.coord.lng);
+    isFirstPickupLeg = false;
     cur = p.coord;
   }
   for (const t of orderedDropoffs) {
@@ -1437,8 +1455,14 @@ async function tomtomReverseGeocode(lat, lng) {
 async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
   if (!TOMTOM_API_KEY || !startAnchor) return null;
   try {
-    // Build the full waypoint list
-    const coords = [startAnchor];
+    // Build the full waypoint list — starting from the FIRST PICKUP, not
+    // startAnchor. "Driver's full route" means first pickup through last
+    // drop-off, per explicit requirement, so the company-to-first-pickup
+    // leg (or wherever the driver actually was at start-trip time) is
+    // deliberately excluded from this distance — startAnchor is only
+    // used elsewhere (buildPickupSequence/buildDropoffSequence) to
+    // determine WHICH pickup is nearest for sequencing, not counted here.
+    const coords = [];
     for (const p of orderedPickups) {
       if (p.coord?.lat != null) coords.push(p.coord);
     }
@@ -1476,34 +1500,30 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
   }
 }
 
-async function tomtomOptimalStopOrder(anchorCoord, stopCoords, realEndAnchor) {
+async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
   const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
   if (valid.length <= 1) return null;
   try {
-    // anchor + all stops + end anchor → all stops are "supporting points"
-    // that TomTom can freely reorder with computeBestOrder=true. Works for
-    // both pickup and dropoff sequencing — the math is identical, only the
-    // caller's anchor point and coordinate set differ.
+    // CRITICAL — confirmed against real production data: computeBestOrder
+    // with BOTH a fixed start AND a fixed end anchor solves a CLOSED-LOOP
+    // ("leave anchor, visit all stops, return to anchor") problem, not the
+    // one-way trip we actually want. For any given cyclic order of stops,
+    // a round trip's total distance is the same regardless of which
+    // direction you traverse it or where you "start" within the loop —
+    // so TomTom had no real basis to prefer one order over another and
+    // was simply echoing back whatever order we provided as already
+    // "optimal" for the round-trip objective, even when the true ONE-WAY
+    // distance (no return leg) differed by 30+ km between orderings.
+    // Verified with real Google Maps data across multiple stop
+    // combinations: TomTom consistently returned optimizedIndex ===
+    // providedIndex ("no change needed") regardless of input order —
+    // exactly the symptom of solving the wrong (cyclic) problem.
     //
-    // The end anchor is either:
-    //   (a) the driver's REAL home address, when known — the route is then
-    //       genuinely optimized to end there, per explicit requirement
-    //       that the last dropoff should be the one closest to the
-    //       driver's home, not just whichever stop the greedy chain
-    //       happens to land on last; or
-    //   (b) a throwaway point ~1m from the start anchor, when no real end
-    //       point is known — this exists ONLY to stop TomTom silently
-    //       deduplicating an end waypoint that's byte-identical to the
-    //       start (confirmed in production: identical start/end waypoints
-    //       collapse into fewer effective waypoints and corrupt the
-    //       providedIndex/optimizedIndex mapping below). It has no
-    //       optimization effect of its own — the driver isn't actually
-    //       going there — it just needs to be numerically distinct.
-    const endAnchor = realEndAnchor?.lat != null
-      ? realEndAnchor
-      : { lat: anchorCoord.lat + 0.00001, lng: anchorCoord.lng + 0.00001 };
-    const allWaypoints = [anchorCoord, ...valid, endAnchor];
+    // Fix: fix ONLY the start point. Every dropoff is a free waypoint,
+    // with NO forced return to the anchor — this is what "find the
+    // shortest one-way route visiting these stops" genuinely means.
+    const allWaypoints = [anchorCoord, ...valid];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car`;
@@ -1511,15 +1531,12 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, realEndAnchor) {
     if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
     const data = await res.json();
     // IMPORTANT — confirmed in production against real API responses:
-    // optimizedWaypoints does NOT include the fixed start/end anchors at
-    // all. providedIndex is 0-indexed relative ONLY to the "soft"
-    // reorderable waypoints we listed (i.e. our `valid` dropoffs array),
-    // not the full allWaypoints array that also contains the two anchors.
-    // A request with 2 dropoffs → optimizedWaypoints has exactly 2 entries,
-    // with providedIndex values 0 and 1 (NOT 1 and 2). The previous version
-    // of this code assumed providedIndex was 1-indexed with 0/N+1 reserved
-    // for anchors, which silently discarded a real dropoff at index 0 on
-    // every single call and made this feature never actually work.
+    // optimizedWaypoints does NOT include the fixed start anchor at all.
+    // providedIndex is 0-indexed relative ONLY to the "soft" reorderable
+    // waypoints we listed (i.e. our `valid` dropoffs array), not the full
+    // allWaypoints array that also contains the anchor. A request with 2
+    // dropoffs → optimizedWaypoints has exactly 2 entries, with
+    // providedIndex values 0 and 1 (NOT 1 and 2).
     const optimized = data.routes?.[0]?.optimizedWaypoints;
     if (!optimized || optimized.length !== valid.length) {
       console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${valid.length}. Falling back to haversine.`);
@@ -2936,11 +2953,22 @@ function appReducer(state, action) {
           return { ...state, _error: "Start trip denied — trips can only be started within 2 hours of the scheduled time." };
         }
       }
-      const { totalRoadKm: rrTotalRoadKm } = computeOptimalRoute(rrTrips, rrDriverCoord);
+      const { pickupOrder: rrPickupOrder, dropoffOrder: rrDropoffOrder, totalRoadKm: rrTotalRoadKm } = computeOptimalRoute(rrTrips, rrDriverCoord);
       const rrTripIds = new Set(rrTrips.map(t => t.trip_id));
+      // Collapse per-agent order to each trip's earliest position — see
+      // the Supabase handler's identical case for the full rationale.
+      const rrFirstPickupPos = {};
+      rrPickupOrder.forEach((p, i) => { if (rrFirstPickupPos[p.trip_id] === undefined) rrFirstPickupPos[p.trip_id] = i + 1; });
+      const rrFirstDropoffPos = {};
+      rrDropoffOrder.forEach((d, i) => { if (rrFirstDropoffPos[d.trip_id] === undefined) rrFirstDropoffPos[d.trip_id] = i + 1; });
       return {
         ...state,
-        trips: state.trips.map(t => rrTripIds.has(t.trip_id) ? { ...t, route_total_km: rrTotalRoadKm } : t),
+        trips: state.trips.map(t => rrTripIds.has(t.trip_id) ? {
+          ...t,
+          route_total_km: rrTotalRoadKm,
+          pickup_order_num: rrFirstPickupPos[t.trip_id] ?? t.pickup_order_num,
+          drop_sequence_num: rrFirstDropoffPos[t.trip_id] ?? t.drop_sequence_num,
+        } : t),
         _error: null,
       };
     }
@@ -4228,9 +4256,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const haversineKmAdd = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const tomtomKmAdd = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
-        const routeDistanceKmAdd = tomtomKmAdd ?? haversineKmAdd;
+        const routeDistanceKmAdd = tomtomKmAdd ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
         const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
         for (const t of driverTripsRaw || []) {
@@ -4319,9 +4346,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const haversineKmRem = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const tomtomKmRem = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
-        const routeDistanceKmRem = tomtomKmRem ?? haversineKmRem;
+        const routeDistanceKmRem = tomtomKmRem ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
         const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
         for (const t of driverTripsRaw || []) {
@@ -4411,9 +4437,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const haversineKmReloc = computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const tomtomKmReloc = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
-        const routeDistanceKmReloc = tomtomKmReloc ?? haversineKmReloc;
+        const routeDistanceKmReloc = tomtomKmReloc ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
         const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
         for (const t of driverTripsRaw || []) {
@@ -5136,9 +5161,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
         acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
         const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const acHaversineKm = computeDriverRouteDistanceKm(acCompanyAnchor, acOrdered, acDropOrdered);
         const acTomtomKm = await tomtomRealRouteKm(acCompanyAnchor, acOrdered, acDropOrdered);
-        const acRouteDistanceKm = acTomtomKm ?? acHaversineKm;
+        const acRouteDistanceKm = acTomtomKm ?? computeDriverRouteDistanceKm(acCompanyAnchor, acOrdered, acDropOrdered);
         const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
         const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
         for (const t of acDriverTripsRaw || []) {
@@ -5471,9 +5495,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const mergeSeqMap = {}, mergeDropMap = {};
           mergeOrdered.forEach((o, i) => { mergeSeqMap[o.trip.trip_id] = i + 1; });
           mergeDropOrdered.forEach((t, i) => { mergeDropMap[t.trip_id] = i + 1; });
-          const mergeHaversineKm = computeDriverRouteDistanceKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
           const mergeTomtomKm = await tomtomRealRouteKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
-          const mergeRouteKm = mergeTomtomKm ?? mergeHaversineKm;
+          const mergeRouteKm = mergeTomtomKm ?? computeDriverRouteDistanceKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
           const mergeTotalSeats = allForDriverMerge.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
           const mergePolicyCap = companyPolicyDistanceCapKm(mergeTotalSeats);
           for (const r of (driverTripsAfterMerge || [])) {
@@ -5528,10 +5551,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Total route distance — try TomTom for real road distance first,
       // fall back to haversine × 1.35 if TomTom is unavailable.
       const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-      const haversineKmEstimate = computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
       const tomtomKm = await tomtomRealRouteKm(startAnchor, ordered, dropOrdered);
-      const routeDistanceKm = tomtomKm ?? haversineKmEstimate;
-      console.log(`[ASSIGN_DRIVER] route: TomTom=${tomtomKm?.toFixed(1) ?? "n/a"} km, haversine estimate=${haversineKmEstimate.toFixed(1)} km, using=${routeDistanceKm.toFixed(1)} km`);
+      const routeDistanceKm = tomtomKm ?? computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
+      console.log(`[ASSIGN_DRIVER] route: TomTom=${tomtomKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${routeDistanceKm.toFixed(1)} km`);
       const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
       const exceedsPolicy = routeDistanceKm > policyCapKm;
       const nowTs = nowEpoch();
@@ -5966,14 +5988,45 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           throw new Error("Start trip denied — trips can only be started within 2 hours of the scheduled time.");
         }
       }
-      // Computes the full optimized route (driver's current position ->
-      // every pickup -> every drop-off, nearest-neighbour ordered) across
-      // ALL of a driver's currently active trips, and writes the same
-      // total distance onto every one of those trips — the total belongs
-      // to the whole run, not any single trip's own pickup-to-dropoff leg.
-      const { totalRoadKm } = computeOptimalRoute(routeTrips, driver_coord);
+      // Computes the full optimized route (driver's ACTUAL current
+      // position at the moment they tapped Start Trip -> every pickup ->
+      // every drop-off, nearest-neighbour ordered) across ALL of a
+      // driver's currently active trips, and writes the total distance
+      // AND the per-trip sequence numbers onto every one of those trips.
+      //
+      // pickupordernum/dropsequencenum previously only ever held the
+      // DISPATCH-TIME planned order (set once when the driver was first
+      // assigned) and were never updated again — even though a driver's
+      // live route re-sequences from wherever they actually are once
+      // they start driving, which can genuinely differ from the plan
+      // (confirmed: Google Maps comparisons this session showed the
+      // dispatch-time haversine estimate disagreeing with the real
+      // fastest road route). This meant the CSV and admin views were
+      // reporting a sequence the driver may never have actually
+      // followed. Overwriting these fields HERE — the one moment we
+      // know the driver's true starting point — makes them reflect
+      // what genuinely happened, for accurate reporting.
+      const { pickupOrder, dropoffOrder, totalRoadKm } = computeOptimalRoute(routeTrips, driver_coord);
+      // pickupOrder/dropoffOrder are per-AGENT (one entry per passenger,
+      // since a merged trip has several). pickupordernum/dropsequencenum
+      // are per-TRIP fields (one number per trip row: "this trip is stop
+      // #N of the driver's day") — collapse to each trip's EARLIEST
+      // position across its own agents, i.e. when the driver first
+      // reaches any passenger on that trip.
+      const firstPickupPosForTrip = {};
+      pickupOrder.forEach((p, i) => {
+        if (firstPickupPosForTrip[p.trip_id] === undefined) firstPickupPosForTrip[p.trip_id] = i + 1;
+      });
+      const firstDropoffPosForTrip = {};
+      dropoffOrder.forEach((d, i) => {
+        if (firstDropoffPosForTrip[d.trip_id] === undefined) firstDropoffPosForTrip[d.trip_id] = i + 1;
+      });
       for (const t of routeTrips) {
-        await supabase.from("trips").update({ routetotalkm: totalRoadKm }).eq("id", t.trip_id);
+        await supabase.from("trips").update({
+          routetotalkm: totalRoadKm,
+          pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
+          dropsequencenum: firstDropoffPosForTrip[t.trip_id] ?? t.drop_sequence_num ?? null,
+        }).eq("id", t.trip_id);
       }
       await refetch();
       return;
@@ -10433,7 +10486,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v11-shortest-distance-only";
+const _TOMTOM_CACHE_VERSION = "v12-one-way-not-round-trip";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
 function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord) {
   const isOutbound = direction === "OUTBOUND";
@@ -10475,7 +10528,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
     const requestedCount = coords.length;
     setLoading(true);
     setTomtomError(null);
-    tomtomOptimalStopOrder(anchorCoord, coords, driverEndCoord).then(result => {
+    tomtomOptimalStopOrder(anchorCoord, coords).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
@@ -10841,7 +10894,10 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     "Pickup Address", "Booked Pickup Coord (lat,lng)",
     // Dropoff (per agent)
     "Drop-off Address", "Booked Dropoff Coord (lat,lng)",
-    // Dispatch sequencing (PLANNED order, computed at dispatch time)
+    // Trip sequencing — starts as the dispatch-time plan, then gets
+    // OVERWRITTEN with the driver's real post-start route the moment
+    // they tap Start Trip (recomputed from their actual live position),
+    // so this reflects the plan only for trips not yet started.
     "Pickup Order #", "Drop Sequence #",
     // Actual sequencing (REAL order the driver visited them in, from timestamps)
     "Actual Pickup Order #", "Actual Drop Order #",
@@ -12421,6 +12477,134 @@ function AdminLiveMap({ state, user }) {
   );
 }
 
+
+// Live sequencing for a SINGLE driver's currently-active trips — extracted
+// from DriverNavTab's own logic so admins see the EXACT same pickup/
+// dropoff order and progress the driver sees on their own screen after
+// tapping Start Trip, not just the dispatch-time PLANNED order
+// (pickup_order_num/drop_sequence_num), which can differ once the driver
+// actually starts driving (their live route re-sequences from wherever
+// they currently are — see buildPickupSequence/sortDropoffCoordsByProximity).
+function computeLiveSequenceForDriver(driverTrips, state) {
+  const pickupStops = driverTrips.flatMap(trip =>
+    (trip.pickup_sequence_coords || []).map((p, idx) => {
+      const agentId = p.agent_id ?? trip.agent_ids?.[idx];
+      const agentUser = state.users.find(u => u.id === agentId);
+      return {
+        lat: p.lat, lng: p.lng, label: p.label || trip.custom_pickup,
+        trip_id: trip.trip_id, agent_id: agentId,
+        agent_name: agentUser?.name || trip.agent_name,
+        done: !!(agentId != null && trip.completed_pickups?.includes(agentId)),
+      };
+    })
+  );
+  const dropoffGroups = {};
+  driverTrips.forEach(trip => {
+    let dropCoords = trip.dropoff_sequence_coords || [];
+    if (trip.direction === "OUTBOUND" && dropCoords.length < (trip.agent_ids?.length || 0)) {
+      const derivedCoords = [...dropCoords];
+      const coveredAgentIds = new Set(dropCoords.map(d => d.agent_id).filter(Boolean));
+      (trip.agent_ids || []).forEach(agentId => {
+        if (coveredAgentIds.has(agentId)) return;
+        const agentUser = state.users.find(u => u.id === agentId);
+        if (agentUser?.home_address?.lat != null) {
+          derivedCoords.push({ lat: agentUser.home_address.lat, lng: agentUser.home_address.lng, label: agentUser.home_address.label, agent_id: agentId, _derived: true });
+        }
+      });
+      dropCoords = derivedCoords;
+    }
+    if (trip.direction === "OUTBOUND" && dropCoords.length > 1) {
+      const anchor = defaultCompanyAnchor(state);
+      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
+    }
+    if (dropCoords.length === 0) return;
+    dropCoords.forEach((coord, coordIdx) => {
+      if (!coord) return;
+      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
+      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, passengers: [], done: false };
+      if (coord.agent_id) {
+        const u = state.users.find(x => x.id === coord.agent_id);
+        if (!dropoffGroups[key].passengers.find(p => p.id === coord.agent_id && p.trip_id === trip.trip_id)) {
+          dropoffGroups[key].passengers.push({ id: coord.agent_id, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+        }
+      } else if (coordIdx === 0) {
+        (trip.agent_ids || [trip.agent_id]).filter(Boolean).forEach(aid => {
+          const u = state.users.find(x => x.id === aid);
+          dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+        });
+      }
+    });
+  });
+  const anchorForDropSort = defaultCompanyAnchor(state);
+  const dropStops = sortDropoffsByProximity(Object.values(dropoffGroups), anchorForDropSort);
+  dropStops.forEach(group => {
+    group.done = group.passengers.every(p => {
+      const t = driverTrips.find(x => x.trip_id === p.trip_id);
+      return t && (t.completed_dropoffs || []).includes(p.id);
+    });
+  });
+  return { pickupStops, dropStops };
+}
+
+function AdminActiveTrips({ state }) {
+  const activeDrivers = state.driver_status.filter(ds =>
+    state.trips.some(t => t.driver_id === ds.driver_id && t.state === TRIP_STATE.IN_TRANSIT)
+  );
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ACTIVE TRIPS</div>
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2, marginBottom: 12 }}>
+        Live pickup/drop-off order exactly as it appears on each driver's own navigation
+        screen — this can differ from the planned dispatch order once a driver has
+        actually started driving.
+      </div>
+      {activeDrivers.length === 0 ? (
+        <Empty icon="🚦" text="No drivers currently in transit" />
+      ) : activeDrivers.map(ds => {
+        const driverUser = state.users.find(u => u.id === ds.driver_id);
+        const driverTrips = state.trips.filter(t => t.driver_id === ds.driver_id && t.state === TRIP_STATE.IN_TRANSIT);
+        const { pickupStops, dropStops } = computeLiveSequenceForDriver(driverTrips, state);
+        const allPickedUp = pickupStops.length > 0 && pickupStops.every(s => s.done);
+        return (
+          <Card key={ds.driver_id}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{driverUser?.name || "Driver"}</span>
+              <StateBadge state={TRIP_STATE.IN_TRANSIT} />
+            </div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
+              {allPickedUp ? "Drop-offs" : "Pickups"}
+            </div>
+            {!allPickedUp ? (
+              pickupStops.map((s, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < pickupStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
+                  <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : "rgba(245,166,35,.4)"}`, background: s.done ? "rgba(29,185,84,.15)" : "rgba(245,166,35,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: s.done ? COLORS.green : COLORS.amber, flexShrink: 0 }}>{i + 1}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, textDecoration: s.done ? "line-through" : "none", color: s.done ? COLORS.ghost : COLORS.chalk }}>{s.agent_name}</div>
+                    <div style={{ fontSize: 9, color: COLORS.ghost }}>{s.label}</div>
+                  </div>
+                  {s.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
+                </div>
+              ))
+            ) : (
+              dropStops.map((g, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < dropStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
+                  <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${g.done ? "rgba(29,185,84,.4)" : "rgba(232,58,58,.4)"}`, background: g.done ? "rgba(29,185,84,.15)" : "rgba(232,58,58,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: g.done ? COLORS.green : COLORS.red, flexShrink: 0 }}>{i + 1}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 11, fontWeight: 600, textDecoration: g.done ? "line-through" : "none", color: g.done ? COLORS.ghost : COLORS.chalk }}>
+                      {g.passengers.map(p => p.name).join(", ")}
+                    </div>
+                    <div style={{ fontSize: 9, color: COLORS.ghost }}>{g.label}</div>
+                  </div>
+                  {g.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
+                </div>
+              ))
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
 
 function AdminDrivers({ state, user }) {
   // Which trip cards are expanded, per driver. Collapsed by default —
@@ -14067,7 +14251,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
 
@@ -14083,6 +14267,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // broken/blank screen instead of falling back to the default.
   const visibleNav = ADMIN_NAV.filter(([id]) => {
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
+    if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
     return true;
@@ -14197,6 +14382,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     <div style={{ flex: 1, overflowY: "auto", minWidth: 0 }}>
       {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
+      {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
