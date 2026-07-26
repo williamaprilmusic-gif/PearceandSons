@@ -17513,12 +17513,6 @@ function AppInner() {
     prevMyNotifIds.current = myNotifIds;
   }, [state.notifications, activeUser?.id]);
 
-  const handleLogout8 = React.useCallback(() => {
-    dispatchWithToast({ type: "AUTH/LOGOUT" });
-  }, [dispatchWithToast]);
-  const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
-    useSessionTimeout(activeUser, handleLogout8);
-
   const handleLogin = async (login, pass) => {
     setLoginError(null);
     // Uses the raw store dispatch, not the wrapped one below — login
@@ -17554,6 +17548,14 @@ function AppInner() {
       throw e;
     }
   }, [dispatch, pushToast]);
+
+  // Session timeout — defined AFTER dispatchWithToast so the logout callback
+  // can safely reference it without hitting the temporal dead zone.
+  const handleLogout8 = React.useCallback(() => {
+    dispatchWithToast({ type: "AUTH/LOGOUT" });
+  }, [dispatchWithToast]);
+  const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
+    useSessionTimeout(activeUser, handleLogout8);
 
   useEffect(() => {
     if (state._error && !state.active_user_id) setLoginError(state._error);
