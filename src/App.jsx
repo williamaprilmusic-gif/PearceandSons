@@ -9036,11 +9036,6 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
         ))}
       </div>
 
-      <WeeklyOpsSummaryPanel state={state} />
-      <SectionHeader label="7-Day Demand Forecast" />
-      <CapacityForecastPanel state={state} />
-      <SectionHeader label="Staffing Gaps (Next 7 Days)" />
-      <SmartSchedulingPanel state={state} />
       <SectionHeader label="Recent Activity" />
       {/* Recurring booking shortcut — show when agent has a recent trip */}
       {(() => {
@@ -12822,6 +12817,11 @@ function AdminDashboard({ state, user }) {
           </Card>
         );
       })}
+      <WeeklyOpsSummaryPanel state={state} />
+      <SectionHeader label="7-Day Demand Forecast" />
+      <CapacityForecastPanel state={state} />
+      <SectionHeader label="Staffing Gaps (Next 7 Days)" />
+      <SmartSchedulingPanel state={state} />
       <SectionHeader label="Recent Activity" />
       <Card body={false}>
         {trips.slice(0, 8).length === 0 ? <Empty icon="⊟" text="No bookings or trips yet" /> : trips.slice(0, 8).map(t => (
