@@ -28,7 +28,7 @@ const FONTS = { mono: "'JetBrains Mono', 'Courier New', monospace", head: "'Rajd
 
 const STATE_BADGE_MAP = {
   UNASSIGNED_BOOKING: { bg: "rgba(78,95,116,0.2)",   fg: COLORS.ghost,  border: COLORS.wire,             label: "UNASSIGNED" },
-  ASSIGNED:           { bg: "rgba(45,140,240,0.15)", fg: COLORS.blue,   border: "rgba(45,140,240,0.3)",  label: "ASSIGNED" },
+  ASSIGNED:           { bg: "rgba(245,166,35,0.12)", fg: COLORS.amber,  border: "rgba(245,166,35,0.35)", label: "PENDING ACCEPTANCE" },
   DRIVER_CONFIRMED:   { bg: "rgba(124,77,255,0.15)", fg: COLORS.purple, border: "rgba(124,77,255,0.3)",  label: "CONFIRMED" },
   IN_TRANSIT:         { bg: "rgba(245,166,35,0.15)", fg: COLORS.amber,  border: "rgba(245,166,35,0.3)",  label: "IN TRANSIT" },
   ARCHIVED_COMPLETED: { bg: "rgba(29,185,84,0.15)",  fg: COLORS.green,  border: "rgba(29,185,84,0.3)",   label: "ARCHIVED" },
@@ -936,7 +936,7 @@ function buildPickupSequence(trips, driverStartCoord) {
 // — this function is ONLY used at async (Supabase) call sites; the local/
 // demo reducer keeps calling the synchronous buildPickupSequence directly,
 // since a reducer can't await a network call.
-async function buildPickupSequenceTomTom(trips, driverStartCoord) {
+async function buildPickupSequenceTomTom(trips, driverStartCoord, departAtEpoch = null) {
   const start = driverStartCoord || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
   const haversineResult = buildPickupSequence(trips, driverStartCoord);
   if (trips.length <= 1) return haversineResult;
@@ -944,7 +944,7 @@ async function buildPickupSequenceTomTom(trips, driverStartCoord) {
     const c = t.pickup_sequence_coords?.[0] || start;
     return { lat: c.lat, lng: c.lng, trip_id: t.trip_id };
   });
-  const tomtomResult = await tomtomOptimalStopOrder(start, coords);
+  const tomtomResult = await tomtomOptimalStopOrder(start, coords, departAtEpoch);
   if (!tomtomResult) return haversineResult;
   // Map the TomTom-ordered coords back to their trip objects, preserving
   // the same { trip, coord } shape buildPickupSequence returns.
@@ -1366,6 +1366,69 @@ console.log(
     : "[TomTom] No VITE_TOMTOM_API_KEY found in env — falling back to Nominatim. Check your .env file and restart 'npm run dev'."
 );
 
+// ── FEATURE: Route cache (time-of-day window, 30-min TTL) ─────────────────
+// Avoids repeat TomTom API calls for the same driver/stop set on the same
+// scheduled run. Key: sorted waypoint fingerprint + departAt hour window.
+// Uber/Bolt use a much more sophisticated version — this is the same idea
+// scoped to TransitOS's fixed-schedule runs where routes genuinely repeat.
+const _routeCache = new Map(); // key → { km, ts }
+const ROUTE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
+
+function routeCacheKey(coords, departAtEpoch) {
+  const waypts = coords.map(c => `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`).join("|");
+  // Round to the nearest hour so trips booked at 14:26 and 14:58 for a
+  // 21:00 run don't generate two separate cache entries.
+  const hourBucket = departAtEpoch ? Math.floor(departAtEpoch / 3600000) : 0;
+  return `${waypts}::${hourBucket}`;
+}
+
+function routeCacheGet(key) {
+  const entry = _routeCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > ROUTE_CACHE_TTL_MS) { _routeCache.delete(key); return null; }
+  return entry.km;
+}
+
+function routeCacheSet(key, km) {
+  _routeCache.set(key, { km, ts: Date.now() });
+}
+
+// ── FEATURE: Supporting points — preferred arterial corridors for Cape Flats ──
+// These coords snap TomTom's route onto the M5 → Baden Powell → Weltevreden
+// corridor that Pearce & Sons drivers use for evening outbound runs.
+// TomTom's supportingPoints param says "pass through these road segments"
+// without forcing exact stops — the engine still optimises around them.
+// Only injected when the route's bounding box overlaps the Cape Flats
+// (roughly south of -33.88 and east of 18.48) to avoid corrupting
+// non-Cape-Flats routes (e.g. a future Atlantic Seaboard branch).
+const CAPE_FLATS_CORRIDOR = [
+  { lat: -33.9200, lng: 18.4950 }, // M5 southern entry near Mowbray
+  { lat: -33.9550, lng: 18.5100 }, // M5 mid — past Ottery
+  { lat: -33.9800, lng: 18.5600 }, // Baden Powell junction near Marina da Gama
+  { lat: -34.0100, lng: 18.5800 }, // Baden Powell heading east toward Rocklands
+  { lat: -34.0350, lng: 18.5650 }, // Weltevreden Road turn-off toward Lentegeur
+];
+
+function isCapeFlatsBoundingBox(coords) {
+  return coords.some(c => c.lat < -33.88 && c.lng > 18.48);
+}
+
+function buildSupportingPointsParam(coords) {
+  if (!isCapeFlatsBoundingBox(coords)) return "";
+  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lat},${c.lng}`).join(":");
+  return `&supportingPoints=${encodeURIComponent(pts)}`;
+}
+
+// ── FEATURE: Road-type avoidance ───────────────────────────────────────────
+// avoidUnpavedRoads: never route via informal-settlement unmaintained tracks
+// avoidTollRoads: no toll roads in Cape Town but good practice for future
+// (N1 east, N2 toll plazas if Pearce & Sons ever expands to Paarl/Stellenbosch)
+const TOMTOM_AVOID = "avoidAreas=&avoid=unpavedRoads";
+// Note: TomTom uses comma-separated values in the `avoid` param:
+//   avoid=tollRoads,unpavedRoads,ferries
+// Using unpavedRoads only for now — add tollRoads if needed.
+const TOMTOM_AVOID_PARAM = "&avoid=unpavedRoads";
+
 async function tomtomAutocompleteSearch(query) {
   if (!TOMTOM_API_KEY || !query || query.trim().length < 2) return [];
   try {
@@ -1452,7 +1515,7 @@ async function tomtomReverseGeocode(lat, lng) {
 // sequence of coordinates: startAnchor → each ordered pickup → each ordered dropoff.
 // Returns null if TomTom is unavailable or the call fails; caller falls back
 // to haversine estimate in that case.
-async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
+async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, departAtEpoch = null) {
   if (!TOMTOM_API_KEY || !startAnchor) return null;
   try {
     // Build the full waypoint list — starting from the FIRST PICKUP, not
@@ -1486,21 +1549,36 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs) {
     const dedupedCoords = dedupeCoordsByLocation(coords);
     if (dedupedCoords.length < 2) return null;
     const locations = dedupedCoords.map(c => `${c.lat},${c.lng}`).join(":");
+    // departAt: use the trip's scheduled time so TomTom applies historical
+    // traffic patterns for that hour, not live conditions at booking time.
+    const departAtParam = departAtEpoch
+      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+      : "";
+    // Feature 1: route cache — skip the API call if we've asked the same
+    // question in the last 30 minutes (same waypoints + same hour window).
+    const cacheKey = routeCacheKey(dedupedCoords, departAtEpoch);
+    const cached = routeCacheGet(cacheKey);
+    if (cached != null) { console.log("[TomTom] route cache hit"); return cached; }
+    // Feature 2: supporting points — nudge TomTom onto preferred arterials.
+    const supportingPtsParam = buildSupportingPointsParam(dedupedCoords);
+    // Feature 3: avoid unpaved roads.
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car`;
+      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
     const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
     const metres = data.routes?.[0]?.summary?.lengthInMeters;
     if (metres == null) return null;
-    return metres / 1000; // → km
+    const km = metres / 1000;
+    routeCacheSet(cacheKey, km);
+    return km; // → km
   } catch (e) {
     console.warn("[TomTom] real route km failed:", e.message);
     return null;
   }
 }
 
-async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
+async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
   const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
   if (valid.length <= 1) return null;
@@ -1525,8 +1603,12 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
     // shortest one-way route visiting these stops" genuinely means.
     const allWaypoints = [anchorCoord, ...valid];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
+    const departAtParam = departAtEpoch
+      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+      : "";
+    const supportingPtsParam = buildSupportingPointsParam(valid);
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car`;
+      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
     const data = await res.json();
@@ -1565,6 +1647,50 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords) {
     return [...reordered, ...invalid];
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
+    return null;
+  }
+}
+
+// ── FEATURE 4: TomTom Matrix Routing API ──────────────────────────────────
+// Replaces N sequential calculateRoute calls with a single matrix request
+// when we need distances from one origin to multiple destinations (or
+// multiple origins to one destination). Used during dispatch to evaluate
+// how far each available driver is from the company anchor — previously
+// this was N separate API calls fired sequentially; now it's one HTTP
+// request that returns all N distances in parallel.
+//
+// TomTom Matrix API: POST /routing/1/matrix/json?key=...
+// origins and destinations are arrays of { point: { latitude, longitude } }
+// Returns a matrix of summary objects — we only need lengthInMeters here.
+//
+// Falls back to haversineKm × ROAD_FACTOR if TomTom is unavailable.
+async function tomtomMatrixDistances(origin, destinations, departAtEpoch = null) {
+  if (!TOMTOM_API_KEY || !origin || !destinations?.length) return null;
+  try {
+    const departAtParam = departAtEpoch
+      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+      : "";
+    const url = `https://api.tomtom.com/routing/1/matrix/json?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}`;
+    const body = {
+      origins: [{ point: { latitude: origin.lat, longitude: origin.lng } }],
+      destinations: destinations.map(d => ({ point: { latitude: d.lat, longitude: d.lng } })),
+    };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`TomTom matrix returned ${res.status}`);
+    const data = await res.json();
+    // data.matrix is a 2D array [originIndex][destinationIndex]
+    // We have 1 origin so it's always data.matrix[0][destIndex]
+    return destinations.map((_, i) => {
+      const cell = data.matrix?.[0]?.[i];
+      const m = cell?.response?.routeSummary?.lengthInMeters;
+      return m != null ? m / 1000 : null; // → km, or null if unreachable
+    });
+  } catch (e) {
+    console.warn("[TomTom] matrix distances failed, falling back to haversine:", e.message);
     return null;
   }
 }
@@ -2203,6 +2329,10 @@ function appReducer(state, action) {
         driverAccepted: false,
         acceptedAt: null,
         declinedBy: [],
+        rejection_reason: null,   // reason category chosen on decline
+        rejection_note: null,     // free-text detail from driver
+        rejected_at: null,        // epoch of rejection
+        rejection_driver_id: null, // which driver rejected (for multi-reassign tracking)
         chat_messages: [],
         reminder_sent: false,
         long_distance_flag: roadDistKm > 40,
@@ -2409,7 +2539,8 @@ function appReducer(state, action) {
         return { ...state, _error: `Driver doesn't have room — ${currentLoad}/${driverCapacity} seats taken, this trip needs ${incomingSeats}.` };
       }
 
-      try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
+      // Assign → ASSIGNED (driver must explicitly accept before DRIVER_CONFIRMED)
+      try { assertTripTransition(trip.state, TRIP_STATE.ASSIGNED); }
       catch (e) { return { ...state, _error: e.message }; }
 
       const existingAssigned = state.trips.filter(
@@ -2438,10 +2569,11 @@ function appReducer(state, action) {
       const newTrips = state.trips.map(t => {
         if (t.trip_id === action.trip_id) {
           return {
-            ...t, state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: action.driver_id,
+            // ASSIGNED = waiting for driver to accept. DRIVER_CONFIRMED fires on TRIP/ACCEPT.
+            ...t, state: TRIP_STATE.ASSIGNED, driver_id: action.driver_id,
             pickup_order_num: seqMap[action.trip_id],
             drop_sequence_num: dropMap[action.trip_id],
-            driverAccepted: true, acceptedAt: now(), confirmed_at: now(), tripStartedAt: now(),
+            driverAccepted: false, acceptedAt: null, confirmed_at: null, tripStartedAt: null,
             driver_route_km: routeDistanceKm, driver_route_cap_km: policyCapKm, driver_route_exceeds_policy: exceedsPolicy,
           };
         }
@@ -2469,7 +2601,7 @@ function appReducer(state, action) {
       const notif = {
         id: mkId(), type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT],
         for_user_ids: [...trip.agent_ids],
-        message: `Driver ${driverUser?.name} (${driverRec?.vehicle}) assigned. You are pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
+        message: `Driver ${driverUser?.name} (${driverRec?.vehicle}) has been assigned and is reviewing your trip. Pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
         trip_id: action.trip_id, ts: now(), read: false,
       };
 
@@ -2514,15 +2646,20 @@ function appReducer(state, action) {
     case "TRIP/ACCEPT": {
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return state;
+      try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
+      catch (e) { return { ...state, _error: e.message }; }
       const driverUser = state.users.find(u => u.id === trip.driver_id);
+      const nowAccept = now();
       const newTrips = state.trips.map(t =>
-        t.trip_id === action.trip_id ? { ...t, driverAccepted: true, acceptedAt: now() } : t
+        t.trip_id === action.trip_id
+          ? { ...t, state: TRIP_STATE.DRIVER_CONFIRMED, driverAccepted: true, acceptedAt: nowAccept, confirmed_at: nowAccept }
+          : t
       );
       const notif = {
         id: mkId(), type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN],
         for_user_ids: [...trip.agent_ids],
-        message: `Driver ${driverUser?.name} accepted your trip.`,
-        trip_id: action.trip_id, ts: now(), read: false,
+        message: `✓ Driver ${driverUser?.name} accepted your trip — they are confirmed and on the way.`,
+        trip_id: action.trip_id, ts: nowAccept, read: false,
       };
       return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
     }
@@ -2598,10 +2735,18 @@ function appReducer(state, action) {
       const newTrips = state.trips.map(t =>
         t.trip_id === action.trip_id
           ? {
-              ...t, state: TRIP_STATE.UNASSIGNED_BOOKING, driver_id: null,
-              pickup_order_num: null, drop_sequence_num: null,
-              driverAccepted: false, declinedBy: [...(t.declinedBy || []), action.driver_id],
-            }
+              ...t,
+              state: TRIP_STATE.UNASSIGNED_BOOKING,
+              driver_id: null,
+              pickup_order_num: null,
+              drop_sequence_num: null,
+              driverAccepted: false,
+              declinedBy: [...(t.declinedBy || []), action.driver_id],
+              rejection_reason: action.reason || null,
+              rejection_note: action.note || null,
+              rejected_at: now(),
+              rejection_driver_id: action.driver_id,
+              is_exception: true,
           : t
       );
       const remaining = newTrips.filter(t =>
@@ -2616,7 +2761,7 @@ function appReducer(state, action) {
       const driverUser = state.users.find(u => u.id === action.driver_id);
       const notif = {
         id: mkId(), type: "TRIP_DECLINED", for_roles: [ROLE.ADMIN],
-        message: `Driver ${driverUser?.name} declined trip ${action.trip_id}. Needs reassignment.`,
+        message: `⚠ Driver ${driverUser?.name} rejected trip ${action.trip_id}: "${action.reason || "No reason given"}"${action.note ? ` — "${action.note}"` : ""}. Needs reassignment.`,
         trip_id: action.trip_id, ts: now(), read: false,
       };
       return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, ...state.notifications], _error: null };
@@ -3519,7 +3664,13 @@ function tripRowToApp(row, chatByTrip) {
     late_booking_flag: row.latebookingflag || false,
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
-    driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), declinedBy: row.declinedby || [], reminder_sent: row.remindersent,
+    driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat),
+    declinedBy: row.declinedby || [],
+    rejection_reason: row.rejectionreason || null,
+    rejection_note: row.rejectionnote || null,
+    rejected_at: epochToDisplay(row.rejectedat),
+    rejection_driver_id: row.rejectiondriverid || null,
+    reminder_sent: row.remindersent,
     last_reminder_at: row.lastreminderat || null,
     long_distance_flag: row.longdistanceflag || false, admin_note: row.adminnote || null,
     driver_route_km: row.driverroutekm != null ? Number(row.driverroutekm) : null,
@@ -4250,13 +4401,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
+        const departEpochAdd = allForDriver.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochAdd);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmAdd = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const tomtomKmAdd = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochAdd);
         const routeDistanceKmAdd = tomtomKmAdd ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
         const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
@@ -4340,13 +4492,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
+        const departEpochRem = tripRow.scheduledtime ?? null;
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochRem);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmRem = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const tomtomKmRem = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochRem);
         const routeDistanceKmRem = tomtomKmRem ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
         const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
@@ -4431,13 +4584,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo);
+        const departEpochReloc = tripRow.scheduledtime ?? null;
+        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochReloc);
         const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
         const seqMap = {}, dropMap = {};
         ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
         dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
         const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmReloc = await tomtomRealRouteKm(supaCo, ordered, dropOrdered);
+        const tomtomKmReloc = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochReloc);
         const routeDistanceKmReloc = tomtomKmReloc ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
         const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
         const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
@@ -5155,13 +5309,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const acCompanyAnchor = await fetchCompanyAnchor();
-        const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor);
+        const departEpochAc = tripRow.scheduledtime ?? null;
+        const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor, departEpochAc);
         const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
         const acSeqMap = {}, acDropMap = {};
         acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
         acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
         const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const acTomtomKm = await tomtomRealRouteKm(acCompanyAnchor, acOrdered, acDropOrdered);
+        const acTomtomKm = await tomtomRealRouteKm(acCompanyAnchor, acOrdered, acDropOrdered, departEpochAc);
         const acRouteDistanceKm = acTomtomKm ?? computeDriverRouteDistanceKm(acCompanyAnchor, acOrdered, acDropOrdered);
         const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
         const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
@@ -5490,12 +5645,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
           });
           const mergeAnchor = await fetchCompanyAnchor();
-          const mergeOrdered = await buildPickupSequenceTomTom(allForDriverMerge, mergeAnchor);
+          const departEpochMerge = allForDriverMerge.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
+          const mergeOrdered = await buildPickupSequenceTomTom(allForDriverMerge, mergeAnchor, departEpochMerge);
           const mergeDropOrdered = buildDropoffSequence(allForDriverMerge, dropoffAnchor(allForDriverMerge, mergeOrdered, mergeAnchor));
           const mergeSeqMap = {}, mergeDropMap = {};
           mergeOrdered.forEach((o, i) => { mergeSeqMap[o.trip.trip_id] = i + 1; });
           mergeDropOrdered.forEach((t, i) => { mergeDropMap[t.trip_id] = i + 1; });
-          const mergeTomtomKm = await tomtomRealRouteKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
+          const mergeTomtomKm = await tomtomRealRouteKm(mergeAnchor, mergeOrdered, mergeDropOrdered, departEpochMerge);
           const mergeRouteKm = mergeTomtomKm ?? computeDriverRouteDistanceKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
           const mergeTotalSeats = allForDriverMerge.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
           const mergePolicyCap = companyPolicyDistanceCapKm(mergeTotalSeats);
@@ -5543,7 +5699,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         };
       });
       const startAnchor = await fetchCompanyAnchor();
-      const ordered = await buildPickupSequenceTomTom(allForDriver, startAnchor);
+      const departEpochAssign = allForDriver.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
+      const ordered = await buildPickupSequenceTomTom(allForDriver, startAnchor, departEpochAssign);
       const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, startAnchor));
       const seqMap = {}, dropMap = {};
       ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
@@ -5551,16 +5708,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Total route distance — try TomTom for real road distance first,
       // fall back to haversine × 1.35 if TomTom is unavailable.
       const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-      const tomtomKm = await tomtomRealRouteKm(startAnchor, ordered, dropOrdered);
+      const tomtomKm = await tomtomRealRouteKm(startAnchor, ordered, dropOrdered, departEpochAssign);
       const routeDistanceKm = tomtomKm ?? computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
       console.log(`[ASSIGN_DRIVER] route: TomTom=${tomtomKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${routeDistanceKm.toFixed(1)} km`);
       const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
       const exceedsPolicy = routeDistanceKm > policyCapKm;
       const nowTs = nowEpoch();
+      // Set ASSIGNED — driver must explicitly accept before DRIVER_CONFIRMED.
+      // driveraccepted stays false; acceptedat/confirmedat stay null until TRIP/ACCEPT.
       const { error: upErr } = await supabase.from("trips").update({
-        status: TRIP_STATE.DRIVER_CONFIRMED, driverid: action.driver_id,
+        status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
         pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
-        driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
+        driveraccepted: false, updatedat: nowTs,
         driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
       }).eq("id", action.trip_id);
       if (upErr) throw upErr;
@@ -5583,7 +5742,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
-        message: `Driver ${driverUser?.fullname} (${driverRow.vehicle}) assigned. You are pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
+        message: `Driver ${driverUser?.fullname} (${driverRow.vehicle}) has been assigned and is reviewing your trip. Pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       });
       if (newLoad >= assignDriverCapacitySupa) {
@@ -5626,7 +5785,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripRow) throw new Error("Trip not found");
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
-      must(await supabase.from("trips").update({ driveraccepted: true, acceptedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
+      // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
+      must(await supabase.from("trips").update({
+        status: TRIP_STATE.DRIVER_CONFIRMED,
+        driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
+      }).eq("id", action.trip_id));
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: tripAgentIds,
@@ -5717,7 +5880,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
-        driveraccepted: false, declinedby: [...(tripRow.declinedby || []), action.driver_id], updatedat: nowTs,
+        driveraccepted: false,
+        declinedby: [...(tripRow.declinedby || []), action.driver_id],
+        // Driver rejection exception — stamped as an exception so it
+        // appears in the CSV Exception column and admin exception count.
+        rejectionreason: action.reason || null,
+        rejectionnote: action.note || null,
+        rejectedat: nowTs,
+        rejectiondriverid: action.driver_id,
+        isexception: true,
+        updatedat: nowTs,
       }).eq("id", action.trip_id));
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", action.driver_id)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
@@ -5727,8 +5899,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
       await insertNotification({
         type: "TRIP_DECLINED", for_roles: [ROLE.ADMIN],
-        message: `Driver ${driverUser?.fullname} declined trip ${action.trip_id}. Needs reassignment.`,
+        message: `⚠ DRIVER REJECTION — ${driverUser?.fullname} rejected trip ${action.trip_id}: "${action.reason || "No reason given"}"${action.note ? ` — "${action.note}"` : ""}. Needs reassignment.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await logAuditAction({
+        actorId: action.driver_id, actorName: driverUser?.fullname || action.driver_id,
+        actionType: "TRIP/DECLINE",
+        tripId: action.trip_id,
+        details: `Driver rejected trip. Reason: ${action.reason || "(none)"}${action.note ? ` — "${action.note}"` : ""}`,
       });
       await refetch();
       return;
@@ -7849,7 +8027,7 @@ function driverPositionChannelName(driverId) {
 const BROADCAST_INTERVAL_MS = 4000;
 const DB_PERSIST_INTERVAL_MS = 25000;
 
-function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
+function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
   const watchIdRef = useRef(null);
@@ -7857,6 +8035,9 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
   const lastPersistRef = useRef(0);
   const channelRef = useRef(null);
   const wakeLockRef = useRef(null);
+  // Geofence: track which stops we've already auto-triggered so we
+  // don't fire CONFIRM_AGENT_PICKUP/DROPOFF twice for the same stop.
+  const geofenceTriggeredRef = useRef(new Set());
 
   // Screen Wake Lock — the real, genuine improvement available for
   // keeping tracking alive longer while the app is open, per explicit
@@ -7937,6 +8118,53 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
         });
       }
 
+      // Feature 6: Geofence auto-confirm ──────────────────────────────────
+      // When the driver is within GEOFENCE_RADIUS_M of a pickup or dropoff
+      // coord for a passenger who hasn't been confirmed yet, auto-fire the
+      // confirmation dispatch — same as the driver tapping the P/D button.
+      // Threshold: 80m — tight enough to not false-trigger a nearby street,
+      // loose enough to handle GPS drift in dense urban areas. Uber uses ~50m
+      // with their more accurate native-app GPS; 80m is appropriate for a PWA.
+      const GEOFENCE_RADIUS_KM = 0.08; // 80 metres
+      if (dispatch && activeTrips?.length) {
+        for (const trip of activeTrips) {
+          if (!["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(trip.state)) continue;
+          const completedPickups = trip.completed_pickups || [];
+          const completedDropoffs = trip.completed_dropoffs || [];
+          const agentIds = trip.agent_ids || [];
+          // Check pickups first — agents not yet confirmed picked up
+          for (const aid of agentIds) {
+            if (completedPickups.includes(aid)) continue;
+            const pCoord = trip.pickup_sequence_coords?.find(p => p.agent_id === aid)
+              || trip.pickup_sequence_coords?.[0];
+            if (!pCoord?.lat) continue;
+            const distKm = haversineKm(latitude, longitude, pCoord.lat, pCoord.lng);
+            const geoKey = `pickup:${trip.trip_id}:${aid}`;
+            if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
+              geofenceTriggeredRef.current.add(geoKey);
+              console.log(`[Geofence] Auto-confirming pickup for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
+              dispatch({ type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: trip.trip_id, agent_id: aid,
+                driver_coord: { lat: latitude, lng: longitude } }).catch(() => {});
+            }
+          }
+          // Check dropoffs — agents confirmed picked up but not yet dropped
+          for (const aid of agentIds) {
+            if (!completedPickups.includes(aid)) continue;
+            if (completedDropoffs.includes(aid)) continue;
+            const dCoord = trip.dropoff_sequence_coords?.find(d => d.agent_id === aid)
+              || trip.dropoff_sequence_coords?.[0];
+            if (!dCoord?.lat) continue;
+            const distKm = haversineKm(latitude, longitude, dCoord.lat, dCoord.lng);
+            const geoKey = `dropoff:${trip.trip_id}:${aid}`;
+            if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
+              geofenceTriggeredRef.current.add(geoKey);
+              console.log(`[Geofence] Auto-confirming dropoff for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
+              dispatch({ type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: trip.trip_id, agent_id: aid,
+                driver_coord: { lat: latitude, lng: longitude } }).catch(() => {});
+            }
+          }
+        }
+      }
       // Slow path: persist to the database roughly every 25s — far less
       // frequent than before, since the database write is the expensive
       // part (two REST calls) and live updates no longer depend on it.
@@ -7983,7 +8211,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId) {
       watchIdRef.current = null;
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
     };
-  }, [isLoggedIn, user?.id, currentTripId]);
+  }, [isLoggedIn, user?.id, currentTripId, activeTrips, dispatch]);
 
   return { tracking, lastError };
 }
@@ -9030,6 +9258,83 @@ function DriverTripDropoffs({ trip, state }) {
   return <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{finalCoords[0]?.label || trip.custom_dropoff}</div>;
 }
 
+// ── Driver rejection modal ────────────────────────────────────────────────
+// Shown when a driver taps DECLINE on an assigned trip. Requires them to
+// choose a reason category and optionally add a note before confirming.
+// This data flows into the exception system and the CSV export.
+const REJECTION_REASONS = [
+  "Vehicle unavailable",
+  "Route too far",
+  "Scheduling conflict",
+  "Passenger issue",
+  "Medical / personal emergency",
+  "Other",
+];
+
+function DriverDeclineModal({ trip, user, dispatch, onClose }) {
+  const [reason, setReason] = React.useState("");
+  const [note, setNote] = React.useState("");
+  const [submitting, setSubmitting] = React.useState(false);
+  const [err, setErr] = React.useState(null);
+
+  const handleSubmit = async () => {
+    if (!reason) { setErr("Please select a reason before declining."); return; }
+    setSubmitting(true);
+    try {
+      await dispatch({
+        type: "TRIP/DECLINE",
+        trip_id: trip.trip_id,
+        driver_id: user.id,
+        reason,
+        note: note.trim() || null,
+      });
+      onClose();
+    } catch (e) {
+      setErr(e.message || "Failed to decline — please try again.");
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>✗ DECLINE TRIP #{trip.trip_id}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>
+          You are required to give a reason. This will be logged as a driver exception and reviewed by dispatch.
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>REASON *</span>
+          {REJECTION_REASONS.map(r => (
+            <div key={r} onClick={() => setReason(r)}
+              style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, border: `1px solid ${reason === r ? COLORS.red : COLORS.wire}`, background: reason === r ? "rgba(255,80,80,0.08)" : COLORS.surface, cursor: "pointer" }}>
+              <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${reason === r ? COLORS.red : COLORS.ghost}`, background: reason === r ? COLORS.red : "transparent", flexShrink: 0 }} />
+              <span style={{ fontSize: 11, color: COLORS.chalk }}>{r}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>ADDITIONAL NOTE (optional)</span>
+          <textarea
+            value={note} onChange={e => setNote(e.target.value)}
+            placeholder="Add any detail that will help dispatch reassign this trip…"
+            rows={3} maxLength={400}
+            style={{ width: "100%", resize: "vertical", fontFamily: "inherit", fontSize: 11, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8, color: COLORS.chalk, boxSizing: "border-box" }}
+          />
+        </div>
+        {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={submitting} />
+          <Button title={submitting ? "DECLINING…" : "✗ CONFIRM DECLINE"} variant="danger" style={{ flex: 1 }} onClick={handleSubmit} disabled={submitting} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   const myStatus = state.driver_status.find(d => d.driver_id === user.id);
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
@@ -9063,6 +9368,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   // driver deliberately collapsed themselves afterward.
   const autoExpandedRef = useRef(new Set());
   useEffect(() => {
+    const [decliningTrip, setDecliningTrip] = useState(null); // trip being declined — shows modal
     const needsAction = active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted);
     const toAdd = needsAction.filter(t => !autoExpandedRef.current.has(t.trip_id));
     if (toAdd.length === 0) return;
@@ -9189,22 +9495,20 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             )}
             {pickupCoord && <GpsBlock coord={pickupCoord} />}
             {trip.state === TRIP_STATE.ASSIGNED && !trip.driverAccepted && (
-              <div style={{ display: "flex", gap: 8 }}>
-                <Button title="✓ ACCEPT" variant="green" style={{ flex: 1 }} onClick={async () => {
-                  try {
-                    await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
-                    await dispatch({ type: "TRIP/DRIVER_CONFIRM", trip_id: trip.trip_id });
-                  } catch (e) {
-                    // The trip card's own state-driven UI (this button only
-                    // shows while trip.state === ASSIGNED) will naturally
-                    // reflect whatever actually happened once the next
-                    // realtime refetch lands — no separate error banner
-                    // wired up at this render depth, but the failure is at
-                    // least visible in the console rather than silent.
-                    console.warn("[DriverTripsTab] accept/confirm failed:", e.message);
-                  }
-                }} />
-                <Button title="✗ DECLINE" variant="danger" style={{ flex: 1 }} onClick={() => dispatch({ type: "TRIP/DECLINE", trip_id: trip.trip_id, driver_id: user.id }).catch(() => {}) /* failure already toasted by the wrapper */} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700, letterSpacing: 0.5, padding: "6px 10px", background: "rgba(245,166,35,0.08)", border: `1px solid rgba(245,166,35,0.3)`, borderRadius: 4 }}>
+                  ⏳ AWAITING YOUR RESPONSE — please accept or decline this trip
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button title="✓ ACCEPT TRIP" variant="green" style={{ flex: 1 }} onClick={async () => {
+                    try {
+                      await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
+                    } catch (e) {
+                      console.warn("[DriverTripsTab] accept failed:", e.message);
+                    }
+                  }} />
+                  <Button title="✗ DECLINE" variant="danger" style={{ flex: 1 }} onClick={() => setDecliningTrip(trip)} />
+                </div>
               </div>
             )}
             {trip.driverAccepted && <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ ACCEPTED — {trip.acceptedAt}</span>}
@@ -9225,6 +9529,14 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
           otherUser={chatWith.otherUser}
           dispatch={dispatch}
           onClose={() => setChatWith(null)}
+        />
+      )}
+      {decliningTrip && (
+        <DriverDeclineModal
+          trip={decliningTrip}
+          user={user}
+          dispatch={dispatch}
+          onClose={() => setDecliningTrip(null)}
         />
       )}
     </div>
@@ -10098,7 +10410,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // position logging context; falls back to the first active trip if
   // none are in transit yet (still assigned/confirmed but not started).
   const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
-  const location = useDriverLocationTracking(user, !!user, trackedTripId);
+  const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch);
 
   return (
     <div className="screen">
@@ -10868,13 +11180,11 @@ function exceptionLabel(t) {
   if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) labels.push("Late Cancellation");
   if (t.no_shows && t.no_shows.length > 0) labels.push("No Show");
   if (t.late_booking_flag) labels.push("Late Booking");
-  // Fallback: is_exception can be true without matching any of the 3
-  // specific reasons above (confirmed via a real trip that showed the
-  // exception badge in the app but no label here) — rather than
-  // silently showing nothing, which makes a genuine, confirmed
-  // exception disappear from the export entirely, fall back to a
-  // generic label so it's never invisible, even if this function
-  // doesn't yet know how to name the specific cause.
+  // Driver rejection — a driver explicitly declining an assigned trip is
+  // tracked as an exception so it surfaces in the CSV and admin dashboard.
+  if (t.rejection_reason || t.rejection_driver_id) {
+    labels.push(`Driver Rejection${t.rejection_reason ? ` (${t.rejection_reason})` : ""}`);
+  }
   if (labels.length === 0 && t.is_exception) labels.push("Exception");
   return labels.join(" + ");
 }
@@ -10906,7 +11216,7 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     // Driver route
     "Driver Full Route (km)", "Driver Route Cap (km)", "Exceeds Policy",
     // Status
-    "Status", "Driver Accepted", "Driver Accepted At", "Reminder Sent",
+    "Status", "Driver Accepted", "Driver Accepted At", "Driver Rejection Reason", "Driver Rejection Note", "Reminder Sent",
     // Timestamps (epoch → readable)
     "Booked At", "Driver Confirmed At", "In Transit At", "Completed At", "Cancelled At",
     // Per-agent timing & GPS (driver's location at moment of pickup/dropoff)
@@ -11014,6 +11324,12 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         t.state || "",
         t.driverAccepted ? "YES" : "NO",
         t.acceptedAt || "",
+        // Driver rejection — populated when a driver declined the trip.
+        // rejection_reason is the category; rejection_note is their
+        // free-text explanation. Both appear in the Exception column
+        // AND here as dedicated columns for cleaner reporting.
+        t.rejection_reason || "",
+        t.rejection_note || "",
         t.reminder_sent ? "YES" : "NO",
         // Timestamps (booked_at/confirmed_at are already display strings from tripRowToApp)
         t.booked_at || "",
@@ -11992,7 +12308,18 @@ function AdminDispatch({ state, dispatch }) {
               <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>{t.trip_type}</span>
             </div>
-            {t.declinedBy?.length > 0 && <span style={{ fontSize: 9, color: COLORS.red }}>Declined by {t.declinedBy.length} driver{t.declinedBy.length !== 1 ? "s" : ""}</span>}
+            {t.declinedBy?.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ fontSize: 9, color: COLORS.red, fontWeight: 700 }}>
+                  ⚠ DRIVER REJECTION — declined by {t.declinedBy.length} driver{t.declinedBy.length !== 1 ? "s" : ""}
+                </span>
+                {t.rejection_reason && (
+                  <span style={{ fontSize: 9, color: COLORS.red }}>
+                    Reason: {t.rejection_reason}{t.rejection_note ? ` — "${t.rejection_note}"` : ""}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         );
       })}
@@ -14173,7 +14500,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "✗", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
