@@ -165,15 +165,53 @@ function hasAdminPermission(user, permission) {
   return !!ADMIN_PERMISSIONS[level][permission];
 }
 
-// True only for a VIEWER-tier admin who has actually been assigned at
-// least one company to scope to — FLEET_OPS/STANDARD are never scoped
-// regardless of what's stored on scoped_company_ids (a level change back
-// up should restore full visibility without needing the field cleared
-// separately), and a Viewer with no companies assigned yet sees
-// everything, same as before this feature existed, rather than being
-// scoped to "nothing."
-function isCompanyScoped(user) {
-  return !!user && user.role === ROLE.ADMIN && user.admin_level === ADMIN_LEVEL.VIEWER && Array.isArray(user.scoped_company_ids) && user.scoped_company_ids.length > 0;
+// ── Company visibility rules ─────────────────────────────────────────────
+//
+// isMasterAdmin(user, companies):
+//   Only FLEET_OPS admins whose scoped_company_ids includes a Pearce & Sons
+//   company ID (or who have no scoped company, for backward compat) are
+//   master admins. They see ALL companies. Everyone else is scoped.
+//
+// getAdminCompanyIds(user, companies):
+//   Returns the set of company IDs this admin may see. Empty = all.
+//   - Master admin (Pearce & Sons FLEET_OPS): [] = unrestricted
+//   - FLEET_OPS linked to another company: their company only
+//   - STANDARD: their scoped_company_ids (or branch_id-derived)
+//   - VIEWER: their scoped_company_ids
+//
+// isCompanyScoped(user, companies):
+//   True when the admin has a non-empty company restriction.
+
+function isPearceCompany(company) {
+  return /pearce/i.test(company?.name || "") || /pearce/i.test(company?.label || "");
+}
+
+function isMasterAdmin(user, companies) {
+  if (!user || user.role !== ROLE.ADMIN) return false;
+  if (user.admin_level !== ADMIN_LEVEL.FLEET_OPS) return false;
+  // FLEET_OPS with no scoped companies = legacy master admin (backward compat)
+  if (!user.scoped_company_ids?.length) return true;
+  // FLEET_OPS explicitly linked to Pearce & Sons = master admin
+  const pearceIds = (companies || []).filter(isPearceCompany).map(c => c.id);
+  return user.scoped_company_ids.some(id => pearceIds.includes(id));
+}
+
+function getAdminCompanyIds(user, companies) {
+  if (!user || user.role !== ROLE.ADMIN) return [];
+  if (isMasterAdmin(user, companies)) return []; // [] = unrestricted
+  // FLEET_OPS linked to a non-Pearce company → only that company
+  if (user.admin_level === ADMIN_LEVEL.FLEET_OPS && user.scoped_company_ids?.length) {
+    return user.scoped_company_ids;
+  }
+  // STANDARD or VIEWER → their scoped companies
+  if (user.scoped_company_ids?.length) return user.scoped_company_ids;
+  // STANDARD with no explicit scopes but a branch_id → derive from branch
+  if (user.branch_id) return [user.branch_id];
+  return []; // no restriction (shouldn't happen for non-Pearce FLEET_OPS)
+}
+
+function isCompanyScoped(user, companies) {
+  return getAdminCompanyIds(user, companies).length > 0;
 }
 
 // Filters a user list down to: agents on any of the scoped companies,
@@ -1525,6 +1563,42 @@ function printWaybill(driverUser, driverStatus, trips, users, dateStr) {
   setTimeout(() => w.print(), 400);
 }
 
+
+// ── Offline navigation queue ──────────────────────────────────────────────
+// When a driver taps "OPEN IN WAZE" while offline, we can't launch Waze
+// immediately (some devices block deep-links without network). Queue the
+// destination and fire it automatically when connectivity returns.
+const OFFLINE_NAV_KEY = "transitos_offline_nav";
+
+function queueOfflineNav(lat, lng, label) {
+  try {
+    localStorage.setItem(OFFLINE_NAV_KEY, JSON.stringify({ lat, lng, label, queuedAt: Date.now() }));
+    console.log("[Offline] Waze destination queued:", label);
+  } catch {}
+}
+
+function consumeOfflineNav() {
+  try {
+    const raw = localStorage.getItem(OFFLINE_NAV_KEY);
+    if (!raw) return null;
+    localStorage.removeItem(OFFLINE_NAV_KEY);
+    const nav = JSON.parse(raw);
+    // Stale if queued more than 30 min ago (driver may have resolved it)
+    if (Date.now() - nav.queuedAt > 30 * 60 * 1000) return null;
+    return nav;
+  } catch { return null; }
+}
+
+// Extended smartOpenWazeOfflineAware: queues if offline, opens if online
+function smartOpenWazeWithOfflineFallback(lat, lng, label, isManual) {
+  if (!navigator.onLine) {
+    queueOfflineNav(lat, lng, label);
+    alert("You\'re offline. Waze will open automatically when you\'re back online.");
+    return;
+  }
+  smartOpenWaze(lat, lng, label, isManual);
+}
+
 // ── Offline mode — action queue ───────────────────────────────────────────
 // When a driver is offline, critical actions (pickup/dropoff confirmations)
 // are queued to localStorage and replayed when connectivity returns.
@@ -1556,6 +1630,12 @@ function useOfflineSync(dispatch) {
   React.useEffect(() => {
     const goOnline = async () => {
       setIsOnline(true);
+      // Replay queued Waze navigation first — driver needs to know where to go
+      const pendingNav = consumeOfflineNav();
+      if (pendingNav) {
+        console.log("[Offline] Replaying queued Waze nav:", pendingNav.label);
+        smartOpenWaze(pendingNav.lat, pendingNav.lng, pendingNav.label, false);
+      }
       const q = getOfflineQueue();
       if (q.length === 0) return;
       setSyncing(true);
@@ -2024,7 +2104,7 @@ function WazeNavPanel({ trip, user, state }) {
             {current.coord.label || "Address not available"}
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button onClick={() => smartOpenWaze(current.coord.lat, current.coord.lng, current.coord.label, false)}
+            <button onClick={() => smartOpenWazeWithOfflineFallback(current.coord.lat, current.coord.lng, current.coord.label, false)}
               style={{ flex: 1, background: "#00CCFF", border: "none", borderRadius: 5, padding: "10px 0",
                 fontWeight: 800, fontSize: 12, cursor: "pointer", color: "#000", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
               <span style={{ fontSize: 16 }}>🗺</span> OPEN IN WAZE
@@ -2403,6 +2483,245 @@ function SlaReportPanel({ trips, users }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+
+
+// ── Smart scheduling recommendations ─────────────────────────────────────
+// Looks ahead 7 days: for each day+time slot that historically has demand,
+// checks how many drivers are actually rostered. Surfaces gaps where
+// historical demand exceeds rostered capacity.
+function computeSchedulingRecommendations(trips, driverStatus, companies) {
+  const now = new Date();
+  const gaps = [];
+
+  // For each of the next 7 days
+  for (let d = 1; d <= 7; d++) {
+    const date = new Date(now);
+    date.setDate(date.getDate() + d);
+    const dow = date.getDay(); // 0=Sun
+    const dateStr = `${date.getFullYear()}/${String(date.getMonth()+1).padStart(2,"0")}/${String(date.getDate()).padStart(2,"0")}`;
+    const dayName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dow];
+
+    // Check common time slots
+    for (const timeStr of ["06:00","07:00","17:00","18:00","21:00","22:00"]) {
+      const [th] = timeStr.split(":").map(Number);
+      // Historical demand: completed trips on this dow ± 1h
+      const historical = trips.filter(t => {
+        if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return false;
+        if (!t.scheduled_date) return false;
+        const p = t.scheduled_date.split("/").map(Number);
+        const td = new Date(p[0], p[1]-1, p[2]);
+        if (td.getDay() !== dow) return false;
+        const h = parseInt((t.scheduled_time_str || "00:00").split(":")[0], 10);
+        return Math.abs(h - th) <= 1;
+      });
+      if (historical.length < 3) continue; // need at least 3 data points
+
+      const avgPax = historical.reduce((n, t) => n + (t.agent_ids?.length || 1), 0) / historical.length;
+      const driversNeeded = Math.ceil(avgPax / DRIVER_CAPACITY);
+
+      // Count drivers rostered for this slot
+      const rosteredCount = driverStatus.filter(ds =>
+        isDriverOnShift(ds, dateStr, timeStr) && !ds.is_unavailable
+      ).length;
+
+      if (rosteredCount < driversNeeded) {
+        gaps.push({
+          date: dateStr, dayName, time: timeStr,
+          driversNeeded, rosteredCount,
+          shortfall: driversNeeded - rosteredCount,
+          avgPax: Math.round(avgPax),
+          sampleSize: historical.length,
+        });
+      }
+    }
+  }
+  return gaps.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+function SmartSchedulingPanel({ state }) {
+  const gaps = React.useMemo(() =>
+    computeSchedulingRecommendations(state.trips, state.driver_status, state.companies),
+    [state.trips, state.driver_status, state.companies]
+  );
+  if (gaps.length === 0) return (
+    <div style={{ fontSize: 10, color: COLORS.ghost }}>
+      ✓ No staffing gaps detected in the next 7 days — or not enough historical data yet (need 3+ trips per time slot).
+    </div>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {gaps.map((gap, i) => (
+        <div key={i} style={{ background: "rgba(245,166,35,0.06)", border: "1px solid rgba(245,166,35,0.25)", borderRadius: 4, padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>
+              {gap.dayName} {gap.date} @ {gap.time}
+            </div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>
+              Avg {gap.avgPax} passengers ({gap.sampleSize} historical runs) · {gap.rosteredCount}/{gap.driversNeeded} drivers rostered
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.red, fontFamily: FONTS.head }}>
+              -{gap.shortfall}
+            </div>
+            <div style={{ fontSize: 8, color: COLORS.ghost }}>driver{gap.shortfall !== 1 ? "s" : ""} short</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Weekly ops summary ────────────────────────────────────────────────────
+// Computes a plain-language ops summary for the last 7 days.
+// Designed to be: (a) shown in the dashboard, (b) copied and emailed,
+// (c) callable from a Supabase Edge Function for automated Monday emails.
+function computeWeeklySummary(trips, users, driverStatus) {
+  const now = Date.now();
+  const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
+
+  const lastWeek = trips.filter(t => {
+    const d = t.booked_at || t.in_transit_at || 0;
+    return d >= sevenDaysAgo;
+  });
+
+  const completed = lastWeek.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
+  const cancelled = lastWeek.filter(t => t.state === TRIP_STATE.ARCHIVED_CANCELLED);
+  const exceptions = lastWeek.filter(t => t.is_exception);
+  const rejections = lastWeek.filter(t => t.rejection_reason);
+  const noShows = lastWeek.filter(t => (t.no_shows || []).length > 0);
+  const totalPax = completed.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+  const totalKm = completed.reduce((n, t) => n + (t.actual_distance_km || t.est_distance_km || 0), 0);
+
+  // Per-driver stats for the week
+  const driverStats = {};
+  for (const t of completed) {
+    if (!t.driver_id) continue;
+    if (!driverStats[t.driver_id]) {
+      const u = users.find(u => u.id === t.driver_id);
+      driverStats[t.driver_id] = { name: u?.name || t.driver_id, trips: 0, pax: 0, km: 0, rejections: 0 };
+    }
+    driverStats[t.driver_id].trips++;
+    driverStats[t.driver_id].pax += (t.agent_ids?.length || 1);
+    driverStats[t.driver_id].km += (t.actual_distance_km || t.est_distance_km || 0);
+  }
+  for (const t of rejections) {
+    if (!t.rejection_driver_id) continue;
+    if (!driverStats[t.rejection_driver_id]) {
+      const u = users.find(u => u.id === t.rejection_driver_id);
+      driverStats[t.rejection_driver_id] = { name: u?.name || t.rejection_driver_id, trips: 0, pax: 0, km: 0, rejections: 0 };
+    }
+    driverStats[t.rejection_driver_id].rejections++;
+  }
+
+  const driverRows = Object.values(driverStats).sort((a, b) => b.trips - a.trips);
+  const topDriver = driverRows[0] || null;
+  const worstRejector = [...driverRows].sort((a, b) => b.rejections - a.rejections).find(d => d.rejections > 0);
+
+  // Compliance flags
+  const onlineDrivers = (driverStatus || []).filter(d => d.is_online).length;
+  const expiredDocs = (driverStatus || []).filter(d => {
+    const docs = d.documents || {};
+    return DOC_TYPES.some(dt => docExpiryStatus(docs[dt.key]).status === "expired");
+  }).length;
+
+  return {
+    period: "Last 7 days",
+    completedTrips: completed.length,
+    cancelledTrips: cancelled.length,
+    totalPax,
+    totalKm: Math.round(totalKm),
+    exceptions: exceptions.length,
+    rejections: rejections.length,
+    noShows: noShows.length,
+    topDriver,
+    worstRejector,
+    expiredDocs,
+    onlineDrivers,
+    driverRows,
+  };
+}
+
+function formatWeeklySummaryText(s) {
+  const lines = [
+    `TransitOS — Weekly Ops Summary (${s.period})`,
+    `========================================`,
+    `Trips completed:   ${s.completedTrips}`,
+    `Trips cancelled:   ${s.cancelledTrips}`,
+    `Passengers moved:  ${s.totalPax}`,
+    `Total km driven:   ${s.totalKm} km`,
+    ``,
+    `Exceptions:        ${s.exceptions}`,
+    `Driver rejections: ${s.rejections}`,
+    `No-shows:          ${s.noShows}`,
+    ``,
+    `Top driver:        ${s.topDriver ? s.topDriver.name + " — " + s.topDriver.trips + " trips, " + s.topDriver.pax + " pax" : "N/A"}`,
+    s.worstRejector ? `⚠ Rejections:     ${s.worstRejector.name} (${s.worstRejector.rejections} rejection${s.worstRejector.rejections !== 1 ? "s" : ""} this week)` : "",
+    s.expiredDocs > 0 ? `🚨 Expired docs:  ${s.expiredDocs} driver${s.expiredDocs !== 1 ? "s" : ""} with expired documents` : "",
+    ``,
+    `Generated by TransitOS on ${new Date().toLocaleDateString("en-ZA")}`,
+  ].filter(l => l !== undefined);
+  return lines.join("\n");
+}
+
+function WeeklyOpsSummaryPanel({ state }) {
+  const [copied, setCopied] = React.useState(false);
+  const s = React.useMemo(() =>
+    computeWeeklySummary(state.trips, state.users, state.driver_status),
+    [state.trips, state.users, state.driver_status]
+  );
+  const text = formatWeeklySummaryText(s);
+  const copy = () => {
+    navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
+  };
+
+  return (
+    <div style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>📊 WEEKLY OPS SUMMARY</span>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Button title={copied ? "✓ COPIED" : "📋 COPY FOR EMAIL"} variant="ghost" size="sm"
+            style={{ borderColor: copied ? COLORS.green : COLORS.wire, color: copied ? COLORS.green : COLORS.ghost }}
+            onClick={copy} />
+        </div>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {[
+          ["TRIPS DONE", s.completedTrips, COLORS.green],
+          ["PASSENGERS", s.totalPax, COLORS.chalk],
+          ["KM DRIVEN", s.totalKm, COLORS.chalk],
+          ["EXCEPTIONS", s.exceptions, s.exceptions > 0 ? COLORS.amber : COLORS.ghost],
+          ["REJECTIONS", s.rejections, s.rejections > 0 ? COLORS.red : COLORS.ghost],
+          ["NO-SHOWS", s.noShows, s.noShows > 0 ? COLORS.amber : COLORS.ghost],
+        ].map(([label, val, color]) => (
+          <div key={label} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "5px 10px", minWidth: 80 }}>
+            <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{label}</div>
+            <div style={{ fontSize: 15, fontWeight: 800, color, fontFamily: FONTS.head }}>{val}</div>
+          </div>
+        ))}
+      </div>
+      {s.topDriver && (
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>
+          🏆 Top driver: <span style={{ color: COLORS.green, fontWeight: 700 }}>{s.topDriver.name}</span> — {s.topDriver.trips} trips, {s.topDriver.pax} passengers, {Math.round(s.topDriver.km)} km
+        </div>
+      )}
+      {s.worstRejector && (
+        <div style={{ fontSize: 10, color: COLORS.amber }}>
+          ⚠ Most rejections: {s.worstRejector.name} ({s.worstRejector.rejections} this week)
+        </div>
+      )}
+      {s.expiredDocs > 0 && (
+        <div style={{ fontSize: 10, color: COLORS.red, fontWeight: 700 }}>
+          🚨 {s.expiredDocs} driver{s.expiredDocs !== 1 ? "s" : ""} with expired documents — check Drivers tab
+        </div>
+      )}
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        To automate Monday morning emails, deploy the TransitOS weekly-summary Edge Function (see docs).
+      </div>
     </div>
   );
 }
@@ -5132,7 +5451,7 @@ async function fetchTripHistory({ fromMs, toMs, agentId, driverId } = {}) {
 async function assertAdminPermission(activeUserRef, permission) {
   const actingId = activeUserRef.current;
   if (actingId == null) throw new Error("Not logged in.");
-  const { data: actingUser, error } = await supabase.from("users").select("role, adminlevel, fullname").eq("id", actingId).single();
+  const { data: actingUser, error } = await supabase.from("users").select("role, adminlevel, fullname, scopedcompanyids, branchid").eq("id", actingId).single();
   if (error || !actingUser) throw new Error("Could not verify permissions.");
   if (actingUser.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
   const level = ADMIN_PERMISSIONS[actingUser.adminlevel] ? actingUser.adminlevel : ADMIN_LEVEL.VIEWER;
@@ -5764,6 +6083,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Creating an admin account (any level) is Fleet Ops only; creating
       // an agent or driver just needs manageAgentsDrivers.
       const actingAdminCreate = await assertAdminPermission(activeUserRef, action.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
+      // Company scope enforcement: a scoped admin can only create users for their own company
+      if (actingAdminCreate.scopedCompanyIds?.length && action.branch_id && !actingAdminCreate.scopedCompanyIds.includes(action.branch_id)) {
+        throw new Error("Not authorised — you can only create users for your assigned company");
+      }
       // New accounts are salted-hashed from the start — only lazy-upgraded
       // legacy accounts ever hold plaintext, and only until first login.
       const newUserSalt = makeSalt();
@@ -8294,8 +8617,11 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
         ))}
       </div>
 
+      <WeeklyOpsSummaryPanel state={state} />
       <SectionHeader label="7-Day Demand Forecast" />
       <CapacityForecastPanel state={state} />
+      <SectionHeader label="Staffing Gaps (Next 7 Days)" />
+      <SmartSchedulingPanel state={state} />
       <SectionHeader label="Recent Activity" />
       {/* Recurring booking shortcut — show when agent has a recent trip */}
       {(() => {
@@ -8963,7 +9289,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_UPDATED: "✎" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -9418,6 +9744,51 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           }
         }
       }
+      // Feature: Speed anomaly detection ───────────────────────────────────
+      // Stationary: driver in IN_TRANSIT but speed < 2 km/h for 8+ minutes
+      // Speeding: speed > 130 km/h — insurance/compliance threshold
+      // Each fires at most once per trip per category (guarded by refs).
+      if (currentTripId && speedKmh != null && user?.id && supabase) {
+        const STATIONARY_THRESHOLD_KMH = 2;
+        const STATIONARY_DURATION_MS = 8 * 60 * 1000; // 8 min
+        const SPEED_THRESHOLD_KMH = 130;
+
+        if (!geofenceTriggeredRef.current.speedAlerts) {
+          geofenceTriggeredRef.current.speedAlerts = { stationaryStart: null, stationaryFired: false, speedingFired: {} };
+        }
+        const sa = geofenceTriggeredRef.current.speedAlerts;
+
+        // Speeding alert — fire once per trip if speed > 130
+        if (speedKmh > SPEED_THRESHOLD_KMH && !sa.speedingFired[currentTripId]) {
+          sa.speedingFired[currentTripId] = true;
+          insertNotification({
+            type: "SPEED_ANOMALY", for_roles: [ROLE.ADMIN],
+            message: `⚡ SPEEDING — ${user.name || user.id} is travelling at ${Math.round(speedKmh)} km/h on trip ${currentTripId}. Review immediately.`,
+            trip_id: currentTripId, ts: Date.now(), read: false,
+          }).catch(() => {});
+        }
+
+        // Stationary tracking
+        const isActiveTrip = activeTrips?.some(t => t.trip_id === currentTripId && t.state === "IN_TRANSIT");
+        if (isActiveTrip && speedKmh < STATIONARY_THRESHOLD_KMH) {
+          if (!sa.stationaryStart) sa.stationaryStart = now;
+          if (!sa.stationaryFired && now - sa.stationaryStart >= STATIONARY_DURATION_MS) {
+            sa.stationaryFired = true;
+            insertNotification({
+              type: "SPEED_ANOMALY", for_roles: [ROLE.ADMIN],
+              message: `⚠ STATIONARY — ${user.name || user.id} has not moved for 8+ minutes on trip ${currentTripId}. Possible breakdown or incident.`,
+              trip_id: currentTripId, ts: Date.now(), read: false,
+            }).catch(() => {});
+          }
+        } else {
+          // Moving again — reset stationary state (allow re-alert on next long stop)
+          if (speedKmh >= STATIONARY_THRESHOLD_KMH) {
+            sa.stationaryStart = null;
+            sa.stationaryFired = false;
+          }
+        }
+      }
+
       // Feature 6: Route deviation alert ────────────────────────────────────
       // If the driver is more than 600m from their current nav target for
       // 2+ consecutive GPS readings while IN_TRANSIT, fire an admin alert.
@@ -10298,14 +10669,12 @@ function MessagesTab({ user, dispatch, state }) {
   const load = useCallback(async () => {
     if (!supabase) { setConversations([]); return; }
     try {
-      // Needs the staff directory to resolve a counterpart's name when
-      // the most recent message in a thread is one the current user
-      // sent (see fetchMyConversations' comment) — a lightweight
-      // targeted query rather than pulling in the whole app's users
-      // list, since this tab doesn't otherwise need it.
-      const { data: usersData } = await supabase.from("users").select("id, fullname").eq("role", ROLE.ADMIN);
-      const adminUsers = (usersData || []).map(u => ({ id: u.id, name: u.fullname }));
-      const convos = await fetchMyConversations(user.id, adminUsers);
+      // Load contacts for all roles — drivers need to reach admins, admins
+      // need to reach drivers. Using a broad select scoped to the roles
+      // that make sense for DM: ADMIN + DRIVER + AGENT (not anonymous).
+      const { data: usersData } = await supabase.from("users").select("id, fullname, role");
+      const allUsers = (usersData || []).map(u => ({ id: u.id, name: u.fullname, role: u.role }));
+      const convos = await fetchMyConversations(user.id, allUsers);
       setConversations(convos.sort((a, b) => b.last_ts_epoch - a.last_ts_epoch));
     } catch (e) {
       setErr(e.message || "Couldn't load messages.");
@@ -10337,6 +10706,19 @@ function MessagesTab({ user, dispatch, state }) {
     <div className="pad">
       <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, letterSpacing: 1 }}>MESSAGES</div>
       {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+      {/* Pinned ops contact — always show for drivers so they can reach dispatch */}
+      {user.role === ROLE.DRIVER && conversations !== null && conversations.length === 0 && (
+        <div style={{ background: "rgba(45,140,240,0.06)", border: "1px solid rgba(45,140,240,0.25)", borderRadius: 6, padding: "10px 14px", marginBottom: 8 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.blue }}>💬 OPS / DISPATCH</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>No messages yet. Start a conversation with your operations team.</div>
+          <Button title="MESSAGE OPS" variant="ghost" size="sm" style={{ marginTop: 6, borderColor: COLORS.blue, color: COLORS.blue }}
+            onClick={async () => {
+              // Find the first available admin to DM
+              const { data } = await supabase.from("users").select("id, fullname").eq("role", ROLE.ADMIN).limit(1);
+              if (data?.[0]) setOpenWith({ id: data[0].id, name: data[0].fullname });
+            }} />
+        </div>
+      )}
       {conversations === null ? (
         <span style={{ fontSize: 10, color: COLORS.ghost }}>Loading…</span>
       ) : conversations.length === 0 ? (
@@ -11684,7 +12066,7 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
   );
 }
 
-const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]];
+const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"], ["messages", "✉", "Messages"], ["help", "🎫", "Help"], ["history", "◈", "History"], ["alerts", "◬", "Alerts"], ["me", "◐", "Me"]]; // messages badge wired in DriverApp
 
 function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [tab, setTab] = usePersistedTab("driver", user.id, "trips", DRIVER_TABS.map(t => t[0]));
@@ -11806,7 +12188,7 @@ function AdminDashboard({ state, user }) {
   // affect Viewer's access to History (which has its own separate 60-day
   // cap already) — this is specifically about the Dashboard's daily
   // snapshot being genuinely daily for that tier.
-  const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER;
+  const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER || (isCompanyScoped(user, state.companies) && user.admin_level !== ADMIN_LEVEL.FLEET_OPS);
   const todayStr = (() => {
     const d = new Date();
     return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
@@ -13198,8 +13580,8 @@ function AdminHistory({ state, user }) {
       // companyFilter checklist gets the same treatment, just driven by
       // their own one-off selection instead of a permanent account-level
       // scope.
-      const effectiveCompanyIds = isCompanyScoped(user)
-        ? user.scoped_company_ids
+      const effectiveCompanyIds = isCompanyScoped(user, state.companies)
+        ? getAdminCompanyIds(user, state.companies)
         : (companyFilter.length ? companyFilter : null);
       setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
     } catch (e) {
@@ -15477,7 +15859,7 @@ function AdminUsers({ state, dispatch, user }) {
               ) : (
                 <select className="inp" value={form.branchId || ""} onChange={e => set("branchId", e.target.value || null)} style={{ width: "100%" }}>
                   <option value="">— None —</option>
-                  {state.companies.filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  {(isMasterAdmin(user, state.companies) ? state.companies : (state.companies || []).filter(c => getAdminCompanyIds(user, state.companies).includes(c.id))).filter(c => c.active).map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                 </select>
               )}
               <SectionHeader label="Campaign / Project" />
@@ -16127,13 +16509,16 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // identical state object back — scoping is strictly additive, it
   // never changes behavior for anyone it doesn't apply to.
   const scopedState = React.useMemo(() => {
-    if (!isCompanyScoped(user)) return state;
+    const adminCompanyIds = getAdminCompanyIds(user, state.companies);
+    if (!adminCompanyIds.length) return state; // master admin or no restriction
     return {
       ...state,
-      users: scopeUsersToCompany(state.users, state.trips, user.scoped_company_ids),
-      trips: scopeTripsToCompany(state.trips, state.users, user.scoped_company_ids),
-      tickets: scopeTicketsToCompany(state.tickets, state.users, user.scoped_company_ids),
-      notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, user.scoped_company_ids),
+      // Companies: admins only see their own company + its branches
+      companies: (state.companies || []).filter(c => adminCompanyIds.includes(c.id)),
+      users: scopeUsersToCompany(state.users, state.trips, adminCompanyIds),
+      trips: scopeTripsToCompany(state.trips, state.users, adminCompanyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, adminCompanyIds),
+      notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, adminCompanyIds),
     };
   }, [state, user]);
 
@@ -16144,7 +16529,19 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     <>
       <div style={{ padding: 16, borderBottom: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <img src={LOGO_DATA_URI} alt="Pearce & Sons" style={{ height: 28, width: 28, objectFit: "contain" }} />
-        <RoleBadge role={ROLE.ADMIN} />
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
+          <RoleBadge role={ROLE.ADMIN} />
+          {isMasterAdmin(user, state.companies)
+            ? <span style={{ fontSize: 8, color: COLORS.amber, fontWeight: 700, letterSpacing: 0.5 }}>ALL COMPANIES</span>
+            : getAdminCompanyIds(user, state.companies).length > 0
+              ? <span style={{ fontSize: 8, color: COLORS.blue, fontWeight: 700, letterSpacing: 0.5 }} title={getAdminCompanyIds(user, state.companies).map(id => state.companies.find(c=>c.id===id)?.name||id).join(", ")}>
+                  {getAdminCompanyIds(user, state.companies).length === 1
+                    ? (state.companies.find(c => c.id === getAdminCompanyIds(user, state.companies)[0])?.name || "SCOPED")
+                    : getAdminCompanyIds(user, state.companies).length + " COMPANIES"}
+                </span>
+              : null
+          }
+        </div>
       </div>
       <div style={{ flex: 1, paddingTop: 12, overflowY: "auto" }}>
         {visibleNav.map(([id, icon, label]) => {
