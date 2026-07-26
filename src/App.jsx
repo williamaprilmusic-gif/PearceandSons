@@ -12097,7 +12097,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id, driver_coord: driverCoord };
       if (!navigator.onLine) {
         enqueueOfflineAction(action);
-        // Optimistically update local state so the button disappears immediately
         await dispatch(action).catch(() => {});
         return;
       }
@@ -12106,20 +12105,43 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
       return;
     }
-    // Immediately navigate to whichever pickup becomes current next —
-    // pickupStops is derived from state.trips, so after the dispatch
-    // above resolves and state updates, the next un-done stop (if any)
-    // is the new "current" one. Read it fresh here rather than from the
-    // stale closure captured when this render happened.
     const remaining = pickupStops.filter(s => s.trip_id !== trip_id || s.agent_id !== agent_id).filter(s => !s.done);
     const next = remaining[0];
     if (next?.lat && next?.lng) {
       smartOpenWaze(next.lat, next.lng, next.label, next.isManual);
       return;
     }
-    // No pickups left — this was the last one, so go straight into
-    // drop-off navigation instead of leaving the driver stranded with no
-    // active Waze prompt until they notice and tap a separate button.
+    const firstDrop = dropStops.find(s => !s.done);
+    if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+  };
+
+  // OUTBOUND trips: all agents board at ONE location (company/work site).
+  // Confirm all pickups at once, then navigate to the first home dropoff.
+  const isOutboundRun = myActiveTrips.length > 0 && myActiveTrips.every(t => t.direction === "OUTBOUND");
+  const outboundAllSamePickup = isOutboundRun && (() => {
+    const lats = pickupStops.map(s => s.lat?.toFixed(3));
+    const lngs = pickupStops.map(s => s.lng?.toFixed(3));
+    return lats.length > 0 && new Set(lats).size === 1 && new Set(lngs).size === 1;
+  })();
+
+  const confirmPickupAll = async () => {
+    try {
+      const driverCoord = await getFreshDriverCoord();
+      // Confirm each agent's pickup sequentially
+      for (const stop of pickupStops.filter(s => !s.done)) {
+        const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: stop.trip_id, agent_id: stop.agent_id, driver_coord: driverCoord };
+        if (!navigator.onLine) {
+          enqueueOfflineAction(action);
+          await dispatch(action).catch(() => {});
+        } else {
+          await dispatch(action);
+        }
+      }
+    } catch (e) {
+      setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
+      return;
+    }
+    // Navigate to first home dropoff
     const firstDrop = dropStops.find(s => !s.done);
     if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
   };
@@ -12190,7 +12212,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         <Card style={{ alignItems: "center", padding: 28, textAlign: "center", borderColor: COLORS.amber }}>
           <div style={{ fontSize: 40 }}>🚐</div>
           <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800 }}>Ready to go?</div>
-          <div style={{ fontSize: 10, color: COLORS.mist }}>{pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} · {dropStops.length} drop-off location{dropStops.length !== 1 ? "s" : ""}</div>
+          {isOutboundRun ? (
+            <div style={{ fontSize: 10, color: COLORS.mist }}>
+              🚌 OUTBOUND — pick up {pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} at one location, then drop off at {dropStops.length} home address{dropStops.length !== 1 ? "es" : ""}
+            </div>
+          ) : (
+            <div style={{ fontSize: 10, color: COLORS.mist }}>{pickupStops.length} passenger{pickupStops.length !== 1 ? "s" : ""} · {dropStops.length} drop-off location{dropStops.length !== 1 ? "s" : ""}</div>
+          )}
           {pickupStops.map((s, i) => (
             <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}`, width: "100%", textAlign: "left" }}>
               <span style={{ color: COLORS.green, fontWeight: 800, minWidth: 22 }}>#{i + 1}</span>
@@ -12255,55 +12283,102 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
 
       {tripStarted && !allPickedUp && curPickup && (
         <>
-          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            {pickupStops.map((s, i) => (
-              <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ padding: "4px 10px", borderRadius: 2, fontSize: 9, fontWeight: 700, background: s.done ? "rgba(29,185,84,.15)" : i === curPickupIdx ? "rgba(245,166,35,.2)" : COLORS.surface, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : i === curPickupIdx ? COLORS.amber : COLORS.wire}`, color: s.done ? COLORS.green : i === curPickupIdx ? COLORS.amber : COLORS.ghost }}>
-                {s.done ? "✓ " : i === curPickupIdx ? "▶ " : "○ "}P{i + 1}: {s.agent_name?.split(" ")[0]}
+          {/* ── OUTBOUND: single pickup location, all agents board together ── */}
+          {outboundAllSamePickup ? (
+            <Card style={{ gap: 12, borderColor: COLORS.amber, background: "rgba(245,166,35,.04)" }}>
+              <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.amber, fontWeight: 800, textTransform: "uppercase" }}>
+                🚌 OUTBOUND — PICK UP ALL PASSENGERS
               </div>
-            ))}
-          </div>
-          <Card style={{ gap: 12, borderColor: COLORS.amber, background: "rgba(245,166,35,.04)" }}>
-            <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.amber, fontWeight: 800, textTransform: "uppercase" }}>▶ PICKUP {curPickupIdx + 1} OF {pickupStops.length}</div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
-              <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.green }}>◉ {curPickup.agent_name}</div>
-              {curPickup.scheduled_time && (
-                <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 1 }}>BOOKED FOR</div>
-                  <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800, color: COLORS.amber }}>{curPickup.scheduled_time}</div>
-                </div>
-              )}
-            </div>
-            <div style={{ display: "flex", gap: 6 }}>
-              <Button title="💬 MESSAGE" variant="ghost" size="sm" onClick={() => setChatWith({ trip: myActiveTrips.find(t => t.trip_id === curPickup.trip_id), otherUser: { id: curPickup.agent_id, name: curPickup.agent_name, role: ROLE.AGENT } })} style={{ flex: 1 }} />
-              {call && (
-                <Button
-                  title="📞 CALL" variant="green" size="sm"
-                  onClick={() => call.startCall({ id: curPickup.agent_id, name: curPickup.agent_name }, curPickup.trip_id)}
-                  disabled={call.callState !== CALL_STATE.IDLE}
-                  style={{ flex: 1 }}
-                />
-              )}
-            </div>
-            <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
-              <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP ADDRESS</div>
-              <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
-            </div>
-            <Button title={`🧭 WAZE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)} style={{ padding: 16, fontSize: 14 }} />
-            <div style={{ display: "flex", gap: 8 }}>
-              <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} style={{ flex: 2 }} />
-              <Button title="🚫 NO SHOW" variant="danger" full onClick={() => setNoShowFor({ trip_id: curPickup.trip_id, agent_id: curPickup.agent_id, agent_name: curPickup.agent_name })} style={{ flex: 1 }} />
-            </div>
-          </Card>
-          {pickupStops.slice(curPickupIdx + 1).length > 0 && (
+              <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+                <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP LOCATION</div>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
+              </div>
+              {/* Passenger list */}
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {pickupStops.map((s, i) => (
+                  <div key={`${s.trip_id}-${s.agent_id ?? i}`}
+                    style={{ display: "flex", alignItems: "center", gap: 10, background: s.done ? "rgba(29,185,84,.1)" : COLORS.card, borderRadius: 4, padding: "8px 10px", border: `1px solid ${s.done ? "rgba(29,185,84,.3)" : COLORS.wire}` }}>
+                    <span style={{ fontSize: 16, color: s.done ? COLORS.green : COLORS.amber }}>{s.done ? "✓" : "◉"}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, color: s.done ? COLORS.green : COLORS.chalk }}>{s.agent_name}</div>
+                    </div>
+                    {!s.done && call && (
+                      <Button title="📞" variant="ghost" size="sm"
+                        onClick={() => call.startCall({ id: s.agent_id, name: s.agent_name }, s.trip_id)}
+                        disabled={call.callState !== CALL_STATE.IDLE} />
+                    )}
+                    {!s.done && (
+                      <Button title="💬" variant="ghost" size="sm"
+                        onClick={() => setChatWith({ trip: myActiveTrips.find(t => t.trip_id === s.trip_id), otherUser: { id: s.agent_id, name: s.agent_name, role: ROLE.AGENT } })} />
+                    )}
+                  </div>
+                ))}
+              </div>
+              <Button title={`🧭 WAZE → PICKUP`} variant="waze" full
+                onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)}
+                style={{ padding: 14, fontSize: 13 }} />
+              <Button
+                title={`✓ ALL ${pickupStops.filter(s => !s.done).length} PASSENGERS ON BOARD`}
+                variant="green" full
+                onClick={confirmPickupAll}
+                style={{ padding: 18, fontSize: 15, letterSpacing: 1 }}
+              />
+              <div style={{ fontSize: 9, color: COLORS.ghost, textAlign: "center" }}>
+                Confirm once everyone listed above is in the vehicle — next stop: first drop-off
+              </div>
+            </Card>
+          ) : (
+            /* ── INBOUND / mixed: individual per-agent pickup stops ── */
             <>
-              <SectionHeader label="Up Next" />
-              {pickupStops.slice(curPickupIdx + 1).map((s, i) => (
-                <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 9, border: `1px solid ${COLORS.wire}`, opacity: .65 }}>
-                  <span style={{ color: COLORS.ghost, fontWeight: 800, minWidth: 22 }}>#{curPickupIdx + 2 + i}</span>
-                  <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 11 }}>{s.agent_name}</div><div style={{ color: COLORS.ghost, fontSize: 10 }}>{s.label}</div></div>
-                  {s.scheduled_time && <div style={{ fontSize: 10, color: COLORS.ghost, whiteSpace: "nowrap" }}>🕐 {s.scheduled_time}</div>}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {pickupStops.map((s, i) => (
+                  <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ padding: "4px 10px", borderRadius: 2, fontSize: 9, fontWeight: 700, background: s.done ? "rgba(29,185,84,.15)" : i === curPickupIdx ? "rgba(245,166,35,.2)" : COLORS.surface, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : i === curPickupIdx ? COLORS.amber : COLORS.wire}`, color: s.done ? COLORS.green : i === curPickupIdx ? COLORS.amber : COLORS.ghost }}>
+                    {s.done ? "✓ " : i === curPickupIdx ? "▶ " : "○ "}P{i + 1}: {s.agent_name?.split(" ")[0]}
+                  </div>
+                ))}
+              </div>
+              <Card style={{ gap: 12, borderColor: COLORS.amber, background: "rgba(245,166,35,.04)" }}>
+                <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.amber, fontWeight: 800, textTransform: "uppercase" }}>▶ PICKUP {curPickupIdx + 1} OF {pickupStops.length}</div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+                  <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.green }}>◉ {curPickup.agent_name}</div>
+                  {curPickup.scheduled_time && (
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 1 }}>BOOKED FOR</div>
+                      <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800, color: COLORS.amber }}>{curPickup.scheduled_time}</div>
+                    </div>
+                  )}
                 </div>
-              ))}
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Button title="💬 MESSAGE" variant="ghost" size="sm" onClick={() => setChatWith({ trip: myActiveTrips.find(t => t.trip_id === curPickup.trip_id), otherUser: { id: curPickup.agent_id, name: curPickup.agent_name, role: ROLE.AGENT } })} style={{ flex: 1 }} />
+                  {call && (
+                    <Button title="📞 CALL" variant="green" size="sm"
+                      onClick={() => call.startCall({ id: curPickup.agent_id, name: curPickup.agent_name }, curPickup.trip_id)}
+                      disabled={call.callState !== CALL_STATE.IDLE}
+                      style={{ flex: 1 }} />
+                  )}
+                </div>
+                <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP ADDRESS</div>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
+                </div>
+                <Button title={`🧭 WAZE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)} style={{ padding: 16, fontSize: 14 }} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} style={{ flex: 2 }} />
+                  <Button title="🚫 NO SHOW" variant="danger" full onClick={() => setNoShowFor({ trip_id: curPickup.trip_id, agent_id: curPickup.agent_id, agent_name: curPickup.agent_name })} style={{ flex: 1 }} />
+                </div>
+              </Card>
+              {pickupStops.slice(curPickupIdx + 1).length > 0 && (
+                <>
+                  <SectionHeader label="Up Next" />
+                  {pickupStops.slice(curPickupIdx + 1).map((s, i) => (
+                    <div key={`${s.trip_id}-${s.agent_id ?? "x"}`} style={{ display: "flex", gap: 10, alignItems: "center", background: COLORS.surface, borderRadius: 3, padding: 9, border: `1px solid ${COLORS.wire}`, opacity: .65 }}>
+                      <span style={{ color: COLORS.ghost, fontWeight: 800, minWidth: 22 }}>#{curPickupIdx + 2 + i}</span>
+                      <div style={{ flex: 1 }}><div style={{ fontWeight: 700, fontSize: 11 }}>{s.agent_name}</div><div style={{ color: COLORS.ghost, fontSize: 10 }}>{s.label}</div></div>
+                      {s.scheduled_time && <div style={{ fontSize: 10, color: COLORS.ghost, whiteSpace: "nowrap" }}>🕐 {s.scheduled_time}</div>}
+                    </div>
+                  ))}
+                </>
+              )}
             </>
           )}
         </>
@@ -12322,8 +12397,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
             ))}
           </div>
           <Card style={{ gap: 12, borderColor: COLORS.red, background: "rgba(232,58,58,.04)" }}>
-            <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.red, fontWeight: 800, textTransform: "uppercase" }}>▶ DROP-OFF {curDropIdx + 1} OF {dropStops.length}</div>
-            <div style={{ fontFamily: FONTS.head, fontSize: 20, fontWeight: 800, color: COLORS.red }}>◎ {curDrop.label}</div>
+            <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.red, fontWeight: 800, textTransform: "uppercase" }}>
+              ⬇ DROP-OFF {curDropIdx + 1} OF {dropStops.length}
+              {curDrop.passengers.length === 1 && (
+                <span style={{ color: COLORS.chalk, fontWeight: 700, marginLeft: 8 }}>— {curDrop.passengers[0].name}</span>
+              )}
+            </div>
+            <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, color: COLORS.red }}>◎ {curDrop.label}</div>
             {curDrop.passengers.map((p, i) => (
               <div key={i} style={{ background: COLORS.surface, borderRadius: 3, padding: 7, border: `1px solid ${COLORS.wire}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontWeight: 700, fontSize: 10 }}>{p.name}</span>
@@ -12340,7 +12420,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
               <div style={{ fontSize: 13, fontWeight: 700 }}>{curDrop.label}</div>
             </div>
             <Button title={`🧭 WAZE → DROP-OFF ${curDropIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curDrop.lat, curDrop.lng, curDrop.label, curDrop.isManual)} style={{ padding: 16, fontSize: 14 }} />
-            <Button title={`🏁 DROPPED OFF — ${curDrop.passengers.map(p => p.name.split(" ")[0]).join(" & ")}`} variant="amber" full onClick={() => confirmDropoff(curDrop)} />
+            <Button
+              title={curDrop.passengers.length === 1
+                ? `🏁 DROPPED OFF — ${curDrop.passengers[0].name}`
+                : `🏁 DROPPED OFF — ${curDrop.passengers.map(p => p.name.split(" ")[0]).join(" & ")}`}
+              variant="amber" full
+              onClick={() => confirmDropoff(curDrop)}
+              style={{ padding: 18, fontSize: 14, letterSpacing: 0.5 }}
+            />
           </Card>
           {dropStops.slice(curDropIdx + 1).length > 0 && (
             <>
