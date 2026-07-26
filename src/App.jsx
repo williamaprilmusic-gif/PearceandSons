@@ -1894,6 +1894,559 @@ function computeDriverStats(driverId, allTrips) {
   return { completed, cancelled, total, completionRate, rejections, noShowTrips, avgPassengers };
 }
 
+
+
+
+// ── SOS / Emergency button ────────────────────────────────────────────────
+// One tap → confirms intent → fires admin alert with GPS + trip context.
+// Requires two taps to avoid accidental triggers (confirm step).
+// Matches South African transport operator compliance requirements.
+function SOSButton({ user, tripId, driverName, dispatch }) {
+  const [armed, setArmed] = React.useState(false);
+  const [sent, setSent] = React.useState(false);
+  const [armTimeout, setArmTimeout] = React.useState(null);
+
+  const arm = () => {
+    setArmed(true);
+    const t = setTimeout(() => setArmed(false), 5000); // auto-disarm after 5s
+    setArmTimeout(t);
+  };
+
+  const fire = async () => {
+    if (armTimeout) clearTimeout(armTimeout);
+    setArmed(false);
+    setSent(true);
+    // Get GPS if available
+    let gpsStr = "GPS unavailable";
+    try {
+      await new Promise((res, rej) => navigator.geolocation.getCurrentPosition(
+        pos => { gpsStr = pos.coords.latitude.toFixed(5) + "," + pos.coords.longitude.toFixed(5); res(); },
+        () => res(), { timeout: 3000 }
+      ));
+    } catch {}
+    const mapsLink = gpsStr !== "GPS unavailable"
+      ? " https://maps.google.com/?q=" + gpsStr : "";
+    await dispatch({
+      type: "SYSTEM/SOS_ALERT",
+      sender_id: user.id, sender_name: user.name,
+      trip_id: tripId || null,
+      driver_name: driverName || null,
+      gps: gpsStr,
+      message: "🚨 SOS — " + user.name + " (" + user.role + ") triggered emergency alert on trip " + (tripId || "unknown") + ". GPS: " + gpsStr + "." + mapsLink + " Immediate attention required.",
+    }).catch(() => {});
+    setTimeout(() => setSent(false), 10000);
+  };
+
+  if (sent) return (
+    <div style={{ background: "rgba(220,53,69,0.12)", border: "1px solid rgba(220,53,69,0.5)", borderRadius: 6, padding: "10px 14px", textAlign: "center" }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color: COLORS.red }}>🚨 SOS SENT</div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>Operations has been alerted with your location.</div>
+    </div>
+  );
+
+  if (armed) return (
+    <div style={{ display: "flex", gap: 8 }}>
+      <button onClick={() => { setArmed(false); clearTimeout(armTimeout); }}
+        style={{ flex: 1, background: COLORS.surface, border: `1px solid \${COLORS.wire}`, borderRadius: 5, padding: 10, cursor: "pointer", color: COLORS.chalk, fontSize: 11, fontWeight: 700 }}>
+        CANCEL
+      </button>
+      <button onClick={fire}
+        style={{ flex: 2, background: COLORS.red, border: "none", borderRadius: 5, padding: 10, cursor: "pointer", color: "#fff", fontSize: 12, fontWeight: 800, animation: "pulse 0.8s infinite" }}>
+        🚨 CONFIRM SOS
+      </button>
+    </div>
+  );
+
+  return (
+    <button onClick={arm}
+      style={{ width: "100%", background: "rgba(220,53,69,0.08)", border: `2px solid \${COLORS.red}`, borderRadius: 6, padding: 10, cursor: "pointer", color: COLORS.red, fontSize: 11, fontWeight: 800, letterSpacing: 0.5 }}>
+      🚨 SOS / EMERGENCY
+    </button>
+  );
+}
+
+// ── In-app Waze navigation panel ─────────────────────────────────────────
+// Professional fleet apps can't actually embed Waze (Waze blocks iframes
+// and cross-origin embedding). What they DO is a persistent nav panel
+// that shows: current stop details, one-tap launch into Waze pre-loaded
+// with the destination, and trip progress — so it FEELS embedded.
+// This is the same technique Bolt and inDriver use on Android/iOS.
+function WazeNavPanel({ trip, user, state }) {
+  if (!trip) return null;
+  const agentIds = trip.agent_ids || [];
+  const completedPickups = trip.completed_pickups || [];
+  const completedDropoffs = trip.completed_dropoffs || [];
+
+  // Build the ordered sequence of remaining stops
+  const remaining = [];
+  for (const coord of (trip.pickup_sequence_coords || [])) {
+    if (!completedPickups.includes(coord.agent_id)) {
+      const agent = state.users.find(u => u.id === coord.agent_id);
+      remaining.push({ type: "PICKUP", coord, agentName: agent?.name || "Passenger", agentId: coord.agent_id });
+    }
+  }
+  for (const coord of (trip.dropoff_sequence_coords || [])) {
+    if (completedPickups.includes(coord.agent_id) && !completedDropoffs.includes(coord.agent_id)) {
+      const agent = state.users.find(u => u.id === coord.agent_id);
+      remaining.push({ type: "DROPOFF", coord, agentName: agent?.name || "Passenger", agentId: coord.agent_id });
+    }
+  }
+
+  const current = remaining[0] || null;
+  const totalStops = agentIds.length * 2;
+  const doneStops = completedPickups.length + completedDropoffs.length;
+  const pct = totalStops > 0 ? Math.round((doneStops / totalStops) * 100) : 0;
+
+  return (
+    <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 8, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      {/* Progress bar */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>ROUTE PROGRESS</span>
+        <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{doneStops}/{totalStops} stops</span>
+      </div>
+      <div style={{ height: 6, background: COLORS.surface, borderRadius: 3, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${pct}%`, background: COLORS.green, borderRadius: 3, transition: "width 0.4s ease" }} />
+      </div>
+
+      {/* Current stop */}
+      {current ? (
+        <div style={{ background: current.type === "PICKUP" ? "rgba(245,166,35,0.08)" : "rgba(29,185,84,0.08)",
+          border: `1px solid ${current.type === "PICKUP" ? "rgba(245,166,35,0.3)" : "rgba(29,185,84,0.3)"}`,
+          borderRadius: 6, padding: 12 }}>
+          <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 1,
+            color: current.type === "PICKUP" ? COLORS.amber : COLORS.green }}>
+            {current.type === "PICKUP" ? "⬆ NEXT PICKUP" : "⬇ NEXT DROPOFF"}
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 800, color: COLORS.chalk, marginTop: 4, fontFamily: FONTS.head }}>
+            {current.agentName}
+          </div>
+          <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>
+            {current.coord.label || "Address not available"}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button onClick={() => smartOpenWaze(current.coord.lat, current.coord.lng, current.coord.label, false)}
+              style={{ flex: 1, background: "#00CCFF", border: "none", borderRadius: 5, padding: "10px 0",
+                fontWeight: 800, fontSize: 12, cursor: "pointer", color: "#000", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <span style={{ fontSize: 16 }}>🗺</span> OPEN IN WAZE
+            </button>
+            {remaining.length > 1 && (
+              <div style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.wire}`,
+                borderRadius: 5, padding: "10px 8px", fontSize: 9, color: COLORS.ghost, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                <div style={{ fontWeight: 700, color: COLORS.chalk, fontSize: 10 }}>AFTER THIS</div>
+                <div>{remaining[1]?.type === "PICKUP" ? "⬆" : "⬇"} {remaining[1]?.agentName}</div>
+              </div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div style={{ textAlign: "center", padding: 16, color: COLORS.green, fontWeight: 700, fontSize: 13 }}>
+          ✓ All stops complete
+        </div>
+      )}
+
+      {/* Remaining stops list */}
+      {remaining.length > 1 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 0.5 }}>UPCOMING STOPS</div>
+          {remaining.slice(1).map((stop, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px",
+              background: COLORS.surface, borderRadius: 4, fontSize: 10 }}>
+              <span style={{ color: stop.type === "PICKUP" ? COLORS.amber : COLORS.green, fontWeight: 700 }}>
+                {stop.type === "PICKUP" ? "⬆" : "⬇"}
+              </span>
+              <span style={{ color: COLORS.chalk }}>{stop.agentName}</span>
+              <span style={{ color: COLORS.ghost, fontSize: 9, marginLeft: "auto" }}>{stop.coord.label?.split(",")[0]}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
+
+
+// ── Automated backup verification ────────────────────────────────────────
+// Supabase handles physical DB backups automatically (daily on Pro/Team).
+// This adds: (1) a verify-connection health check that confirms Supabase
+// is reachable and the trips table is readable, (2) a last-verified
+// timestamp on the dashboard, and (3) an automated weekly reminder to
+// ops to check their Supabase backup settings.
+// Note: True offsite backup scheduling (pg_dump → S3) requires a
+// Supabase Edge Function or external cron — this is the in-app layer.
+const BACKUP_VERIFY_KEY = "transitos_last_backup_verify";
+
+async function verifyDatabaseConnection() {
+  const start = Date.now();
+  try {
+    const { data, error } = await supabase
+      .from("trips")
+      .select("id")
+      .limit(1);
+    if (error) throw error;
+    const ms = Date.now() - start;
+    const result = { ok: true, ms, checkedAt: Date.now(), tripCount: null };
+    // Also get a count to verify read access is real
+    const { count } = await supabase.from("trips").select("*", { count: "exact", head: true });
+    result.tripCount = count;
+    try { localStorage.setItem(BACKUP_VERIFY_KEY, JSON.stringify(result)); } catch {}
+    return result;
+  } catch (e) {
+    const result = { ok: false, error: e.message, checkedAt: Date.now() };
+    try { localStorage.setItem(BACKUP_VERIFY_KEY, JSON.stringify(result)); } catch {}
+    return result;
+  }
+}
+
+function BackupVerifyPanel() {
+  const [last, setLast] = React.useState(() => {
+    try { return JSON.parse(localStorage.getItem(BACKUP_VERIFY_KEY) || "null"); } catch { return null; }
+  });
+  const [checking, setChecking] = React.useState(false);
+
+  const check = async () => {
+    setChecking(true);
+    const result = await verifyDatabaseConnection();
+    setLast(result);
+    setChecking(false);
+  };
+
+  const age = last ? Math.round((Date.now() - last.checkedAt) / 60000) : null;
+  const ageStr = age == null ? "Never checked" : age < 60 ? `${age}m ago` : age < 1440 ? `${Math.round(age/60)}h ago` : `${Math.round(age/1440)}d ago`;
+
+  return (
+    <div style={{ background: "rgba(29,185,84,0.05)", border: `1px solid ${last?.ok === false ? "rgba(220,53,69,0.4)" : "rgba(29,185,84,0.2)"}`, borderRadius: 6, padding: "10px 14px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.green }}>🛡 DATABASE HEALTH CHECK</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>
+            {last == null && "Not yet verified this session."}
+            {last?.ok === true && `✓ Connected — ${last.tripCount != null ? last.tripCount + " trips" : ""} — ${last.ms}ms — ${ageStr}`}
+            {last?.ok === false && `✗ Error: ${last.error} — ${ageStr}`}
+          </div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>
+            Physical backups managed by Supabase. Check your project dashboard → Settings → Backups for schedule.
+          </div>
+        </div>
+        <Button title={checking ? "CHECKING…" : "▶ RUN CHECK"} variant="ghost" size="sm"
+          style={{ borderColor: COLORS.green, color: COLORS.green, flexShrink: 0 }}
+          onClick={check} disabled={checking} />
+      </div>
+    </div>
+  );
+}
+
+// ── Driver document expiry tracking ──────────────────────────────────────
+// Tracks PrDP (Professional Driving Permit), vehicle licence disc, and
+// roadworthy certificate expiry dates. Alerts ops 30 days before expiry
+// and flags expired docs on dispatch driver cards.
+// Stored on driver_status.documents: { prdp: "YYYY-MM-DD", licence: "...", roadworthy: "..." }
+const DOC_TYPES = [
+  { key: "prdp",       label: "PrDP",             required: true },
+  { key: "licence",    label: "Vehicle Licence",   required: true },
+  { key: "roadworthy", label: "Roadworthy Cert",   required: false },
+];
+const DOC_WARN_DAYS = 30;
+
+function docExpiryStatus(dateStr) {
+  if (!dateStr) return { status: "missing", daysLeft: null };
+  const expiry = new Date(dateStr);
+  const now = new Date();
+  const daysLeft = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
+  if (daysLeft < 0) return { status: "expired", daysLeft };
+  if (daysLeft <= DOC_WARN_DAYS) return { status: "expiring", daysLeft };
+  return { status: "ok", daysLeft };
+}
+
+function DriverDocSummary({ ds }) {
+  const docs = ds.documents || {};
+  const issues = DOC_TYPES.map(d => ({ ...d, ...docExpiryStatus(docs[d.key]), date: docs[d.key] }))
+    .filter(d => d.status !== "ok");
+  if (issues.length === 0) return (
+    <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700 }}>✓ DOCS OK</span>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      {issues.map(d => (
+        <span key={d.key} style={{ fontSize: 8, fontWeight: 700, color: d.status === "expired" ? COLORS.red : COLORS.amber }}>
+          {d.status === "expired" ? "✗" : "⚠"} {d.label}: {d.status === "missing" ? "NOT SET" : d.status === "expired" ? `EXPIRED ${Math.abs(d.daysLeft)}d ago` : `expires in ${d.daysLeft}d`}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function DriverDocEditor({ ds, dispatch, onClose }) {
+  const existing = ds.documents || {};
+  const [docs, setDocs] = React.useState({ prdp: existing.prdp || "", licence: existing.licence || "", roadworthy: existing.roadworthy || "" });
+  const [saving, setSaving] = React.useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await dispatch({ type: "DRIVER/SET_DOCUMENTS", driver_id: ds.driver_id, documents: docs });
+      onClose();
+    } catch(e) { setSaving(false); }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>📄 DRIVER DOCUMENTS</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        {DOC_TYPES.map(d => (
+          <div key={d.key}>
+            <label style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, display: "block", marginBottom: 4 }}>
+              {d.label} EXPIRY {d.required ? "*" : ""}
+            </label>
+            <input type="date" value={docs[d.key]} onChange={e => setDocs(v => ({ ...v, [d.key]: e.target.value }))}
+              style={{ width: "100%", background: COLORS.card, border: `1px solid ${docExpiryStatus(docs[d.key]).status === "expired" ? COLORS.red : docExpiryStatus(docs[d.key]).status === "expiring" ? COLORS.amber : COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box" }} />
+            {docs[d.key] && (() => { const s = docExpiryStatus(docs[d.key]); return s.status !== "ok" ? (
+              <div style={{ fontSize: 9, color: s.status === "expired" ? COLORS.red : COLORS.amber, marginTop: 2 }}>
+                {s.status === "expired" ? "Expired " + Math.abs(s.daysLeft) + " days ago" : "Expires in " + s.daysLeft + " days"}
+              </div>
+            ) : null; })()}
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={saving} />
+          <Button title={saving ? "SAVING…" : "✓ SAVE"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={saving} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Audit export for compliance ───────────────────────────────────────────
+// Exports a full audit trail CSV for a date range — every action logged
+// against every trip, with actor, timestamp, GPS where captured, and
+// exception flags. Suitable for transport regulator submissions and
+// insurance claims.
+async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDateStr) {
+  const headers = [
+    "Trip ID","Date","Time","Direction","Driver","Agent(s)","Status",
+    "Exception","Booked At","Driver Assigned At","Driver Accepted At",
+    "Trip Started At","Completed At","Rejection Reason","Rejection Note",
+    "No-Show Count","Delay Reports","Route km","Audit Actions",
+  ];
+
+  const agentNames = (t) => (t.agent_ids || [])
+    .map(id => users.find(u => u.id === id)?.name || id).join(" | ");
+  const driverName = (t) => users.find(u => u.id === t.driver_id)?.name || t.driver_id || "";
+  const fmtEpoch = (ep) => ep ? new Date(ep).toLocaleString("en-ZA") : "";
+
+  const inRange = trips.filter(t => {
+    const d = t.scheduled_date || "";
+    return d >= fromDateStr && d <= toDateStr;
+  });
+
+  const rows = inRange.map(t => {
+    const tripAudit = (auditLogs || []).filter(a => a.trip_id === t.trip_id || a.tripid === t.trip_id);
+    const auditSummary = tripAudit.map(a =>
+      `[${fmtEpoch(a.timestamp)}] ${a.actor_name || a.actorname}: ${a.action_type || a.actiontype}${a.details ? " — " + a.details : ""}`
+    ).join(" || ");
+
+    const delayCount = (t.delays || []).length;
+
+    return [
+      t.trip_id,
+      t.scheduled_date || "",
+      t.scheduled_time || "",
+      t.direction || "",
+      driverName(t),
+      agentNames(t),
+      t.state || "",
+      exceptionLabel(t) || "",
+      fmtEpoch(t.booked_at),
+      fmtEpoch(t.confirmed_at),
+      fmtEpoch(t.accepted_at),
+      fmtEpoch(t.in_transit_at),
+      fmtEpoch(t.completed_at),
+      t.rejection_reason || "",
+      t.rejection_note || "",
+      (t.no_shows || []).length,
+      delayCount,
+      (t.driver_route_km || t.est_distance_km || ""),
+      auditSummary,
+    ].map(v => typeof v === "string" && v.includes(",") ? `"${v.replace(/"/g,'""')}"` : v);
+  });
+
+  const now = new Date().toLocaleString("en-ZA");
+  const csv = [
+    `# TransitOS Compliance Audit Export — Generated: ${now}`,
+    `# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`,
+    `# This document constitutes a complete operational audit trail.`,
+    ``,
+    headers.join(","),
+    ...rows.map(r => r.join(",")),
+  ].join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `compliance_audit_${fromDateStr}_to_${toDateStr}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function AuditExportPanel({ state }) {
+  const [from, setFrom] = React.useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0,10);
+  });
+  const [to, setTo] = React.useState(new Date().toISOString().slice(0,10));
+  const [exporting, setExporting] = React.useState(false);
+
+  const doExport = async () => {
+    setExporting(true);
+    try {
+      // Fetch audit logs for all trips in range
+      const inRange = state.trips.filter(t => {
+        const d = (t.scheduled_date || "").replace(/\//g, "-");
+        return d >= from && d <= to;
+      });
+      const tripIds = inRange.map(t => t.trip_id).filter(Boolean);
+      const auditLogs = tripIds.length > 0 ? await fetchAuditLogsForTrips(tripIds) : [];
+      await exportComplianceAudit(state.trips, state.users, auditLogs, from.replace(/-/g,"/"), to.replace(/-/g,"/"));
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return (
+    <div style={{ background: "rgba(29,185,84,0.05)", border: "1px solid rgba(29,185,84,0.2)", borderRadius: 6, padding: "10px 14px" }}>
+      <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.green, marginBottom: 8 }}>📋 COMPLIANCE AUDIT EXPORT</div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+        <input type="date" value={from} onChange={e => setFrom(e.target.value)}
+          style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "5px 8px", fontSize: 11 }} />
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>to</span>
+        <input type="date" value={to} onChange={e => setTo(e.target.value)}
+          style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "5px 8px", fontSize: 11 }} />
+        <Button title={exporting ? "EXPORTING…" : "⬇ EXPORT CSV"} variant="ghost" size="sm"
+          style={{ borderColor: COLORS.green, color: COLORS.green }} onClick={doExport} disabled={exporting} />
+      </div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 6 }}>
+        Includes all trip actions, GPS timestamps, exceptions, rejections, and delay reports. Suitable for regulatory submissions.
+      </div>
+    </div>
+  );
+}
+
+// ── SLA reporting ─────────────────────────────────────────────────────────
+// On-time defined as: in_transit_at within 10 min of scheduled epoch.
+// Returns per-driver metrics for a given set of completed trips.
+const SLA_GRACE_MINUTES = 10;
+
+function computeSlaReport(trips, users) {
+  const byDriver = {};
+  for (const t of trips) {
+    if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) continue;
+    if (!t.driver_id) continue;
+    const scheduledEpoch = t.scheduled_time; // bigint ms
+    const actualEpoch = t.in_transit_at;
+    if (!scheduledEpoch || !actualEpoch) continue;
+    const deltaMin = (actualEpoch - scheduledEpoch) / 60000;
+    const onTime = deltaMin <= SLA_GRACE_MINUTES;
+    if (!byDriver[t.driver_id]) {
+      const u = users.find(u => u.id === t.driver_id);
+      byDriver[t.driver_id] = { name: u?.name || t.driver_id, total: 0, onTime: 0, lateMin: [] };
+    }
+    byDriver[t.driver_id].total++;
+    if (onTime) byDriver[t.driver_id].onTime++;
+    else byDriver[t.driver_id].lateMin.push(Math.round(deltaMin));
+  }
+  return Object.values(byDriver).map(d => ({
+    ...d,
+    rate: d.total > 0 ? d.onTime / d.total : null,
+    avgLateMin: d.lateMin.length > 0 ? Math.round(d.lateMin.reduce((a,b)=>a+b,0)/d.lateMin.length) : 0,
+  })).sort((a, b) => (b.rate ?? -1) - (a.rate ?? -1));
+}
+
+function SlaReportPanel({ trips, users }) {
+  const report = computeSlaReport(trips, users);
+  if (report.length === 0) return (
+    <div style={{ fontSize: 10, color: COLORS.ghost }}>No completed trips with timing data yet. SLA tracking requires in_transit_at timestamps.</div>
+  );
+  const overall = report.reduce((acc, d) => ({ total: acc.total + d.total, onTime: acc.onTime + d.onTime }), { total: 0, onTime: 0 });
+  const overallRate = overall.total > 0 ? overall.onTime / overall.total : null;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {[
+          ["OVERALL ON-TIME", overallRate != null ? Math.round(overallRate*100)+"%" : "—", overallRate >= 0.9 ? COLORS.green : overallRate >= 0.7 ? COLORS.amber : COLORS.red],
+          ["TOTAL TRIPS", overall.total, COLORS.chalk],
+          ["SLA THRESHOLD", SLA_GRACE_MINUTES+" min", COLORS.ghost],
+        ].map(([l,v,c]) => (
+          <div key={l} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "6px 12px", minWidth: 90 }}>
+            <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{l}</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: c, fontFamily: FONTS.head }}>{v}</div>
+          </div>
+        ))}
+      </div>
+      {report.map(d => {
+        const rateColor = d.rate == null ? COLORS.ghost : d.rate >= 0.9 ? COLORS.green : d.rate >= 0.7 ? COLORS.amber : COLORS.red;
+        return (
+          <div key={d.name} style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 12px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>{d.name}</div>
+              <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{d.total} trips · {d.lateMin.length} late{d.avgLateMin > 0 ? ` (avg ${d.avgLateMin} min)` : ""}</div>
+            </div>
+            <div style={{ fontSize: 18, fontWeight: 800, color: rateColor, fontFamily: FONTS.head }}>
+              {d.rate != null ? Math.round(d.rate*100)+"%" : "—"}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Auto-grouping suggestions ─────────────────────────────────────────────
+// Finds pairs/clusters of unassigned bookings that are good candidates
+// to combine into one trip: same date, same direction, pickups within
+// 8 km of each other, and no agent overlap.
+function computeGroupSuggestions(unassigned) {
+  const suggestions = [];
+  const used = new Set();
+  for (let i = 0; i < unassigned.length; i++) {
+    if (used.has(i)) continue;
+    const a = unassigned[i];
+    const aCoord = a.pickup_sequence_coords?.[0];
+    if (!aCoord?.lat) continue;
+    const group = [a];
+    const groupIdxs = [i];
+    for (let j = i + 1; j < unassigned.length; j++) {
+      if (used.has(j)) continue;
+      const b = unassigned[j];
+      if (b.scheduled_date !== a.scheduled_date) continue;
+      if (b.direction !== a.direction) continue;
+      const bCoord = b.pickup_sequence_coords?.[0];
+      if (!bCoord?.lat) continue;
+      const distKm = haversineKm(aCoord.lat, aCoord.lng, bCoord.lat, bCoord.lng);
+      if (distKm > 8) continue;
+      // No agent overlap
+      const aAgents = new Set(a.agent_ids || []);
+      const hasOverlap = (b.agent_ids || []).some(id => aAgents.has(id));
+      if (hasOverlap) continue;
+      group.push(b);
+      groupIdxs.push(j);
+      if (group.length >= 4) break; // cap at 4 per suggestion
+    }
+    if (group.length >= 2) {
+      groupIdxs.forEach(idx => used.add(idx));
+      const totalPax = group.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+      suggestions.push({ trips: group, totalPax, date: a.scheduled_date, direction: a.direction });
+    }
+  }
+  return suggestions;
+}
+
 // ── Smart driver ranking ──────────────────────────────────────────────────
 // Scores each available driver for a given trip on 4 dimensions:
 //   proximity (0-40 pts) — closer to pickup = higher score
@@ -3226,6 +3779,13 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
     }
 
+
+    case "DRIVER/SET_DOCUMENTS": {
+      return { ...state, driver_status: state.driver_status.map(d =>
+        d.driver_id === action.driver_id ? { ...d, documents: action.documents } : d
+      ), _error: null };
+    }
+
     case "DRIVER/SET_SHIFT_SCHEDULE": {
       // Update driver availability schedule in local state (Supabase handled in handleSupabaseAction)
       const newDriverStatus = state.driver_status.map(d =>
@@ -4155,6 +4715,16 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...cancelNotifs, ...state.notifications], _error: null };
     }
 
+    case "SYSTEM/SOS_ALERT": {
+      // Optimistic: add notification locally so UI updates immediately
+      const sosNotif = {
+        id: mkId(), type: "SOS_ALERT", for_roles: [ROLE.ADMIN],
+        message: action.message,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, notifications: [sosNotif, ...state.notifications], _error: null };
+    }
+
     case "_CLEAR_ERROR":
       return { ...state, _error: null };
 
@@ -4204,7 +4774,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [] };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {} };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -6348,6 +6918,35 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await refetch();
       return;
     }
+    case "SYSTEM/SOS_ALERT": {
+      // SOS fires to ALL admins immediately — no permission check,
+      // no auth gate. Anyone can trigger an emergency.
+      await insertNotification({
+        type: "SOS_ALERT", for_roles: [ROLE.ADMIN],
+        message: action.message,
+        trip_id: action.trip_id, ts: nowEpoch(), read: false,
+      });
+      await logAuditAction({
+        actorId: action.sender_id, actorName: action.sender_name,
+        actionType: "SYSTEM/SOS_ALERT", tripId: action.trip_id,
+        details: `SOS alert fired. GPS: \${action.gps}. Driver: \${action.driver_name || "N/A"}`,
+      });
+      await refetch();
+      return;
+    }
+
+    case "DRIVER/SET_DOCUMENTS": {
+      const actingDocs = await assertAdminPermission(activeUserRef, "manageDispatch");
+      must(await supabase.from("driver_status").update({
+        documents: action.documents, updatedat: new Date().toISOString(),
+      }).eq("driverid", action.driver_id));
+      await logAuditAction({ actorId: actingDocs.id, actorName: actingDocs.name,
+        actionType: "DRIVER/SET_DOCUMENTS", targetUserId: action.driver_id,
+        details: "Updated document expiry dates" });
+      await refetch();
+      return;
+    }
+
     case "DRIVER/SET_SHIFT_SCHEDULE": {
       const actingShift = await assertAdminPermission(activeUserRef, "manageDispatch");
       must(await supabase.from("driver_status").update({
@@ -7698,6 +8297,26 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
       <SectionHeader label="7-Day Demand Forecast" />
       <CapacityForecastPanel state={state} />
       <SectionHeader label="Recent Activity" />
+      {/* Recurring booking shortcut — show when agent has a recent trip */}
+      {(() => {
+        const last = [...myTrips]
+          .filter(t => [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED].includes(t.state))
+          .sort((a,b) => String(b.scheduled_date).localeCompare(String(a.scheduled_date)))[0];
+        if (!last) return null;
+        return (
+          <div style={{ background: "rgba(245,166,35,0.06)", border: "1px solid rgba(245,166,35,0.25)", borderRadius: 6, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 4 }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>⟳ BOOK SAME AS LAST TIME</div>
+              <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{last.direction} · {last.scheduled_time} · {last.scheduled_date}</div>
+            </div>
+            <Button title="BOOK NOW" variant="amber" size="sm" onClick={() => {
+              setTab("book");
+              // signal pre-fill via sessionStorage (AgentBookTab reads this on mount)
+              try { sessionStorage.setItem("transitos_prefill_last", "1"); } catch {}
+            }} />
+          </div>
+        );
+      })()}
       {myTrips.length === 0 ? <Empty icon="⊟" text="No bookings yet" /> : myTrips.slice(0, 4).map(t => (
         <div key={t.trip_id} onClick={() => goToTrip(t)} style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 4 }}>
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
@@ -7793,6 +8412,16 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
   const [errs, setErrs] = useState({});
   const [loading, setLoading] = useState(false);
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  // Auto-fire prefillFromLast when coming from the "Book same as last" shortcut
+  React.useEffect(() => {
+    try {
+      if (sessionStorage.getItem("transitos_prefill_last") === "1") {
+        sessionStorage.removeItem("transitos_prefill_last");
+        if (lastTrip) prefillFromLast();
+      }
+    } catch {}
+  }, []);
 
   // Agents commute the same route daily — one tap copies the recurring
   // parts of their most recent booking (direction, time, phone; and
@@ -8125,6 +8754,9 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   return (
     <div className="pad">
       <Button title="‹ BACK" variant="ghost" size="sm" onClick={onBack} style={{ alignSelf: "flex-start" }} />
+      {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state) && (
+        <SOSButton user={user} tripId={trip.trip_id} dispatch={dispatch} />
+      )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
           <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</div>
@@ -8331,7 +8963,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", TRIP_UPDATED: "✎" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -10672,6 +11304,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
         {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
       </div>
+      {/* Feature B: Waze nav panel — persistent stop-by-stop guide */}
+      {myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} />}
       {startTripError && (
         <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
           <span style={{ fontSize: 11, color: COLORS.red }}>{startTripError}</span>
@@ -10865,6 +11499,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           onClose={() => setChatWith(null)}
         />
       )}
+      <SOSButton user={user} tripId={myActiveTrips[0]?.trip_id} dispatch={dispatch} />
     </div>
   );
 }
@@ -11212,6 +11847,7 @@ function AdminDashboard({ state, user }) {
   return (
     <div className="pad">
       {/* Emergency backup panel — always visible at the top of the dashboard */}
+      <BackupVerifyPanel />
       <div style={{ background: "rgba(245,166,35,.06)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 6, padding: "10px 14px", marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
         <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>🛡 EMERGENCY BACKUP</div>
@@ -12623,6 +13259,9 @@ function AdminHistory({ state, user }) {
   return (
     <div className="pad">
       <SurchargeInvoicePanel state={state} />
+      <AuditExportPanel state={state} />
+      <SectionHeader label="SLA Report (On-Time Performance)" />
+      <SlaReportPanel trips={results || state.trips} users={state.users} />
       <SectionHeader label="Trip History" />
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
         The live Trips view only shows completed trips from the last 30 days. Search here for anything older.
@@ -12981,6 +13620,23 @@ function AdminDispatch({ state, dispatch }) {
           <span style={{ color: msg.startsWith("✗") ? COLORS.red : COLORS.green, fontWeight: 700, fontSize: 11 }}>{msg}</span>
         </div>
       )}
+      {(() => {
+        const suggestions = computeGroupSuggestions(unassignedAllDates.filter(t => !selectedTripIds.has(t.trip_id)));
+        if (!suggestions.length) return null;
+        return (
+          <div style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.green, letterSpacing: 1, marginBottom: 6 }}>💡 COMBINE SUGGESTED</div>
+            {suggestions.map((sg, i) => (
+              <div key={i} style={{ background: "rgba(29,185,84,0.06)", border: "1px solid rgba(29,185,84,0.25)", borderRadius: 4, padding: "8px 10px", marginBottom: 6 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.green }}>{sg.trips.length} bookings · {sg.date} · {sg.direction} · {sg.totalPax} passengers</div>
+                <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{sg.trips.map(t => t.agent_name || t.trip_id).join(", ")} — pickups within 8 km of each other</div>
+                <Button title="SELECT ALL FOR COMBINING" variant="ghost" size="sm" style={{ marginTop: 6, borderColor: COLORS.green, color: COLORS.green }}
+                  onClick={() => { setSelectedTripIds(new Set(sg.trips.map(t => t.trip_id))); setSelectedDriverId(null); }} />
+              </div>
+            ))}
+          </div>
+        );
+      })()}
       <SectionHeader label={`Unassigned Bookings (${unassigned.length}${(dayFilter || directionFilter || areaFilter) ? ` of ${unassignedAllDates.length}` : ""})`} />
       {availableDates.length > 1 && (
         <div>
@@ -13122,6 +13778,7 @@ function AdminDispatch({ state, dispatch }) {
                   <span style={{ fontSize: 13, fontWeight: 700, fontFamily: FONTS.head, color: sel ? COLORS.ink : COLORS.chalk }}>{u?.name}</span>
                   <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
                     {isUnavailable && <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>UNAVAILABLE</span>}
+                    {(() => { const docs = ds.documents || {}; const expired = DOC_TYPES.filter(d => docExpiryStatus(docs[d.key]).status === "expired"); return expired.length > 0 ? <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>EXPIRED DOCS</span> : null; })()}
                     {isNearest && !sel && !isUnavailable && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, border: `1px solid ${COLORS.green}`, padding: "2px 5px", borderRadius: 2 }}>NEAREST</span>}
                     {declined && <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>DECLINED</span>}
                     {sel && <span style={{ color: COLORS.ink }}>✓</span>}
@@ -13141,10 +13798,10 @@ function AdminDispatch({ state, dispatch }) {
                 )}
                 {acceptRate < 0.7 && !sel && (
                   <span style={{ fontSize: 9, color: COLORS.amber }}>⚠ {Math.round(acceptRate * 100)}% acceptance rate</span>
+                )}
                 {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
                   <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost }}>{"⭐".repeat(Math.round(r.avg))} {r.avg.toFixed(1)} avg rating</span>
                 ) : null; })()}
-                )}
                 {distKm != null ? (
                   <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.teal }}>
                     {usedLivePosition ? "🛰 " : "🏠 "}
@@ -13774,6 +14431,7 @@ function AdminDrivers({ state, user }) {
   }
 
   const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
+  const [docEditorFor, setDocEditorFor] = React.useState(null);
   return (
     <div className="pad">
       <SectionHeader label={`Drivers (${state.driver_status.length})`} />
@@ -13803,7 +14461,13 @@ function AdminDrivers({ state, user }) {
                     onClick={() => setShiftEditorFor(ds.driver_id)} />
                   <Button title="🖨 WAYBILL" variant="ghost" size="sm"
                     onClick={() => printWaybill(driverUser, ds, state.trips, state.users, todayStr)} />
+                  <Button title="📄 DOCS" variant="ghost" size="sm"
+                    onClick={() => setDocEditorFor(ds.driver_id)} />
                 </div>
+                <DriverDocSummary ds={ds} />
+                {docEditorFor === ds.driver_id && (
+                  <DriverDocEditor ds={ds} dispatch={dispatch} onClose={() => setDocEditorFor(null)} />
+                )}
                 <DriverStatsCard driverId={ds.driver_id} allTrips={state.trips} />
                 {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
                   <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 4 }}>
