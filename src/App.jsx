@@ -677,6 +677,41 @@ function useIsNarrowScreen(breakpointPx = 768) {
   return isNarrow;
 }
 
+
+// ── Predictive no-show scoring ────────────────────────────────────────────
+// Returns { risk: 'HIGH'|'MEDIUM'|null, rate: 0-1, noShows: n, total: n }
+// for a given agent across all historical trips. HIGH = 2+ no-shows OR
+// ≥40% rate (min 3 trips). MEDIUM = 1 no-show OR 25–40% rate.
+// Runs client-side against state.trips — no extra query needed.
+function computeNoShowRisk(agentId, allTrips) {
+  const agentTrips = allTrips.filter(t =>
+    [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) &&
+    (t.agent_ids || []).includes(agentId)
+  );
+  const total = agentTrips.length;
+  if (total === 0) return { risk: null, rate: 0, noShows: 0, total: 0 };
+  const noShows = agentTrips.filter(t =>
+    (t.no_shows || []).some(ns => ns.agent_id === agentId)
+  ).length;
+  const rate = noShows / total;
+  let risk = null;
+  if (noShows >= 2 || (total >= 3 && rate >= 0.40)) risk = 'HIGH';
+  else if (noShows >= 1 || (total >= 3 && rate >= 0.25)) risk = 'MEDIUM';
+  return { risk, rate, noShows, total };
+}
+
+// Returns a combined risk for a whole trip (worst of all its agents).
+function tripNoShowRisk(trip, allTrips) {
+  const agentIds = trip.agent_ids || [];
+  let worst = null;
+  for (const aid of agentIds) {
+    const { risk } = computeNoShowRisk(aid, allTrips);
+    if (risk === 'HIGH') return 'HIGH';
+    if (risk === 'MEDIUM') worst = 'MEDIUM';
+  }
+  return worst;
+}
+
 function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -1371,6 +1406,525 @@ console.log(
 // scheduled run. Key: sorted waypoint fingerprint + departAt hour window.
 // Uber/Bolt use a much more sophisticated version — this is the same idea
 // scoped to TransitOS's fixed-schedule runs where routes genuinely repeat.
+
+
+
+
+
+
+
+
+
+// ── Insurance & compliance triggers ──────────────────────────────────────
+const COMPLIANCE_ROUTE_MAX_KM = 80;  // notify when driver route > 80 km
+const COMPLIANCE_MAX_SHIFT_HOURS = 10; // notify when driver online > 10h
+
+// Called inside TRIP/ASSIGN_DRIVER and TRIP/ADD_AGENT after route is computed.
+// Returns array of compliance issues (empty = all clear).
+function checkComplianceTriggers(driverUser, driverStatus, routeDistanceKm, totalPassengers) {
+  const issues = [];
+  if (routeDistanceKm > COMPLIANCE_ROUTE_MAX_KM) {
+    issues.push({
+      type: "COMPLIANCE_DISTANCE",
+      message: `⚠ COMPLIANCE: ${driverUser?.name || "Driver"}'s route is ${routeDistanceKm.toFixed(1)} km — exceeds the ${COMPLIANCE_ROUTE_MAX_KM} km insurance notification threshold.`,
+    });
+  }
+  // Vehicle licence category check: minibus (≤15 pax) vs midi-bus (>15)
+  const cap = driverStatus?.capacity || DRIVER_CAPACITY;
+  if (totalPassengers > cap) {
+    issues.push({
+      type: "COMPLIANCE_OVERLOAD",
+      message: `⚠ COMPLIANCE: ${driverUser?.name || "Driver"}'s vehicle capacity is ${cap} but ${totalPassengers} passengers are assigned — vehicle overloaded.`,
+    });
+  }
+  return issues;
+}
+
+// ── Digital waybill ───────────────────────────────────────────────────────
+// Opens a print-ready HTML page for a driver's full day — all trips,
+// all passengers, pickup and dropoff addresses in sequence.
+// window.print() triggers the system print/PDF dialog.
+function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
+  const driverTrips = trips
+    .filter(t => t.driver_id === driverUser.id && t.scheduled_date === dateStr)
+    .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+
+  const agentName = (id) => users.find(u => u.id === id)?.name || id;
+  const agentStaff = (id) => users.find(u => u.id === id)?.staff_number || "";
+
+  const tripRows = driverTrips.flatMap(t => {
+    const agentIds = t.agent_ids || [];
+    return agentIds.map((aid, idx) => {
+      const pickup = t.pickup_sequence_coords?.find(p => p.agent_id === aid) || t.pickup_sequence_coords?.[0];
+      const dropoff = t.dropoff_sequence_coords?.find(d => d.agent_id === aid) || t.dropoff_sequence_coords?.[0];
+      return {
+        tripId: t.trip_id,
+        agent: agentName(aid),
+        staff: agentStaff(aid),
+        pickup: pickup?.label || t.custom_pickup || "—",
+        dropoff: dropoff?.label || t.custom_dropoff || "—",
+        pickupSeq: t.pickup_order_num || "—",
+        dropSeq: t.drop_sequence_num || "—",
+        time: t.scheduled_time || "—",
+        type: t.trip_type || "",
+        direction: t.direction || "",
+      };
+    });
+  });
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Waybill — ${driverUser.name} — ${dateStr}</title>
+<style>
+  body { font-family: Arial, sans-serif; font-size: 12px; color: #000; padding: 20px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .meta { font-size: 11px; color: #555; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { background: #1a1a2e; color: #fff; padding: 6px 8px; text-align: left; font-size: 10px; letter-spacing: 0.5px; }
+  td { padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 11px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f9f9f9; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 2px; font-size: 9px; font-weight: 700; }
+  .inbound { background: #e3f2fd; color: #1565c0; }
+  .outbound { background: #fce4ec; color: #b71c1c; }
+  @media print { body { padding: 0; } }
+</style></head><body>
+<h1>Pearce &amp; Sons — Driver Waybill</h1>
+<div class="meta">
+  <strong>${driverUser.name}</strong> | ${driverStatus?.vehicle || "—"} | ${driverStatus?.phone || "—"}<br>
+  Date: <strong>${dateStr}</strong> | Trips: <strong>${driverTrips.length}</strong> | Passengers: <strong>${tripRows.length}</strong>
+</div>
+<table>
+  <thead><tr>
+    <th>#</th><th>Time</th><th>Agent</th><th>Staff</th><th>Type</th><th>Pickup Address</th><th>Dropoff Address</th><th>P</th><th>D</th>
+  </tr></thead>
+  <tbody>
+  ${tripRows.map((r, i) => `<tr>
+    <td>${i + 1}</td>
+    <td>${r.time}</td>
+    <td>${r.agent}</td>
+    <td>${r.staff}</td>
+    <td><span class="badge ${r.direction?.toLowerCase()}">${r.type} ${r.direction}</span></td>
+    <td>${r.pickup}</td>
+    <td>${r.dropoff}</td>
+    <td>${r.pickupSeq}</td>
+    <td>${r.dropSeq}</td>
+  </tr>`).join("")}
+  </tbody>
+</table>
+<div style="margin-top: 20px; font-size: 10px; color: #888;">
+  Generated by TransitOS — Pearce &amp; Sons Fleet Operations — ${new Date().toLocaleString("en-ZA")}
+</div>
+</body></html>`;
+}
+
+function printWaybill(driverUser, driverStatus, trips, users, dateStr) {
+  const html = generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr);
+  const w = window.open("", "_blank");
+  if (!w) { alert("Pop-up blocked — please allow pop-ups for this site to print waybills."); return; }
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  setTimeout(() => w.print(), 400);
+}
+
+// ── Offline mode — action queue ───────────────────────────────────────────
+// When a driver is offline, critical actions (pickup/dropoff confirmations)
+// are queued to localStorage and replayed when connectivity returns.
+// This prevents drivers losing confirmation data when signal drops mid-route.
+const OFFLINE_QUEUE_KEY = "transitos_offline_queue";
+
+function getOfflineQueue() {
+  try { return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]"); } catch { return []; }
+}
+function setOfflineQueue(q) {
+  try { localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch {}
+}
+function enqueueOfflineAction(action) {
+  const q = getOfflineQueue();
+  q.push({ ...action, _queuedAt: Date.now() });
+  setOfflineQueue(q);
+  console.log(`[Offline] Queued: ${action.type} (queue depth: ${q.length})`);
+}
+function clearOfflineQueue() {
+  setOfflineQueue([]);
+}
+
+// Hook that tracks online status and auto-replays the queue on reconnect
+function useOfflineSync(dispatch) {
+  const [isOnline, setIsOnline] = React.useState(navigator.onLine);
+  const [syncing, setSyncing] = React.useState(false);
+  const [syncResult, setSyncResult] = React.useState(null); // { replayed, failed }
+
+  React.useEffect(() => {
+    const goOnline = async () => {
+      setIsOnline(true);
+      const q = getOfflineQueue();
+      if (q.length === 0) return;
+      setSyncing(true);
+      let replayed = 0, failed = 0;
+      for (const action of q) {
+        try {
+          await dispatch(action);
+          replayed++;
+        } catch (e) {
+          console.warn(`[Offline] Replay failed for ${action.type}:`, e.message);
+          failed++;
+        }
+      }
+      clearOfflineQueue();
+      setSyncing(false);
+      setSyncResult({ replayed, failed });
+      setTimeout(() => setSyncResult(null), 5000);
+    };
+    const goOffline = () => setIsOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, [dispatch]);
+
+  return { isOnline, syncing, syncResult };
+}
+
+function OfflineBanner({ isOnline, syncing, syncResult }) {
+  if (isOnline && !syncing && !syncResult) return null;
+  if (syncing) return (
+    <div style={{ position: "sticky", top: 0, zIndex: 50, background: COLORS.amber, color: COLORS.ink, padding: "6px 14px", fontSize: 10, fontWeight: 700, textAlign: "center" }}>
+      ⟳ BACK ONLINE — Syncing offline actions…
+    </div>
+  );
+  if (syncResult) return (
+    <div style={{ position: "sticky", top: 0, zIndex: 50, background: syncResult.failed === 0 ? COLORS.green : COLORS.amber, color: syncResult.failed === 0 ? COLORS.ink : COLORS.ink, padding: "6px 14px", fontSize: 10, fontWeight: 700, textAlign: "center" }}>
+      ✓ Synced {syncResult.replayed} offline action{syncResult.replayed !== 1 ? "s" : ""}{syncResult.failed > 0 ? ` — ${syncResult.failed} failed` : ""}
+    </div>
+  );
+  if (!isOnline) return (
+    <div style={{ position: "sticky", top: 0, zIndex: 50, background: COLORS.red, color: "#fff", padding: "6px 14px", fontSize: 10, fontWeight: 700, textAlign: "center", letterSpacing: 0.5 }}>
+      ⚠ NO INTERNET — Confirmations will be queued and sent when back online
+    </div>
+  );
+  return null;
+}
+
+// ── Two-way agent feedback ────────────────────────────────────────────────
+// Appears on the agent's completed trip card. One submission per trip per agent.
+function TripRatingPrompt({ trip, user, dispatch }) {
+  const myRating = trip.agent_ratings?.[user.id];
+  const [hovered, setHovered] = React.useState(0);
+  const [selected, setSelected] = React.useState(myRating?.stars || 0);
+  const [note, setNote] = React.useState("");
+  const [submitted, setSubmitted] = React.useState(!!myRating);
+  const [submitting, setSubmitting] = React.useState(false);
+
+  if (submitted || myRating) {
+    return (
+      <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 4 }}>
+        {"⭐".repeat(myRating?.stars || selected)} — Thank you for your feedback.
+      </div>
+    );
+  }
+
+  const submit = async (stars) => {
+    setSelected(stars);
+    setSubmitting(true);
+    try {
+      await dispatch({ type: "TRIP/RATE", trip_id: trip.trip_id, agent_id: user.id, stars, note: note.trim() || null });
+      setSubmitted(true);
+    } catch (e) {
+      console.warn("Rating failed:", e.message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 8, padding: "8px 10px", background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4 }}>
+      <div style={{ fontSize: 10, color: COLORS.chalk, fontWeight: 700, marginBottom: 6 }}>Rate your trip</div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+        {[1,2,3,4,5].map(s => (
+          <span key={s} onMouseEnter={() => setHovered(s)} onMouseLeave={() => setHovered(0)}
+            onClick={() => !submitting && submit(s)}
+            style={{ fontSize: 22, cursor: submitting ? "default" : "pointer", opacity: submitting ? 0.5 : 1,
+              filter: (hovered || selected) >= s ? "none" : "grayscale(1) opacity(0.4)" }}>⭐</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Average star rating for a driver across all rated trips
+function driverAvgRating(driverId, allTrips) {
+  const ratings = [];
+  for (const t of allTrips) {
+    if (t.driver_id !== driverId) continue;
+    for (const r of Object.values(t.agent_ratings || {})) {
+      if (r?.stars) ratings.push(r.stars);
+    }
+  }
+  if (ratings.length === 0) return null;
+  return { avg: ratings.reduce((a, b) => a + b, 0) / ratings.length, count: ratings.length };
+}
+
+// ── Surcharge auto-invoicing ──────────────────────────────────────────────
+// Generates a per-agent, per-month surcharge summary as a downloadable CSV.
+// R8 base + R3.50/km standard; R20/km surcharge for every km over 40.
+const RATE_BASE_ZAR = 8;
+const RATE_PER_KM_ZAR = 3.5;
+const SURCHARGE_THRESHOLD_KM = 40;
+const SURCHARGE_RATE_ZAR = 20;
+
+function computeSurchargeInvoice(trips, users, monthPrefix) {
+  // monthPrefix: "YYYY/MM"
+  const inMonth = trips.filter(t =>
+    t.state === TRIP_STATE.ARCHIVED_COMPLETED &&
+    t.scheduled_date?.startsWith(monthPrefix) &&
+    t.long_distance_flag
+  );
+  const rows = [];
+  for (const t of inMonth) {
+    const km = (t.actual_distance_km ?? t.est_distance_km ?? 0) * ROAD_FACTOR;
+    if (km <= SURCHARGE_THRESHOLD_KM) continue;
+    const billableKm = km - SURCHARGE_THRESHOLD_KM;
+    const baseCost = RATE_BASE_ZAR + km * RATE_PER_KM_ZAR;
+    const surcharge = billableKm * SURCHARGE_RATE_ZAR;
+    const total = baseCost + surcharge;
+    const agentIds = t.agent_ids || [];
+    for (const aid of agentIds) {
+      const agent = users.find(u => u.id === aid);
+      rows.push({
+        tripId: t.trip_id,
+        date: t.scheduled_date,
+        agent: agent?.name || aid,
+        staffNum: agent?.staff_number || "",
+        km: km.toFixed(1),
+        billableKm: billableKm.toFixed(1),
+        baseCostZar: baseCost.toFixed(2),
+        surchargeZar: surcharge.toFixed(2),
+        totalZar: total.toFixed(2),
+      });
+    }
+  }
+  return rows;
+}
+
+function exportSurchargeInvoice(trips, users, monthPrefix) {
+  const rows = computeSurchargeInvoice(trips, users, monthPrefix);
+  if (rows.length === 0) { alert("No long-distance surcharge trips found for " + monthPrefix); return; }
+  const headers = ["Trip ID","Date","Agent","Staff #","Road km","Billable km (over 40)","Base cost (ZAR)","Surcharge (ZAR)","Total (ZAR)"];
+  const totalSurcharge = rows.reduce((n, r) => n + parseFloat(r.surchargeZar), 0);
+  const csv = [
+    headers.join(","),
+    ...rows.map(r => [r.tripId, r.date, `"${r.agent}"`, r.staffNum, r.km, r.billableKm, r.baseCostZar, r.surchargeZar, r.totalZar].join(",")),
+    "",
+    `,,,,,,TOTAL SURCHARGE:,${totalSurcharge.toFixed(2)},`,
+  ].join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `surcharge_invoice_${monthPrefix.replace("/","-")}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ── Capacity forecasting ──────────────────────────────────────────────────
+// Groups historical completed trips by day-of-week + hour bucket, then
+// predicts how many passengers to expect for a given future date+time.
+// Returns { predicted: N, confidence: "HIGH"|"MEDIUM"|"LOW", sampleSize: N }
+function forecastDemand(allTrips, targetDateStr, targetTimeStr) {
+  if (!targetDateStr || !targetTimeStr) return null;
+  const parts = targetDateStr.split("/").map(Number);
+  const targetDate = new Date(parts[0], parts[1] - 1, parts[2]);
+  const targetDow = targetDate.getDay();
+  const [th] = targetTimeStr.split(":").map(Number);
+  // Find historical completed trips on same day-of-week within ±1 hour
+  const historical = allTrips.filter(t => {
+    if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return false;
+    if (!t.scheduled_date || !t.scheduled_time) return false;
+    const p = t.scheduled_date.split("/").map(Number);
+    const d = new Date(p[0], p[1] - 1, p[2]);
+    if (d.getDay() !== targetDow) return false;
+    const h = parseInt((t.scheduled_time_str || "").split(":")[0], 10);
+    return Math.abs(h - th) <= 1;
+  });
+  if (historical.length === 0) return { predicted: null, confidence: "LOW", sampleSize: 0 };
+  const totalPax = historical.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+  const predicted = Math.round(totalPax / historical.length);
+  const confidence = historical.length >= 8 ? "HIGH" : historical.length >= 4 ? "MEDIUM" : "LOW";
+  return { predicted, confidence, sampleSize: historical.length };
+}
+
+function CapacityForecastPanel({ state }) {
+  // Show forecast for the next 7 days at common time slots
+  const slots = [];
+  const now = new Date();
+  for (let d = 1; d <= 7; d++) {
+    const date = new Date(now);
+    date.setDate(date.getDate() + d);
+    const dateStr = `${date.getFullYear()}/${String(date.getMonth()+1).padStart(2,"0")}/${String(date.getDate()).padStart(2,"0")}`;
+    const dayName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][date.getDay()];
+    for (const time of ["06:00","07:00","17:00","18:00","21:00"]) {
+      const f = forecastDemand(state.trips, dateStr, time);
+      if (f?.predicted > 0) {
+        const driversNeeded = Math.ceil(f.predicted / DRIVER_CAPACITY);
+        slots.push({ dateStr, dayName, time, ...f, driversNeeded });
+      }
+    }
+  }
+  if (slots.length === 0) return (
+    <div style={{ fontSize: 10, color: COLORS.ghost }}>Not enough historical data yet — forecasts appear after 4+ completed trips per time slot.</div>
+  );
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {slots.map((s, i) => {
+        const confColor = s.confidence === "HIGH" ? COLORS.green : s.confidence === "MEDIUM" ? COLORS.amber : COLORS.ghost;
+        return (
+          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 10px", background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4 }}>
+            <div>
+              <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk }}>{s.dayName} {s.dateStr} @ {s.time}</span>
+              <span style={{ fontSize: 9, color: confColor, marginLeft: 8 }}>{s.confidence} confidence ({s.sampleSize} historical runs)</span>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.amber, fontFamily: FONTS.head }}>{s.predicted} pax</div>
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>{s.driversNeeded} driver{s.driversNeeded !== 1 ? "s" : ""} needed</div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Driver shift scheduling ───────────────────────────────────────────────
+// availability_schedule on driver_status: array of
+// { day: 0-6 (Sun=0), start: "HH:MM", end: "HH:MM" }
+// "HH:MM" is 24h format. Empty array = always available (backward compat).
+function isDriverOnShift(ds, scheduledDateStr, scheduledTimeStr) {
+  const schedule = ds.availability_schedule;
+  if (!schedule || schedule.length === 0) return true; // no schedule = always available
+  if (!scheduledDateStr || !scheduledTimeStr) return true; // no trip time = show driver
+  // Parse scheduled date into a JS Date to get day-of-week
+  const parts = scheduledDateStr.split("/").map(Number); // YYYY/MM/DD
+  const tripDate = new Date(parts[0], parts[1] - 1, parts[2]);
+  const tripDow = tripDate.getDay(); // 0=Sun
+  // Parse trip time "HH:MM"
+  const [tripH, tripM] = scheduledTimeStr.split(":").map(Number);
+  const tripMins = tripH * 60 + tripM;
+  return schedule.some(slot => {
+    if (slot.day !== tripDow) return false;
+    const [sh, sm] = slot.start.split(":").map(Number);
+    const [eh, em] = slot.end.split(":").map(Number);
+    const startMins = sh * 60 + sm;
+    const endMins = eh * 60 + em;
+    return tripMins >= startMins && tripMins <= endMins;
+  });
+}
+
+const DAYS_OF_WEEK = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function DriverShiftEditor({ ds, dispatch, onClose }) {
+  const existing = ds.availability_schedule || [];
+  const [slots, setSlots] = React.useState(existing.length > 0 ? existing : []);
+  const [saving, setSaving] = React.useState(false);
+  const [err, setErr] = React.useState(null);
+
+  const addSlot = () => setSlots(s => [...s, { day: 1, start: "06:00", end: "22:00" }]);
+  const removeSlot = (i) => setSlots(s => s.filter((_, idx) => idx !== i));
+  const updateSlot = (i, key, val) => setSlots(s => s.map((sl, idx) => idx === i ? { ...sl, [key]: val } : sl));
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await dispatch({ type: "DRIVER/SET_SHIFT_SCHEDULE", driver_id: ds.driver_id, schedule: slots });
+      onClose();
+    } catch (e) {
+      setErr(e.message || "Failed to save shift schedule");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "80vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>⏱ SHIFT SCHEDULE</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>
+          Leave empty = always available. Add blocks for specific days and hours.
+        </div>
+        {slots.map((sl, i) => (
+          <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8 }}>
+            <select value={sl.day} onChange={e => updateSlot(i, "day", +e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "4px 6px", fontSize: 11 }}>
+              {DAYS_OF_WEEK.map((d, idx) => <option key={idx} value={idx}>{d}</option>)}
+            </select>
+            <input type="time" value={sl.start} onChange={e => updateSlot(i, "start", e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "4px 6px", fontSize: 11, flex: 1 }} />
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>to</span>
+            <input type="time" value={sl.end} onChange={e => updateSlot(i, "end", e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "4px 6px", fontSize: 11, flex: 1 }} />
+            <button onClick={() => removeSlot(i)} style={{ background: "none", border: "none", color: COLORS.red, fontSize: 14, cursor: "pointer", flexShrink: 0 }}>✕</button>
+          </div>
+        ))}
+        <Button title="+ ADD SHIFT BLOCK" variant="ghost" onClick={addSlot} full />
+        {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={saving} />
+          <Button title={saving ? "SAVING…" : "✓ SAVE SCHEDULE"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={saving} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Driver performance stats ─────────────────────────────────────────────
+// Computed from trip history. Returned object used in AdminDrivers panel.
+function computeDriverStats(driverId, allTrips) {
+  const mine = allTrips.filter(t => t.driver_id === driverId);
+  const completed = mine.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
+  const cancelled = mine.filter(t => t.state === TRIP_STATE.ARCHIVED_CANCELLED).length;
+  const total = mine.length;
+  const completionRate = total > 0 ? (completed / total) : null;
+  const rejections = allTrips.filter(t => (t.declinedBy || []).includes(driverId)).length;
+  const noShowTrips = mine.filter(t => t.no_shows && t.no_shows.length > 0).length;
+  // Avg passengers per completed trip
+  const avgPassengers = completed > 0
+    ? mine.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
+        .reduce((sum, t) => sum + (t.agent_ids?.length || 1), 0) / completed
+    : null;
+  return { completed, cancelled, total, completionRate, rejections, noShowTrips, avgPassengers };
+}
+
+// ── Smart driver ranking ──────────────────────────────────────────────────
+// Scores each available driver for a given trip on 4 dimensions:
+//   proximity (0-40 pts) — closer to pickup = higher score
+//   load      (0-30 pts) — fewer seats used today = higher score
+//   history   (0-20 pts) — past acceptance rate (completions / assignments)
+//   fit       (0-10 pts) — penalty if driver previously declined this agent
+function scoreDriverForTrip(ds, u, distKm, state, tripAgentIds, trips) {
+  let score = 0;
+  const proxScore = distKm != null ? Math.max(0, 40 - (distKm / 30) * 40) : 0;
+  score += proxScore;
+  const cap = ds.capacity || DRIVER_CAPACITY;
+  const load = trips.filter(t =>
+    t.driver_id === ds.driver_id &&
+    [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+  ).reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
+  score += Math.max(0, 30 - (load / cap) * 30);
+  const driverTrips = trips.filter(t => t.driver_id === ds.driver_id || (t.declinedBy || []).includes(ds.driver_id));
+  const completed = driverTrips.filter(t => t.driver_id === ds.driver_id && t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
+  const declined = driverTrips.filter(t => (t.declinedBy || []).includes(ds.driver_id)).length;
+  const total = completed + declined;
+  const acceptRate = total > 0 ? completed / total : 1;
+  score += acceptRate * 20;
+  const agentSet = new Set(tripAgentIds || []);
+  const prevDeclinedThisAgent = trips.some(t =>
+    (t.declinedBy || []).includes(ds.driver_id) &&
+    (t.agent_ids || []).some(aid => agentSet.has(aid))
+  );
+  if (prevDeclinedThisAgent) score -= 10;
+  return { score: Math.round(Math.max(0, Math.min(100, score))), proxScore: Math.round(proxScore), load, acceptRate, prevDeclinedThisAgent };
+}
+
 const _routeCache = new Map(); // key → { km, ts }
 const ROUTE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
@@ -2643,6 +3197,14 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
     }
 
+    case "TRIP/RATE": {
+      const trip = state.trips.find(t => t.trip_id === action.trip_id);
+      if (!trip) return state;
+      const newRatings = { ...(trip.agent_ratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, ratedAt: now() } };
+      const newTrips = state.trips.map(t => t.trip_id === action.trip_id ? { ...t, agent_ratings: newRatings } : t);
+      return { ...state, trips: newTrips, _error: null };
+    }
+
     case "TRIP/ACCEPT": {
       const trip = state.trips.find(t => t.trip_id === action.trip_id);
       if (!trip) return state;
@@ -2662,6 +3224,16 @@ function appReducer(state, action) {
         trip_id: action.trip_id, ts: nowAccept, read: false,
       };
       return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
+    }
+
+    case "DRIVER/SET_SHIFT_SCHEDULE": {
+      // Update driver availability schedule in local state (Supabase handled in handleSupabaseAction)
+      const newDriverStatus = state.driver_status.map(d =>
+        d.driver_id === action.driver_id
+          ? { ...d, availability_schedule: action.schedule }
+          : d
+      );
+      return { ...state, driver_status: newDriverStatus, _error: null };
     }
 
     case "TRIP/REMOVE_DRIVER": {
@@ -3631,7 +4203,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [] };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -3677,6 +4249,7 @@ function tripRowToApp(row, chatByTrip) {
     driver_route_cap_km: row.driverroutecapkm != null ? Number(row.driverroutecapkm) : null,
     driver_route_exceeds_policy: row.driverrouteexceedspolicy || false,
     chat_messages: chatByTrip[row.id] || [],
+    agent_ratings: row.agentratings || {},
   };
 }
 function notifRowToApp(row) {
@@ -5745,6 +6318,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `Driver ${driverUser?.fullname} (${driverRow.vehicle}) has been assigned and is reviewing your trip. Pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       });
+      // Feature 13: compliance checks — run after route is computed
+      const { data: driverUserForCompliance } = await supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle();
+      const complianceIssues = checkComplianceTriggers(
+        { name: driverUserForCompliance?.fullname }, driverRow, routeDistanceKm, totalAgentCountAssign
+      );
+      for (const issue of complianceIssues) {
+        await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false });
+      }
       if (newLoad >= assignDriverCapacitySupa) {
         await insertNotification({
           type: "DRIVER_FULLY_BOOKED", for_roles: [ROLE.ADMIN],
@@ -5766,6 +6347,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await refetch();
       return;
     }
+    case "DRIVER/SET_SHIFT_SCHEDULE": {
+      const actingShift = await assertAdminPermission(activeUserRef, "manageDispatch");
+      must(await supabase.from("driver_status").update({
+        availability_schedule: action.schedule,
+        updatedat: new Date().toISOString(),
+      }).eq("driverid", action.driver_id));
+      await logAuditAction({
+        actorId: actingShift.id, actorName: actingShift.name,
+        actionType: "DRIVER/SET_SHIFT_SCHEDULE", targetUserId: action.driver_id,
+        details: `Set ${action.schedule.length} shift block${action.schedule.length !== 1 ? "s" : ""}`,
+      });
+      await refetch();
+      return;
+    }
+
     case "TRIP/DRIVER_CONFIRM": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
@@ -5780,6 +6376,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await refetch();
       return;
     }
+    case "TRIP/RATE": {
+      const { data: tripRow } = await supabase.from("trips").select("agentratings").eq("id", action.trip_id).single();
+      const newRatings = { ...(tripRow?.agentratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, rated_at: nowEpoch() } };
+      must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id));
+      await refetch();
+      return;
+    }
+
     case "TRIP/ACCEPT": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
@@ -5862,13 +6466,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `⏱ ${reportingDriver?.fullname || "Driver"} reported a delay on trip ${action.trip_id}: ${action.reason}${action.note ? ` — "${action.note.trim()}"` : ""}`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       });
-      // Agents on the trip get a lighter-weight heads-up too, without the
-      // internal note detail (which might be operationally sensitive,
-      // e.g. "driver seems lost") — just the fact there's a delay.
-      if (tripAgentIds.length) {
+      // Feature 3: Delay cascade — notify agents on ALL of this driver's
+      // active trips, not just the one that reported the delay. If a
+      // driver is stuck in traffic on trip #1, agents on trips #2 and #3
+      // need to know their ETA has shifted too.
+      const { data: driverActiveTrips } = await supabase.from("trips")
+        .select("id, agentid, extraagentids")
+        .eq("driverid", tripRow.driverid)
+        .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      const allAffectedAgentIds = new Set();
+      for (const t of (driverActiveTrips || [])) {
+        if (t.agentid) allAffectedAgentIds.add(t.agentid);
+        for (const aid of (t.extraagentids || [])) allAffectedAgentIds.add(aid);
+      }
+      const isOnCurrentTrip = (aid) => tripAgentIds.includes(aid);
+      for (const aid of allAffectedAgentIds) {
+        const isCurrentTrip = isOnCurrentTrip(aid);
         await insertNotification({
-          type: "TRIP_DELAY", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
-          message: `⏱ Your driver reported a delay: ${action.reason}. Your trip may take longer than expected.`,
+          type: "TRIP_DELAY", for_roles: [ROLE.AGENT], for_user_ids: [aid],
+          message: isCurrentTrip
+            ? `⏱ Your driver reported a delay: ${action.reason}. Your trip may take longer than expected.`
+            : `⏱ Your driver reported a delay on an earlier run (${action.reason}). Your pick-up time may be affected — please stand by.`,
           trip_id: action.trip_id, ts: nowTs, read: false,
         });
       }
@@ -7076,6 +7694,8 @@ function AgentHomeTab({ myTrips, dispatch, goToTrip, setTab }) {
         ))}
       </div>
 
+      <SectionHeader label="7-Day Demand Forecast" />
+      <CapacityForecastPanel state={state} />
       <SectionHeader label="Recent Activity" />
       {myTrips.length === 0 ? <Empty icon="⊟" text="No bookings yet" /> : myTrips.slice(0, 4).map(t => (
         <div key={t.trip_id} onClick={() => goToTrip(t)} style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 4 }}>
@@ -7476,7 +8096,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const trackingReferencePoint = trip
     ? (trip.completed_pickups?.includes(user.id) ? myDropoffCoord : myPickupCoord) ?? null
     : null;
-  const shuttleStatus = useAgentShuttleStatus(isActiveTripForTracking ? trip?.driver_id : null, trackingReferencePoint);
+  const shuttleStatus = useAgentShuttleStatus(isActiveTripForTracking ? trip?.driver_id : null, trackingReferencePoint, user?.id);
   if (!trip) return <div className="pad"><span style={{ color: COLORS.ghost }}>Trip not found.</span></div>;
 
   const driverUser = state.users.find(u => u.id === trip.driver_id);
@@ -7710,7 +8330,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", TRIP_UPDATED: "✎" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -8165,6 +8785,45 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           }
         }
       }
+      // Feature 6: Route deviation alert ────────────────────────────────────
+      // If the driver is more than 600m from their current nav target for
+      // 2+ consecutive GPS readings while IN_TRANSIT, fire an admin alert.
+      // The deviationCountRef counts consecutive off-course readings and
+      // resets when back on course — prevents a single GPS blip from firing.
+      if (currentTripId && activeTrips?.length) {
+        const activeTripForNav = activeTrips.find(t => t.trip_id === currentTripId && t.state === "IN_TRANSIT");
+        if (activeTripForNav) {
+          // Current nav target: first un-done pickup, else first un-done dropoff
+          const undonePkup = (activeTripForNav.pickup_sequence_coords || [])
+            .find(p => !(activeTripForNav.completed_pickups || []).includes(p.agent_id));
+          const undoneDrop = (activeTripForNav.dropoff_sequence_coords || [])
+            .find(d => !(activeTripForNav.completed_dropoffs || []).includes(d.agent_id));
+          const navTarget = undonePkup || undoneDrop;
+          if (navTarget?.lat) {
+            const devKm = haversineKm(latitude, longitude, navTarget.lat, navTarget.lng);
+            const DEVIATION_THRESHOLD_KM = 0.6; // 600 m
+            if (!geofenceTriggeredRef.current.deviationCount) geofenceTriggeredRef.current.deviationCount = 0;
+            if (!geofenceTriggeredRef.current.deviationAlertFired) geofenceTriggeredRef.current.deviationAlertFired = false;
+            if (devKm > DEVIATION_THRESHOLD_KM) {
+              geofenceTriggeredRef.current.deviationCount++;
+              if (geofenceTriggeredRef.current.deviationCount >= 2 && !geofenceTriggeredRef.current.deviationAlertFired) {
+                geofenceTriggeredRef.current.deviationAlertFired = true;
+                if (supabase && user?.id) {
+                  insertNotification({
+                    type: "ROUTE_DEVIATION", for_roles: [ROLE.ADMIN],
+                    message: `⚠ Route deviation — ${user.name || user.id} appears to be ${(devKm * 1000).toFixed(0)}m off-course on trip ${currentTripId}. Check Live Map.`,
+                    trip_id: currentTripId, ts: Date.now(), read: false,
+                  }).catch(() => {});
+                }
+              }
+            } else {
+              // Back on course — reset counter and allow future alert if they deviate again
+              geofenceTriggeredRef.current.deviationCount = 0;
+              geofenceTriggeredRef.current.deviationAlertFired = false;
+            }
+          }
+        }
+      }
       // Slow path: persist to the database roughly every 25s — far less
       // frequent than before, since the database write is the expensive
       // part (two REST calls) and live updates no longer depend on it.
@@ -8225,24 +8884,47 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
 // could accidentally end up rendered as a map later. Map rendering stays
 // exclusively on the admin/driver side, per the requirement that agents
 // only ever see "your shuttle is 3 mins away," never a position.
-function useAgentShuttleStatus(driverId, referencePoint) {
+function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null) {
   const [summary, setSummary] = useState(null); // { distanceKm, etaMin, updatedAt } — never lat/lng
   const [stale, setStale] = useState(false);
+  // ETA push tracking — fire once per threshold crossing, not on every update.
+  const etaPushFiredRef = React.useRef({ fiveMin: false, arriving: false });
 
   useEffect(() => {
     if (!supabase || !driverId) { setSummary(null); return; }
+    // Reset push flags when driver/reference changes (new trip context).
+    etaPushFiredRef.current = { fiveMin: false, arriving: false };
     const channel = supabase.channel(driverPositionChannelName(driverId));
     channel.on("broadcast", { event: "pos" }, ({ payload }) => {
       const { la, lo, s } = payload; // la/lo used only for this immediate calculation, never stored
       let distanceKm = null, etaMin = null;
       if (referencePoint) {
         distanceKm = haversineKm(la, lo, referencePoint.lat, referencePoint.lng) * ROAD_FACTOR;
-        // Rough ETA from current speed if moving fast enough for it to be
-        // meaningful, otherwise fall back to a flat ~25km/h city-average
-        // assumption — a stationary/slow reading would otherwise imply an
-        // absurdly long or short ETA.
         const effectiveSpeedKmh = s != null && s > 5 ? s : 25;
         etaMin = Math.max(1, Math.round((distanceKm / effectiveSpeedKmh) * 60));
+        // ── Feature 2: ETA push to agent ─────────────────────────────────
+        // Fire an in-app notification when driver crosses 5-min and
+        // 2-min ETA thresholds. One notification per threshold per trip
+        // — guarded by etaPushFiredRef so a GPS jitter that briefly
+        // dips under then back over the threshold doesn't re-fire.
+        if (agentUserId && supabase) {
+          if (!etaPushFiredRef.current.fiveMin && etaMin <= 5) {
+            etaPushFiredRef.current.fiveMin = true;
+            insertNotification({
+              type: "DRIVER_ETA", for_roles: [ROLE.AGENT], for_user_ids: [agentUserId],
+              message: `🚗 Your driver is ~${etaMin} minute${etaMin !== 1 ? "s" : ""} away — please make your way to the pickup point.`,
+              trip_id: payload.t, ts: Date.now(), read: false,
+            }).catch(() => {});
+          }
+          if (!etaPushFiredRef.current.arriving && etaMin <= 2) {
+            etaPushFiredRef.current.arriving = true;
+            insertNotification({
+              type: "DRIVER_ETA", for_roles: [ROLE.AGENT], for_user_ids: [agentUserId],
+              message: `🚗 Your driver is ARRIVING NOW — please be at the pickup point.`,
+              trip_id: payload.t, ts: Date.now(), read: false,
+            }).catch(() => {});
+          }
+        }
       }
       setSummary({ distanceKm, etaMin, updatedAt: Date.now() });
       setStale(false);
@@ -8923,8 +9605,11 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   const goToTrip = (trip) => { setJumpTripId(trip?.trip_id ?? null); setTab("trips"); };
   const call = useWebRTCCall(user);
 
+  const { isOnline, syncing, syncResult } = useOfflineSync(dispatch);
+
   return (
     <div className="screen">
+      <OfflineBanner isOnline={isOnline} syncing={syncing} syncResult={syncResult} />
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
         <img src={LOGO_DATA_URI} alt="Pearce & Sons" style={{ height: 32, width: 32, objectFit: "contain" }} />
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -9499,6 +10184,18 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
                 <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700, letterSpacing: 0.5, padding: "6px 10px", background: "rgba(245,166,35,0.08)", border: `1px solid rgba(245,166,35,0.3)`, borderRadius: 4 }}>
                   ⏳ AWAITING YOUR RESPONSE — please accept or decline this trip
                 </div>
+                {(() => {
+                  const risk = tripNoShowRisk(trip, state.trips);
+                  if (!risk) return null;
+                  return (
+                    <div style={{ fontSize: 9, color: risk === 'HIGH' ? COLORS.red : COLORS.amber, fontWeight: 700,
+                      border: `1px solid ${risk === 'HIGH' ? COLORS.red : COLORS.amber}`, padding: "4px 8px", borderRadius: 3 }}>
+                      {risk === 'HIGH' ? '🚨 HIGH' : '⚠ ELEVATED'} NO-SHOW RISK — {
+                        (() => { const ids = trip.agent_ids || []; const worst = ids.map(aid => computeNoShowRisk(aid, state.trips)).sort((a,b)=>b.noShows-a.noShows)[0]; return worst ? `${worst.noShows} no-show${worst.noShows!==1?'s':''} in ${worst.total} trip${worst.total!==1?'s':''}` : ''; })()
+                      }
+                    </div>
+                  );
+                })()}
                 <div style={{ display: "flex", gap: 8 }}>
                   <Button title="✓ ACCEPT TRIP" variant="green" style={{ flex: 1 }} onClick={async () => {
                     try {
@@ -9518,6 +10215,9 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             </div>
               </>
             )}
+          {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && (
+            <TripRatingPrompt trip={trip} user={user} dispatch={dispatch} />
+          )}
           </Card>
         );
       })}
@@ -9887,7 +10587,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const confirmPickup = async (trip_id, agent_id) => {
     try {
       const driverCoord = await getFreshDriverCoord();
-      await dispatch({ type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id, driver_coord: driverCoord });
+      const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id, driver_coord: driverCoord };
+      if (!navigator.onLine) {
+        enqueueOfflineAction(action);
+        // Optimistically update local state so the button disappears immediately
+        await dispatch(action).catch(() => {});
+        return;
+      }
+      await dispatch(action);
     } catch (e) {
       setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
       return;
@@ -11762,6 +12469,27 @@ function AdminProfileSearch({ state, user }) {
   );
 }
 
+function SurchargeInvoicePanel({ state }) {
+  const months = [...new Set(state.trips
+    .filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED && t.long_distance_flag && t.scheduled_date)
+    .map(t => t.scheduled_date.slice(0, 7))
+  )].sort().reverse().slice(0, 6);
+  if (months.length === 0) return null;
+  return (
+    <div style={{ background: "rgba(245,166,35,.06)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 6, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>💰 SURCHARGE INVOICING</div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>Download a monthly surcharge CSV for billing.</div>
+      </div>
+      <select onChange={e => { if (e.target.value) exportSurchargeInvoice(state.trips, state.users, e.target.value); e.target.value = ""; }}
+        defaultValue="" style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "6px 10px", fontSize: 11 }}>
+        <option value="">Select month…</option>
+        {months.map(m => <option key={m} value={m}>{m}</option>)}
+      </select>
+    </div>
+  );
+}
+
 function AdminHistory({ state, user }) {
   const today = new Date();
   // Viewer is capped at 60 days of trip history; other tiers keep the
@@ -11893,6 +12621,7 @@ function AdminHistory({ state, user }) {
 
   return (
     <div className="pad">
+      <SurchargeInvoicePanel state={state} />
       <SectionHeader label="Trip History" />
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
         The live Trips view only shows completed trips from the last 30 days. Search here for anything older.
@@ -12103,12 +12832,16 @@ function AdminDispatch({ state, dispatch }) {
   const MIN_FULL_PCT = 0.75;
   const underCapacityWarning = !isWeekBookingSelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
   const availableDriversRaw = state.driver_status.filter(ds => {
+    // Feature 7: shift filtering — exclude drivers not rostered for this time slot.
+    // isDriverOnShift returns true when no schedule is set (backward compat).
+    const tripTimeStr = primaryTrip?.scheduled_time || null;
+    const tripDateStr = primaryTrip?.scheduled_date || null;
+    if (!isDriverOnShift(ds, tripDateStr, tripTimeStr)) return false;
     if (isWeekBookingSelection) {
-      // Needs room on EVERY selected day independently — a driver full
-      // on Tuesday but free on the other 5 days can't take this whole
-      // week selection (that specific day would fail), so the filter
-      // must check each date, not just the busiest one in isolation.
-      return selectedTrips.every(t => getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= DRIVER_CAPACITY);
+      return selectedTrips.every(t => {
+        if (!isDriverOnShift(ds, t.scheduled_date, tripTimeStr)) return false;
+        return getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= DRIVER_CAPACITY;
+      });
     }
     const checkDate = primaryTrip?.scheduled_date;
     return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= DRIVER_CAPACITY;
@@ -12163,15 +12896,15 @@ function AdminDispatch({ state, dispatch }) {
       const distKm = (pickupCoord && originCoord)
         ? haversineKm(pickupCoord.lat, pickupCoord.lng, originCoord.lat, originCoord.lng) * ROAD_FACTOR
         : null;
-      return { ds, u, distKm, usedLivePosition: liveIsFresh && distKm != null };
+      // Feature 4: smart score — combines proximity, load, acceptance rate, and
+      // whether this driver has previously declined any of this trip's agents.
+      const tripAgentIds = selectedTrips.flatMap(t => t.agent_ids || []);
+      const { score, acceptRate, prevDeclinedThisAgent } = scoreDriverForTrip(ds, u, distKm, state, tripAgentIds, state.trips);
+      return { ds, u, distKm, usedLivePosition: liveIsFresh && distKm != null, score, acceptRate, prevDeclinedThisAgent };
     })
-    .sort((a, b) => {
-      if (a.distKm == null && b.distKm == null) return 0;
-      if (a.distKm == null) return 1;
-      if (b.distKm == null) return -1;
-      return a.distKm - b.distKm;
-    });
+    .sort((a, b) => b.score - a.score); // highest score first
   const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
+  const topScoredDriverId = availableDrivers[0]?.ds.driver_id || null;
   // Search-filtered list for DISPLAY only — per the scan finding, a
   // fleet with many drivers had no way to narrow this list at all.
   // Deliberately a SEPARATE list from availableDrivers itself, so
@@ -12308,7 +13041,18 @@ function AdminDispatch({ state, dispatch }) {
               <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
               <span style={{ fontSize: 9, color: COLORS.ghost }}>{t.trip_type}</span>
             </div>
-            {t.declinedBy?.length > 0 && (
+            {(() => {
+                const risk = tripNoShowRisk(t, state.trips);
+                if (!risk) return null;
+                const isHigh = risk === 'HIGH';
+                return (
+                  <span style={{ fontSize: 9, fontWeight: 700, color: isHigh ? COLORS.red : COLORS.amber,
+                    border: `1px solid ${isHigh ? COLORS.red : COLORS.amber}`, padding: "2px 6px", borderRadius: 2, width: "fit-content" }}>
+                    {isHigh ? "🚨 HIGH NO-SHOW RISK" : "⚠ ELEVATED NO-SHOW RISK"} — check history before dispatching
+                  </span>
+                );
+              })()}
+              {t.declinedBy?.length > 0 && (
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 <span style={{ fontSize: 9, color: COLORS.red, fontWeight: 700 }}>
                   ⚠ DRIVER REJECTION — declined by {t.declinedBy.length} driver{t.declinedBy.length !== 1 ? "s" : ""}
@@ -12352,7 +13096,7 @@ function AdminDispatch({ state, dispatch }) {
             <Empty icon="◉" text="No drivers available — all fully booked" />
           ) : displayedDrivers.length === 0 ? (
             <Empty icon="◉" text={`No drivers match "${driverSearch}"`} />
-          ) : displayedDrivers.map(({ ds, u, distKm, usedLivePosition }) => {
+          ) : displayedDrivers.map(({ ds, u, distKm, usedLivePosition, score, acceptRate, prevDeclinedThisAgent }) => {
             const load = getDriverLoad(state, ds.driver_id, primaryTrip?.scheduled_date);
             const driverCapacityDispatch = ds.capacity || DRIVER_CAPACITY;
             // Workload warning: per explicit decision ("select it per
@@ -12382,7 +13126,24 @@ function AdminDispatch({ state, dispatch }) {
                     {sel && <span style={{ color: COLORS.ink }}>✓</span>}
                   </div>
                 </div>
-                <span style={{ fontSize: 10, color: sel ? COLORS.ink : COLORS.ghost }}>{ds.vehicle}</span>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontSize: 10, color: sel ? COLORS.ink : COLORS.ghost }}>{ds.vehicle}</span>
+                  <div style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                    {ds.driver_id === topScoredDriverId && !sel && (
+                      <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, border: `1px solid ${COLORS.green}`, padding: "1px 4px", borderRadius: 2 }}>BEST MATCH</span>
+                    )}
+                    <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost }}>Score: <span style={{ fontWeight: 700, color: sel ? COLORS.ink : (score >= 70 ? COLORS.green : score >= 40 ? COLORS.amber : COLORS.red) }}>{score}</span>/100</span>
+                  </div>
+                </div>
+                {prevDeclinedThisAgent && !sel && (
+                  <span style={{ fontSize: 9, color: COLORS.red }}>⚠ Previously declined a trip for this agent</span>
+                )}
+                {acceptRate < 0.7 && !sel && (
+                  <span style={{ fontSize: 9, color: COLORS.amber }}>⚠ {Math.round(acceptRate * 100)}% acceptance rate</span>
+                {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
+                  <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.ghost }}>{"⭐".repeat(Math.round(r.avg))} {r.avg.toFixed(1)} avg rating</span>
+                ) : null; })()}
+                )}
                 {distKm != null ? (
                   <span style={{ fontSize: 9, color: sel ? COLORS.ink : COLORS.teal }}>
                     {usedLivePosition ? "🛰 " : "🏠 "}
@@ -12933,6 +13694,31 @@ function AdminActiveTrips({ state }) {
   );
 }
 
+function DriverStatsCard({ driverId, allTrips }) {
+  const stats = computeDriverStats(driverId, allTrips);
+  if (stats.total === 0) return (
+    <div style={{ fontSize: 9, color: COLORS.ghost, padding: "4px 0" }}>No trip history yet.</div>
+  );
+  const rate = stats.completionRate;
+  const rateColor = rate == null ? COLORS.ghost : rate >= 0.9 ? COLORS.green : rate >= 0.7 ? COLORS.amber : COLORS.red;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 6 }}>
+      {[
+        ["COMPLETION", rate != null ? `${Math.round(rate * 100)}%` : "—", rateColor],
+        ["TRIPS", stats.completed, COLORS.chalk],
+        ["REJECTIONS", stats.rejections, stats.rejections > 0 ? COLORS.red : COLORS.ghost],
+        ["NO-SHOW TRIPS", stats.noShowTrips, stats.noShowTrips > 0 ? COLORS.amber : COLORS.ghost],
+        ["AVG PAX", stats.avgPassengers != null ? stats.avgPassengers.toFixed(1) : "—", COLORS.ghost],
+      ].map(([label, val, color]) => (
+        <div key={label} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: "4px 10px", minWidth: 70 }}>
+          <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{label}</div>
+          <div style={{ fontSize: 14, fontWeight: 800, color, fontFamily: FONTS.head }}>{val}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AdminDrivers({ state, user }) {
   // Which trip cards are expanded, per driver. Collapsed by default —
   // a driver with several active trips otherwise dumps a wall of detail
@@ -12986,6 +13772,7 @@ function AdminDrivers({ state, user }) {
     );
   }
 
+  const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
   return (
     <div className="pad">
       <SectionHeader label={`Drivers (${state.driver_status.length})`} />
@@ -13009,6 +13796,21 @@ function AdminDrivers({ state, user }) {
                 <div style={{ fontSize: 10, color: COLORS.ghost }}>{ds.phone}</div>
                 {driverUser?.home_address && (
                   <div style={{ fontSize: 10, color: COLORS.teal, marginTop: 2 }}>🏠 Lives in {driverUser.home_address.area || driverUser.home_address.label}</div>
+                )}
+                <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  <Button title={ds.availability_schedule?.length > 0 ? `⏱ SHIFTS (${ds.availability_schedule.length} blocks)` : "⏱ SET SHIFTS"} variant="ghost" size="sm"
+                    onClick={() => setShiftEditorFor(ds.driver_id)} />
+                  <Button title="🖨 WAYBILL" variant="ghost" size="sm"
+                    onClick={() => printWaybill(driverUser, ds, state.trips, state.users, todayStr)} />
+                </div>
+                <DriverStatsCard driverId={ds.driver_id} allTrips={state.trips} />
+                {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
+                  <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 4 }}>
+                    {"⭐".repeat(Math.round(r.avg))} {r.avg.toFixed(1)} avg ({r.count} rating{r.count !== 1 ? "s" : ""})
+                  </div>
+                ) : null; })()}
+                {shiftEditorFor === ds.driver_id && (
+                  <DriverShiftEditor ds={ds} dispatch={dispatch} onClose={() => setShiftEditorFor(null)} />
                 )}
               </div>
               <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
