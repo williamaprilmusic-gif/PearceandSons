@@ -9671,20 +9671,33 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
       </div>
       {(() => {
         const TripRow = ({ t }) => (
-          <div onClick={() => setDetailId(t.trip_id)} style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 9 }}>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <div>
-                <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>{t.trip_id}</div>
-                <div style={{ fontSize: 12, fontWeight: 600 }}>{t.trip_type} TRIP</div>
+          <div style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 9 }}>
+            <div onClick={() => setDetailId(t.trip_id)} style={{ cursor: "pointer" }}>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <div>
+                  <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>{t.trip_id}</div>
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>{t.trip_type} TRIP</div>
+                </div>
+                <StateBadge state={t.state} />
               </div>
-              <StateBadge state={t.state} />
+              <div style={{ fontSize: 12, fontWeight: 600 }}>{agentRouteLabel(t.direction)}</div>
+              <div style={{ display: "flex", gap: 10 }}>
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
+                {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
+              </div>
             </div>
-            <div style={{ fontSize: 12, fontWeight: 600 }}>{agentRouteLabel(t.direction)}</div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <span style={{ fontSize: 9, color: COLORS.ghost }}>📅 {t.scheduled_date}</span>
-              <span style={{ fontSize: 9, color: COLORS.ghost }}>🕐 {t.scheduled_time}</span>
-              {t.pickup_order_num && <span style={{ fontSize: 9, color: COLORS.amber }}>PICKUP #{t.pickup_order_num}</span>}
-            </div>
+            {t.state === TRIP_STATE.ARCHIVED_COMPLETED && !t.dispute && (
+              <Button title="⚠ FILE A DISPUTE" variant="ghost" size="sm"
+                style={{ alignSelf: "flex-start", borderColor: COLORS.amber, color: COLORS.amber }}
+                onClick={e => { e.stopPropagation(); setDisputingTrip(t); }} />
+            )}
+            {t.state === TRIP_STATE.ARCHIVED_COMPLETED && t.dispute && (
+              <div style={{ padding: "5px 8px", background: "rgba(220,53,69,0.06)", border: "1px solid rgba(220,53,69,0.25)", borderRadius: 4, fontSize: 9, color: COLORS.red, fontWeight: 700 }}>
+                ⚠ DISPUTE {t.dispute.state?.replace(/_/g," ")} — {t.dispute.category}
+                {t.dispute.resolution_note && <div style={{ color: COLORS.ghost, fontWeight: 400, marginTop: 2 }}>Resolution: {t.dispute.resolution_note}</div>}
+              </div>
+            )}
           </div>
         );
         if (filtered.length === 0) return <Empty icon="⊟" text="No trips" />;
@@ -9701,6 +9714,9 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
           </>
         );
       })()}
+      {disputingTrip && (
+        <DisputeFilingModal trip={disputingTrip} user={user} dispatch={dispatch} onClose={() => setDisputingTrip(null)} />
+      )}
     </div>
   );
 }
@@ -11703,11 +11719,6 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
           {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && (
             <TripRatingPrompt trip={trip} user={user} dispatch={dispatch} />
           )}
-          {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && !trip.dispute && (
-            <Button title="⚠ FILE A DISPUTE" variant="ghost" size="sm"
-              style={{ marginTop: 4, borderColor: COLORS.amber, color: COLORS.amber }}
-              onClick={() => setDisputingTrip(trip)} />
-          )}
           {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && trip.dispute && (
             <div style={{ marginTop: 4, padding: "6px 10px", background: "rgba(220,53,69,0.06)", border: "1px solid rgba(220,53,69,0.25)", borderRadius: 4, fontSize: 9, color: COLORS.red, fontWeight: 700 }}>
               ⚠ DISPUTE {trip.dispute.state?.replace(/_/g," ")} — {trip.dispute.category}
@@ -11718,9 +11729,6 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
         );
       })}
 
-      {disputingTrip && (
-        <DisputeFilingModal trip={disputingTrip} user={user} dispatch={dispatch} onClose={() => setDisputingTrip(null)} />
-      )}
       {chatWith && (
         <TripChatModal
           trip={chatWith.trip}
