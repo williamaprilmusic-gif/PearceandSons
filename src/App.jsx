@@ -11553,8 +11553,8 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
   // exactly once as it first appears, without re-collapsing a trip the
   // driver deliberately collapsed themselves afterward.
   const autoExpandedRef = useRef(new Set());
+  const [decliningTrip, setDecliningTrip] = useState(null); // trip being declined — shows modal
   useEffect(() => {
-    const [decliningTrip, setDecliningTrip] = useState(null); // trip being declined — shows modal
     const needsAction = active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted);
     const toAdd = needsAction.filter(t => !autoExpandedRef.current.has(t.trip_id));
     if (toAdd.length === 0) return;
