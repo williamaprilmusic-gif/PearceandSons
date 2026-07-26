@@ -2115,7 +2115,7 @@ function CapacityForecastPanel({ state }) {
     const dateStr = `${date.getFullYear()}/${String(date.getMonth()+1).padStart(2,"0")}/${String(date.getDate()).padStart(2,"0")}`;
     const dayName = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][date.getDay()];
     for (const time of ["06:00","07:00","17:00","18:00","21:00"]) {
-      const f = forecastDemand(state.trips, dateStr, time);
+      const f = forecastDemand(state.trips || [], dateStr, time);
       if (f?.predicted > 0) {
         const driversNeeded = Math.ceil(f.predicted / DRIVER_CAPACITY);
         slots.push({ dateStr, dayName, time, ...f, driversNeeded });
@@ -2847,7 +2847,7 @@ function computeSchedulingRecommendations(trips, driverStatus, companies) {
       const driversNeeded = Math.ceil(avgPax / DRIVER_CAPACITY);
 
       // Count drivers rostered for this slot
-      const rosteredCount = driverStatus.filter(ds =>
+      const rosteredCount = (driverStatus || []).filter(ds =>
         isDriverOnShift(ds, dateStr, timeStr) && !ds.is_unavailable
       ).length;
 
@@ -2867,7 +2867,7 @@ function computeSchedulingRecommendations(trips, driverStatus, companies) {
 
 function SmartSchedulingPanel({ state }) {
   const gaps = React.useMemo(() =>
-    computeSchedulingRecommendations(state.trips, state.driver_status, state.companies),
+    computeSchedulingRecommendations(state.trips || [], state.driver_status || [], state.companies || []),
     [state.trips, state.driver_status, state.companies]
   );
   if (gaps.length === 0) return (
@@ -2995,7 +2995,7 @@ function formatWeeklySummaryText(s) {
 function WeeklyOpsSummaryPanel({ state }) {
   const [copied, setCopied] = React.useState(false);
   const s = React.useMemo(() =>
-    computeWeeklySummary(state.trips, state.users, state.driver_status),
+    computeWeeklySummary(state.trips || [], state.users || [], state.driver_status || []),
     [state.trips, state.users, state.driver_status]
   );
   const text = formatWeeklySummaryText(s);
@@ -12817,11 +12817,11 @@ function AdminDashboard({ state, user }) {
           </Card>
         );
       })}
-      <WeeklyOpsSummaryPanel state={state} />
+      {(() => { try { return <WeeklyOpsSummaryPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>WeeklyOps error: {e.message}</div>; } })()}
       <SectionHeader label="7-Day Demand Forecast" />
-      <CapacityForecastPanel state={state} />
+      {(() => { try { return <CapacityForecastPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>CapacityForecast error: {e.message}</div>; } })()}
       <SectionHeader label="Staffing Gaps (Next 7 Days)" />
-      <SmartSchedulingPanel state={state} />
+      {(() => { try { return <SmartSchedulingPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>SmartScheduling error: {e.message}</div>; } })()}
       <SectionHeader label="Recent Activity" />
       <Card body={false}>
         {trips.slice(0, 8).length === 0 ? <Empty icon="⊟" text="No bookings or trips yet" /> : trips.slice(0, 8).map(t => (
@@ -17408,10 +17408,12 @@ class AppErrorBoundary extends React.Component {
   componentDidCatch(error, info) { console.error("[Pearce & Sons] render error:", error, info); }
   render() {
     if (!this.state.error) return this.props.children;
+    const errMsg = this.state.error?.message || String(this.state.error);
     return (
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 24, background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif", textAlign: "center" }}>
         <div style={{ fontSize: 18, fontWeight: 800 }}>Something went wrong</div>
-        <div style={{ fontSize: 12, color: "#888", maxWidth: 340 }}>Pearce & Sons hit an unexpected error and couldn't continue. Reloading should fix it.</div>
+        <div style={{ fontSize: 12, color: "#f5a623", maxWidth: 480, wordBreak: "break-word", fontFamily: "monospace", background: "#111", padding: 12, borderRadius: 4, textAlign: "left" }}>{errMsg}</div>
+        <div style={{ fontSize: 11, color: "#888", maxWidth: 340 }}>Pearce &amp; Sons hit an unexpected error. Screenshot this and send it.</div>
         <button
           onClick={() => { try { localStorage.removeItem("transitos_active_user_id"); } catch (e) {} window.location.reload(); }}
           style={{ background: "#f5a623", color: "#000", border: "none", borderRadius: 4, padding: "10px 20px", fontWeight: 700, cursor: "pointer" }}
