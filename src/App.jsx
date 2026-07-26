@@ -1496,17 +1496,17 @@ function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
     <th>#</th><th>Time</th><th>Agent</th><th>Staff</th><th>Type</th><th>Pickup Address</th><th>Dropoff Address</th><th>P</th><th>D</th>
   </tr></thead>
   <tbody>
-  ${tripRows.map((r, i) => `<tr>
-    <td>${i + 1}</td>
-    <td>${r.time}</td>
-    <td>${r.agent}</td>
-    <td>${r.staff}</td>
-    <td><span class="badge ${r.direction?.toLowerCase()}">${r.type} ${r.direction}</span></td>
-    <td>${r.pickup}</td>
-    <td>${r.dropoff}</td>
-    <td>${r.pickupSeq}</td>
-    <td>${r.dropSeq}</td>
-  </tr>`).join("")}
+  ${tripRows.map((r, i) => "<tr>" +
+    "<td>" + (i + 1) + "</td>" +
+    "<td>" + r.time + "</td>" +
+    "<td>" + r.agent + "</td>" +
+    "<td>" + r.staff + "</td>" +
+    "<td><span class=\"badge " + (r.direction?.toLowerCase() || '') + "\">" + r.type + " " + r.direction + "</span></td>" +
+    "<td>" + r.pickup + "</td>" +
+    "<td>" + r.dropoff + "</td>" +
+    "<td>" + r.pickupSeq + "</td>" +
+    "<td>" + r.dropSeq + "</td>" +
+  "</tr>").join('')}
   </tbody>
 </table>
 <div style="margin-top: 20px; font-size: 10px; color: #888;">
@@ -3319,6 +3319,7 @@ function appReducer(state, action) {
               rejected_at: now(),
               rejection_driver_id: action.driver_id,
               is_exception: true,
+            }
           : t
       );
       const remaining = newTrips.filter(t =>
