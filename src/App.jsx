@@ -40,6 +40,7 @@ const STATE_BADGE_MAP = {
 const ROLE_BADGE_MAP = {
   ADMIN:  { bg: "rgba(124,77,255,0.15)", fg: COLORS.purple, border: "rgba(124,77,255,0.3)" },
   AGENT:  { bg: "rgba(45,140,240,0.15)", fg: COLORS.blue,   border: "rgba(45,140,240,0.3)" },
+  CLIENT: { bg: "rgba(100,100,240,0.15)", fg: "#6464f0",    border: "rgba(100,100,240,0.3)" },
   DRIVER: { bg: "rgba(245,166,35,0.15)", fg: COLORS.amber,  border: "rgba(245,166,35,0.3)" },
 };
 
@@ -123,7 +124,7 @@ input, select, textarea { font-family: inherit; }
 // This file is pure JS — ported byte-for-byte from the web app's
 // SECTION 1, 2, 4 (no DOM/CSS dependency existed there to begin with).
 
-const ROLE = Object.freeze({ ADMIN: "ADMIN", AGENT: "AGENT", DRIVER: "DRIVER" });
+const ROLE = Object.freeze({ ADMIN: "ADMIN", AGENT: "AGENT", DRIVER: "DRIVER", CLIENT: "CLIENT" });
 
 const ADMIN_LEVEL = Object.freeze({ FLEET_OPS: "FLEET_OPS", STANDARD: "STANDARD", VIEWER: "VIEWER" });
 
@@ -1564,6 +1565,38 @@ function printWaybill(driverUser, driverStatus, trips, users, dateStr) {
 }
 
 
+
+// ── Booking rate limiter ──────────────────────────────────────────────────
+// Prevents accidental duplicate-submission floods and malicious abuse.
+// Client-side: tracks timestamps in sessionStorage (clears on tab close).
+// Max 3 bookings per 5 minutes per user.
+const RATE_LIMIT_MAX = 3;
+const RATE_LIMIT_WINDOW_MS = 5 * 60 * 1000; // 5 min
+const RATE_LIMIT_KEY = "transitos_booking_rate";
+
+function checkBookingRateLimit(userId) {
+  try {
+    const raw = sessionStorage.getItem(RATE_LIMIT_KEY);
+    const record = raw ? JSON.parse(raw) : {};
+    const userRecord = record[userId] || [];
+    const now = Date.now();
+    // Prune timestamps outside the window
+    const recent = userRecord.filter(ts => now - ts < RATE_LIMIT_WINDOW_MS);
+    if (recent.length >= RATE_LIMIT_MAX) {
+      const oldest = Math.min(...recent);
+      const resetIn = Math.ceil((RATE_LIMIT_WINDOW_MS - (now - oldest)) / 1000);
+      return { allowed: false, resetIn };
+    }
+    // Record this booking attempt
+    recent.push(now);
+    record[userId] = recent;
+    sessionStorage.setItem(RATE_LIMIT_KEY, JSON.stringify(record));
+    return { allowed: true };
+  } catch {
+    return { allowed: true }; // fail open — don't block on storage error
+  }
+}
+
 // ── Offline navigation queue ──────────────────────────────────────────────
 // When a driver taps "OPEN IN WAZE" while offline, we can't launch Waze
 // immediately (some devices block deep-links without network). Queue the
@@ -1597,6 +1630,239 @@ function smartOpenWazeWithOfflineFallback(lat, lng, label, isManual) {
     return;
   }
   smartOpenWaze(lat, lng, label, isManual);
+}
+
+
+
+// ── Trip dispute resolution ───────────────────────────────────────────────
+const DISPUTE_CATEGORIES = [
+  "Driver did not arrive",
+  "Driver was very late (30+ min)",
+  "Wrong pickup location",
+  "Driver behaviour issue",
+  "Trip marked complete but wasn't",
+  "Charged incorrectly",
+  "Other",
+];
+
+const DISPUTE_STATE = { OPEN: "OPEN", DRIVER_RESPONDED: "DRIVER_RESPONDED", RESOLVED_UPHELD: "RESOLVED_UPHELD", RESOLVED_DISMISSED: "RESOLVED_DISMISSED" };
+
+function DisputeFilingModal({ trip, user, dispatch, onClose }) {
+  const [category, setCategory] = React.useState("");
+  const [description, setDescription] = React.useState("");
+  const [submitting, setSubmitting] = React.useState(false);
+  const [err, setErr] = React.useState(null);
+
+  const submit = async () => {
+    if (!category) { setErr("Please select a category."); return; }
+    if (description.trim().length < 10) { setErr("Please describe the issue (at least 10 characters)."); return; }
+    setSubmitting(true);
+    try {
+      await dispatch({
+        type: "TRIP/FILE_DISPUTE",
+        trip_id: trip.trip_id,
+        agent_id: user.id,
+        category,
+        description: description.trim(),
+        filed_at: Date.now(),
+      });
+      onClose();
+    } catch (e) {
+      setErr(e.message || "Failed to file dispute.");
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>⚠ FILE A DISPUTE</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>Trip #{trip.trip_id} · {trip.scheduled_date}. Your dispute will be reviewed by dispatch within 24 hours.</div>
+        <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>CATEGORY *</div>
+        {DISPUTE_CATEGORIES.map(c => (
+          <div key={c} onClick={() => setCategory(c)}
+            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, border: `1px solid ${category === c ? COLORS.red : COLORS.wire}`, background: category === c ? "rgba(220,53,69,0.08)" : COLORS.surface, cursor: "pointer" }}>
+            <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${category === c ? COLORS.red : COLORS.ghost}`, background: category === c ? COLORS.red : "transparent", flexShrink: 0 }} />
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>{c}</span>
+          </div>
+        ))}
+        <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>DESCRIPTION *</div>
+        <textarea value={description} onChange={e => setDescription(e.target.value)}
+          placeholder="Describe what happened in detail…" rows={4} maxLength={800}
+          style={{ fontFamily: "inherit", fontSize: 11, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8, color: COLORS.chalk, resize: "vertical", boxSizing: "border-box", width: "100%" }} />
+        {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={submitting} />
+          <Button title={submitting ? "SUBMITTING…" : "⚠ SUBMIT DISPUTE"} variant="danger" style={{ flex: 1 }} onClick={submit} disabled={submitting} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DisputeAdminPanel({ trip, dispatch, users }) {
+  const dispute = trip.dispute;
+  if (!dispute) return null;
+  const filer = users.find(u => u.id?.toString() === dispute.agent_id?.toString());
+  const [resolution, setResolution] = React.useState("");
+  const [resolving, setResolving] = React.useState(false);
+
+  const resolve = async (outcome) => {
+    if (!resolution.trim()) return;
+    setResolving(true);
+    await dispatch({ type: "TRIP/RESOLVE_DISPUTE", trip_id: trip.trip_id, outcome, resolution_note: resolution.trim() }).catch(() => {});
+    setResolving(false);
+  };
+
+  const stateColor = { OPEN: COLORS.red, DRIVER_RESPONDED: COLORS.amber, RESOLVED_UPHELD: COLORS.green, RESOLVED_DISMISSED: COLORS.ghost }[dispute.state] || COLORS.ghost;
+
+  return (
+    <div style={{ background: "rgba(220,53,69,0.05)", border: "1px solid rgba(220,53,69,0.25)", borderRadius: 6, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.red }}>⚠ DISPUTE</span>
+        <span style={{ fontSize: 10, fontWeight: 700, color: stateColor }}>{dispute.state?.replace(/_/g, " ")}</span>
+      </div>
+      <div style={{ fontSize: 10, color: COLORS.chalk, fontWeight: 700 }}>{dispute.category}</div>
+      <div style={{ fontSize: 10, color: COLORS.ghost }}>{dispute.description}</div>
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>Filed by {filer?.name || dispute.agent_id} · {new Date(dispute.filed_at).toLocaleString("en-ZA")}</div>
+      {dispute.state === DISPUTE_STATE.OPEN && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+          <textarea value={resolution} onChange={e => setResolution(e.target.value)}
+            placeholder="Resolution note (required before closing)…" rows={2}
+            style={{ fontFamily: "inherit", fontSize: 11, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8, color: COLORS.chalk, resize: "vertical", boxSizing: "border-box", width: "100%" }} />
+          <div style={{ display: "flex", gap: 6 }}>
+            <Button title="✓ UPHOLD" variant="green" size="sm" style={{ flex: 1 }} onClick={() => resolve("RESOLVED_UPHELD")} disabled={resolving || !resolution.trim()} />
+            <Button title="✗ DISMISS" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => resolve("RESOLVED_DISMISSED")} disabled={resolving || !resolution.trim()} />
+          </div>
+        </div>
+      )}
+      {dispute.resolution_note && (
+        <div style={{ fontSize: 9, color: COLORS.ghost, borderTop: `1px solid ${COLORS.wire}`, paddingTop: 6 }}>
+          Resolution: {dispute.resolution_note}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ── Session timeout ───────────────────────────────────────────────────────
+// 30-minute inactivity auto-logout for admin and agent roles.
+// Resets on any mouse move, key press, or touch event.
+// Shows a warning modal at 5 minutes remaining.
+const SESSION_TIMEOUT_MS = 30 * 60 * 1000;   // 30 min total
+const SESSION_WARN_MS    =  5 * 60 * 1000;   // warn at 5 min remaining
+
+function useSessionTimeout(user, onLogout) {
+  const [warningVisible, setWarningVisible] = React.useState(false);
+  const [secondsLeft, setSecondsLeft] = React.useState(null);
+  const timerRef = React.useRef(null);
+  const warnTimerRef = React.useRef(null);
+  const countdownRef = React.useRef(null);
+
+  const resetTimer = React.useCallback(() => {
+    setWarningVisible(false);
+    setSecondsLeft(null);
+    clearTimeout(timerRef.current);
+    clearTimeout(warnTimerRef.current);
+    clearInterval(countdownRef.current);
+
+    // Set warning timer
+    warnTimerRef.current = setTimeout(() => {
+      setWarningVisible(true);
+      setSecondsLeft(SESSION_WARN_MS / 1000);
+      countdownRef.current = setInterval(() => {
+        setSecondsLeft(s => {
+          if (s <= 1) { clearInterval(countdownRef.current); return 0; }
+          return s - 1;
+        });
+      }, 1000);
+    }, SESSION_TIMEOUT_MS - SESSION_WARN_MS);
+
+    // Set logout timer
+    timerRef.current = setTimeout(() => {
+      onLogout();
+    }, SESSION_TIMEOUT_MS);
+  }, [onLogout]);
+
+  React.useEffect(() => {
+    // Only active for admin and agent — drivers stay logged in (they're in-vehicle)
+    if (!user || user.role === ROLE.DRIVER) return;
+    const events = ["mousemove", "keydown", "touchstart", "click", "scroll"];
+    events.forEach(e => window.addEventListener(e, resetTimer, { passive: true }));
+    resetTimer();
+    return () => {
+      events.forEach(e => window.removeEventListener(e, resetTimer));
+      clearTimeout(timerRef.current);
+      clearTimeout(warnTimerRef.current);
+      clearInterval(countdownRef.current);
+    };
+  }, [user?.id, resetTimer]);
+
+  return { warningVisible, secondsLeft, resetTimer };
+}
+
+function SessionWarningModal({ secondsLeft, onStayLoggedIn, onLogout }) {
+  const mins = Math.floor(secondsLeft / 60);
+  const secs = secondsLeft % 60;
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", zIndex: 9999, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.amber}`, borderRadius: 10, padding: 24, maxWidth: 360, width: "100%", display: "flex", flexDirection: "column", gap: 14, textAlign: "center" }}>
+        <div style={{ fontSize: 32 }}>⏱</div>
+        <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, color: COLORS.chalk }}>
+          Still there?
+        </div>
+        <div style={{ fontSize: 13, color: COLORS.ghost }}>
+          You'll be logged out in{" "}
+          <span style={{ color: COLORS.amber, fontWeight: 700 }}>
+            {mins > 0 ? `${mins}m ${secs}s` : `${secs}s`}
+          </span>{" "}
+          due to inactivity.
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <Button title="LOG OUT NOW" variant="ghost" style={{ flex: 1 }} onClick={onLogout} />
+          <Button title="STAY LOGGED IN" variant="amber" style={{ flex: 2 }} onClick={onStayLoggedIn} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Live trip sharing ─────────────────────────────────────────────────────
+// Generates a public share URL for a trip. The URL contains a one-way
+// token (not the trip ID) so it can be shared without exposing system IDs.
+// Token is generated at driver confirmation and stored on the trip.
+// The public viewer page reads driver GPS via Supabase Realtime (no auth).
+// NOTE: The public /share/:token page is a separate deployment concern —
+// this generates the token and the URL. The agent UI hook is intentionally
+// NOT added yet (per spec). Accessible from admin trip details for testing.
+function generateShareToken() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+function buildShareUrl(token) {
+  return `${window.location.origin}/share/${token}`;
+}
+
+function copyShareLink(trip, dispatch) {
+  if (!trip.share_token) {
+    // Generate and save token
+    const token = generateShareToken();
+    dispatch({ type: "TRIP/SET_SHARE_TOKEN", trip_id: trip.trip_id, token })
+      .then(() => {
+        navigator.clipboard.writeText(buildShareUrl(token))
+          .catch(() => {});
+      })
+      .catch(() => {});
+    return;
+  }
+  navigator.clipboard.writeText(buildShareUrl(trip.share_token)).catch(() => {});
 }
 
 // ── Offline mode — action queue ───────────────────────────────────────────
@@ -1795,13 +2061,15 @@ function exportSurchargeInvoice(trips, users, monthPrefix) {
     "",
     `,,,,,,TOTAL SURCHARGE:,${totalSurcharge.toFixed(2)},`,
   ].join("\n");
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `surcharge_invoice_${monthPrefix.replace("/","-")}.csv`;
+  a.setAttribute("download", `surcharge_invoice_${monthPrefix.replace("/","-")}.csv`);
+  document.body.appendChild(a);
   a.click();
-  URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ── Capacity forecasting ──────────────────────────────────────────────────
@@ -1821,8 +2089,14 @@ function forecastDemand(allTrips, targetDateStr, targetTimeStr) {
     const p = t.scheduled_date.split("/").map(Number);
     const d = new Date(p[0], p[1] - 1, p[2]);
     if (d.getDay() !== targetDow) return false;
-    const h = parseInt((t.scheduled_time_str || "").split(":")[0], 10);
-    return Math.abs(h - th) <= 1;
+    const rawTime = t.scheduled_time_str || t.scheduled_time || "";
+    const rawStr = String(rawTime);
+    // If it looks like an epoch (all digits, > 4 chars), convert to HH:MM
+    const timeVal = /^\d{10,}$/.test(rawStr.trim())
+      ? new Date(Number(rawStr)).toTimeString().slice(0, 5)
+      : rawStr;
+    const h = parseInt(timeVal.split(":")[0], 10);
+    return !isNaN(h) && Math.abs(h - th) <= 1;
   });
   if (historical.length === 0) return { predicted: null, confidence: "LOW", sampleSize: 0 };
   const totalPax = historical.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
@@ -2054,8 +2328,9 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
 function WazeNavPanel({ trip, user, state }) {
   if (!trip) return null;
   const agentIds = trip.agent_ids || [];
-  const completedPickups = trip.completed_pickups || [];
-  const completedDropoffs = trip.completed_dropoffs || [];
+  // completed_pickups/completed_dropoffs are arrays of agent IDs who were confirmed
+  const completedPickups = trip.completed_pickups || trip.completedpickups || [];
+  const completedDropoffs = trip.completed_dropoffs || trip.completeddropoffs || [];
 
   // Build the ordered sequence of remaining stops
   const remaining = [];
@@ -2161,6 +2436,7 @@ const BACKUP_VERIFY_KEY = "transitos_last_backup_verify";
 async function verifyDatabaseConnection() {
   const start = Date.now();
   try {
+    if (!supabase) throw new Error("Supabase not configured");
     const { data, error } = await supabase
       .from("trips")
       .select("id")
@@ -2315,21 +2591,58 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
     "No-Show Count","Delay Reports","Route km","Audit Actions",
   ];
 
+  // Safely wrap a value for CSV — escape quotes and wrap in quotes if needed
+  const csvCell = (v) => {
+    if (v == null || v === "") return "";
+    const s = String(v);
+    if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+
+  // Type-safe ID comparison — bigint vs string vs number all normalised to string
+  const idEq = (a, b) => String(a) === String(b);
+
   const agentNames = (t) => (t.agent_ids || [])
-    .map(id => users.find(u => u.id === id)?.name || id).join(" | ");
-  const driverName = (t) => users.find(u => u.id === t.driver_id)?.name || t.driver_id || "";
-  const fmtEpoch = (ep) => ep ? new Date(ep).toLocaleString("en-ZA") : "";
+    .map(id => users.find(u => idEq(u.id, id))?.name || String(id)).join(" | ");
+  const driverName = (t) => {
+    if (!t.driver_id) return "";
+    return users.find(u => idEq(u.id, t.driver_id))?.name || String(t.driver_id);
+  };
+  const fmtEpoch = (ep) => {
+    if (!ep) return "";
+    try { return new Date(Number(ep)).toLocaleString("en-ZA"); } catch { return String(ep); }
+  };
 
   const inRange = trips.filter(t => {
-    const d = t.scheduled_date || "";
-    return d >= fromDateStr && d <= toDateStr;
+    const d = (t.scheduled_date || "").replace(/\//g, "-");
+    const f = fromDateStr.replace(/\//g, "-");
+    const to2 = toDateStr.replace(/\//g, "-");
+    return d >= f && d <= to2;
   });
 
+  if (inRange.length === 0) {
+    alert("No trips found in the selected date range.");
+    return;
+  }
+
+  // auditLogs from fetchAuditLogsForTrips is a { [tripId]: entries[] } object
+  // Normalise to handle both object and array inputs defensively
+  const getAuditForTrip = (tripId) => {
+    if (!auditLogs) return [];
+    if (Array.isArray(auditLogs)) {
+      return auditLogs.filter(a => idEq(a.trip_id ?? a.tripid, tripId));
+    }
+    // Object keyed by tripid (the normal case from fetchAuditLogsForTrips)
+    return auditLogs[tripId] || auditLogs[String(tripId)] || [];
+  };
+
   const rows = inRange.map(t => {
-    const tripAudit = (auditLogs || []).filter(a => a.trip_id === t.trip_id || a.tripid === t.trip_id);
-    const auditSummary = tripAudit.map(a =>
-      `[${fmtEpoch(a.timestamp)}] ${a.actor_name || a.actorname}: ${a.action_type || a.actiontype}${a.details ? " — " + a.details : ""}`
-    ).join(" || ");
+    const tripAuditEntries = getAuditForTrip(t.trip_id);
+    const auditSummary = tripAuditEntries.map(a =>
+      `[${fmtEpoch(a.timestamp)}] ${a.username || a.actor_name || ""}: ${a.actionType || a.action_type || ""}${a.details ? " - " + a.details : ""}`
+    ).join(" | ");
 
     const delayCount = (t.delays || []).length;
 
@@ -2342,37 +2655,40 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
       agentNames(t),
       t.state || "",
       exceptionLabel(t) || "",
-      fmtEpoch(t.booked_at),
-      fmtEpoch(t.confirmed_at),
-      fmtEpoch(t.accepted_at),
-      fmtEpoch(t.in_transit_at),
-      fmtEpoch(t.completed_at),
+      t.booked_at || "",
+      t.confirmed_at || "",
+      t.acceptedAt || "",
+      t.in_transit_at || "",
+      t.completed_at || "",
       t.rejection_reason || "",
       t.rejection_note || "",
       (t.no_shows || []).length,
       delayCount,
-      (t.driver_route_km || t.est_distance_km || ""),
+      t.driver_route_km ?? t.est_distance_km ?? "",
       auditSummary,
-    ].map(v => typeof v === "string" && v.includes(",") ? `"${v.replace(/"/g,'""')}"` : v);
+    ].map(csvCell);
   });
 
   const now = new Date().toLocaleString("en-ZA");
-  const csv = [
-    `# TransitOS Compliance Audit Export — Generated: ${now}`,
-    `# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`,
-    `# This document constitutes a complete operational audit trail.`,
-    ``,
+  const csvLines = [
+    csvCell(`# TransitOS Compliance Audit Export — Generated: ${now}`),
+    csvCell(`# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`),
+    "# This document constitutes a complete operational audit trail.",
+    "",
     headers.join(","),
     ...rows.map(r => r.join(",")),
-  ].join("\n");
+  ];
+  const csv = csvLines.join("\r\n"); // CRLF for Excel compatibility
 
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" }); // BOM for Excel
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `compliance_audit_${fromDateStr}_to_${toDateStr}.csv`;
+  a.setAttribute("download", `compliance_audit_${fromDateStr.replace(/\//g, "-")}_to_${toDateStr.replace(/\//g, "-")}.csv`);
+  document.body.appendChild(a); // required for Firefox
   a.click();
-  URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function AuditExportPanel({ state }) {
@@ -2428,10 +2744,13 @@ function computeSlaReport(trips, users) {
   for (const t of trips) {
     if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) continue;
     if (!t.driver_id) continue;
-    const scheduledEpoch = t.scheduled_time; // bigint ms
-    const actualEpoch = t.in_transit_at;
+    // Use raw epoch fields — in_transit_at and scheduled_time are display
+    // strings after tripRowToApp; scheduled_time_epoch and in_transit_at_epoch
+    // are the original bigint ms values preserved alongside them.
+    const scheduledEpoch = t.scheduled_time_epoch;
+    const actualEpoch = t.in_transit_at_epoch;
     if (!scheduledEpoch || !actualEpoch) continue;
-    const deltaMin = (actualEpoch - scheduledEpoch) / 60000;
+    const deltaMin = (Number(actualEpoch) - Number(scheduledEpoch)) / 60000;
     const onTime = deltaMin <= SLA_GRACE_MINUTES;
     if (!byDriver[t.driver_id]) {
       const u = users.find(u => u.id === t.driver_id);
@@ -2515,8 +2834,12 @@ function computeSchedulingRecommendations(trips, driverStatus, companies) {
         const p = t.scheduled_date.split("/").map(Number);
         const td = new Date(p[0], p[1]-1, p[2]);
         if (td.getDay() !== dow) return false;
-        const h = parseInt((t.scheduled_time_str || "00:00").split(":")[0], 10);
-        return Math.abs(h - th) <= 1;
+        const rawTimeSched = t.scheduled_time_str || t.scheduled_time || "00:00";
+        const rawStrSched = String(rawTimeSched);
+        const timeValSched = /^\d{10,}$/.test(rawStrSched.trim())
+          ? new Date(Number(rawStrSched)).toTimeString().slice(0, 5) : rawStrSched;
+        const h = parseInt(timeValSched.split(":")[0], 10);
+        return !isNaN(h) && Math.abs(h - th) <= 1;
       });
       if (historical.length < 3) continue; // need at least 3 data points
 
@@ -2585,8 +2908,9 @@ function computeWeeklySummary(trips, users, driverStatus) {
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
 
   const lastWeek = trips.filter(t => {
-    const d = t.booked_at || t.in_transit_at || 0;
-    return d >= sevenDaysAgo;
+    // Use raw epoch fields — booked_at and in_transit_at are display strings
+    const d = t.booked_at_epoch || t.in_transit_at_epoch || 0;
+    return Number(d) >= sevenDaysAgo;
   });
 
   const completed = lastWeek.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED);
@@ -3678,6 +4002,16 @@ function appReducer(state, action) {
     }
 
     case "TRIP/BOOK": {
+      // ── Duplicate booking check (client-side) ───────────────────────────
+      const existingForDate = state.trips.filter(t =>
+        (t.agent_ids || []).map(String).includes(String(action.agent_id)) &&
+        t.scheduled_date === action.scheduled_date &&
+        t.direction === action.direction &&
+        [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
+      );
+      if (existingForDate.length > 0) {
+        return { ...state, _error: `You already have a ${action.direction} booking on ${action.scheduled_date} (Trip #${existingForDate[0].trip_id}). Cancel it first.` };
+      }
       const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
       const dropCoord = action.dropoff_coord || defaultCompanyAnchor(state);
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
@@ -5034,6 +5368,31 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [...cancelNotifs, ...state.notifications], _error: null };
     }
 
+    case "TRIP/FILE_DISPUTE": {
+      return { ...state, trips: state.trips.map(t =>
+        t.trip_id === action.trip_id ? { ...t, dispute: {
+          agent_id: action.agent_id, category: action.category,
+          description: action.description, filed_at: action.filed_at,
+          state: DISPUTE_STATE.OPEN, resolution_note: null,
+        } } : t
+      )};
+    }
+
+    case "TRIP/RESOLVE_DISPUTE": {
+      return { ...state, trips: state.trips.map(t =>
+        t.trip_id === action.trip_id && t.dispute ? { ...t, dispute: {
+          ...t.dispute, state: action.outcome, resolution_note: action.resolution_note, resolved_at: Date.now(),
+        } } : t
+      )};
+    }
+
+    case "TRIP/SET_SHARE_TOKEN": {
+      const newTrips = state.trips.map(t =>
+        t.trip_id === action.trip_id ? { ...t, share_token: action.token } : t
+      );
+      return { ...state, trips: newTrips };
+    }
+
     case "SYSTEM/SOS_ALERT": {
       // Optimistic: add notification locally so UI updates immediately
       const sosNotif = {
@@ -5093,7 +5452,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {} };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -5122,11 +5481,13 @@ function tripRowToApp(row, chatByTrip) {
     trip_type: row.triptype, scheduled_date: row.scheduleddate,
     scheduled_time: row.scheduledtimestr || row.scheduledtime, scheduled_time_epoch: row.scheduledtime,
     booked_at: epochToDisplay(row.bookedat), confirmed_at: epochToDisplay(row.confirmedat),
-    in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat), cancelled_at: epochToDisplay(row.cancelledat),
+    booked_at_epoch: row.bookedat || null, confirmed_at_epoch: row.confirmedat || null,
+    in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat),
+    in_transit_at_epoch: row.intransitat || null, completed_at_epoch: row.completedat || null, cancelled_at: epochToDisplay(row.cancelledat),
     late_booking_flag: row.latebookingflag || false,
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
-    driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat),
+    driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), accepted_at_epoch: row.acceptedat || null,
     declinedBy: row.declinedby || [],
     rejection_reason: row.rejectionreason || null,
     rejection_note: row.rejectionnote || null,
@@ -5140,6 +5501,8 @@ function tripRowToApp(row, chatByTrip) {
     driver_route_exceeds_policy: row.driverrouteexceedspolicy || false,
     chat_messages: chatByTrip[row.id] || [],
     agent_ratings: row.agentratings || {},
+    share_token: row.sharetoken || null,
+    dispute: row.dispute || null,
   };
 }
 function notifRowToApp(row) {
@@ -5615,7 +5978,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!action.driver_id || action.driver_id !== activeUserRef.current) {
         throw new Error("You can only change your own availability.");
       }
-      must(await supabase.from("driver_status").update({ isunavailable: !!action.unavailable }).eq("driverid", action.driver_id));
+      must(await supabase.from("driver_status").update({
+        isunavailable: !!action.unavailable,
+        unavailablereason: action.unavailable ? (action.reason || null) : null,
+        unavailablenote: action.unavailable ? (action.note || null) : null,
+        updatedat: new Date().toISOString(),
+      }).eq("driverid", action.driver_id));
       await refetch();
       return;
     }
@@ -6398,6 +6766,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const scheduledTimeEpoch = scheduledDtForInsert ? scheduledDtForInsert.getTime() : null;
       if (scheduledTimeEpoch == null) {
         throw new Error(`Couldn't understand the scheduled date/time ("${action.scheduled_date}" "${action.scheduled_time}"). Please use YYYY/MM/DD for the date and HH:MM for the time.`);
+      }
+
+      // ── Duplicate booking check ──────────────────────────────────────────
+      // An agent cannot have two active/pending bookings for the same
+      // date AND direction. Catches both primary agent and extra agent slots.
+      const { data: existingBookings } = await supabase
+        .from("trips")
+        .select("id, status, direction")
+        .eq("agentid", action.agent_id)
+        .eq("scheduleddate", action.scheduled_date)
+        .in("status", [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      const dupTrip = (existingBookings || []).find(t => t.direction === action.direction);
+      if (dupTrip) {
+        throw new Error(`You already have a ${action.direction} booking on ${action.scheduled_date} (Trip #${dupTrip.id}). Cancel it first if you need to rebook.`);
       }
 
       // Exception flag: booked on the SAME calendar day as the trip,
@@ -7241,6 +7623,43 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await refetch();
       return;
     }
+    case "TRIP/FILE_DISPUTE": {
+      must(await supabase.from("trips").update({
+        dispute: {
+          agent_id: action.agent_id, category: action.category,
+          description: action.description, filed_at: action.filed_at,
+          state: "OPEN", resolution_note: null,
+        },
+        isexception: true,
+        updatedat: nowEpoch(),
+      }).eq("id", action.trip_id));
+      await insertNotification({
+        type: "TRIP_DISPUTE", for_roles: [ROLE.ADMIN],
+        message: `⚠ DISPUTE filed on trip ${action.trip_id}: "${action.category}"`,
+        trip_id: action.trip_id, ts: nowEpoch(), read: false,
+      });
+      await refetch();
+      return;
+    }
+
+    case "TRIP/RESOLVE_DISPUTE": {
+      const { data: tripForDispute } = await supabase.from("trips").select("dispute").eq("id", action.trip_id).single();
+      must(await supabase.from("trips").update({
+        dispute: { ...(tripForDispute?.dispute || {}), state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
+        updatedat: nowEpoch(),
+      }).eq("id", action.trip_id));
+      await refetch();
+      return;
+    }
+
+    case "TRIP/SET_SHARE_TOKEN": {
+      must(await supabase.from("trips").update({
+        sharetoken: action.token, updatedat: nowEpoch()
+      }).eq("id", action.trip_id));
+      await refetch();
+      return;
+    }
+
     case "SYSTEM/SOS_ALERT": {
       // SOS fires to ALL admins immediately — no permission check,
       // no auth gate. Anyone can trigger an emergency.
@@ -8826,6 +9245,12 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
 
   const submit = async () => {
     if (!validate()) return;
+    // Rate limit check — max 3 bookings per 5 minutes
+    const rateCheck = checkBookingRateLimit(user.id);
+    if (!rateCheck.allowed) {
+      setErrs(e => ({ ...e, _rate: `Too many bookings. Please wait ${rateCheck.resetIn}s before booking again.` }));
+      return;
+    }
     setLoading(true);
     // All-or-nothing: every leg's new trip id is collected as it's
     // created, and if ANY later leg fails, everything created so far is
@@ -9224,6 +9649,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
 
 function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJumpConsumed }) {
   const [filter, setFilter] = useState("ALL");
+  const [disputingTrip, setDisputingTrip] = useState(null);
   // Seeded from a home-screen card tap (jumpTripId), then consumed so the
   // deep-link is one-shot — the TRIPS tab itself still opens on the list.
   const [detailId, setDetailId] = useState(jumpTripId ?? null);
@@ -9289,7 +9715,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.includes(user.id));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", TRIP_UPDATED: "✎" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -10958,6 +11384,55 @@ function DriverTripDropoffs({ trip, state }) {
   return <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ DROP-OFF: </span>{finalCoords[0]?.label || trip.custom_dropoff}</div>;
 }
 
+
+// ── Driver unavailability reason modal ────────────────────────────────────
+const UNAVAIL_REASONS = [
+  "Sick / unwell",
+  "Vehicle issue",
+  "Personal emergency",
+  "Day off (scheduled)",
+  "Public holiday",
+  "Other",
+];
+
+function UnavailableReasonModal({ onConfirm, onCancel }) {
+  const [reason, setReason] = React.useState("");
+  const [note, setNote] = React.useState("");
+  const [err, setErr] = React.useState(null);
+  const submit = () => {
+    if (!reason) { setErr("Please select a reason."); return; }
+    onConfirm(reason, note.trim() || null);
+  };
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>✕ MARK UNAVAILABLE</span>
+          <button onClick={onCancel} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>Please give a reason — this is logged and visible to dispatch.</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {UNAVAIL_REASONS.map(r => (
+            <div key={r} onClick={() => setReason(r)}
+              style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, border: `1px solid ${reason === r ? COLORS.red : COLORS.wire}`, background: reason === r ? "rgba(220,53,69,0.08)" : COLORS.surface, cursor: "pointer" }}>
+              <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${reason === r ? COLORS.red : COLORS.ghost}`, background: reason === r ? COLORS.red : "transparent", flexShrink: 0 }} />
+              <span style={{ fontSize: 11, color: COLORS.chalk }}>{r}</span>
+            </div>
+          ))}
+        </div>
+        <textarea value={note} onChange={e => setNote(e.target.value)} placeholder="Additional detail (optional)…" rows={2} maxLength={200}
+          style={{ fontFamily: "inherit", fontSize: 11, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8, color: COLORS.chalk, resize: "vertical", boxSizing: "border-box", width: "100%" }} />
+        {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
+        <div style={{ display: "flex", gap: 8 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onCancel} />
+          <Button title="✕ CONFIRM UNAVAILABLE" variant="danger" style={{ flex: 1 }} onClick={submit} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Driver rejection modal ────────────────────────────────────────────────
 // Shown when a driver taps DECLINE on an assigned trip. Requires them to
 // choose a reason category and optionally add a note before confirming.
@@ -11233,10 +11708,24 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
           {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && (
             <TripRatingPrompt trip={trip} user={user} dispatch={dispatch} />
           )}
+          {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && !trip.dispute && (
+            <Button title="⚠ FILE A DISPUTE" variant="ghost" size="sm"
+              style={{ marginTop: 4, borderColor: COLORS.amber, color: COLORS.amber }}
+              onClick={() => setDisputingTrip(trip)} />
+          )}
+          {trip.state === TRIP_STATE.ARCHIVED_COMPLETED && trip.dispute && (
+            <div style={{ marginTop: 4, padding: "6px 10px", background: "rgba(220,53,69,0.06)", border: "1px solid rgba(220,53,69,0.25)", borderRadius: 4, fontSize: 9, color: COLORS.red, fontWeight: 700 }}>
+              ⚠ DISPUTE {trip.dispute.state?.replace(/_/g," ")} — {trip.dispute.category}
+              {trip.dispute.resolution_note && <div style={{ color: COLORS.ghost, fontWeight: 400, marginTop: 2 }}>Resolution: {trip.dispute.resolution_note}</div>}
+            </div>
+          )}
           </Card>
         );
       })}
 
+      {disputingTrip && (
+        <DisputeFilingModal trip={disputingTrip} user={user} dispatch={dispatch} onClose={() => setDisputingTrip(null)} />
+      )}
       {chatWith && (
         <TripChatModal
           trip={chatWith.trip}
@@ -11988,6 +12477,7 @@ function DriverHistoryTab({ myTrips, state }) {
 }
 
 function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
+  const [availModalOpen, setAvailModalOpen] = React.useState(false);
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const full = load >= myCapacity;
   const initials = user.name.split(" ").map(w => w[0]).join("").slice(0, 2);
@@ -12006,18 +12496,75 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
         <StateBadge state={full ? "FULLY_BOOKED" : (myStatus?.state || DRIVER_STATE.AVAILABLE)} />
         <CapacityBar load={load} capacity={myCapacity} />
       </Card>
+      {/* Driver document expiry — visible to driver on their own Me tab */}
+      {(() => {
+        const docs = myStatus?.documents || {};
+        const statuses = DOC_TYPES.map(d => ({ ...d, ...docExpiryStatus(docs[d.key]), date: docs[d.key] }));
+        const issues = statuses.filter(d => d.status !== "ok");
+        if (issues.length === 0 && statuses.every(d => d.date)) return (
+          <div style={{ background: "rgba(29,185,84,0.06)", border: "1px solid rgba(29,185,84,0.25)", borderRadius: 6, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.green }}>📄 DOCUMENTS — ALL VALID</div>
+            {statuses.map(d => (
+              <div key={d.key} style={{ fontSize: 9, color: COLORS.ghost, marginTop: 4 }}>
+                {d.label}: expires {d.date} ({d.daysLeft} days)
+              </div>
+            ))}
+          </div>
+        );
+        if (issues.length === 0) return (
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.ghost }}>📄 DOCUMENTS</div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 4 }}>No expiry dates set. Ask your admin to update your document records.</div>
+          </div>
+        );
+        const hasExpired = issues.some(d => d.status === "expired");
+        return (
+          <div style={{ background: hasExpired ? "rgba(220,53,69,0.06)" : "rgba(245,166,35,0.06)", border: `1px solid ${hasExpired ? "rgba(220,53,69,0.3)" : "rgba(245,166,35,0.3)"}`, borderRadius: 6, padding: "10px 14px" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: hasExpired ? COLORS.red : COLORS.amber }}>
+              {hasExpired ? "🚨 DOCUMENTS EXPIRED" : "⚠ DOCUMENTS EXPIRING SOON"}
+            </div>
+            {issues.map(d => (
+              <div key={d.key} style={{ display: "flex", justifyContent: "space-between", marginTop: 6 }}>
+                <span style={{ fontSize: 10, color: COLORS.chalk }}>{d.label}</span>
+                <span style={{ fontSize: 10, fontWeight: 700, color: d.status === "expired" ? COLORS.red : COLORS.amber }}>
+                  {d.status === "expired" ? `Expired ${Math.abs(d.daysLeft)} days ago` : d.status === "missing" ? "Not set" : `Expires in ${d.daysLeft} days`}
+                </span>
+              </div>
+            ))}
+            <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 8 }}>
+              {hasExpired ? "⛔ You cannot legally operate with expired documents. Contact your admin immediately." : "Please renew before expiry to avoid being taken off the rota."}
+            </div>
+          </div>
+        );
+      })()}
       <Card>
         <SectionHeader label="Availability" />
+        {availModalOpen && !myStatus?.is_unavailable && (
+          <UnavailableReasonModal
+            onConfirm={(reason, note) => {
+              setAvailModalOpen(false);
+              dispatch({ type: "TRIP/SET_DRIVER_AVAILABILITY", driver_id: user.id, unavailable: true, reason, note }).catch(() => {});
+            }}
+            onCancel={() => setAvailModalOpen(false)}
+          />
+        )}
         <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 8 }}>
           {myStatus?.is_unavailable
-            ? "You're marked unavailable — admins won't assign you new trips until you switch back."
+            ? `You're marked unavailable${myStatus.unavailable_reason ? ` — ${myStatus.unavailable_reason}` : ""}. Admins won't assign you new trips until you switch back.`
             : "You're marked available — admins can assign you new trips."}
         </div>
         <Button
           title={myStatus?.is_unavailable ? "✓ SWITCH TO AVAILABLE" : "✕ MARK MYSELF UNAVAILABLE"}
           variant={myStatus?.is_unavailable ? "green" : "danger"}
           full
-          onClick={() => dispatch({ type: "TRIP/SET_DRIVER_AVAILABILITY", driver_id: user.id, unavailable: !myStatus?.is_unavailable }).catch(() => {}) /* failure already toasted by the wrapper */}
+          onClick={() => {
+            if (myStatus?.is_unavailable) {
+              // Going available — no modal needed
+              dispatch({ type: "TRIP/SET_DRIVER_AVAILABILITY", driver_id: user.id, unavailable: false }).catch(() => {});
+            } else {
+              setAvailModalOpen(true);
+            }
+          }}
         />
       </Card>
       <Card body={false}>
@@ -13455,6 +14002,13 @@ function AdminProfileSearch({ state, user }) {
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL BOOKINGS: </span><span style={{ fontWeight: 700 }}>{allTrips.length}</span></span>
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>COMPLETED: </span><span style={{ fontWeight: 700, color: COLORS.green }}>{completedCount}</span></span>
               {exceptionCount > 0 && <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>EXCEPTIONS: </span><span style={{ fontWeight: 700, color: COLORS.red }}>{exceptionCount}</span></span>}
+              <DisputeAdminPanel trip={groupTrips[0]} dispatch={dispatch} users={state.users} />
+              {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(groupTrips[0].state) && (
+                <button onClick={() => copyShareLink(groupTrips[0], dispatch)}
+                  style={{ fontSize: 9, color: COLORS.teal, fontWeight: 700, border: `1px solid ${COLORS.teal}`, padding: "2px 6px", borderRadius: 2, background: "none", cursor: "pointer" }}>
+                  🔗 {groupTrips[0].share_token ? "COPY SHARE LINK" : "GENERATE LIVE LINK"}
+                </button>
+              )}
             </div>
             <span style={{ fontSize: 8, color: COLORS.ghost }}>Counts here cover this person's FULL history (fetched on demand) — the profile panel above only shows the live current+previous-month window, same as the rest of the app.</span>
             {hasAdminPermission(user, "exportCsv") && allTrips.length > 0 && (
@@ -13626,8 +14180,8 @@ function AdminHistory({ state, user }) {
       // Same scoping as runSearch — this was previously missing entirely
       // here, so the quick-range buttons let a company-scoped Viewer see
       // every company's trips regardless of their assigned scope.
-      const effectiveCompanyIds = isCompanyScoped(user)
-        ? user.scoped_company_ids
+      const effectiveCompanyIds = isCompanyScoped(user, state.companies)
+        ? getAdminCompanyIds(user, state.companies)
         : (companyFilter.length ? companyFilter : null);
       setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
     } catch (e) {
@@ -16427,7 +16981,202 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["notifs", "◬", "Alerts"]];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLIENT PORTAL
+// Read-only dashboard for company clients (e.g. Pearce & Sons HR).
+// Scoped to their company's data. Pearce & Sons CLIENTs see all companies.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function ClientPortalSummaryCard({ trips, label }) {
+  const completed = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
+  const active = trips.filter(t => [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT, TRIP_STATE.ASSIGNED].includes(t.state)).length;
+  const exceptions = trips.filter(t => t.is_exception).length;
+  const pax = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
+    .reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+  const km = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
+    .reduce((n, t) => n + (Number(t.actual_distance_km ?? t.est_distance_km) || 0), 0);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {label && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, letterSpacing: 0.5 }}>{label}</div>}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {[
+          ["TRIPS", completed, COLORS.green],
+          ["ACTIVE NOW", active, active > 0 ? COLORS.amber : COLORS.ghost],
+          ["PASSENGERS", pax, COLORS.chalk],
+          ["KM DRIVEN", Math.round(km), COLORS.chalk],
+          ["EXCEPTIONS", exceptions, exceptions > 0 ? COLORS.red : COLORS.ghost],
+        ].map(([l, v, c]) => (
+          <div key={l} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "6px 12px", minWidth: 80 }}>
+            <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{l}</div>
+            <div style={{ fontSize: 16, fontWeight: 800, color: c, fontFamily: FONTS.head }}>{v}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ClientPortalTripRow({ trip, users }) {
+  const agentNames = (trip.agent_ids || []).map(id => users.find(u => u.id === id)?.name || id).join(", ");
+  const statusColor = {
+    [TRIP_STATE.ARCHIVED_COMPLETED]: COLORS.green,
+    [TRIP_STATE.IN_TRANSIT]: COLORS.amber,
+    [TRIP_STATE.DRIVER_CONFIRMED]: COLORS.blue,
+    [TRIP_STATE.ASSIGNED]: COLORS.amber,
+    [TRIP_STATE.ARCHIVED_CANCELLED]: COLORS.red,
+  }[trip.state] || COLORS.ghost;
+  return (
+    <div style={{ display: "flex", gap: 10, padding: "10px 12px", background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 4, alignItems: "flex-start" }}>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk }}>
+          #{trip.trip_id} · {trip.scheduled_date} {trip.scheduled_time} · {trip.direction}
+        </div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{agentNames}</div>
+        {exceptionLabel(trip) && (
+          <div style={{ fontSize: 9, color: COLORS.red, marginTop: 2, fontWeight: 700 }}>⚠ {exceptionLabel(trip)}</div>
+        )}
+      </div>
+      <div style={{ textAlign: "right", flexShrink: 0 }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>{trip.state.replace(/_/g, " ")}</div>
+        {(trip.est_distance_km || trip.actual_distance_km) && (
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{(trip.actual_distance_km ?? trip.est_distance_km).toFixed(1)} km</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ClientPortalApp({ state, dispatch, user }) {
+  const [tab, setTab] = React.useState("overview");
+  const [companyFilter, setCompanyFilter] = React.useState("all");
+
+  const isMaster = !!user.is_master_client;
+
+  // Get company IDs this client may see
+  const clientCompanyIds = isMaster
+    ? state.companies.map(c => c.id?.toString())
+    : (user.scoped_company_ids || user.branch_id ? [user.branch_id] : []);
+
+  const visibleCompanies = isMaster
+    ? state.companies
+    : state.companies.filter(c => clientCompanyIds.includes(c.id?.toString()));
+
+  // Filter trips to this client's scope
+  const myTrips = state.trips.filter(t => {
+    if (isMaster && companyFilter !== "all") {
+      // Filter by selected company
+      const co = state.companies.find(c => c.id?.toString() === companyFilter);
+      if (!co) return false;
+      const agentIds = state.users.filter(u => u.branch_id === co.id?.toString()).map(u => u.id?.toString());
+      const tripAgents = [...(t.agent_ids || [])].map(String);
+      return tripAgents.some(aid => agentIds.includes(aid));
+    }
+    if (isMaster) return true;
+    const agentIds = state.users.filter(u => clientCompanyIds.includes(u.branch_id)).map(u => u.id?.toString());
+    const tripAgents = [...(t.agent_ids || [])].map(String);
+    return tripAgents.some(aid => agentIds.includes(aid));
+  });
+
+  const recentTrips = [...myTrips]
+    .filter(t => t.scheduled_date)
+    .sort((a, b) => String(b.scheduled_date).localeCompare(String(a.scheduled_date)))
+    .slice(0, 30);
+
+  const TABS = [["overview", "◈", "Overview"], ["trips", "⊟", "Trips"], ["sla", "📊", "SLA"], ["exceptions", "⚠", "Exceptions"]];
+
+  return (
+    <div className="screen">
+      {/* Header */}
+      <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
+        <div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800, color: COLORS.amber }}>CLIENT PORTAL</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{user.name} · {isMaster ? "All Companies" : visibleCompanies.map(c => c.name).join(", ")}</div>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {isMaster && (
+            <select value={companyFilter} onChange={e => setCompanyFilter(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "4px 8px", fontSize: 10 }}>
+              <option value="all">All Companies</option>
+              {state.companies.filter(c => c.active).map(c => (
+                <option key={c.id} value={c.id?.toString()}>{c.name}</option>
+              ))}
+            </select>
+          )}
+          <Button title="LOG OUT" variant="ghost" size="sm" onClick={() => dispatch({ type: "AUTH/LOGOUT" })} />
+        </div>
+      </div>
+
+      {/* Tab bar */}
+      <div style={{ display: "flex", borderBottom: `1px solid ${COLORS.wire}`, background: COLORS.panel, position: "sticky", top: 50, zIndex: 9 }}>
+        {TABS.map(([id, icon, label]) => (
+          <button key={id} onClick={() => setTab(id)}
+            style={{ flex: 1, padding: "10px 4px", background: "none", border: "none", borderBottom: tab === id ? `2px solid ${COLORS.amber}` : "2px solid transparent", color: tab === id ? COLORS.amber : COLORS.ghost, fontSize: 9, fontWeight: 700, cursor: "pointer", letterSpacing: 0.5 }}>
+            {icon} {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="pad">
+        {tab === "overview" && (
+          <>
+            <SectionHeader label={`Overview · Last 30 Days`} />
+            {isMaster && companyFilter === "all" ? (
+              <>
+                <ClientPortalSummaryCard trips={myTrips} label="ALL COMPANIES" />
+                {state.companies.filter(c => c.active).map(co => {
+                  const coAgentIds = state.users.filter(u => u.branch_id === co.id?.toString()).map(u => u.id?.toString());
+                  const coTrips = myTrips.filter(t => (t.agent_ids || []).map(String).some(aid => coAgentIds.includes(aid)));
+                  if (coTrips.length === 0) return null;
+                  return <ClientPortalSummaryCard key={co.id} trips={coTrips} label={co.name.toUpperCase()} />;
+                })}
+              </>
+            ) : (
+              <ClientPortalSummaryCard trips={myTrips} />
+            )}
+            <SectionHeader label="Recent Trips" />
+            {recentTrips.slice(0, 10).map(t => (
+              <ClientPortalTripRow key={t.trip_id} trip={t} users={state.users} />
+            ))}
+          </>
+        )}
+
+        {tab === "trips" && (
+          <>
+            <SectionHeader label={`All Trips (${myTrips.length})`} />
+            {recentTrips.length === 0 ? <Empty icon="⊟" text="No trips found" /> :
+              recentTrips.map(t => <ClientPortalTripRow key={t.trip_id} trip={t} users={state.users} />)}
+          </>
+        )}
+
+        {tab === "sla" && (
+          <>
+            <SectionHeader label="On-Time Performance" />
+            <SlaReportPanel trips={myTrips} users={state.users} />
+          </>
+        )}
+
+        {tab === "exceptions" && (
+          <>
+            <SectionHeader label="Exceptions & Incidents" />
+            {myTrips.filter(t => t.is_exception).length === 0
+              ? <Empty icon="◎" text="No exceptions in this period" />
+              : myTrips.filter(t => t.is_exception).map(t => (
+                <div key={t.trip_id} style={{ background: "rgba(220,53,69,0.06)", border: `1px solid rgba(220,53,69,0.25)`, borderRadius: 4, padding: "10px 12px", marginBottom: 6 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk }}>#{t.trip_id} · {t.scheduled_date}</div>
+                  <div style={{ fontSize: 10, color: COLORS.red, marginTop: 2 }}>{exceptionLabel(t) || "Exception"}</div>
+                  {t.rejection_reason && <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>Reason: {t.rejection_reason}{t.rejection_note ? ` — "${t.rejection_note}"` : ""}</div>}
+                </div>
+              ))
+            }
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
 
@@ -16446,6 +17195,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
+    if (id === "portal") return isMasterAdmin(user, state.companies);
     return true;
   });
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
@@ -16580,6 +17330,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
+      {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
       {tab === "notifs" && <AdminNotifs state={scopedState} user={user} dispatch={dispatch} onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }} />}
@@ -16762,6 +17513,12 @@ function AppInner() {
     prevMyNotifIds.current = myNotifIds;
   }, [state.notifications, activeUser?.id]);
 
+  const handleLogout8 = React.useCallback(() => {
+    dispatchWithToast({ type: "AUTH/LOGOUT" });
+  }, [dispatchWithToast]);
+  const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
+    useSessionTimeout(activeUser, handleLogout8);
+
   const handleLogin = async (login, pass) => {
     setLoginError(null);
     // Uses the raw store dispatch, not the wrapped one below — login
@@ -16826,10 +17583,19 @@ function AppInner() {
         <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.AGENT ? (
         <AgentApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
+      ) : activeUser.role === ROLE.CLIENT ? (
+        <ClientPortalApp state={state} dispatch={dispatchWithToast} user={{ ...activeUser, is_master_client: isMasterAdmin({ ...activeUser, role: ROLE.ADMIN, admin_level: "FLEET_OPS" }, state.companies) }} />
       ) : (
         <DriverApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       )}
 
+      {sessionWarning && activeUser && (
+        <SessionWarningModal
+          secondsLeft={sessionSecondsLeft}
+          onStayLoggedIn={resetSessionTimer}
+          onLogout={handleLogout8}
+        />
+      )}
       <div className="toast-stack">
         {toasts.map(t => (
           <div key={t.id} className="toast" style={{ borderLeftColor: t.color }}>
