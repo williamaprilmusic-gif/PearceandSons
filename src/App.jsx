@@ -215,7 +215,10 @@ function getAdminCompanyIds(user, companies) {
   // VIEWER → scoped to their explicit companies (read-only limited view)
   if (user.scoped_company_ids?.length) return user.scoped_company_ids;
   if (user.branch_id) return [user.branch_id];
-  return [];
+  // VIEWER with no configured scope → deny everything (show nothing).
+  // Returning [] would mean "unrestricted", which is wrong for an
+  // unconfigured viewer. "__NONE__" won't match any real company id.
+  return ["__NONE__"];
 }
 
 function isCompanyScoped(user, companies) {
@@ -5959,6 +5962,68 @@ async function fetchCompanyAnchor() {
   return { lat: -33.9249, lng: 18.4241 }; // last-resort fallback only
 }
 
+
+
+// ── ViewerPortal ────────────────────────────────────────────────────────────
+// Full-screen Client Portal for VIEWER admin accounts.
+// No admin sidebar, no tabs — just the portal view for their company,
+// a small header with their name and a logout button.
+function ViewerPortal({ state, dispatch, user }) {
+  // Scope state to this viewer's companies (same logic as AdminApp scopedState)
+  const scopedState = React.useMemo(() => {
+    const companyIds = user.scoped_company_ids || [];
+    if (!companyIds.length) return state; // no scope = see all (shouldn't happen for VIEWER)
+    return {
+      ...state,
+      companies: (state.companies || []).filter(c => companyIds.some(id => String(id) === String(c.id))),
+      users: scopeUsersToCompany(state.users, state.trips, companyIds),
+      trips: scopeTripsToCompany(state.trips, state.users, companyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, companyIds),
+      notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, companyIds),
+    };
+  }, [state, user.scoped_company_ids]);
+
+  // Determine which company name to show in the header
+  const companyName = React.useMemo(() => {
+    const ids = user.scoped_company_ids || [];
+    if (!ids.length) return "All Companies";
+    const co = state.companies.find(c => ids.some(id => String(id) === String(c.id)));
+    return co?.name || "Client Portal";
+  }, [state.companies, user.scoped_company_ids]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100dvh", background: COLORS.bg }}>
+      {/* Minimal header */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12,
+        padding: "10px 16px", paddingTop: "calc(10px + env(safe-area-inset-top, 0px))",
+        background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, flexShrink: 0,
+      }}>
+        <div style={{ width: 32, height: 32, borderRadius: 16, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: "#000", flexShrink: 0 }}>
+          {(user.name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()}
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 800, color: COLORS.chalk }}>{companyName}</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 0.5 }}>{user.name}</div>
+        </div>
+        <button
+          onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})}
+          style={{ background: "none", border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "5px 10px", color: COLORS.ghost, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: "pointer", fontFamily: FONTS.head }}
+        >
+          LOG OUT
+        </button>
+      </div>
+      {/* Full-height portal — no sidebar, no tabs chrome */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        <ClientPortalApp
+          state={scopedState}
+          dispatch={dispatch}
+          user={{ ...user, is_master_client: false }}
+        />
+      </div>
+    </div>
+  );
+}
 
 // ── WebAuthn biometric login helpers ──────────────────────────────────────
 const WEBAUTHN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/webauthn";
@@ -15332,7 +15397,35 @@ let tomtomTileErrorLoggedOnce = { current: false };
 
 function LiveMapTiles({ width, height, viewport }) {
   if (!TOMTOM_API_KEY) {
-    return <div style={{ position: "absolute", inset: 0, background: COLORS.surface }} />;
+    // No TomTom key — render OSM tiles as fallback using the same SVG approach
+    const zoom = Math.round(viewport.zoom);
+    const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
+    const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
+    const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
+    const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+    const osmTiles = [];
+    for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
+      for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
+        const nw = tileToLonLat(tx, ty, zoom);
+        const se = tileToLonLat(tx + 1, ty + 1, zoom);
+        const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
+        const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+        const sub = ["a","b","c"][((tx + ty) % 3 + 3) % 3]; // rotate OSM subdomains
+        osmTiles.push(
+          <image
+            key={`osm-${zoom}-${tx}-${ty}`}
+            href={`https://${sub}.tile.openstreetmap.org/${zoom}/${tx}/${ty}.png`}
+            x={p1.x} y={p1.y}
+            width={Math.max(1, p2.x - p1.x)}
+            height={Math.max(1, p2.y - p1.y)}
+            preserveAspectRatio="none"
+            style={{ pointerEvents: "none" }}
+            onError={e => { e.target.style.display = "none"; }}
+          />
+        );
+      }
+    }
+    return <>{osmTiles}</>;
   }
   const zoom = Math.round(viewport.zoom);
   // Corners of the visible canvas, converted to lon/lat, then to which
@@ -15353,31 +15446,29 @@ function LiveMapTiles({ width, height, viewport }) {
       const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
       const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
       tiles.push(
-        <img
+        <image
           key={`${zoom}-${tx}-${ty}`}
-          src={tomtomTileUrl(tx, ty, zoom)}
-          alt=""
-          draggable={false}
-          style={{ position: "absolute", left: p1.x, top: p1.y, width: p2.x - p1.x, height: p2.y - p1.y, pointerEvents: "none" }}
+          href={tomtomTileUrl(tx, ty, zoom)}
+          x={p1.x} y={p1.y}
+          width={Math.max(1, p2.x - p1.x)}
+          height={Math.max(1, p2.y - p1.y)}
+          preserveAspectRatio="none"
+          style={{ pointerEvents: "none" }}
           onError={(e) => {
             e.target.style.display = "none";
             if (!tomtomTileErrorLoggedOnce.current) {
               tomtomTileErrorLoggedOnce.current = true;
-              console.error(
-                "[TomTom] Map tile failed to load even though an API key is configured. " +
-                "This usually means the key is invalid, expired, or not authorized for the " +
-                "Maps/tile product specifically (a key can be valid for Search/Geocoding but " +
-                "still be rejected here if your TomTom plan gates them separately) — check " +
-                "the failed request's status in the Network tab (401/403 = key/auth problem) " +
-                "and your TomTom developer dashboard for which products this key is enabled for."
-              );
+              console.warn("[TomTom] Map tile failed — check API key and tile product authorization.");
             }
           }}
         />
       );
     }
   }
-  return <div style={{ position: "absolute", inset: 0, background: COLORS.surface, overflow: "hidden" }}>{tiles}</div>;
+  // Render tiles as SVG <image> elements — coordinate space matches the
+  // SVG viewBox exactly (0-700, 0-560), so tiles align with pins correctly
+  // at any screen size. No separate positioning div needed.
+  return <>{tiles}</>;
 }
 
 function timeSinceLabel(isoString) {
@@ -15484,31 +15575,52 @@ function AdminLiveMap({ state, user }) {
   // screen pixels the pointer has moved and convert that into a real
   // lat/lng shift for the center — same math as unprojectFromSvg, just
   // applied to a delta instead of an absolute point.
+  const pinchRef = useRef(null); // tracks 2-finger pinch state
   const handlePointerDown = (e) => {
     const rect = svgRef.current.getBoundingClientRect();
+    if (e.touches && e.touches.length === 2) {
+      // Two-finger pinch start — record initial distance and zoom
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      pinchRef.current = { startDist: dist, startZoom: viewport.zoom };
+      dragRef.current = null;
+      return;
+    }
+    pinchRef.current = null;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
     dragRef.current = {
       startScreenX: clientX, startScreenY: clientY,
       startCenterLat: viewport.centerLat, startCenterLng: viewport.centerLng,
+      // Capture rect fresh — critical for correct coordinate scaling
       rectWidth: rect.width, rectHeight: rect.height,
     };
   };
   const handlePointerMove = (e) => {
+    // Two-finger pinch — scale zoom by ratio of current to initial finger distance
+    if (e.touches && e.touches.length === 2 && pinchRef.current) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      const ratio = dist / pinchRef.current.startDist;
+      const newZoom = Math.max(3, Math.min(18, pinchRef.current.startZoom + Math.log2(ratio)));
+      setViewport(v => ({ ...v, zoom: newZoom }));
+      return;
+    }
     if (!dragRef.current) return;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
     const dxScreen = clientX - dragRef.current.startScreenX;
     const dyScreen = clientY - dragRef.current.startScreenY;
-    // Scale from actual rendered CSS pixels to the SVG's internal W/H
-    // coordinate space, since the SVG scales to fill its container.
-    const scaleX = W / dragRef.current.rectWidth, scaleY = H / dragRef.current.rectHeight;
+    // Re-read rect on each move — avoids stale rect from layout shifts
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const scaleX = W / rect.width, scaleY = H / rect.height;
     const startCenterPx = lonLatToWorldPixel(dragRef.current.startCenterLng, dragRef.current.startCenterLat, viewport.zoom);
     const newCenterPx = { x: startCenterPx.x - dxScreen * scaleX, y: startCenterPx.y - dyScreen * scaleY };
     const newCenterLonLat = worldPixelToLonLat(newCenterPx.x, newCenterPx.y, viewport.zoom);
     setViewport(v => ({ ...v, centerLat: newCenterLonLat.lat, centerLng: newCenterLonLat.lon }));
   };
-  const handlePointerUp = () => { dragRef.current = null; };
+  const handlePointerUp = () => { dragRef.current = null; pinchRef.current = null; };
   // Expanding the map doesn't touch any of the pan/zoom/projection logic
   // above — the SVG already scales to fill its container via width/
   // height: 100%, so making the container itself fullscreen is enough.
@@ -15538,11 +15650,24 @@ function AdminLiveMap({ state, user }) {
       )}
       <div style={isMapExpanded ? {
         position: "fixed", zIndex: 200,
-        top: "calc(3vh + env(safe-area-inset-top, 0px))", left: "3vw", right: "3vw", bottom: "calc(3vh + env(safe-area-inset-bottom, 0px))",
+        top: 0, left: 0, right: 0, bottom: 0,
         display: "flex", flexDirection: "column",
+        background: COLORS.bg,
+        paddingTop: "env(safe-area-inset-top, 0px)",
+        paddingBottom: "env(safe-area-inset-bottom, 0px)",
       } : undefined}>
+        {/* Floating controls — always visible inside the map when expanded */}
         {isMapExpanded && (
-          <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 8 }}>
+          <div style={{
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            padding: "8px 12px", background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`,
+            flexShrink: 0,
+          }}>
+            <div style={{ display: "flex", gap: 6 }}>
+              <Button title="🎯" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} style={{ width: 36 }} />
+              <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 36 }} />
+              <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 36 }} />
+            </div>
             <Button title="✕ CLOSE" variant="ghost" size="sm" onClick={() => setIsMapExpanded(false)} />
           </div>
         )}
@@ -15555,7 +15680,6 @@ function AdminLiveMap({ state, user }) {
           <div style={{ position: "relative", width: "100%", minHeight: 280,
             height: isMapExpanded ? "100%" : undefined,
             aspectRatio: isMapExpanded ? undefined : `${W} / ${H}` }}>
-          <LiveMapTiles width={W} height={H} viewport={viewport} />
           <svg
             ref={svgRef}
             viewBox={`0 0 ${W} ${H}`}
@@ -15568,6 +15692,10 @@ function AdminLiveMap({ state, user }) {
             onTouchEnd={e => { e.preventDefault(); handlePointerUp(e); }}
             onWheel={(e) => { e.preventDefault(); setViewport(v => ({ ...v, zoom: Math.max(3, Math.min(18, v.zoom + (e.deltaY < 0 ? 0.5 : -0.5))) })); }}
           >
+          {/* Map background — visible while tiles load */}
+          <rect width={W} height={H} fill="#1a2333" />
+          {/* Tile layer — SVG <image> elements mapped to the same viewBox coords as pins */}
+          <LiveMapTiles width={W} height={H} viewport={viewport} />
           {/* Company location reference points */}
           {(state.companies || []).filter(co => co.address?.lat != null).map(co => {
             const p = projectToSvg(co.address.lat, co.address.lng, W, H, viewport);
@@ -15817,7 +15945,7 @@ function DriverStatsCard({ driverId, allTrips }) {
   );
 }
 
-function AdminDrivers({ state, user }) {
+function AdminDrivers({ state, user, dispatch }) {
   // Which trip cards are expanded, per driver. Collapsed by default —
   // a driver with several active trips otherwise dumps a wall of detail
   // (pickup, dropoffs, Waze buttons) for every single one at once. Keyed
@@ -17695,11 +17823,11 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // someone into a tab their permissions no longer allow would show a
   // broken/blank screen instead of falling back to the default.
   const visibleNav = ADMIN_NAV.filter(([id]) => {
+    // Note: VIEWER admins never reach AdminApp — they're routed to ViewerPortal.
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
-    if (id === "portal") return isMasterAdmin(user, state.companies);
     return true;
   });
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
@@ -17768,7 +17896,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     return {
       ...state,
       // Companies: admins only see their own company + its branches
-      companies: (state.companies || []).filter(c => adminCompanyIds.includes(c.id)),
+      companies: (state.companies || []).filter(c => adminCompanyIds.some(id => String(id) === String(c.id))),
       users: scopeUsersToCompany(state.users, state.trips, adminCompanyIds),
       trips: scopeTripsToCompany(state.trips, state.users, adminCompanyIds),
       tickets: scopeTicketsToCompany(state.tickets, state.users, adminCompanyIds),
@@ -17833,7 +17961,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
-      {tab === "drivers" && <AdminDrivers state={scopedState} user={user} />}
+      {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
@@ -18109,6 +18237,11 @@ function AppInner() {
     <div className="app-root">
       {!activeUser ? (
         <LoginScreen users={state.users} onLogin={handleLogin} onBiometricLogin={handleBiometricLogin} error={loginError} />
+      ) : activeUser.role === ROLE.ADMIN && activeUser.admin_level === ADMIN_LEVEL.VIEWER ? (
+        // VIEWER admins get the Client Portal directly — no admin shell, no tabs.
+        // They see only their company's portal view, same as a CLIENT role but
+        // scoped by their scopedcompanyids.
+        <ViewerPortal state={state} dispatch={dispatchWithToast} user={activeUser} />
       ) : activeUser.role === ROLE.ADMIN ? (
         <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.AGENT ? (
