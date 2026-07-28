@@ -192,23 +192,30 @@ function isMasterAdmin(user, companies) {
   if (user.admin_level !== ADMIN_LEVEL.FLEET_OPS) return false;
   // FLEET_OPS with no scoped companies = legacy master admin (backward compat)
   if (!user.scoped_company_ids?.length) return true;
-  // FLEET_OPS explicitly linked to Pearce & Sons = master admin
+  // FLEET_OPS explicitly linked to Pearce & Sons = master admin.
+  // Pearce & Sons is the OPERATOR company — FLEET_OPS scoped there has
+  // authority over all client companies (e.g. Turas Hotel).
   const pearceIds = (companies || []).filter(isPearceCompany).map(c => c.id);
-  return user.scoped_company_ids.some(id => pearceIds.includes(id));
+  if (pearceIds.length === 0) {
+    // Companies not yet loaded — grant access if scopedcompanyids looks like
+    // it includes a low-numbered operator ID (defensive fallback).
+    // This prevents a brief "0 trips" flash on login before companies fetch.
+    return user.scoped_company_ids.some(id => Number(id) <= 5);
+  }
+  return user.scoped_company_ids.some(id => pearceIds.some(pid => String(pid) === String(id)));
 }
 
 function getAdminCompanyIds(user, companies) {
   if (!user || user.role !== ROLE.ADMIN) return [];
-  if (isMasterAdmin(user, companies)) return []; // [] = unrestricted
-  // FLEET_OPS linked to a non-Pearce company → only that company
-  if (user.admin_level === ADMIN_LEVEL.FLEET_OPS && user.scoped_company_ids?.length) {
-    return user.scoped_company_ids;
+  // FLEET_OPS and STANDARD both see all companies — they're the same operational
+  // tier, just STANDARD can't manage other admin accounts.
+  if (user.admin_level === ADMIN_LEVEL.FLEET_OPS || user.admin_level === ADMIN_LEVEL.STANDARD) {
+    return []; // [] = unrestricted — sees all trips, agents, drivers
   }
-  // STANDARD or VIEWER → their scoped companies
+  // VIEWER → scoped to their explicit companies (read-only limited view)
   if (user.scoped_company_ids?.length) return user.scoped_company_ids;
-  // STANDARD with no explicit scopes but a branch_id → derive from branch
   if (user.branch_id) return [user.branch_id];
-  return []; // no restriction (shouldn't happen for non-Pearce FLEET_OPS)
+  return [];
 }
 
 function isCompanyScoped(user, companies) {
@@ -3631,8 +3638,13 @@ const INITIAL_STATE = {
 function appReducer(state, action) {
   switch (action.type) {
 
+    case "AUTH/LOGIN_BIOMETRIC":
     case "AUTH/LOGIN": {
-      const user = state.users.find(u => u.auth.login === action.login && u.auth.pass === action.pass);
+      // AUTH/LOGIN_BIOMETRIC: biometric already verified by Edge Function,
+      // just find the user by ID and create the session.
+      const user = action.type === "AUTH/LOGIN_BIOMETRIC"
+        ? state.users.find(u => String(u.id) === String(action.user_id))
+        : state.users.find(u => u.auth.login === action.login && u.auth.pass === action.pass);
       if (!user) return { ...state, _error: "Invalid credentials" };
       // Per explicit decision: "online" means logged in right now — set
       // the instant login succeeds, cleared on logout, no idle timeout.
@@ -5947,8 +5959,146 @@ async function fetchCompanyAnchor() {
   return { lat: -33.9249, lng: 18.4241 }; // last-resort fallback only
 }
 
+
+// ── WebAuthn biometric login helpers ──────────────────────────────────────
+const WEBAUTHN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/webauthn";
+
+async function webauthnPost(payload) {
+  const res = await fetch(WEBAUTHN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// Check if this browser supports WebAuthn (platform authenticator = biometric)
+async function webauthnSupported() {
+  if (!window.PublicKeyCredential) return false;
+  try {
+    return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+  } catch {
+    return false;
+  }
+}
+
+// Convert base64url ↔ ArrayBuffer (WebAuthn API needs ArrayBuffers)
+function b64ToArrayBuf(b64) {
+  const padded = b64.replace(/-/g, "+").replace(/_/g, "/").padEnd(
+    b64.length + (4 - b64.length % 4) % 4, "="
+  );
+  return Uint8Array.from(atob(padded), c => c.charCodeAt(0)).buffer;
+}
+function arrayBufToB64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+// Register the current device's biometric as a credential
+async function webauthnRegister(userId, username) {
+  // 1. Get challenge + options from Edge Function
+  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username });
+  // 2. Convert strings → ArrayBuffers for the browser API
+  opts.challenge = b64ToArrayBuf(opts.challenge);
+  opts.user.id = b64ToArrayBuf(opts.user.id);
+  if (opts.excludeCredentials) {
+    opts.excludeCredentials = opts.excludeCredentials.map(c => ({
+      ...c, id: b64ToArrayBuf(c.id),
+    }));
+  }
+  // 3. Prompt for biometric — browser shows Face ID / fingerprint UI
+  let cred;
+  try {
+    cred = await navigator.credentials.create({ publicKey: opts });
+  } catch (e) {
+    if (e.name === "NotAllowedError") throw new Error("Biometric cancelled — please try again.");
+    throw e;
+  }
+  if (!cred) throw new Error("No credential returned from device.");
+  // 4. Send result to Edge Function to store
+  await webauthnPost({
+    action: "register",
+    user_id: userId,
+    credential: {
+      id: cred.id,
+      rawId: arrayBufToB64(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: arrayBufToB64(cred.response.clientDataJSON),
+        attestationObject: arrayBufToB64(cred.response.attestationObject),
+      },
+      friendlyName: navigator.userAgent.includes("iPhone") ? "iPhone" :
+                    navigator.userAgent.includes("iPad")   ? "iPad"   :
+                    navigator.userAgent.includes("Android")? "Android":
+                    "This Device",
+    },
+  });
+}
+
+// Authenticate using a registered biometric credential
+async function webauthnAuthenticate(username) {
+  // 1. Get options from Edge Function
+  const opts = await webauthnPost({ action: "authentication-options", username });
+  if (!opts.hasCredentials) return null; // no biometric registered for this user
+  // 2. Convert strings → ArrayBuffers
+  opts.challenge = b64ToArrayBuf(opts.challenge);
+  if (opts.allowCredentials) {
+    opts.allowCredentials = opts.allowCredentials.map(c => ({
+      ...c, id: b64ToArrayBuf(c.id),
+    }));
+  }
+  // 3. Prompt for biometric
+  let cred;
+  try {
+    cred = await navigator.credentials.get({ publicKey: opts });
+  } catch (e) {
+    if (e.name === "NotAllowedError") throw new Error("Biometric cancelled.");
+    throw e;
+  }
+  if (!cred) throw new Error("No credential returned.");
+  // 4. Verify with Edge Function — returns { success: true, userId }
+  const result = await webauthnPost({
+    action: "authenticate",
+    username,
+    credential: {
+      id: cred.id,
+      rawId: arrayBufToB64(cred.rawId),
+      type: cred.type,
+      response: {
+        clientDataJSON: arrayBufToB64(cred.response.clientDataJSON),
+        authenticatorData: arrayBufToB64(cred.response.authenticatorData),
+        signature: arrayBufToB64(cred.response.signature),
+        userHandle: cred.response.userHandle ? arrayBufToB64(cred.response.userHandle) : null,
+      },
+    },
+  });
+  return result;
+}
+
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
+    case "AUTH/LOGIN_BIOMETRIC": {
+      // Biometric already verified by Edge Function — just set the session
+      // for the given user ID. The Edge Function already checked:
+      //   - credential ID exists and belongs to this user
+      //   - signature is valid against the stored public key
+      //   - challenge matches and hasn't expired
+      //   - sign count is incrementing (no cloned authenticator)
+      const { data: bioUser, error: bioErr } = await supabase
+        .from("users").select("*").eq("id", action.user_id).maybeSingle();
+      if (bioErr || !bioUser) throw new Error("User not found");
+      if (bioUser.status !== "ACTIVE") throw new Error("Account is not active");
+      activeUserRef.current = bioUser.id;
+      persistActiveUserId(bioUser.id);
+      await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
+      if (bioUser.role === ROLE.DRIVER) {
+        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", bioUser.id).then(() => {}, () => {});
+      }
+      await refetch();
+      return;
+    }
     case "AUTH/LOGIN": {
       // Fetch by username only, verify the password client-side — the old
       // version matched passwordhash in the query itself, which only works
@@ -9005,10 +9155,31 @@ function LocationSelector({ mode, setMode, companyId, setCompanyId, state, stree
 /* ============================================================
    LOGIN SCREEN
    ============================================================ */
-function LoginScreen({ users, onLogin, error }) {
+function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
   const [login, setLogin] = useState("");
   const [pass, setPass] = useState("");
   const [submitting, setSubmitting] = useState(false);
+
+  const [biometricError, setBiometricError] = useState(null);
+  const [biometricLoading, setBiometricLoading] = useState(false);
+  const [showBiometricBtn, setShowBiometricBtn] = useState(false);
+
+  // Check if WebAuthn is available on this device
+  React.useEffect(() => {
+    webauthnSupported().then(ok => setShowBiometricBtn(ok)).catch(() => {});
+  }, []);
+
+  // Check if this specific username has a registered credential
+  const [hasCredential, setHasCredential] = useState(false);
+  React.useEffect(() => {
+    if (!login || !showBiometricBtn) { setHasCredential(false); return; }
+    const t = setTimeout(() => {
+      webauthnPost({ action: "authentication-options", username: login })
+        .then(r => setHasCredential(!!r?.hasCredentials))
+        .catch(() => setHasCredential(false));
+    }, 500); // debounce
+    return () => clearTimeout(t);
+  }, [login, showBiometricBtn]);
 
   const handleSubmit = async () => {
     if (!login || !pass || submitting) return;
@@ -9020,6 +9191,22 @@ function LoginScreen({ users, onLogin, error }) {
       await onLogin(login, pass);
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleBiometricLogin = async () => {
+    if (!login) { setBiometricError("Enter your username first."); return; }
+    setBiometricLoading(true);
+    setBiometricError(null);
+    try {
+      const result = await webauthnAuthenticate(login);
+      if (!result) { setBiometricError("No biometric registered for this account."); return; }
+      // Biometric verified — log in directly (bypass password)
+      await onBiometricLogin(result.userId);
+    } catch (e) {
+      setBiometricError(e.message || "Biometric login failed.");
+    } finally {
+      setBiometricLoading(false);
     }
   };
 
@@ -9057,6 +9244,43 @@ function LoginScreen({ users, onLogin, error }) {
             </div>
           ) : null}
           <Button title={submitting ? "LOGGING IN…" : "LOGIN →"} variant="amber" full onClick={handleSubmit} disabled={submitting} loading={submitting} />
+          {showBiometricBtn && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <div style={{ flex: 1, height: 1, background: COLORS.wire }} />
+                <span style={{ fontSize: 10, color: COLORS.ghost, letterSpacing: 1 }}>OR</span>
+                <div style={{ flex: 1, height: 1, background: COLORS.wire }} />
+              </div>
+              <button
+                onClick={handleBiometricLogin}
+                disabled={biometricLoading || !login}
+                style={{
+                  width: "100%", padding: "13px 0", borderRadius: 4,
+                  background: hasCredential ? "rgba(245,166,35,0.08)" : COLORS.surface,
+                  border: `1px solid ${hasCredential ? COLORS.amber : COLORS.wire}`,
+                  color: hasCredential ? COLORS.amber : COLORS.ghost,
+                  fontSize: 13, fontWeight: 800, letterSpacing: 0.5,
+                  cursor: biometricLoading || !login ? "not-allowed" : "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                  fontFamily: FONTS.head, transition: "all 0.15s",
+                  opacity: biometricLoading || !login ? 0.5 : 1,
+                }}
+              >
+                <span style={{ fontSize: 20 }}>
+                  {/iphone|ipad|ipod/i.test(navigator.userAgent) ? "🔒" : "👆"}
+                </span>
+                {biometricLoading ? "VERIFYING…" : hasCredential ? "USE FINGERPRINT / FACE ID" : "SIGN IN WITH BIOMETRICS"}
+              </button>
+              {biometricError && (
+                <div style={{ fontSize: 11, color: COLORS.red, textAlign: "center" }}>{biometricError}</div>
+              )}
+              {!hasCredential && login && (
+                <div style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center" }}>
+                  Log in with your password first, then enable biometrics in Settings.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -10021,6 +10245,7 @@ function AgentProfileTab({ user, myTrips, dispatch }) {
         ))}
       </Card>
       <AlertSoundToggle />
+      <BiometricEnrollButton user={user} />
       <Button title="LOGOUT" variant="ghost" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
     </div>
   );
@@ -10766,6 +10991,74 @@ function useWebRTCCall(currentUser) {
   }, []);
 
   return { callState, remoteUser, callTripId, errorMsg, remoteAudioRef, startCall, acceptCall, declineCall, hangUp, resetAfterEnd, toggleMute };
+}
+
+
+// ── BiometricEnrollButton ──────────────────────────────────────────────────
+// Shows in the sidebar. Lets logged-in users register their device biometric.
+// Once registered, they can log in with fingerprint / Face ID next time.
+function BiometricEnrollButton({ user }) {
+  const [supported, setSupported] = useState(false);
+  const [enrolling, setEnrolling] = useState(false);
+  const [status, setStatus] = useState(null); // null | 'success' | 'error'
+  const [msg, setMsg] = useState("");
+  const [hasCredential, setHasCredential] = useState(false);
+  const [removing, setRemoving] = useState(false);
+
+  React.useEffect(() => {
+    webauthnSupported().then(ok => {
+      setSupported(ok);
+      if (ok && user?.name) {
+        // Check if this user already has a credential registered
+        webauthnPost({ action: "authentication-options", username: user.name })
+          .then(r => setHasCredential(!!r?.hasCredentials))
+          .catch(() => {});
+      }
+    }).catch(() => {});
+  }, [user?.name]);
+
+  if (!supported) return null;
+
+  const handleEnroll = async () => {
+    setEnrolling(true);
+    setStatus(null);
+    setMsg("");
+    try {
+      await webauthnRegister(user.id, user.name);
+      setHasCredential(true);
+      setStatus("success");
+      setMsg("Biometric registered! You can now log in with your fingerprint or Face ID.");
+    } catch (e) {
+      setStatus("error");
+      setMsg(e.message || "Registration failed — please try again.");
+    } finally {
+      setEnrolling(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <button
+        onClick={handleEnroll}
+        disabled={enrolling}
+        style={{
+          background: "none", border: `1px solid ${hasCredential ? "rgba(29,185,84,.4)" : COLORS.wire}`,
+          borderRadius: 4, padding: "7px 10px", color: hasCredential ? COLORS.green : COLORS.ghost,
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: enrolling ? "wait" : "pointer",
+          display: "flex", alignItems: "center", gap: 6, width: "100%",
+          opacity: enrolling ? 0.6 : 1,
+        }}
+      >
+        <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
+        {enrolling ? "SETTING UP…" : hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
+      </button>
+      {status && (
+        <div style={{ fontSize: 9, color: status === "success" ? COLORS.green : COLORS.red, lineHeight: 1.4, padding: "0 2px" }}>
+          {msg}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /* ---------- ALERT SOUND ----------
@@ -17492,16 +17785,18 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
         <img src={LOGO_DATA_URI} alt="Pearce & Sons" style={{ height: 28, width: 28, objectFit: "contain" }} />
         <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 2 }}>
           <RoleBadge role={ROLE.ADMIN} />
-          {isMasterAdmin(user, state.companies)
-            ? <span style={{ fontSize: 8, color: COLORS.amber, fontWeight: 700, letterSpacing: 0.5 }}>ALL COMPANIES</span>
-            : getAdminCompanyIds(user, state.companies).length > 0
-              ? <span style={{ fontSize: 8, color: COLORS.blue, fontWeight: 700, letterSpacing: 0.5 }} title={getAdminCompanyIds(user, state.companies).map(id => state.companies.find(c=>String(c.id)===String(id))?.name||id).join(", ")}>
-                  {getAdminCompanyIds(user, state.companies).length === 1
-                    ? (state.companies.find(c => String(c.id) === String(getAdminCompanyIds(user, state.companies)[0]))?.name || "SCOPED")
-                    : getAdminCompanyIds(user, state.companies).length + " COMPANIES"}
-                </span>
-              : null
-          }
+          {(() => {
+            const adminIds = getAdminCompanyIds(user, state.companies);
+            const isUnrestricted = adminIds.length === 0; // master or operator-scoped
+            if (isUnrestricted) {
+              return <span style={{ fontSize: 8, color: COLORS.amber, fontWeight: 700, letterSpacing: 0.5 }}>ALL COMPANIES</span>;
+            }
+            if (adminIds.length === 1) {
+              const co = state.companies.find(c => String(c.id) === String(adminIds[0]));
+              return <span style={{ fontSize: 8, color: COLORS.blue, fontWeight: 700, letterSpacing: 0.5 }}>{co?.name || "SCOPED"}</span>;
+            }
+            return <span style={{ fontSize: 8, color: COLORS.blue, fontWeight: 700, letterSpacing: 0.5 }} title={adminIds.map(id => state.companies.find(c=>String(c.id)===String(id))?.name||id).join(", ")}>{adminIds.length} COMPANIES</span>;
+          })()}
         </div>
       </div>
       <div style={{ flex: 1, paddingTop: 12, overflowY: "auto" }}>
@@ -17525,6 +17820,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
         <span style={{ fontSize: 11, fontWeight: 700, marginTop: 6 }}>{user.name}</span>
         <span style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 10 }}>{ADMIN_LEVEL_LABEL[user.admin_level] || "Administrator"}</span>
         <AlertSoundToggle />
+        <BiometricEnrollButton user={user} />
         <Button title="LOGOUT" variant="ghost" size="sm" full onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
       </div>
     </>
@@ -17748,6 +18044,19 @@ function AppInner() {
     }
   };
 
+  // Biometric login — called after Edge Function verifies the credential.
+  // At this point the user's identity is confirmed by their device biometric.
+  // We dispatch AUTH/LOGIN_BIOMETRIC which skips the password check and just
+  // sets the session for the given user ID.
+  const handleBiometricLogin = async (userId) => {
+    setLoginError(null);
+    try {
+      await dispatch({ type: "AUTH/LOGIN_BIOMETRIC", user_id: userId });
+    } catch (e) {
+      setLoginError(e.message || "Biometric login failed — please use your password.");
+    }
+  };
+
   // Every call site across the app does `await dispatch(...)`, many with
   // no try/catch of their own (dispatch used to swallow failures, so there
   // was nothing to catch). Now that dispatch throws on failure, wrapping it
@@ -17799,7 +18108,7 @@ function AppInner() {
   return (
     <div className="app-root">
       {!activeUser ? (
-        <LoginScreen users={state.users} onLogin={handleLogin} error={loginError} />
+        <LoginScreen users={state.users} onLogin={handleLogin} onBiometricLogin={handleBiometricLogin} error={loginError} />
       ) : activeUser.role === ROLE.ADMIN ? (
         <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.AGENT ? (
