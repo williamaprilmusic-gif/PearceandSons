@@ -3378,7 +3378,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
   }
 }
 
-async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null) {
+async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null, destinationCoord = null) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
   const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
   if (valid.length <= 1) return null;
@@ -3401,7 +3401,13 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // Fix: fix ONLY the start point. Every dropoff is a free waypoint,
     // with NO forced return to the anchor — this is what "find the
     // shortest one-way route visiting these stops" genuinely means.
-    const allWaypoints = [anchorCoord, ...valid];
+    // Build waypoints: fixed start anchor + reorderable stops + optional fixed end.
+    // Adding a fixed destination does NOT create a closed loop (as a fixed start+end
+    // would if start===end) — it means "shortest path from start, visiting all
+    // intermediate stops in the best order, ending at destination."
+    const allWaypoints = destinationCoord?.lat != null
+      ? [anchorCoord, ...valid, destinationCoord]
+      : [anchorCoord, ...valid];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const departAtParam = departAtEpoch
       ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
@@ -6018,7 +6024,8 @@ function ViewerPortal({ state, dispatch, user }) {
         <ClientPortalApp
           state={scopedState}
           dispatch={dispatch}
-          user={{ ...user, is_master_client: false }}
+          user={{ ...user, is_master_client: true }}
+          hideHeader={true}
         />
       </div>
     </div>
@@ -11753,7 +11760,7 @@ function AdminTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
   const finalCoords = sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
@@ -11791,7 +11798,7 @@ function DriverTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
   const finalCoords = (sorted || dropCoords);
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -12429,7 +12436,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   // runs the TSP is direction-agnostic anyway.
   const navDirection = myActiveTrips[0]?.direction || "OUTBOUND";
   const navTripKey = myActiveTrips.map(t => t.trip_id).join("-");
-  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey);
+  // For INBOUND: the destination is the company office — TomTom optimises the full
+  // route: driver_start → pickup_home_A → pickup_home_B → ... → office (min km).
+  // For OUTBOUND: no fixed destination — optimise drop sequence from office outward.
+  const navDestination = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
+  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination);
   // Re-order the groups to match TomTom's coord sequence. Match by lat/lng
   // rounded to 4dp (same precision as the group key used above).
   let dropStops;
@@ -13572,7 +13583,8 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // coords. Uses TomTom routing for road-optimal ordering when available, haversine
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
-  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id);
+  const destination = trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination);
   const finalCoords = sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
@@ -13614,7 +13626,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // and re-fetched against the corrected one, instead of silently persisting.
 const _TOMTOM_CACHE_VERSION = "v12-one-way-not-round-trip";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
-function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord) {
+function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null) {
   // TomTom optimisation applies to any multi-stop run regardless of direction —
   // the goal is always shortest total km, not direction-specific heuristics.
   const isMultiStop = coords && coords.length > 1;
@@ -13623,7 +13635,8 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   // driver whose home address changes) needs a fresh optimization, not a
   // cached result computed for someone else's home endpoint.
   const endKey = driverEndCoord?.lat != null ? `${driverEndCoord.lat.toFixed(4)},${driverEndCoord.lng.toFixed(4)}` : "none";
-  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  const destKey = destinationCoord?.lat != null ? `dest:${destinationCoord.lat.toFixed(4)},${destinationCoord.lng.toFixed(4)}` : "nodest";
+  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + destKey + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
   const [sorted, setSorted] = React.useState(() => {
     if (!isMultiStop) return coords;
     if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
@@ -13656,7 +13669,10 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
     const requestedCount = coords.length;
     setLoading(true);
     setTomtomError(null);
-    tomtomOptimalStopOrder(anchorCoord, coords).then(result => {
+    // For INBOUND: pass the company office as destination so TomTom optimises
+    // the full chain: driver_start → home_A → home_B → ... → office (min total km)
+    // For OUTBOUND: no destination — optimise dropoffs from the office outward.
+    tomtomOptimalStopOrder(anchorCoord, coords, null, destinationCoord).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
@@ -14121,9 +14137,19 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         // Dropoff
         agentDropoffLabel,
         fmtCoord(agentDropoffLatLng),
-        // Sequencing — planned (dispatch time)
-        t.pickup_order_num || "",
-        t.drop_sequence_num || "",
+        // Sequencing — planned (dispatch time), per-agent position in the sequence array.
+        // pickup_order_num/drop_sequence_num are trip-level fields (always 1 for multi-agent).
+        // The real per-agent sequence is the index in pickup_sequence_coords/dropoff_sequence_coords.
+        (() => {
+          if (aid == null) return t.pickup_order_num || "";
+          const idx = (t.pickup_sequence_coords || []).findIndex(p => String(p.agent_id) === String(aid));
+          return idx >= 0 ? idx + 1 : (t.pickup_order_num || "");
+        })(),
+        (() => {
+          if (aid == null) return t.drop_sequence_num || "";
+          const idx = (t.dropoff_sequence_coords || []).findIndex(d => String(d.agent_id) === String(aid));
+          return idx >= 0 ? idx + 1 : (t.drop_sequence_num || "");
+        })(),
         // Sequencing — actual (real order the driver visited them, from timestamps)
         actualPickupOrderFor(t, aid) || "",
         actualDropOrderFor(t, aid) || "",
@@ -17679,7 +17705,7 @@ function ClientPortalTripRow({ trip, users }) {
   );
 }
 
-function ClientPortalApp({ state, dispatch, user }) {
+function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
   const [tab, setTab] = React.useState("overview");
   const [companyFilter, setCompanyFilter] = React.useState("all");
 
@@ -17719,7 +17745,7 @@ function ClientPortalApp({ state, dispatch, user }) {
 
   return (
     <div className="screen">
-      {/* Header */}
+{!hideHeader && (
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
         <div>
           <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800, color: COLORS.amber }}>CLIENT PORTAL</div>
@@ -17738,9 +17764,10 @@ function ClientPortalApp({ state, dispatch, user }) {
           <Button title="LOG OUT" variant="ghost" size="sm" onClick={() => dispatch({ type: "AUTH/LOGOUT" })} />
         </div>
       </div>
+)}
 
       {/* Tab bar */}
-      <div style={{ display: "flex", borderBottom: `1px solid ${COLORS.wire}`, background: COLORS.panel, position: "sticky", top: 50, zIndex: 9 }}>
+      <div style={{ display: "flex", borderBottom: `1px solid ${COLORS.wire}`, background: COLORS.panel, position: "sticky", top: hideHeader ? 0 : 50, zIndex: 9 }}>
         {TABS.map(([id, icon, label]) => (
           <button key={id} onClick={() => setTab(id)}
             style={{ flex: 1, padding: "10px 4px", background: "none", border: "none", borderBottom: tab === id ? `2px solid ${COLORS.amber}` : "2px solid transparent", color: tab === id ? COLORS.amber : COLORS.ghost, fontSize: 9, fontWeight: 700, cursor: "pointer", letterSpacing: 0.5 }}>
