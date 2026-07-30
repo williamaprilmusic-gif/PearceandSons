@@ -9,6 +9,12 @@ const SUPABASE_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 const RP_ID = Deno.env.get('WEBAUTHN_RP_ID') ?? 'pearceand-sons.vercel.app';
 const RP_NAME = 'Pearce & Sons Transport';
 const ORIGIN = Deno.env.get('WEBAUTHN_ORIGIN') ?? 'https://pearceand-sons.vercel.app';
+// NOTE: cannot be named with a SUPABASE_ prefix — Supabase reserves that
+// prefix for its own auto-injected platform variables. Same secret used by
+// supabase/functions/session-login for password-based logins — see that
+// function's header comment for the full auth/RLS migration plan.
+const JWT_SECRET = Deno.env.get('PROJECT_JWT_SECRETS')!;
+const SESSION_TTL_SECONDS = 24 * 60 * 60; // 24h
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -173,6 +179,32 @@ async function verifySignature(
 
 // ── Supabase client (service role — bypasses RLS) ──────────────────────────
 const db = () => createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// Self-contained HS256 JWT signer, same shape as session-login's — a
+// biometric login is just as strong a proof of identity as a password
+// login, so it mints the exact same kind of session token. Reuses this
+// file's existing bufToB64() (already base64url, already handles
+// Uint8Array) rather than a separate copy.
+async function signSessionJwt(payload: Record<string, unknown>): Promise<string> {
+  const header = { alg: 'HS256', typ: 'JWT' };
+  const encHeader = bufToB64(new TextEncoder().encode(JSON.stringify(header)));
+  const encPayload = bufToB64(new TextEncoder().encode(JSON.stringify(payload)));
+  const signingInput = `${encHeader}.${encPayload}`;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(JWT_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(signingInput));
+  return `${signingInput}.${bufToB64(new Uint8Array(sig))}`;
+}
+
+async function issueSessionToken(user: { id: number; role: string }): Promise<string> {
+  const nowSec = Math.floor(Date.now() / 1000);
+  return signSessionJwt({
+    aud: 'authenticated', role: 'authenticated', sub: String(user.id),
+    app_user_id: user.id, app_role: user.role,
+    iat: nowSec, exp: nowSec + SESSION_TTL_SECONDS,
+  });
+}
 
 // Matches the client's hashPassword() exactly (App.jsx) — SHA-256 of
 // salt+password, hex-encoded. Deno's WebCrypto is the same API as the
@@ -449,7 +481,8 @@ async function authenticate(username: string, credential: {
   if (user.role === 'DRIVER')
     await supabase.from('driver_status').update({ isonline: true }).eq('driverid', user.id);
   await supabase.from('webauthn_challenges').delete().eq('id', challengeRow.id);
-  return json({ success: true, userId: user.id });
+  const sessionToken = await issueSessionToken(user);
+  return json({ success: true, userId: user.id, sessionToken });
 }
 
 // ── Router ─────────────────────────────────────────────────────────────────

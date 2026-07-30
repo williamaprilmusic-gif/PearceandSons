@@ -168,20 +168,25 @@ function hasAdminPermission(user, permission) {
 
 // ── Company visibility rules ─────────────────────────────────────────────
 //
+// Per explicit product decision: FLEET_OPS and STANDARD are both full-access
+// operational tiers — see and manage every company's agents/drivers/trips,
+// with no company restriction. The ONLY difference between them is
+// manageAdmins (ADMIN_PERMISSIONS above): FLEET_OPS can create/edit/delete
+// other admin accounts, STANDARD cannot. VIEWER is the only tier that's
+// actually company-scoped (read-only, restricted to scoped_company_ids).
+//
 // isMasterAdmin(user, companies):
-//   Only FLEET_OPS admins whose scoped_company_ids includes a Pearce & Sons
-//   company ID (or who have no scoped company, for backward compat) are
-//   master admins. They see ALL companies. Everyone else is scoped.
+//   Legacy naming from an earlier design — despite the name, this is NOT
+//   what gates company visibility (see getAdminCompanyIds below). Used
+//   elsewhere for FLEET_OPS-specific Pearce & Sons authority checks.
 //
 // getAdminCompanyIds(user, companies):
 //   Returns the set of company IDs this admin may see. Empty = all.
-//   - Master admin (Pearce & Sons FLEET_OPS): [] = unrestricted
-//   - FLEET_OPS linked to another company: their company only
-//   - STANDARD: their scoped_company_ids (or branch_id-derived)
-//   - VIEWER: their scoped_company_ids
+//   - FLEET_OPS / STANDARD: [] = unrestricted, always — by design, not a bug
+//   - VIEWER: their scoped_company_ids (or branch_id-derived)
 //
 // isCompanyScoped(user, companies):
-//   True when the admin has a non-empty company restriction.
+//   True when the admin has a non-empty company restriction (VIEWER only).
 
 function isPearceCompany(company) {
   return /pearce/i.test(company?.name || "") || /pearce/i.test(company?.label || "");
@@ -6284,6 +6289,39 @@ function withUpdatedAtGuard(query, expectedUpdatedAt) {
   return expectedUpdatedAt == null ? query.is("updatedat", expectedUpdatedAt) : query.eq("updatedat", expectedUpdatedAt);
 }
 
+// ── Real session tokens (STAGE 1/2 of the auth/RLS migration) ─────────────
+// Mints a Postgres-verifiable session token by independently re-checking the
+// account's password server-side (supabase/functions/session-login), then
+// hands it to supabase-js so every subsequent request carries a real,
+// signature-verified Authorization header instead of just the shared anon
+// key. This is intentionally NON-BLOCKING and NON-FATAL — no RLS policy
+// reads this token yet (that's a deliberately separate, later cutover step
+// requiring its own sign-off), so a failure here must never stop a login
+// that otherwise succeeded under the existing (client-side-only) checks.
+const SESSION_LOGIN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/session-login";
+async function fetchSessionToken(username, password) {
+  const res = await fetch(SESSION_LOGIN_URL, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "login", username, password }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+// refresh_token has no real GoTrue-backed counterpart for a custom-signed
+// token — passing the access token itself is a harmless placeholder;
+// supabase-js's background auto-refresh will simply fail silently against
+// it near the 24h expiry (the old token just keeps working until then)
+// rather than throwing, since autoRefreshToken is on for this client.
+async function applySessionToken(token) {
+  if (!token) return;
+  try {
+    await supabase.auth.setSession({ access_token: token, refresh_token: token });
+  } catch (e) {
+    console.warn("[Auth] applying session token failed (login still proceeds on the existing trust model):", e.message);
+  }
+}
+
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
     case "AUTH/LOGIN_BIOMETRIC": {
@@ -6297,6 +6335,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         .from("users").select("*").eq("id", action.user_id).maybeSingle();
       if (bioErr || !bioUser) throw new Error("User not found");
       if (bioUser.status !== "ACTIVE") throw new Error("Account is not active");
+      // See applySessionToken — additive/non-blocking, no RLS depends on
+      // this yet. The webauthn edge function already minted this token as
+      // part of verifying the biometric assertion.
+      await applySessionToken(action.session_token);
       activeUserRef.current = bioUser.id;
       persistActiveUserId(bioUser.id);
       await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
@@ -6333,6 +6375,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
       if (!valid) throw new Error("Invalid credentials");
+      // Biometric login has always enforced this (both client-side and in
+      // the webauthn edge function) — password login never did, so a
+      // suspended/offboarded account could still sign in normally with
+      // just a password even though the exact same account was correctly
+      // blocked via fingerprint. Closing that gap here.
+      if (data.status !== "ACTIVE") throw new Error("Account is not active");
+      // See applySessionToken — additive/non-blocking, no RLS depends on
+      // this yet.
+      try { await applySessionToken((await fetchSessionToken(action.login, action.pass)).token); }
+      catch (e) { console.warn("[Auth] session token issuance failed (login still proceeds):", e.message); }
       activeUserRef.current = data.id;
       persistActiveUserId(data.id);
       // Per explicit decision: "online" means logged in right now — set
@@ -6882,10 +6934,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Creating an admin account (any level) is Fleet Ops only; creating
       // an agent or driver just needs manageAgentsDrivers.
       const actingAdminCreate = await assertAdminPermission(activeUserRef, action.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
-      // Company scope enforcement: a scoped admin can only create users for their own company
-      if (actingAdminCreate.scopedCompanyIds?.length && action.branch_id && !actingAdminCreate.scopedCompanyIds.includes(action.branch_id)) {
-        throw new Error("Not authorised — you can only create users for your assigned company");
-      }
+      // No company-scope restriction here by design — FLEET_OPS/STANDARD
+      // (the only tiers that can reach this action) are unrestricted across
+      // companies per the confirmed product decision (see the "Company
+      // visibility rules" comment above getAdminCompanyIds). VIEWER-tier
+      // admins can't create users at all (manageAgentsDrivers/manageAdmins
+      // are both false for VIEWER), so there's no tier here that's actually
+      // meant to be company-scoped.
       // New accounts are salted-hashed from the start — only lazy-upgraded
       // legacy accounts ever hold plaintext, and only until first login.
       const newUserSalt = makeSalt();
@@ -9505,7 +9560,7 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
       const result = await webauthnAuthenticate(login);
       if (!result) { setBiometricError("No biometric registered for this account."); return; }
       // Biometric verified — log in directly (bypass password)
-      await onBiometricLogin(result.userId);
+      await onBiometricLogin(result.userId, result.sessionToken);
     } catch (e) {
       setBiometricError(e.message || "Biometric login failed.");
     } finally {
@@ -18475,10 +18530,10 @@ function AppInner() {
   // At this point the user's identity is confirmed by their device biometric.
   // We dispatch AUTH/LOGIN_BIOMETRIC which skips the password check and just
   // sets the session for the given user ID.
-  const handleBiometricLogin = async (userId) => {
+  const handleBiometricLogin = async (userId, sessionToken) => {
     setLoginError(null);
     try {
-      await dispatch({ type: "AUTH/LOGIN_BIOMETRIC", user_id: userId });
+      await dispatch({ type: "AUTH/LOGIN_BIOMETRIC", user_id: userId, session_token: sessionToken });
     } catch (e) {
       setLoginError(e.message || "Biometric login failed — please use your password.");
     }
