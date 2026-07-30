@@ -3451,15 +3451,25 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
 // freeStops reordered by TomTom + pinnedEnd appended, km is the ACTUAL total
 // route distance TomTom computed for that specific order (not an estimate) —
 // or null if the request failed or the response shape didn't match.
-async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, valid, departAtEpoch) {
+async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEpoch) {
   const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
   const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
   const departAtParam = departAtEpoch
     ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
     : "";
-  const supportingPtsParam = buildSupportingPointsParam(valid);
+  // CRITICAL — confirmed against the live API: TomTom rejects supportingPoints
+  // outright when combined with computeBestOrder=true ("Invalid request:
+  // parameter [supportingPoints] not supported", HTTP 400) — the two are not
+  // supported together, full stop. Since almost every real Pearce & Sons
+  // route runs through the Cape Flats (which is exactly what
+  // buildSupportingPointsParam triggers on), this meant EVERY real
+  // route-optimization request was hitting a hard 400 and silently falling
+  // back to the haversine estimate — independent of, and in addition to, the
+  // fixed-last-waypoint bug fixed earlier. supportingPoints is still used
+  // for the actual distance calculation (tomtomRealRouteKm, which never sets
+  // computeBestOrder) — just not here.
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-    `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
+    `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
   const data = await res.json();
@@ -3546,7 +3556,7 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // so this is at most a handful of extra API calls, run concurrently.
     const hasRealDestination = destinationCoord?.lat != null;
     if (hasRealDestination) {
-      const result = await tomtomBestOrderOnce(anchorCoord, valid, destinationCoord, valid, departAtEpoch);
+      const result = await tomtomBestOrderOnce(anchorCoord, valid, destinationCoord, departAtEpoch);
       if (!result) return null;
       // The destination itself is never a real dropoff — exclude it from
       // the returned order (it was only needed to anchor the computation).
@@ -3556,7 +3566,7 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     }
     const candidates = await Promise.all(valid.map(async (candidateEnd, i) => {
       const freeStops = valid.filter((_, j) => j !== i);
-      try { return await tomtomBestOrderOnce(anchorCoord, freeStops, candidateEnd, valid, departAtEpoch); }
+      try { return await tomtomBestOrderOnce(anchorCoord, freeStops, candidateEnd, departAtEpoch); }
       catch (e) { console.warn(`[TomTom] candidate end #${i} failed:`, e.message); return null; }
     }));
     let best = null;
