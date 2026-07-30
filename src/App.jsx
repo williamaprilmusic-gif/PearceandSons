@@ -6179,9 +6179,13 @@ function arrayBufToB64(buf) {
 }
 
 // Register the current device's biometric as a credential
-async function webauthnRegister(userId, username) {
-  // 1. Get challenge + options from Edge Function
-  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username });
+async function webauthnRegister(userId, username, password) {
+  // 1. Get challenge + options from Edge Function. Requires the account's
+  // current password — the edge function re-verifies it server-side before
+  // issuing a challenge or storing a credential, since user_id alone proves
+  // nothing about who's actually asking (see the CRITICAL comment on
+  // verifyPassword in supabase/functions/webauthn/index.ts).
+  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username, password });
   // 2. Convert strings → ArrayBuffers for the browser API
   opts.challenge = b64ToArrayBuf(opts.challenge);
   opts.user.id = b64ToArrayBuf(opts.user.id);
@@ -6203,6 +6207,7 @@ async function webauthnRegister(userId, username) {
   await webauthnPost({
     action: "register",
     user_id: userId,
+    password,
     credential: {
       id: cred.id,
       rawId: arrayBufToB64(cred.rawId),
@@ -6257,6 +6262,26 @@ async function webauthnAuthenticate(username) {
     },
   });
   return result;
+}
+
+// ── Optimistic-concurrency guard for trip writes ────────────────────────────
+// Conditions a trips-table write on the row's updatedat still matching what
+// was read earlier in the same action, so a write based on stale data
+// becomes a no-op (the caller checks the returned row count) instead of
+// silently overwriting a change another admin made in between. Two admins
+// racing to edit the same trip (e.g. one assigning a driver while another
+// removes a passenger) previously always resulted in last-write-wins with
+// no error to either admin — this makes that detectable.
+//
+// updatedat is commonly NULL for a trip that's never been updated since
+// booking (trips.insert() doesn't set it) — Supabase/PostgREST's .eq(col,
+// null) does NOT match NULL rows (the same asymmetry .neq() explicitly
+// documents, excluding NULLs unless you use .is() instead) — so this
+// branches on whether the expected value is null and uses .is() vs .eq()
+// accordingly. Same pattern already used by TRIP/DISPATCH_MULTI and the
+// TRIP/ASSIGN_DRIVER auto-merge path.
+function withUpdatedAtGuard(query, expectedUpdatedAt) {
+  return expectedUpdatedAt == null ? query.is("updatedat", expectedUpdatedAt) : query.eq("updatedat", expectedUpdatedAt);
 }
 
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
@@ -6576,8 +6601,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ? [...(tripRow.extradropoffs || []), { lat: action.dropoff_coord.lat, lng: action.dropoff_coord.lng, label: action.dropoff_label, agent_id: action.agent_id }]
         : (tripRow.extradropoffs || []);
 
-      const { error: upErr } = await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", action.trip_id);
+      // Optimistic-concurrency write — see withUpdatedAtGuard. Without this,
+      // two admins adding DIFFERENT passengers to the same trip within
+      // moments of each other would both read the same starting passenger
+      // list; whichever write lands second overwrites the first, silently
+      // dropping the first passenger from the trip with no error to either
+      // admin.
+      const addAgentNowTs = nowEpoch();
+      const { data: addAgentWriteResult, error: upErr } = await withUpdatedAtGuard(
+        supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs, updatedat: addAgentNowTs }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id");
       if (upErr) throw upErr;
+      if (!addAgentWriteResult || addAgentWriteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
 
       // Re-sequence this driver's active trips the same way ASSIGN_DRIVER does,
       // since the new pickup point may now be geographically first for someone
@@ -6678,8 +6716,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (newPrimaryUser) update.agentname = newPrimaryUser.fullname;
       }
 
-      const { error: rmErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
+      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
+      // the same class of race as TRIP/ADD_AGENT: two admins each removing a
+      // different passenger from the same trip at nearly the same time would
+      // otherwise silently undo one of the two removals.
+      update.updatedat = nowEpoch();
+      const { data: rmWriteResult, error: rmErr } = await withUpdatedAtGuard(
+        supabase.from("trips").update(update).eq("id", action.trip_id), tripRow.updatedat
+      ).select("id");
       if (rmErr) throw rmErr;
+      if (!rmWriteResult || rmWriteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
 
       if (tripRow.driverid) {
         const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
@@ -6770,8 +6818,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         );
       }
 
-      const { error: relErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
+      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
+      // an admin relocating this passenger's pickup at the same moment
+      // another admin removes them (or relocates a different passenger,
+      // whose write would otherwise silently clobber this one).
+      update.updatedat = nowEpoch();
+      const { data: relWriteResult, error: relErr } = await withUpdatedAtGuard(
+        supabase.from("trips").update(update).eq("id", action.trip_id), tripRow.updatedat
+      ).select("id");
       if (relErr) throw relErr;
+      if (!relWriteResult || relWriteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
 
       if (tripRow.driverid) {
         const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
@@ -7387,7 +7445,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // earlier reassignment that didn't fully clean up) — the FK
       // constraint blocks the delete regardless of which driver row it is.
       await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
-      must(await supabase.from("trips").delete().eq("id", action.trip_id));
+      // Optimistic-concurrency delete — see withUpdatedAtGuard. Guards
+      // against cancelling a trip that another admin just changed (e.g.
+      // assigned a driver to) after this action's initial read — without
+      // this, the delete would proceed unconditionally and silently
+      // discard whatever the other admin just did.
+      const { data: cancelDeleteResult } = await withUpdatedAtGuard(
+        supabase.from("trips").delete().eq("id", action.trip_id), tripRow.updatedat
+      ).select("id");
+      if (!cancelDeleteResult || cancelDeleteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
       await refetch();
       return;
     }
@@ -7940,13 +8008,26 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nowTs = nowEpoch();
       // Set ASSIGNED — driver must explicitly accept before DRIVER_CONFIRMED.
       // driveraccepted stays false; acceptedat/confirmedat stay null until TRIP/ACCEPT.
-      const { error: upErr } = await supabase.from("trips").update({
-        status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
-        pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
-        driveraccepted: false, updatedat: nowTs,
-        driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
-      }).eq("id", action.trip_id);
+      // Optimistic-concurrency write — see withUpdatedAtGuard. Without this,
+      // two admins assigning DIFFERENT drivers to the same unassigned trip
+      // within moments of each other would both succeed with no error,
+      // silently leaving whichever write landed last as the "winner" (and
+      // the driver_status/notification side effects below would then run
+      // for BOTH admins' assignments, leaving driver_status pointing at a
+      // driver who isn't actually on the trip anymore).
+      const { data: assignWriteResult, error: upErr } = await withUpdatedAtGuard(
+        supabase.from("trips").update({
+          status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
+          pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
+          driveraccepted: false, updatedat: nowTs,
+          driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
+        }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id");
       if (upErr) throw upErr;
+      if (!assignWriteResult || assignWriteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
       for (const t of existingAssigned) {
         await supabase.from("trips").update({
           pickupordernum: seqMap[t.id] ?? t.pickupordernum,
@@ -8082,6 +8163,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/DRIVER_CONFIRM": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — without this, any authenticated driver could
+      // confirm (and later complete/no-show) a trip assigned to a
+      // different driver, since nothing else in this handler verifies
+      // the caller actually owns it.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
@@ -8104,6 +8190,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/ACCEPT": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
       // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
@@ -8133,10 +8221,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot remove the driver from a completed or cancelled trip.");
       const removedDriverId = tripRow.driverid;
       const nowTs = nowEpoch();
-      must(await supabase.from("trips").update({
-        status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
-        driveraccepted: false, updatedat: nowTs,
-      }).eq("id", action.trip_id));
+      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
+      // an admin removing this driver at the same moment another admin
+      // action (e.g. assigning a different driver) already changed the row.
+      const { data: removeDriverWriteResult } = await withUpdatedAtGuard(
+        supabase.from("trips").update({
+          status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
+          driveraccepted: false, updatedat: nowTs,
+        }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id");
+      if (!removeDriverWriteResult || removeDriverWriteResult.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", removedDriverId)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       if (!remaining || remaining.length === 0) {
@@ -8213,6 +8310,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/DECLINE": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM. Without this, any driver
+      // could decline (and get added to declinedby on) a trip assigned to
+      // someone else.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
@@ -8250,8 +8351,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/CONFIRM_AGENT_PICKUP": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      const newCompleted = [...(tripRow.completedpickups || []), action.agent_id];
+      // Membership + dedup check — action.agent_id must actually be on this
+      // trip, and a retried/duplicate confirmation (e.g. a flaky-connection
+      // double-tap) must not push a second entry into completedpickups.
+      if (!tripAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
+      const newCompleted = (tripRow.completedpickups || []).some(c => String(c) === String(action.agent_id))
+        ? (tripRow.completedpickups || [])
+        : [...(tripRow.completedpickups || []), action.agent_id];
       const allPickedUp = tripAgentIds.every(id => newCompleted.some(c => String(c) === String(id)));
       const nowTs = nowEpoch();
       let newState = tripRow.status, inTransitAt = tripRow.intransitat;
@@ -8294,6 +8403,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // for this specific agent. When all agents are confirmed, completes the trip.
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       const nowTs = nowEpoch();
       // Reverse-geocode the driver's GPS to get a readable street address
@@ -8360,6 +8471,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // than a real pickuptimestamps entry, flagged as an exception).
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const nsAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (!nsAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
       const nsCompletedPrior = tripRow.completedpickups || [];
@@ -8433,6 +8546,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/COMPLETE": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
+      // Ownership check — see TRIP/DRIVER_CONFIRM.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
       const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", tripRow.driverid).maybeSingle();
       if (!driverRow) throw new Error(`Driver status not found for ${action.trip_id}`);
@@ -11192,13 +11307,22 @@ function BiometricEnrollButton({ user }) {
   const [msg, setMsg] = useState("");
   const [hasCredential, setHasCredential] = useState(false);
   const [removing, setRemoving] = useState(false);
+  const [confirmingPassword, setConfirmingPassword] = useState(false);
+  const [password, setPassword] = useState("");
 
   React.useEffect(() => {
     webauthnSupported().then(ok => {
       setSupported(ok);
       if (ok && user?.name) {
-        // Check if this user already has a credential registered
-        webauthnPost({ action: "authentication-options", username: user.name })
+        // Read-only check — must be "has-credential", NOT
+        // "authentication-options". The latter deletes and reissues the
+        // real login challenge on every call (see the comment on
+        // LoginScreen's identical check) — calling it here just to decide
+        // whether to show "BIOMETRIC ACTIVE" could invalidate a challenge a
+        // concurrent, in-flight biometric login for this same account was
+        // about to submit, since this button is mounted in the persistent
+        // sidebar for any logged-in user.
+        webauthnPost({ action: "has-credential", username: user.name })
           .then(r => setHasCredential(!!r?.hasCredentials))
           .catch(() => {});
       }
@@ -11207,15 +11331,25 @@ function BiometricEnrollButton({ user }) {
 
   if (!supported) return null;
 
-  const handleEnroll = async () => {
+  const handleEnrollClick = () => {
+    setStatus(null);
+    setMsg("");
+    setPassword("");
+    setConfirmingPassword(true);
+  };
+
+  const handleConfirmEnroll = async () => {
+    if (!password || enrolling) return;
     setEnrolling(true);
     setStatus(null);
     setMsg("");
     try {
-      await webauthnRegister(user.id, user.name);
+      await webauthnRegister(user.id, user.name, password);
       setHasCredential(true);
       setStatus("success");
       setMsg("Biometric registered! You can now log in with your fingerprint or Face ID.");
+      setConfirmingPassword(false);
+      setPassword("");
     } catch (e) {
       setStatus("error");
       setMsg(e.message || "Registration failed — please try again.");
@@ -11226,20 +11360,41 @@ function BiometricEnrollButton({ user }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      <button
-        onClick={handleEnroll}
-        disabled={enrolling}
-        style={{
-          background: "none", border: `1px solid ${hasCredential ? "rgba(29,185,84,.4)" : COLORS.wire}`,
-          borderRadius: 4, padding: "7px 10px", color: hasCredential ? COLORS.green : COLORS.ghost,
-          fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: enrolling ? "wait" : "pointer",
-          display: "flex", alignItems: "center", gap: 6, width: "100%",
-          opacity: enrolling ? 0.6 : 1,
-        }}
-      >
-        <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
-        {enrolling ? "SETTING UP…" : hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
-      </button>
+      {!confirmingPassword ? (
+        <button
+          onClick={handleEnrollClick}
+          disabled={enrolling}
+          style={{
+            background: "none", border: `1px solid ${hasCredential ? "rgba(29,185,84,.4)" : COLORS.wire}`,
+            borderRadius: 4, padding: "7px 10px", color: hasCredential ? COLORS.green : COLORS.ghost,
+            fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: enrolling ? "wait" : "pointer",
+            display: "flex", alignItems: "center", gap: 6, width: "100%",
+            opacity: enrolling ? 0.6 : 1,
+          }}
+        >
+          <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
+          {hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
+        </button>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8 }}>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>Confirm your password to register this device:</div>
+          <input
+            type="password" value={password} autoFocus
+            onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && handleConfirmEnroll()}
+            style={{
+              background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3,
+              padding: "6px 8px", fontSize: 11, color: COLORS.chalk, width: "100%",
+            }}
+          />
+          <div style={{ display: "flex", gap: 6 }}>
+            <Button title={enrolling ? "SETTING UP…" : "CONFIRM"} variant="amber" size="sm"
+              onClick={handleConfirmEnroll} disabled={enrolling || !password} loading={enrolling} />
+            <Button title="CANCEL" variant="ghost" size="sm"
+              onClick={() => { setConfirmingPassword(false); setPassword(""); }} disabled={enrolling} />
+          </div>
+        </div>
+      )}
       {status && (
         <div style={{ fontSize: 9, color: status === "success" ? COLORS.green : COLORS.red, lineHeight: 1.4, padding: "0 2px" }}>
           {msg}

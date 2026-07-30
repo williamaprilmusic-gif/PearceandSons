@@ -174,10 +174,45 @@ async function verifySignature(
 // ── Supabase client (service role — bypasses RLS) ──────────────────────────
 const db = () => createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
+// Matches the client's hashPassword() exactly (App.jsx) — SHA-256 of
+// salt+password, hex-encoded. Deno's WebCrypto is the same API as the
+// browser's, so this is a direct port, not a reimplementation.
+async function hashPasswordServer(password: string, salt: string): Promise<string> {
+  const data = new TextEncoder().encode(`${salt}${password}`);
+  const digest = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// CRITICAL — this is the fix for a confirmed account-takeover vulnerability:
+// registrationOptions()/register() used to accept a client-supplied user_id
+// with NO check that the caller actually is that user. Anyone who knew (or
+// guessed — ids are small sequential integers) a victim's user_id and
+// username could register their OWN fingerprint/security key against the
+// victim's account and log in as them, including as an admin, without ever
+// knowing the password. Every action that touches webauthn_credentials for
+// a given userId must now re-verify that account's current password first —
+// this is the only credential this app can check server-side that proves
+// the caller is who they claim, since there is no separate session/JWT
+// layer in front of this function (verify_jwt is deliberately off here, see
+// deploy config). Mirrors handleSupabaseAction's AUTH/LOGIN verification
+// (salted-hash compare, with legacy-plaintext fallback for not-yet-upgraded
+// accounts) so behavior matches ordinary password login exactly.
+async function verifyPassword(supabase: ReturnType<typeof createClient>, userId: number, password: string): Promise<boolean> {
+  if (!password) return false;
+  const { data: user } = await supabase.from('users')
+    .select('passwordhash, passwordsalt, status').eq('id', userId).maybeSingle();
+  if (!user || user.status !== 'ACTIVE') return false;
+  if (user.passwordsalt) {
+    return (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash;
+  }
+  return user.passwordhash === password;
+}
+
 // ── Action handlers ────────────────────────────────────────────────────────
-async function registrationOptions(userId: number, username: string) {
-  const challenge = randomChallenge();
+async function registrationOptions(userId: number, username: string, password: string) {
   const supabase = db();
+  if (!(await verifyPassword(supabase, userId, password))) return err('Incorrect password', 401);
+  const challenge = randomChallenge();
   await supabase.from('webauthn_challenges')
     .delete().eq('user_id', userId).eq('type', 'registration');
   const { error } = await supabase.from('webauthn_challenges').insert({
@@ -212,8 +247,14 @@ async function register(userId: number, credential: {
   id: string;
   response: { clientDataJSON: string; attestationObject: string };
   friendlyName?: string;
-}) {
+}, password: string) {
   const supabase = db();
+  // Re-verify password here too, independently of registrationOptions — see
+  // the CRITICAL comment above verifyPassword. This endpoint is reachable
+  // directly (a caller isn't required to have gone through
+  // registration-options first), so it must not rely on that earlier call
+  // having checked anything.
+  if (!(await verifyPassword(supabase, userId, password))) return err('Incorrect password', 401);
   // Fetch and validate challenge
   const { data: challengeRow } = await supabase
     .from('webauthn_challenges').select('*')
@@ -421,9 +462,9 @@ Deno.serve(async (req: Request) => {
   try {
     switch (body.action as string) {
       case 'registration-options':
-        return await registrationOptions(body.user_id as number, body.username as string);
+        return await registrationOptions(body.user_id as number, body.username as string, body.password as string);
       case 'register':
-        return await register(body.user_id as number, body.credential as Parameters<typeof register>[1]);
+        return await register(body.user_id as number, body.credential as Parameters<typeof register>[1], body.password as string);
       case 'has-credential':
         return await hasCredential(body.username as string);
       case 'authentication-options':
