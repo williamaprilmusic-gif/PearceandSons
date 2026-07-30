@@ -3441,6 +3441,56 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
   }
 }
 
+// Runs one computeBestOrder request for a fixed set of free (reorderable)
+// stops plus one pinned end waypoint. Returns { order, km } — order is
+// freeStops reordered by TomTom + pinnedEnd appended, km is the ACTUAL total
+// route distance TomTom computed for that specific order (not an estimate) —
+// or null if the request failed or the response shape didn't match.
+async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, valid, departAtEpoch) {
+  const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
+  const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
+  const departAtParam = departAtEpoch
+    ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+    : "";
+  const supportingPtsParam = buildSupportingPointsParam(valid);
+  const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
+    `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
+  const data = await res.json();
+  // IMPORTANT — confirmed in production against real API responses:
+  // optimizedWaypoints does NOT include either fixed anchor (start or end).
+  // providedIndex is 0-indexed relative ONLY to the "soft" reorderable
+  // waypoints we listed (`freeStops`), not the full allWaypoints array. A
+  // request with 2 free stops → optimizedWaypoints has exactly 2 entries,
+  // with providedIndex values 0 and 1.
+  const optimized = data.routes?.[0]?.optimizedWaypoints;
+  const totalMetres = data.routes?.[0]?.summary?.lengthInMeters;
+  if (!optimized || optimized.length !== freeStops.length || totalMetres == null) {
+    console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${freeStops.length}. Falling back to haversine.`);
+    return null;
+  }
+  // CRITICAL: optimizedWaypoints from the API is consistently ordered by
+  // providedIndex (0,1,2,...) — it is NOT already in visiting order. The
+  // actual optimal sequence is given by each entry's optimizedIndex field.
+  // Sorting by optimizedIndex BEFORE mapping to coordinates is what
+  // actually applies TomTom's computed reordering — without this sort,
+  // .map(w => freeStops[w.providedIndex]) just reconstructs the original
+  // input order (since the array itself is providedIndex-ordered),
+  // silently discarding every genuine reorder TomTom returns. Confirmed in
+  // production: a request with providedIndex/optimizedIndex pairs (0,0)
+  // (1,2) (2,1) — a real, valid reordering (visit index 0, then 2, then 1)
+  // — was being flattened straight back to [0,1,2] by this bug, always
+  // matching the un-optimized input order.
+  const reorderedFree = [...optimized]
+    .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
+    .filter(w => w.providedIndex >= 0 && w.providedIndex < freeStops.length)
+    .map(w => freeStops[w.providedIndex])
+    .filter(Boolean);
+  if (reorderedFree.length !== freeStops.length) return null;
+  return { order: [...reorderedFree, pinnedEnd], km: totalMetres / 1000 };
+}
+
 async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null, destinationCoord = null) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
   const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
@@ -3464,75 +3514,53 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // Fix: fix ONLY the start point. Every dropoff is a free waypoint,
     // with NO forced return to the anchor — this is what "find the
     // shortest one-way route visiting these stops" genuinely means.
-    // Build waypoints: fixed start anchor + reorderable stops + optional fixed end.
-    // Adding a fixed destination does NOT create a closed loop (as a fixed start+end
-    // would if start===end) — it means "shortest path from start, visiting all
-    // intermediate stops in the best order, ending at destination."
+    // Adding a fixed destination does NOT create a closed loop (as a fixed
+    // start+end would if start===end) — it means "shortest path from
+    // start, visiting all intermediate stops in the best order, ending at
+    // destination."
     //
     // CONFIRMED against the live API: computeBestOrder always treats the
     // LAST waypoint in the request as a second fixed anchor too — not just
-    // the first — regardless of whether that last entry is a "real"
-    // destination. A request of [anchor, stop0, stop1, stop2] (no
-    // destinationCoord) returns optimizedWaypoints for only stop0 and stop1;
-    // stop2 is silently excluded because TomTom pins it as the fixed end.
-    // When we DO have a real destination (INBOUND, ending at the company
-    // office) that's exactly the behaviour we want. When we don't
-    // (OUTBOUND), there's no real destination to pin — so the last entry of
-    // `valid` is used as a stand-in fixed endpoint instead, leaving every
-    // OTHER stop free to reorder. Without this, optimized.length could never
-    // equal valid.length for the no-destination case, so every OUTBOUND
-    // multi-stop trip silently fell back to the haversine/straight-line
-    // estimate, 100% of the time.
+    // the first. When we have a genuine destination (INBOUND, ending at
+    // the company office), that's exactly what we want: pin it as the end,
+    // every dropoff in between is free.
+    //
+    // When there's no genuine destination (OUTBOUND), there's nothing
+    // correct to pin as "last" — WHICH stop should be visited last is
+    // itself part of what "shortest route" means, and TomTom's API will
+    // never revisit that choice once one stop is pinned as the fixed end.
+    // An earlier version of this fix pinned whichever stop the haversine
+    // pre-sort happened to place last — but that's a straight-line guess,
+    // not a road-distance one, and it can easily disagree with the true
+    // shortest order (rivers, highways, one-way streets all change which
+    // stop is actually cheapest to visit last). The only way to actually
+    // find the true shortest one-way route is to try EACH stop as the
+    // candidate last stop, let TomTom optimize the rest for each, and keep
+    // whichever candidate's real total road distance comes out shortest.
+    // Stop counts here are always small (1-4 typical dropoffs per trip),
+    // so this is at most a handful of extra API calls, run concurrently.
     const hasRealDestination = destinationCoord?.lat != null;
-    const pinnedEnd = hasRealDestination ? destinationCoord : valid[valid.length - 1];
-    const freeStops = hasRealDestination ? valid : valid.slice(0, -1);
-    const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
-    const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
-    const departAtParam = departAtEpoch
-      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
-      : "";
-    const supportingPtsParam = buildSupportingPointsParam(valid);
-    const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
-    const data = await res.json();
-    // IMPORTANT — confirmed in production against real API responses:
-    // optimizedWaypoints does NOT include either fixed anchor (start or
-    // end). providedIndex is 0-indexed relative ONLY to the "soft"
-    // reorderable waypoints we listed (`freeStops`), not the full
-    // allWaypoints array. A request with 2 free stops → optimizedWaypoints
-    // has exactly 2 entries, with providedIndex values 0 and 1.
-    const optimized = data.routes?.[0]?.optimizedWaypoints;
-    if (!optimized || optimized.length !== freeStops.length) {
-      console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${freeStops.length}. Falling back to haversine.`);
-      return null;
+    if (hasRealDestination) {
+      const result = await tomtomBestOrderOnce(anchorCoord, valid, destinationCoord, valid, departAtEpoch);
+      if (!result) return null;
+      // The destination itself is never a real dropoff — exclude it from
+      // the returned order (it was only needed to anchor the computation).
+      const reordered = result.order.slice(0, -1);
+      const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
+      return [...reordered, ...invalid];
     }
-    // CRITICAL: optimizedWaypoints from the API is consistently ordered by
-    // providedIndex (0,1,2,...) — it is NOT already in visiting order. The
-    // actual optimal sequence is given by each entry's optimizedIndex
-    // field. Sorting by optimizedIndex BEFORE mapping to coordinates is
-    // what actually applies TomTom's computed reordering — without this
-    // sort, .map(w => freeStops[w.providedIndex]) just reconstructs the
-    // original input order (since the array itself is providedIndex-
-    // ordered), silently discarding every genuine reorder TomTom returns.
-    // Confirmed in production: a request with providedIndex/optimizedIndex
-    // pairs (0,0) (1,2) (2,1) — a real, valid reordering (visit index 0,
-    // then 2, then 1) — was being flattened straight back to [0,1,2] by
-    // this bug, always matching the un-optimized input order.
-    const reorderedFree = [...optimized]
-      .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-      .filter(w => w.providedIndex >= 0 && w.providedIndex < freeStops.length)
-      .map(w => freeStops[w.providedIndex])
-      .filter(Boolean);
-    if (reorderedFree.length !== freeStops.length) return null;
-    // The pinned end is only a real dropoff when there's no genuine
-    // destination — a genuine destinationCoord (company office) is never a
-    // stop itself, so it's excluded from the returned dropoff list.
-    const reordered = hasRealDestination ? reorderedFree : [...reorderedFree, pinnedEnd];
-    // Append any invalid (null-coord) entries at the end unchanged.
+    const candidates = await Promise.all(valid.map(async (candidateEnd, i) => {
+      const freeStops = valid.filter((_, j) => j !== i);
+      try { return await tomtomBestOrderOnce(anchorCoord, freeStops, candidateEnd, valid, departAtEpoch); }
+      catch (e) { console.warn(`[TomTom] candidate end #${i} failed:`, e.message); return null; }
+    }));
+    let best = null;
+    for (const c of candidates) {
+      if (c && (!best || c.km < best.km)) best = c;
+    }
+    if (!best) return null;
     const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
-    return [...reordered, ...invalid];
+    return [...best.order, ...invalid];
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
     return null;
