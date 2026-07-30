@@ -6372,17 +6372,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         valid = (await hashPassword(action.pass, data.passwordsalt)) === data.passwordhash;
       } else {
         valid = data.passwordhash === action.pass;
-        if (valid) {
-          // Lazy upgrade — best-effort: a failed upgrade never blocks the
-          // login itself, the account just stays plaintext until next time.
-          try {
-            const upSalt = makeSalt();
-            const upHash = await hashPassword(action.pass, upSalt);
-            await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
-          } catch (e) {
-            console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
-          }
-        }
       }
       if (!valid) throw new Error("Invalid credentials");
       // Biometric login has always enforced this (both client-side and in
@@ -6392,9 +6381,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // blocked via fingerprint. Closing that gap here.
       if (data.status !== "ACTIVE") throw new Error("Account is not active");
       // See applySessionToken — additive/non-blocking, no RLS depends on
-      // this yet.
+      // this yet. Applied BEFORE the lazy hash-upgrade write below: once
+      // RLS requires a valid app token to write to `users` (see the "admin
+      // or self can write users" policy), that write would otherwise run
+      // on the bare anon key (no token yet) and silently no-op — the
+      // account would never actually get upgraded off plaintext.
       try { await applySessionToken((await fetchSessionToken(action.login, action.pass)).token); }
       catch (e) { console.warn("[Auth] session token issuance failed (login still proceeds):", e.message); }
+      if (!data.passwordsalt) {
+        // Lazy upgrade — best-effort: a failed upgrade never blocks the
+        // login itself, the account just stays plaintext until next time.
+        try {
+          const upSalt = makeSalt();
+          const upHash = await hashPassword(action.pass, upSalt);
+          await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
+        } catch (e) {
+          console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
+        }
+      }
       activeUserRef.current = data.id;
       persistActiveUserId(data.id);
       // Per explicit decision: "online" means logged in right now — set
