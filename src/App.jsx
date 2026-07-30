@@ -799,42 +799,105 @@ function dedupeCoordsByLocation(coords) {
 // Used for OUTBOUND trip display so the trip card always shows D1 (closest to
 // company) → D2 → D3 (furthest) regardless of agent array order.
 // Coords without lat/lng are pushed to the end.
-function sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord) {
-  // Nearest-neighbour TSP from anchorCoord — minimises total haversine km
-  // regardless of trip direction. Used as the fast haversine fallback
-  // while TomTom (useSortedDropoffs) computes the true road-distance optimum.
+// ── haversine TSP helpers ────────────────────────────────────────────────
+// Computes total route distance: anchor → stops[0] → ... → stops[n-1] → (destination?)
+function _routeKm(stops, anchor, destination) {
+  let km = 0, cur = anchor;
+  for (const s of stops) {
+    km += haversineKm(cur.lat, cur.lng, s.lat, s.lng);
+    cur = s;
+  }
+  if (destination) km += haversineKm(cur.lat, cur.lng, destination.lat, destination.lng);
+  return km;
+}
+
+// 2-opt improvement: repeatedly swap pairs of edges until no improvement found.
+// Converts a nearest-neighbour solution into a near-optimal one in O(n² * passes).
+function _twoOpt(stops, anchor, destination) {
+  let route = [...stops];
+  let improved = true;
+  while (improved) {
+    improved = false;
+    for (let i = 0; i < route.length - 1; i++) {
+      for (let j = i + 1; j < route.length; j++) {
+        const before = _routeKm(route, anchor, destination);
+        const candidate = [
+          ...route.slice(0, i),
+          ...route.slice(i, j + 1).reverse(),
+          ...route.slice(j + 1),
+        ];
+        if (_routeKm(candidate, anchor, destination) < before - 0.001) {
+          route = candidate;
+          improved = true;
+        }
+      }
+    }
+  }
+  return route;
+}
+
+// Brute-force exact TSP for small n — tries all n! permutations.
+function _exactTsp(stops, anchor, destination) {
+  // Generate all permutations via Heap's algorithm
+  const n = stops.length;
+  const perm = [...stops];
+  const c = new Array(n).fill(0);
+  let best = [...perm], bestKm = _routeKm(perm, anchor, destination);
+  let i = 0;
+  while (i < n) {
+    if (c[i] < i) {
+      if (i % 2 === 0) [perm[0], perm[i]] = [perm[i], perm[0]];
+      else             [perm[c[i]], perm[i]] = [perm[i], perm[c[i]]];
+      const km = _routeKm(perm, anchor, destination);
+      if (km < bestKm) { bestKm = km; best = [...perm]; }
+      c[i]++;
+      i = 0;
+    } else {
+      c[i] = 0;
+      i++;
+    }
+  }
+  return best;
+}
+
+function sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord = null) {
+  // Haversine TSP fallback — minimises TOTAL route km, not just nearest-next-hop.
+  // Used when TomTom API is unavailable or returns no result.
+  // Strategy: exact brute-force for n ≤ 8 (≤ 40,320 permutations, ~5ms),
+  //           2-opt improvement for n > 8 (near-optimal, O(n² × passes)).
   if (!anchorCoord || coords.length <= 1) return coords;
   const valid = coords.filter(c => c?.lat != null && c?.lng != null);
   const invalid = coords.filter(c => c?.lat == null || c?.lng == null);
   if (valid.length <= 1) return [...valid, ...invalid];
-  // Optional: pin the stop closest to the driver's home as the LAST drop
-  // (saves the driver backtracking after their final delivery).
-  let lastStop = null;
-  let chainPool = valid;
-  if (driverEndCoord?.lat != null) {
-    let best = null, bestD = Infinity;
-    for (const c of valid) {
-      const d = haversineKm(driverEndCoord.lat, driverEndCoord.lng, c.lat, c.lng);
-      if (d < bestD) { bestD = d; best = c; }
+
+  // The "destination" for route cost: use destinationCoord (e.g. office for INBOUND)
+  // or driverEndCoord (driver's home) if provided. This ensures the optimization
+  // accounts for the full trip cost including the final leg.
+  const terminus = destinationCoord?.lat != null ? destinationCoord
+                 : driverEndCoord?.lat  != null ? driverEndCoord
+                 : null;
+
+  let ordered;
+  if (valid.length <= 8) {
+    // Exact: guaranteed global minimum for this stop count
+    ordered = _exactTsp(valid, anchorCoord, terminus);
+  } else {
+    // Seed with nearest-neighbour, then improve with 2-opt
+    const seeded = [];
+    let remaining = [...valid], cur = anchorCoord;
+    while (remaining.length) {
+      let best = null, bestD = Infinity;
+      for (const c of remaining) {
+        const d = haversineKm(cur.lat, cur.lng, c.lat, c.lng);
+        if (d < bestD) { bestD = d; best = c; }
+      }
+      seeded.push(best);
+      cur = best;
+      remaining = remaining.filter(c => c !== best);
     }
-    lastStop = best;
-    chainPool = valid.filter(c => c !== lastStop);
+    ordered = _twoOpt(seeded, anchorCoord, terminus);
   }
-  // Greedy nearest-neighbour chain — O(n²) but n is always tiny (≤ 10 stops)
-  const ordered = [];
-  let remaining = [...chainPool];
-  let cur = anchorCoord;
-  while (remaining.length) {
-    let best = null, bestDist = Infinity;
-    for (const c of remaining) {
-      const d = haversineKm(cur.lat, cur.lng, c.lat, c.lng);
-      if (d < bestDist) { bestDist = d; best = c; }
-    }
-    ordered.push(best);
-    cur = { lat: best.lat, lng: best.lng };
-    remaining = remaining.filter(c => c !== best);
-  }
-  if (lastStop) ordered.push(lastStop);
+
   return [...ordered, ...invalid];
 }
 
@@ -1718,10 +1781,10 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
 
 function DisputeAdminPanel({ trip, dispatch, users }) {
   const dispute = trip.dispute;
-  if (!dispute) return null;
-  const filer = users.find(u => u.id?.toString() === dispute.agent_id?.toString());
   const [resolution, setResolution] = React.useState("");
   const [resolving, setResolving] = React.useState(false);
+  if (!dispute) return null;
+  const filer = users.find(u => u.id?.toString() === dispute.agent_id?.toString());
 
   const resolve = async (outcome) => {
     if (!resolution.trim()) return;
@@ -3405,9 +3468,25 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // Adding a fixed destination does NOT create a closed loop (as a fixed start+end
     // would if start===end) — it means "shortest path from start, visiting all
     // intermediate stops in the best order, ending at destination."
-    const allWaypoints = destinationCoord?.lat != null
-      ? [anchorCoord, ...valid, destinationCoord]
-      : [anchorCoord, ...valid];
+    //
+    // CONFIRMED against the live API: computeBestOrder always treats the
+    // LAST waypoint in the request as a second fixed anchor too — not just
+    // the first — regardless of whether that last entry is a "real"
+    // destination. A request of [anchor, stop0, stop1, stop2] (no
+    // destinationCoord) returns optimizedWaypoints for only stop0 and stop1;
+    // stop2 is silently excluded because TomTom pins it as the fixed end.
+    // When we DO have a real destination (INBOUND, ending at the company
+    // office) that's exactly the behaviour we want. When we don't
+    // (OUTBOUND), there's no real destination to pin — so the last entry of
+    // `valid` is used as a stand-in fixed endpoint instead, leaving every
+    // OTHER stop free to reorder. Without this, optimized.length could never
+    // equal valid.length for the no-destination case, so every OUTBOUND
+    // multi-stop trip silently fell back to the haversine/straight-line
+    // estimate, 100% of the time.
+    const hasRealDestination = destinationCoord?.lat != null;
+    const pinnedEnd = hasRealDestination ? destinationCoord : valid[valid.length - 1];
+    const freeStops = hasRealDestination ? valid : valid.slice(0, -1);
+    const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
     const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
     const departAtParam = departAtEpoch
       ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
@@ -3419,15 +3498,14 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
     const data = await res.json();
     // IMPORTANT — confirmed in production against real API responses:
-    // optimizedWaypoints does NOT include the fixed start anchor at all.
-    // providedIndex is 0-indexed relative ONLY to the "soft" reorderable
-    // waypoints we listed (i.e. our `valid` dropoffs array), not the full
-    // allWaypoints array that also contains the anchor. A request with 2
-    // dropoffs → optimizedWaypoints has exactly 2 entries, with
-    // providedIndex values 0 and 1 (NOT 1 and 2).
+    // optimizedWaypoints does NOT include either fixed anchor (start or
+    // end). providedIndex is 0-indexed relative ONLY to the "soft"
+    // reorderable waypoints we listed (`freeStops`), not the full
+    // allWaypoints array. A request with 2 free stops → optimizedWaypoints
+    // has exactly 2 entries, with providedIndex values 0 and 1.
     const optimized = data.routes?.[0]?.optimizedWaypoints;
-    if (!optimized || optimized.length !== valid.length) {
-      console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${valid.length}. Falling back to haversine.`);
+    if (!optimized || optimized.length !== freeStops.length) {
+      console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${freeStops.length}. Falling back to haversine.`);
       return null;
     }
     // CRITICAL: optimizedWaypoints from the API is consistently ordered by
@@ -3435,19 +3513,23 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // actual optimal sequence is given by each entry's optimizedIndex
     // field. Sorting by optimizedIndex BEFORE mapping to coordinates is
     // what actually applies TomTom's computed reordering — without this
-    // sort, .map(w => valid[w.providedIndex]) just reconstructs the
+    // sort, .map(w => freeStops[w.providedIndex]) just reconstructs the
     // original input order (since the array itself is providedIndex-
     // ordered), silently discarding every genuine reorder TomTom returns.
     // Confirmed in production: a request with providedIndex/optimizedIndex
     // pairs (0,0) (1,2) (2,1) — a real, valid reordering (visit index 0,
     // then 2, then 1) — was being flattened straight back to [0,1,2] by
     // this bug, always matching the un-optimized input order.
-    const reordered = [...optimized]
+    const reorderedFree = [...optimized]
       .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-      .filter(w => w.providedIndex >= 0 && w.providedIndex < valid.length)
-      .map(w => valid[w.providedIndex])
+      .filter(w => w.providedIndex >= 0 && w.providedIndex < freeStops.length)
+      .map(w => freeStops[w.providedIndex])
       .filter(Boolean);
-    if (reordered.length !== valid.length) return null;
+    if (reorderedFree.length !== freeStops.length) return null;
+    // The pinned end is only a real dropoff when there's no genuine
+    // destination — a genuine destinationCoord (company office) is never a
+    // stop itself, so it's excluded from the returned dropoff list.
+    const reordered = hasRealDestination ? reorderedFree : [...reorderedFree, pinnedEnd];
     // Append any invalid (null-coord) entries at the end unchanged.
     const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
     return [...reordered, ...invalid];
@@ -7423,7 +7505,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const acCompanyAnchor = await fetchCompanyAnchor();
-        const departEpochAc = tripRow.scheduledtime ?? null;
+        const departEpochAc = acTripRow.scheduledtime ?? null;
         const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor, departEpochAc);
         const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
         const acSeqMap = {}, acDropMap = {};
@@ -9241,12 +9323,18 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
     webauthnSupported().then(ok => setShowBiometricBtn(ok)).catch(() => {});
   }, []);
 
-  // Check if this specific username has a registered credential
+  // Check if this specific username has a registered credential. Uses the
+  // read-only "has-credential" action — NOT "authentication-options", which
+  // deletes and reissues the real login challenge on every call. Polling
+  // that one from this debounced, display-only effect could invalidate a
+  // challenge an in-flight fingerprint scan was about to submit (if this
+  // effect fired again while the OS biometric prompt was still open),
+  // causing the real login attempt to fail right after a successful scan.
   const [hasCredential, setHasCredential] = useState(false);
   React.useEffect(() => {
     if (!login || !showBiometricBtn) { setHasCredential(false); return; }
     const t = setTimeout(() => {
-      webauthnPost({ action: "authentication-options", username: login })
+      webauthnPost({ action: "has-credential", username: login })
         .then(r => setHasCredential(!!r?.hasCredentials))
         .catch(() => setHasCredential(false));
     }, 500); // debounce
@@ -12349,6 +12437,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const lastPickupDone = [...pickupStops].reverse().find(s => s.done) || pickupStops[0];
   const lastPickupCoord = lastPickupDone ? { lat: lastPickupDone.lat, lng: lastPickupDone.lng } : null;
 
+  const navDirection = myActiveTrips[0]?.direction || "OUTBOUND";
   const dropoffGroups = {};
   myActiveTrips.forEach(trip => {
     // Iterate ALL per-agent dropoffs — OUTBOUND multi-agent trips have one
@@ -12385,7 +12474,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     // road-distance optimum — this just ensures a reasonable initial order.
     if (dropCoords.length > 1) {
       const anchor = defaultCompanyAnchor(state);
-      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor);
+      const preSortDest = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
+      dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor, undefined, preSortDest);
     }
 
     if (dropCoords.length === 0) return;
@@ -12434,7 +12524,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   // useSortedDropoffs is a hook — called unconditionally here (before any
   // early-return). Direction is taken from the first active trip; for mixed
   // runs the TSP is direction-agnostic anyway.
-  const navDirection = myActiveTrips[0]?.direction || "OUTBOUND";
   const navTripKey = myActiveTrips.map(t => t.trip_id).join("-");
   // For INBOUND: the destination is the company office — TomTom optimises the full
   // route: driver_start → pickup_home_A → pickup_home_B → ... → office (min km).
@@ -13640,7 +13729,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   const [sorted, setSorted] = React.useState(() => {
     if (!isMultiStop) return coords;
     if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
-    return sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord); // haversine until TomTom responds
+    return sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord); // haversine until TomTom responds
   });
   const [loading, setLoading] = React.useState(false);
   const [tomtomError, setTomtomError] = React.useState(null);
@@ -13683,7 +13772,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
         return;
       }
       if (!result) setTomtomError("TomTom returned no result — using distance estimate instead");
-      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord);
+      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord);
       _tomtomSortCache.set(fingerprint, final);
       setSorted(final);
     }).catch(e => {
@@ -14475,7 +14564,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   );
 }
 
-function AdminProfileSearch({ state, user }) {
+function AdminProfileSearch({ state, user, dispatch }) {
   const [query, setQuery] = useState("");
   const [selectedUserId, setSelectedUserId] = useState(null);
   const [historyTrips, setHistoryTrips] = useState(null); // null = not loaded yet
@@ -14570,11 +14659,11 @@ function AdminProfileSearch({ state, user }) {
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL BOOKINGS: </span><span style={{ fontWeight: 700 }}>{allTrips.length}</span></span>
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>COMPLETED: </span><span style={{ fontWeight: 700, color: COLORS.green }}>{completedCount}</span></span>
               {exceptionCount > 0 && <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>EXCEPTIONS: </span><span style={{ fontWeight: 700, color: COLORS.red }}>{exceptionCount}</span></span>}
-              <DisputeAdminPanel trip={groupTrips[0]} dispatch={dispatch} users={state.users} />
-              {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(groupTrips[0].state) && (
-                <button onClick={() => copyShareLink(groupTrips[0], dispatch)}
+              {allTrips.length > 0 && <DisputeAdminPanel trip={allTrips[0]} dispatch={dispatch} users={state.users} />}
+              {allTrips.length > 0 && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(allTrips[0].state) && (
+                <button onClick={() => copyShareLink(allTrips[0], dispatch)}
                   style={{ fontSize: 9, color: COLORS.teal, fontWeight: 700, border: `1px solid ${COLORS.teal}`, padding: "2px 6px", borderRadius: 2, background: "none", cursor: "pointer" }}>
-                  🔗 {groupTrips[0].share_token ? "COPY SHARE LINK" : "GENERATE LIVE LINK"}
+                  🔗 {allTrips[0].share_token ? "COPY SHARE LINK" : "GENERATE LIVE LINK"}
                 </button>
               )}
             </div>
@@ -15997,6 +16086,8 @@ function AdminDrivers({ state, user, dispatch }) {
   // home address, no live status, no active-route detail. Full tier
   // (Fleet Ops / Standard) still sees everything, same as before.
   const fullView = hasAdminPermission(user, "viewDriverProfiles");
+  const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
+  const [docEditorFor, setDocEditorFor] = React.useState(null);
 
   if (!fullView) {
     return (
@@ -16024,8 +16115,6 @@ function AdminDrivers({ state, user, dispatch }) {
     );
   }
 
-  const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
-  const [docEditorFor, setDocEditorFor] = React.useState(null);
   return (
     <div className="pad">
       <SectionHeader label={`Drivers (${state.driver_status.length})`} />
@@ -17761,7 +17850,7 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
               ))}
             </select>
           )}
-          <Button title="LOG OUT" variant="ghost" size="sm" onClick={() => dispatch({ type: "AUTH/LOGOUT" })} />
+          <Button title="LOG OUT" variant="ghost" size="sm" onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})} />
         </div>
       </div>
 )}
@@ -17990,7 +18079,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
-      {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
+      {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}

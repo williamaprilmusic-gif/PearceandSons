@@ -1,0 +1,441 @@
+/**
+ * WebAuthn Edge Function for Pearce & Sons TransitOS
+ * POST /webauthn { action: 'registration-options' | 'register' | 'authentication-options' | 'authenticate' | 'has-credential', ... }
+ */
+import { createClient } from 'jsr:@supabase/supabase-js@2';
+
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!;
+const SUPABASE_SERVICE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
+const RP_ID = Deno.env.get('WEBAUTHN_RP_ID') ?? 'pearceand-sons.vercel.app';
+const RP_NAME = 'Pearce & Sons Transport';
+const ORIGIN = Deno.env.get('WEBAUTHN_ORIGIN') ?? 'https://pearceand-sons.vercel.app';
+
+const cors = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+  'Content-Type': 'application/json',
+};
+
+const json = (data: unknown, status = 200) =>
+  new Response(JSON.stringify(data), { status, headers: cors });
+const err = (msg: string, status = 400) => json({ error: msg }, status);
+
+// ── Base64url helpers ──────────────────────────────────────────────────────
+function bufToB64(buf: ArrayBuffer | Uint8Array): string {
+  const u8 = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return btoa(String.fromCharCode(...u8))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+function b64ToBuf(b64: string): Uint8Array {
+  const padded = b64.replace(/-/g, '+').replace(/_/g, '/').padEnd(
+    b64.length + (4 - b64.length % 4) % 4, '='
+  );
+  return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+}
+function randomChallenge(): string {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return bufToB64(buf);
+}
+
+// ── CBOR COSE key parser ─────────────────────────────────────────────────
+// Extracts the raw EC P-256 public key (x, y coordinates) from the
+// CBOR-encoded COSE_Key structure in authenticatorData.
+//
+// CBOR encoding of negative integers (COSE negative key labels):
+//   Major type 1 = 0x20. Value -N is encoded as 0x20 | (N-1).
+//   So: -1 = 0x20, -2 = 0x21, -3 = 0x22
+//   Decoded value = -(additional_info + 1) = -((byte & 0x1f) + 1)
+//
+// COSE_Key labels used here:
+//   1  (kty)  = 2 (EC2)
+//   3  (alg)  = -7 (ES256)
+//   -1 (crv)  = 1 (P-256)
+//   -2 (x)    = 32-byte x coordinate
+//   -3 (y)    = 32-byte y coordinate
+function extractPublicKey(authData: Uint8Array): { x: Uint8Array; y: Uint8Array } | null {
+  // authData layout:
+  //   [0..31]  rpIdHash (32 bytes)
+  //   [32]     flags (1 byte) — bit 6 (0x40) = AT flag (attested credential data present)
+  //   [33..36] signCount (4 bytes, big-endian)
+  //   [37..52] AAGUID (16 bytes)
+  //   [53..54] credIdLen (2 bytes, big-endian)
+  //   [55..55+credIdLen-1] credentialId
+  //   [55+credIdLen..]    COSE_Key (CBOR map)
+  if (authData.length < 55) return null;
+  const flags = authData[32];
+  if (!(flags & 0x40)) return null; // no attested credential data
+
+  const credIdLen = (authData[53] << 8) | authData[54];
+  const coseStart = 55 + credIdLen;
+  if (coseStart >= authData.length) return null;
+
+  const coseKey = authData.slice(coseStart);
+
+  // Parse the CBOR map — we only need x(-2) and y(-3) byte strings.
+  // Skip the map header byte (first byte encodes map length).
+  let i = 1;
+  let x: Uint8Array | null = null;
+  let y: Uint8Array | null = null;
+
+  while (i < coseKey.length - 2 && !(x && y)) {
+    // Read the key
+    const keyByte = coseKey[i]; i++;
+    let key: number;
+    const majorType = keyByte >> 5;
+    const addInfo   = keyByte & 0x1f;
+
+    if (majorType === 0) {
+      // Positive integer
+      if (addInfo <= 23) { key = addInfo; }
+      else if (addInfo === 24) { key = coseKey[i]; i++; }
+      else break; // unsupported
+    } else if (majorType === 1) {
+      // Negative integer: value = -(addInfo + 1)
+      // FIXED: was using wrong formula `0x20 - keyByte` which produced off-by-one
+      if (addInfo <= 23) { key = -(addInfo + 1); }
+      else if (addInfo === 24) { key = -(coseKey[i] + 1); i++; }
+      else break;
+    } else {
+      break; // not a COSE map key type we handle
+    }
+
+    // Read the value
+    if (i >= coseKey.length) break;
+    const valByte = coseKey[i]; i++;
+    const valMajor = valByte >> 5;
+    const valInfo  = valByte & 0x1f;
+
+    if (valMajor === 2) {
+      // Byte string — this is what x and y are
+      let len: number;
+      if (valInfo <= 23) {
+        len = valInfo;
+      } else if (valInfo === 24) {
+        len = coseKey[i]; i++;
+      } else if (valInfo === 25) {
+        len = (coseKey[i] << 8) | coseKey[i + 1]; i += 2;
+      } else {
+        break;
+      }
+      const val = coseKey.slice(i, i + len); i += len;
+      if (key === -2) x = val; // x coordinate
+      if (key === -3) y = val; // y coordinate
+    } else if (valMajor === 0) {
+      // Positive integer value — skip (kty, crv etc.)
+      if (valInfo <= 23) { /* inline, no extra bytes */ }
+      else if (valInfo === 24) { i++; }
+      else if (valInfo === 25) { i += 2; }
+      else if (valInfo === 26) { i += 4; }
+      else break;
+    } else if (valMajor === 1) {
+      // Negative integer value — skip (alg = -7)
+      if (valInfo <= 23) { /* inline */ }
+      else if (valInfo === 24) { i++; }
+      else break;
+    } else {
+      break; // unexpected value type
+    }
+  }
+
+  if (!x || !y) return null;
+  return { x, y };
+}
+
+// ── Signature verification ─────────────────────────────────────────────────
+async function verifySignature(
+  publicKeyB64: string,
+  authData: Uint8Array,
+  clientDataJSON: Uint8Array,
+  sig: Uint8Array,
+): Promise<boolean> {
+  try {
+    const pubRaw = b64ToBuf(publicKeyB64);
+    const cryptoKey = await crypto.subtle.importKey(
+      'raw', pubRaw,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false, ['verify']
+    );
+    const clientDataHash = new Uint8Array(
+      await crypto.subtle.digest('SHA-256', clientDataJSON)
+    );
+    const verifyData = new Uint8Array(authData.length + clientDataHash.length);
+    verifyData.set(authData);
+    verifyData.set(clientDataHash, authData.length);
+    return await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      cryptoKey, sig, verifyData
+    );
+  } catch {
+    return false;
+  }
+}
+
+// ── Supabase client (service role — bypasses RLS) ──────────────────────────
+const db = () => createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// ── Action handlers ────────────────────────────────────────────────────────
+async function registrationOptions(userId: number, username: string) {
+  const challenge = randomChallenge();
+  const supabase = db();
+  await supabase.from('webauthn_challenges')
+    .delete().eq('user_id', userId).eq('type', 'registration');
+  const { error } = await supabase.from('webauthn_challenges').insert({
+    user_id: userId, challenge, type: 'registration',
+  });
+  if (error) return err('Failed to store challenge: ' + error.message);
+  const { data: existing } = await supabase.from('webauthn_credentials')
+    .select('credential_id_b64').eq('app_user_id', userId);
+  const excludeCredentials = (existing || []).map((c: { credential_id_b64: string }) => ({
+    id: c.credential_id_b64, type: 'public-key', transports: ['internal', 'hybrid'],
+  }));
+  return json({
+    challenge,
+    rp: { id: RP_ID, name: RP_NAME },
+    user: {
+      id: bufToB64(new TextEncoder().encode(String(userId))),
+      name: username, displayName: username,
+    },
+    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+    authenticatorSelection: {
+      authenticatorAttachment: 'platform',
+      userVerification: 'required',
+      residentKey: 'preferred',
+    },
+    timeout: 60000,
+    attestation: 'none',
+    excludeCredentials,
+  });
+}
+
+async function register(userId: number, credential: {
+  id: string;
+  response: { clientDataJSON: string; attestationObject: string };
+  friendlyName?: string;
+}) {
+  const supabase = db();
+  // Fetch and validate challenge
+  const { data: challengeRow } = await supabase
+    .from('webauthn_challenges').select('*')
+    .eq('user_id', userId).eq('type', 'registration')
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (!challengeRow) return err('Challenge not found or expired — please try again');
+
+  // Parse and verify clientDataJSON
+  const clientDataJSON = b64ToBuf(credential.response.clientDataJSON);
+  let clientData: { type: string; challenge: string; origin: string };
+  try { clientData = JSON.parse(new TextDecoder().decode(clientDataJSON)); }
+  catch { return err('Invalid clientDataJSON'); }
+  if (clientData.type !== 'webauthn.create') return err('Wrong ceremony type');
+  if (clientData.challenge !== challengeRow.challenge) return err('Challenge mismatch');
+  if (clientData.origin !== ORIGIN) return err(`Origin mismatch: got ${clientData.origin}`);
+
+  // Parse attestationObject (minimal CBOR) to get authData
+  const attObj = b64ToBuf(credential.response.attestationObject);
+  const authData = extractAuthData(attObj);
+  if (!authData) return err('Cannot parse attestationObject');
+
+  // Verify rpIdHash
+  const expectedRpIdHash = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(RP_ID))
+  );
+  if (!expectedRpIdHash.every((b, i) => b === authData[i]))
+    return err('RP ID hash mismatch');
+
+  // Check flags
+  const flags = authData[32];
+  if (!(flags & 0x01)) return err('User presence not verified');
+  if (!(flags & 0x04)) return err('User verification required — please use biometric');
+
+  // Extract public key
+  const pubKeyCoords = extractPublicKey(authData);
+  if (!pubKeyCoords) return err('Cannot extract public key from authData — unsupported authenticator format');
+
+  // Build raw 65-byte uncompressed EC point: 0x04 || x || y
+  const rawPub = new Uint8Array(65);
+  rawPub[0] = 0x04;
+  rawPub.set(pubKeyCoords.x, 1);
+  rawPub.set(pubKeyCoords.y, 33);
+  const publicKeyB64 = bufToB64(rawPub);
+
+  // Store credential
+  const { error: insErr } = await supabase.from('webauthn_credentials').insert({
+    app_user_id: userId,
+    credential_id_b64: credential.id,
+    public_key_b64: publicKeyB64,
+    sign_count: 0,
+    transports: ['internal'],
+    friendly_name: credential.friendlyName ?? 'My Device',
+  });
+  if (insErr) {
+    if (insErr.code === '23505') return err('This device is already registered');
+    return err('Failed to save credential: ' + insErr.message);
+  }
+  await supabase.from('webauthn_challenges').delete().eq('id', challengeRow.id);
+  return json({ success: true });
+}
+
+// Extract authData byte array from CBOR-encoded attestationObject.
+// Looks for the CBOR text key "authData" then reads the following byte string.
+function extractAuthData(attObj: Uint8Array): Uint8Array | null {
+  // "authData" in CBOR: text string of length 8 = 0x68 followed by UTF-8 bytes
+  const authDataKey = new TextEncoder().encode('authData');
+  const keyHeader = new Uint8Array([0x60 | authDataKey.length, ...authDataKey]);
+  for (let i = 0; i < attObj.length - keyHeader.length; i++) {
+    if (!keyHeader.every((b, j) => attObj[i + j] === b)) continue;
+    // Found the key — read the byte string value that follows
+    let pos = i + keyHeader.length;
+    if (pos >= attObj.length) break;
+    const vByte = attObj[pos]; pos++;
+    const vMajor = vByte >> 5;
+    const vInfo  = vByte & 0x1f;
+    if (vMajor !== 2) continue; // expect byte string
+    let len: number;
+    if (vInfo <= 23) { len = vInfo; }
+    else if (vInfo === 24) { len = attObj[pos]; pos++; }
+    else if (vInfo === 25) { len = (attObj[pos] << 8) | attObj[pos + 1]; pos += 2; }
+    else if (vInfo === 26) {
+      len = (attObj[pos] << 24) | (attObj[pos+1] << 16) | (attObj[pos+2] << 8) | attObj[pos+3];
+      pos += 4;
+    } else continue;
+    return attObj.slice(pos, pos + len);
+  }
+  return null;
+}
+
+// Read-only check used by the login screen to decide whether to label the
+// button "USE FINGERPRINT / FACE ID" vs "SIGN IN WITH BIOMETRICS" while the
+// user is still typing their username. Deliberately does NOT touch
+// webauthn_challenges — unlike authenticationOptions() below, which deletes
+// and reissues the login challenge on every call. Polling that endpoint from
+// a debounced effect could invalidate a challenge an in-flight fingerprint
+// scan was about to submit, causing an intermittent "Challenge mismatch" /
+// stale-challenge failure right after a successful scan.
+async function hasCredential(username: string) {
+  const supabase = db();
+  const { data: user } = await supabase
+    .from('users').select('id').eq('username', username).maybeSingle();
+  if (!user) return json({ hasCredentials: false });
+  const { data: creds } = await supabase
+    .from('webauthn_credentials').select('credential_id_b64')
+    .eq('app_user_id', user.id).limit(1);
+  return json({ hasCredentials: !!creds?.length });
+}
+
+async function authenticationOptions(username: string) {
+  const supabase = db();
+  const { data: user } = await supabase
+    .from('users').select('id').eq('username', username).maybeSingle();
+  if (!user) return err('User not found');
+  const { data: creds } = await supabase
+    .from('webauthn_credentials').select('credential_id_b64, transports')
+    .eq('app_user_id', user.id);
+  if (!creds?.length) return json({ hasCredentials: false });
+  const challenge = randomChallenge();
+  await supabase.from('webauthn_challenges')
+    .delete().eq('user_id', user.id).eq('type', 'authentication');
+  await supabase.from('webauthn_challenges').insert({
+    user_id: user.id, challenge, type: 'authentication',
+  });
+  return json({
+    hasCredentials: true,
+    challenge,
+    rpId: RP_ID,
+    timeout: 60000,
+    userVerification: 'required',
+    allowCredentials: creds.map((c: { credential_id_b64: string; transports: string[] }) => ({
+      id: c.credential_id_b64, type: 'public-key',
+      transports: c.transports ?? ['internal'],
+    })),
+  });
+}
+
+async function authenticate(username: string, credential: {
+  id: string;
+  response: { clientDataJSON: string; authenticatorData: string; signature: string; userHandle?: string };
+}) {
+  const supabase = db();
+  const { data: user } = await supabase
+    .from('users').select('id, username, fullname, role, adminlevel, scopedcompanyids, branchid, status')
+    .eq('username', username).maybeSingle();
+  if (!user) return err('User not found');
+  const { data: cred } = await supabase
+    .from('webauthn_credentials').select('*')
+    .eq('app_user_id', user.id)
+    .eq('credential_id_b64', credential.id).maybeSingle();
+  if (!cred) return err('Credential not recognised on this account');
+  if (user.status !== 'ACTIVE') return err('Account is not active');
+
+  const { data: challengeRow } = await supabase
+    .from('webauthn_challenges').select('*')
+    .eq('user_id', user.id).eq('type', 'authentication')
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: false }).limit(1).maybeSingle();
+  if (!challengeRow) return err('Challenge expired — please try again');
+
+  const clientDataJSON = b64ToBuf(credential.response.clientDataJSON);
+  let clientData: { type: string; challenge: string; origin: string };
+  try { clientData = JSON.parse(new TextDecoder().decode(clientDataJSON)); }
+  catch { return err('Invalid clientDataJSON'); }
+  if (clientData.type !== 'webauthn.get') return err('Wrong ceremony type');
+  if (clientData.challenge !== challengeRow.challenge) return err('Challenge mismatch');
+  if (clientData.origin !== ORIGIN) return err(`Origin mismatch: got ${clientData.origin}`);
+
+  const authData = b64ToBuf(credential.response.authenticatorData);
+  const expectedRpIdHash = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(RP_ID))
+  );
+  if (!expectedRpIdHash.every((b, i) => b === authData[i]))
+    return err('RP ID hash mismatch');
+  const flags = authData[32];
+  if (!(flags & 0x01)) return err('User presence not verified');
+  if (!(flags & 0x04)) return err('User verification required');
+
+  const sig = b64ToBuf(credential.response.signature);
+  const valid = await verifySignature(cred.public_key_b64, authData, clientDataJSON, sig);
+  if (!valid) return err('Signature verification failed');
+
+  // Sign count replay attack prevention
+  const signCount = (authData[33] << 24) | (authData[34] << 16) | (authData[35] << 8) | authData[36];
+  if (signCount !== 0 && signCount <= cred.sign_count)
+    return err('Sign count indicates a cloned authenticator — authentication rejected');
+
+  await supabase.from('webauthn_credentials')
+    .update({ sign_count: signCount, last_used_at: new Date().toISOString() })
+    .eq('id', cred.id);
+  await supabase.from('users').update({ isonline: true }).eq('id', user.id);
+  if (user.role === 'DRIVER')
+    await supabase.from('driver_status').update({ isonline: true }).eq('driverid', user.id);
+  await supabase.from('webauthn_challenges').delete().eq('id', challengeRow.id);
+  return json({ success: true, userId: user.id });
+}
+
+// ── Router ─────────────────────────────────────────────────────────────────
+Deno.serve(async (req: Request) => {
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors });
+  if (req.method !== 'POST') return err('Method not allowed', 405);
+  let body: Record<string, unknown>;
+  try { body = await req.json(); }
+  catch { return err('Invalid JSON body'); }
+  try {
+    switch (body.action as string) {
+      case 'registration-options':
+        return await registrationOptions(body.user_id as number, body.username as string);
+      case 'register':
+        return await register(body.user_id as number, body.credential as Parameters<typeof register>[1]);
+      case 'has-credential':
+        return await hasCredential(body.username as string);
+      case 'authentication-options':
+        return await authenticationOptions(body.username as string);
+      case 'authenticate':
+        return await authenticate(body.username as string, body.credential as Parameters<typeof authenticate>[1]);
+      default:
+        return err(`Unknown action: ${body.action}`);
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('[webauthn]', body.action, msg);
+    return err('Internal error: ' + msg, 500);
+  }
+});
