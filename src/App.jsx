@@ -5948,8 +5948,19 @@ async function insertNotification(n) {
   // which always succeeds/fails independently above.
   const pushTargets = userIds.filter(Boolean);
   if (pushTargets.length > 0 && SUPABASE_URL) {
+    // Authorization is best-effort here too — if no token is cached yet
+    // (e.g. an already-open session from before login started attaching
+    // one), the edge function will just reject with 401 and this push
+    // silently doesn't go out, same as any other push-delivery failure
+    // this function already tolerates (dead subscription, offline device,
+    // etc.) per the .catch() below. The in-app notification this backs
+    // (inserted separately, above) always still succeeds independently.
     fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
+      },
       body: JSON.stringify({ user_ids: pushTargets, title, message: n.message, type: n.type, trip_id: n.trip_id ?? null }),
     }).catch(() => { /* best-effort — see rationale above */ });
   }
@@ -6323,8 +6334,18 @@ async function fetchSessionToken(username, password) {
 // supabase-js's background auto-refresh will simply fail silently against
 // it near the 24h expiry (the old token just keeps working until then)
 // rather than throwing, since autoRefreshToken is on for this client.
+//
+// Cached separately from whatever supabase.auth.setSession() does
+// internally — that propagation path was never actually verified to work
+// end-to-end in a real browser (see the RLS-lockdown rollback), so any code
+// that needs to explicitly attach the current token to a fetch() (e.g.
+// send-push-notification, which isn't a supabase.from() call and doesn't
+// go through PostgREST's automatic header handling at all) reads this
+// plain variable instead of depending on that mechanism.
+let _cachedSessionToken = null;
 async function applySessionToken(token) {
   if (!token) return;
+  _cachedSessionToken = token;
   try {
     await supabase.auth.setSession({ access_token: token, refresh_token: token });
   } catch (e) {
