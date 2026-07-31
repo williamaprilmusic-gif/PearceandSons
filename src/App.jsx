@@ -3298,7 +3298,7 @@ function isCapeFlatsBoundingBox(coords) {
 
 function buildSupportingPointsParam(coords) {
   if (!isCapeFlatsBoundingBox(coords)) return "";
-  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lat},${c.lng}`).join(":");
+  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
   return `&supportingPoints=${encodeURIComponent(pts)}`;
 }
 
@@ -3430,7 +3430,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     // who are merely nearby but at genuinely different addresses.
     const dedupedCoords = dedupeCoordsByLocation(coords);
     if (dedupedCoords.length < 2) return null;
-    const locations = dedupedCoords.map(c => `${c.lat},${c.lng}`).join(":");
+    const locations = dedupedCoords.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
     // departAt: use the trip's scheduled time so TomTom applies historical
     // traffic patterns for that hour, not live conditions at booking time.
     const departAtParam = departAtEpoch
@@ -3467,7 +3467,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
 // or null if the request failed or the response shape didn't match.
 async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEpoch) {
   const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
-  const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":");
+  const locations = allWaypoints.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
   const departAtParam = departAtEpoch
     ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
     : "";
@@ -3485,7 +3485,13 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
     `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`TomTom routing returned ${res.status}`);
+  if (!res.ok) {
+    let errBody = "";
+    try { errBody = JSON.stringify(await res.json(), null, 2); } catch { errBody = await res.text().catch(() => ""); }
+    console.error(`[TomTom] Routing API error ${res.status} — URL: ${url.replace(TOMTOM_API_KEY, "***")}`);
+    console.error(`[TomTom] Error body: ${errBody}`);
+    throw new Error(`TomTom routing returned ${res.status}: ${errBody.slice(0, 200)}`);
+  }
   const data = await res.json();
   // IMPORTANT — confirmed in production against real API responses:
   // optimizedWaypoints does NOT include either fixed anchor (start or end).
@@ -3520,10 +3526,40 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   return { order: [...reorderedFree, pinnedEnd], km: totalMetres / 1000 };
 }
 
+// Validates a single coordinate is non-null, non-zero, and within
+// a plausible geographic range. Coordinates that geocoded to [0,0]
+// (geocoder error) or are outside the bounding box of greater Cape Town
+// will cause TomTom to return 400 or route to the wrong place entirely.
+// Bounding box covers Cape Town metro area with generous margins.
+const CT_BOUNDS = { minLat: -35.0, maxLat: -33.0, minLng: 17.5, maxLng: 19.5 };
+function isValidCoord(c) {
+  if (c == null || c.lat == null || c.lng == null) return false;
+  if (c.lat === 0 && c.lng === 0) return false; // geocoder fallback sentinel
+  if (Number.isNaN(c.lat) || Number.isNaN(c.lng)) return false;
+  if (c.lat < CT_BOUNDS.minLat || c.lat > CT_BOUNDS.maxLat) return false;
+  if (c.lng < CT_BOUNDS.minLng || c.lng > CT_BOUNDS.maxLng) return false;
+  return true;
+}
+
 async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null, destinationCoord = null) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
-  const valid = stopCoords.filter(c => c?.lat != null && c?.lng != null);
-  if (valid.length <= 1) return null;
+  if (!isValidCoord(anchorCoord)) {
+    console.warn("[TomTom] anchorCoord is invalid or outside Cape Town bounds:", anchorCoord);
+    return null;
+  }
+  if (destinationCoord != null && !isValidCoord(destinationCoord)) {
+    console.warn("[TomTom] destinationCoord is invalid:", destinationCoord);
+    destinationCoord = null;
+  }
+  const valid = stopCoords.filter(c => {
+    if (isValidCoord(c)) return true;
+    console.warn("[TomTom] Dropping stop with invalid/missing coordinates:", c?.label ?? c);
+    return false;
+  });
+  if (valid.length <= 1) {
+    console.warn("[TomTom] Not enough valid stop coordinates after filtering (need ≥2).");
+    return null;
+  }
   try {
     // CRITICAL — confirmed against real production data: computeBestOrder
     // with BOTH a fixed start AND a fixed end anchor solves a CLOSED-LOOP
@@ -14124,6 +14160,9 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   React.useEffect(() => {
     if (!isMultiStop || !TOMTOM_API_KEY) return;
     if (_tomtomSortCache.has(fingerprint)) { setSorted(_tomtomSortCache.get(fingerprint)); return; }
+    const badStops = (coords || []).filter(c => !isValidCoord(c));
+    if (badStops.length) console.warn("[TomTom] Stop(s) with invalid coordinates will be excluded from optimization:", badStops.map(c => c?.label ?? JSON.stringify(c)));
+    if (anchorCoord && !isValidCoord(anchorCoord)) console.warn("[TomTom] anchorCoord is invalid — TomTom optimization may fail:", anchorCoord);
     let cancelled = false;
     // Debounce: wait briefly before firing the actual TomTom call, so a burst
     // of renders with different intermediate coords arrays (e.g. auto-merge
