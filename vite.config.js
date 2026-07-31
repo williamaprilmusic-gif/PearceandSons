@@ -20,6 +20,11 @@ export default defineConfig({
         icons: [
           { src: 'icon-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
           { src: 'icon-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+          // Precached via includeAssets above but never declared here, so
+          // Android never got proper adaptive/maskable home-screen icon
+          // treatment despite the maskable PNGs already existing.
+          { src: 'icon-192-maskable.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
+          { src: 'icon-512-maskable.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
       },
       workbox: {
@@ -27,6 +32,14 @@ export default defineConfig({
         // API calls to Supabase are NOT cached here — they always hit the network,
         // since trip data needs to be live/current, not served from a stale cache.
         globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
+        // Without this, push-handler.js (the actual push/notificationclick
+        // listeners) just sits in public/ as a precached static file that's
+        // never executed — generateSW completely overwrites the old
+        // hand-written public/sw.js, and nothing else loads this script into
+        // the active service worker. Confirmed: web push notifications have
+        // never fired in production because of this, independent of (and in
+        // addition to) the separate missing-VAPID_PRIVATE_KEY issue.
+        importScripts: ['push-handler.js'],
       },
     }),
   ],
