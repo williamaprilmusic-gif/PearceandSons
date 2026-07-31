@@ -22,8 +22,18 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 
-Deno.serve(async (_req) => {
+Deno.serve(async (req) => {
   try {
+    // The platform's verify_jwt only requires *some* valid Supabase JWT —
+    // the public anon key (shipped in the client bundle) satisfies that,
+    // so it's not real access control. pg_cron's http call already sends
+    // the service-role key as its Authorization bearer (see schedule.sql);
+    // require that exact value, matching daily-trip-sheet's same fix.
+    if (req.headers.get("Authorization") !== `Bearer ${SERVICE_ROLE_KEY}`) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401, headers: { "Content-Type": "application/json" },
+      });
+    }
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
     const { data: confirmedTrips, error } = await supabase
@@ -40,7 +50,12 @@ Deno.serve(async (_req) => {
       const [y, m, d] = (t.scheduleddate || "").split("/").map(Number);
       const [hh, mm] = (t.scheduledtime || "").split(":").map(Number);
       if (!y || !m || !d || hh == null || mm == null) continue; // malformed — skip rather than false-positive
-      const scheduledDt = new Date(y, m - 1, d, hh, mm);
+      // scheduleddate/time are SAST (UTC+2) wall-clock values, but this
+      // function runs in UTC — new Date(y, m-1, d, hh, mm) would build the
+      // instant for hh:mm UTC instead, delaying every "late start" alert by
+      // exactly 2 hours (matches daily-trip-sheet's own sast() helper,
+      // which exists to correct for the same runtime-timezone mismatch).
+      const scheduledDt = new Date(Date.UTC(y, m - 1, d, hh - 2, mm));
       const minutesLate = (Date.now() - scheduledDt.getTime()) / 60000;
       if (minutesLate < 30) continue;
 
@@ -75,6 +90,7 @@ Deno.serve(async (_req) => {
       headers: { "Content-Type": "application/json" },
     });
   } catch (e) {
+    console.error("check-late-start failed:", e.message);
     return new Response(JSON.stringify({ ok: false, error: e.message }), {
       status: 500, headers: { "Content-Type": "application/json" },
     });

@@ -17,13 +17,24 @@
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
-serve(async (_req) => {
+serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
   const TO = "app@pearceandsons.co.za";
   const FROM = "TransitOS <onboarding@resend.dev>";
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+
+  // Platform verify_jwt is off (needed since pg_cron's http call carries no
+  // JWT format Supabase itself recognises) and there was previously no
+  // in-code check at all — meaning anyone with this function's URL could
+  // trigger a real Resend send and DB read, with no auth of any kind. The
+  // pg_cron job that's the function's only legitimate caller already sends
+  // the service-role key as its Authorization bearer (see schedule.sql) —
+  // require that same value here instead of accepting any request.
+  if (req.headers.get("Authorization") !== `Bearer ${SERVICE_KEY}`) {
+    return json({ error: "Unauthorized" }, 401);
+  }
 
   console.log("daily-trip-sheet: starting");
   console.log("FROM:", FROM, "| TO:", TO);
@@ -106,20 +117,29 @@ serve(async (_req) => {
     ARCHIVED_CANCELLED: "CANCELLED",
   };
 
+  // Trip fields below (agent name, pickup/dropoff labels) ultimately come
+  // from user-editable text (e.g. the app's manual "Type Address" entry) —
+  // escape before interpolating into this HTML email, or a crafted label
+  // could break the layout or inject markup into an otherwise-trusted
+  // internal report.
+  const esc = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string
+  ));
+
   const row = (t: Record<string, unknown>) => {
     const col = badgeColor[t.status as string] ?? "#888";
     const lbl = statusLabel[t.status as string] ?? String(t.status);
     const dir = t.direction === "INBOUND" ? "▶ IN" : t.direction === "OUTBOUND" ? "▶ OUT" : "";
     const pax = (t.extras as number) > 0 ? ` +${t.extras}` : "";
     return `<tr>
-      <td style="font-weight:700;color:#fff;padding:7px 8px">${t.id}</td>
-      <td style="padding:7px 8px">${t.scheduledtimestr ?? "—"}</td>
+      <td style="font-weight:700;color:#fff;padding:7px 8px">${esc(t.id)}</td>
+      <td style="padding:7px 8px">${esc(t.scheduledtimestr ?? "—")}</td>
       <td style="padding:7px 8px"><span style="color:${col};font-weight:700;font-size:10px">${lbl}</span>
         ${dir ? `<span style="color:#888;font-size:10px;margin-left:4px">${dir}</span>` : ""}</td>
-      <td style="padding:7px 8px">${t.agentname ?? "—"}${pax}</td>
-      <td style="padding:7px 8px;color:#aaa">${t.drivername}</td>
-      <td style="padding:7px 8px;font-size:11px;color:#aaa">${t.pickup}</td>
-      <td style="padding:7px 8px;font-size:11px;color:#aaa">${t.dropoff}</td>
+      <td style="padding:7px 8px">${esc(t.agentname ?? "—")}${esc(pax)}</td>
+      <td style="padding:7px 8px;color:#aaa">${esc(t.drivername)}</td>
+      <td style="padding:7px 8px;font-size:11px;color:#aaa">${esc(t.pickup)}</td>
+      <td style="padding:7px 8px;font-size:11px;color:#aaa">${esc(t.dropoff)}</td>
     </tr>`;
   };
 
