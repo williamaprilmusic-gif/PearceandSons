@@ -263,14 +263,18 @@ function scopeTripsToCompany(trips, users, companyIds) {
 }
 
 // Tickets carry agent_id directly (filed by that agent, whether about
-// themselves or a trip), so this doesn't need the trip cross-reference
-// scopeTripsToCompany does — a simple membership check against the same
-// scoped-agent set.
-function scopeTicketsToCompany(tickets, users, companyIds) {
+// themselves or a trip) — but that same column also holds the filer's id
+// when a DRIVER files a ticket (see TICKET/CREATE), so this needs the same
+// trip cross-reference scopeUsersToCompany uses to resolve relevant drivers,
+// or a ticket filed by a driver silently vanishes for every scoped admin.
+function scopeTicketsToCompany(tickets, users, trips, companyIds) {
   if (!companyIds?.length) return tickets;
   const idSet = new Set(companyIds);
   const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
-  return tickets.filter(t => scopedAgentIds.has(t.agent_id));
+  const relevantDriverIds = new Set(
+    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+  );
+  return tickets.filter(t => scopedAgentIds.has(t.agent_id) || relevantDriverIds.has(t.agent_id));
 }
 
 // Admin notifications are broadcast-style (no for_user_ids), so scoping
@@ -1993,14 +1997,21 @@ function getOfflineQueue() {
 function setOfflineQueue(q) {
   try { localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch {}
 }
+// navigator.onLine only reflects whether a network interface is
+// associated — it stays true during a weak/spotty signal, which is
+// exactly the real-world case this queue exists for (a moving vehicle,
+// not a toggled airplane mode). A failed dispatch whose error looks
+// network-shaped (rather than a real server-side rejection) should be
+// queued too, not just surfaced as a one-shot error the driver must
+// notice and manually retry.
+function isNetworkError(e) {
+  return e instanceof TypeError || /fetch|network|failed to connect/i.test(e?.message || "");
+}
 function enqueueOfflineAction(action) {
   const q = getOfflineQueue();
   q.push({ ...action, _queuedAt: Date.now() });
   setOfflineQueue(q);
   console.log(`[Offline] Queued: ${action.type} (queue depth: ${q.length})`);
-}
-function clearOfflineQueue() {
-  setOfflineQueue([]);
 }
 
 // Hook that tracks online status and auto-replays the queue on reconnect
@@ -2022,6 +2033,11 @@ function useOfflineSync(dispatch) {
       if (q.length === 0) return;
       setSyncing(true);
       let replayed = 0, failed = 0;
+      // Keep failed actions queued instead of unconditionally clearing —
+      // a replay failure (flaky reconnect, one bad request) used to
+      // permanently delete a driver's pickup/dropoff confirmation with no
+      // retry, defeating the entire point of this queue.
+      const stillPending = [];
       for (const action of q) {
         try {
           await dispatch(action);
@@ -2029,9 +2045,10 @@ function useOfflineSync(dispatch) {
         } catch (e) {
           console.warn(`[Offline] Replay failed for ${action.type}:`, e.message);
           failed++;
+          stillPending.push(action);
         }
       }
-      clearOfflineQueue();
+      setOfflineQueue(stillPending);
       setSyncing(false);
       setSyncResult({ replayed, failed });
       setTimeout(() => setSyncResult(null), 5000);
@@ -2417,7 +2434,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   if (armed) return (
     <div style={{ display: "flex", gap: 8 }}>
       <button onClick={() => { setArmed(false); clearTimeout(armTimeout); }}
-        style={{ flex: 1, background: COLORS.surface, border: `1px solid \${COLORS.wire}`, borderRadius: 5, padding: 10, cursor: "pointer", color: COLORS.chalk, fontSize: 11, fontWeight: 700 }}>
+        style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 5, padding: 10, cursor: "pointer", color: COLORS.chalk, fontSize: 11, fontWeight: 700 }}>
         CANCEL
       </button>
       <button onClick={fire}
@@ -2429,7 +2446,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
 
   return (
     <button onClick={arm}
-      style={{ width: "100%", background: "rgba(220,53,69,0.08)", border: `2px solid \${COLORS.red}`, borderRadius: 6, padding: 10, cursor: "pointer", color: COLORS.red, fontSize: 11, fontWeight: 800, letterSpacing: 0.5 }}>
+      style={{ width: "100%", background: "rgba(220,53,69,0.08)", border: `2px solid ${COLORS.red}`, borderRadius: 6, padding: 10, cursor: "pointer", color: COLORS.red, fontSize: 11, fontWeight: 800, letterSpacing: 0.5 }}>
       🚨 SOS / EMERGENCY
     </button>
   );
@@ -5887,7 +5904,11 @@ async function insertNotification(n) {
   const base = { title, type: n.type, forroles: n.for_roles || [], message: n.message, tripid: n.trip_id ?? null, timestamp: n.ts, isread: n.read ?? false };
   const userIds = n.for_user_ids && n.for_user_ids.length ? n.for_user_ids : [null];
   const rows = userIds.map(uid => ({ ...base, userid: uid }));
-  const result = await supabase.from("notifications").insert(rows);
+  // must() throws on a failed insert — per must()'s own doc comment, a
+  // silently-ignored failure here means the calling action (ticket filed,
+  // DM sent, trip event) still reports success while the recipient's
+  // notification simply never exists, with nothing logged anywhere.
+  const result = must(await supabase.from("notifications").insert(rows));
   // Real Web Push — reaches the user's phone even with the app fully
   // closed or the screen locked, per explicit requirement. A specific,
   // targeted user list (userIds, filtering out the null/broadcast-to-
@@ -6073,7 +6094,7 @@ function ViewerPortal({ state, dispatch, user }) {
       companies: (state.companies || []).filter(c => companyIds.some(id => String(id) === String(c.id))),
       users: scopeUsersToCompany(state.users, state.trips, companyIds),
       trips: scopeTripsToCompany(state.trips, state.users, companyIds),
-      tickets: scopeTicketsToCompany(state.tickets, state.users, companyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, companyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, companyIds),
     };
   }, [state, user.scoped_company_ids]);
@@ -8123,6 +8144,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/FILE_DISPUTE": {
+      // Ownership check — DisputeFilingModal always sends agent_id: user.id,
+      // but nothing server-side enforced that. Without this, any caller
+      // could file a dispute "as" an arbitrary agent on any trip.
+      const { data: fdTripRow } = await supabase.from("trips").select("agentid, extraagentids").eq("id", action.trip_id).single();
+      if (!fdTripRow) throw new Error("Trip not found");
+      if (String(action.agent_id) !== String(activeUserRef.current)) throw new Error("You can only file a dispute as yourself.");
+      const fdAgentIds = [fdTripRow.agentid, ...(fdTripRow.extraagentids || [])].filter(Boolean);
+      if (!fdAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
       must(await supabase.from("trips").update({
         dispute: {
           agent_id: action.agent_id, category: action.category,
@@ -8142,16 +8171,30 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
 
     case "TRIP/RESOLVE_DISPUTE": {
+      // Admin-facing — resolving a dispute is operational work, same tier
+      // as TICKET/UPDATE. Previously had no permission gate at all: any
+      // dispatch call with a trip_id could resolve (or dismiss) a dispute
+      // regardless of who sent it, and nothing was ever logged.
+      const actingAdminDispute = await assertAdminPermission(activeUserRef, "manageTrips");
       const { data: tripForDispute } = await supabase.from("trips").select("dispute").eq("id", action.trip_id).single();
       must(await supabase.from("trips").update({
         dispute: { ...(tripForDispute?.dispute || {}), state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
         updatedat: nowEpoch(),
       }).eq("id", action.trip_id));
+      await logAuditAction({
+        actorId: actingAdminDispute.id, actorName: actingAdminDispute.name, actionType: "TRIP/RESOLVE_DISPUTE",
+        tripId: action.trip_id, details: `Resolved dispute — outcome: ${action.outcome}${action.resolution_note ? ` — "${action.resolution_note}"` : ""}`,
+      });
       await refetch();
       return;
     }
 
     case "TRIP/SET_SHARE_TOKEN": {
+      // Admin-facing only (see copyShareLink's one call site, on the admin
+      // user-detail screen). Previously had no permission gate: any
+      // dispatch call could mint a live-tracking share link for an
+      // arbitrary trip_id it had no relationship to.
+      await assertAdminPermission(activeUserRef, "manageTrips");
       must(await supabase.from("trips").update({
         sharetoken: action.token, updatedat: nowEpoch()
       }).eq("id", action.trip_id));
@@ -8170,7 +8213,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await logAuditAction({
         actorId: action.sender_id, actorName: action.sender_name,
         actionType: "SYSTEM/SOS_ALERT", tripId: action.trip_id,
-        details: `SOS alert fired. GPS: \${action.gps}. Driver: \${action.driver_name || "N/A"}`,
+        details: `SOS alert fired. GPS: ${action.gps}. Driver: ${action.driver_name || "N/A"}`,
       });
       await refetch();
       return;
@@ -8223,7 +8266,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/RATE": {
-      const { data: tripRow } = await supabase.from("trips").select("agentratings").eq("id", action.trip_id).single();
+      // Ownership check — without this, any caller could inject/overwrite
+      // any agent's rating on any trip by supplying an arbitrary agent_id.
+      const { data: tripRow } = await supabase.from("trips").select("agentid, extraagentids, agentratings").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      if (String(action.agent_id) !== String(activeUserRef.current)) throw new Error("You can only submit your own rating.");
+      const rateAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (!rateAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
       const newRatings = { ...(tripRow?.agentratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, rated_at: nowEpoch() } };
       must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id));
       await refetch();
@@ -8306,17 +8355,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!validReasons.includes(action.reason)) throw new Error("Please choose a valid delay reason.");
       const { data: tripRow } = await supabase.from("trips").select("driverid, status, agentid, extraagentids").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      if (tripRow.driverid !== action.driver_id) throw new Error("You're not the driver on this trip.");
+      // Ownership check — was comparing tripRow.driverid to the
+      // client-supplied action.driver_id (two values the caller effectively
+      // controls), never against the actual logged-in caller. Anyone who
+      // knew/guessed the real driver's id could spoof delay reports "as"
+      // them. Matches the activeUserRef pattern used everywhere else.
+      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("You're not the driver on this trip.");
       if (![TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(tripRow.status)) {
         throw new Error("Delays can only be reported on an active trip.");
       }
       const nowTs = nowEpoch();
       const { error } = await supabase.from("trip_delays").insert({
-        tripid: action.trip_id, driverid: action.driver_id, reason: action.reason,
+        tripid: action.trip_id, driverid: activeUserRef.current, reason: action.reason,
         note: action.note?.trim() || null, reportedat: nowTs,
       });
       if (error) throw error;
-      const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle();
+      const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", activeUserRef.current).maybeSingle();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "TRIP_DELAY", for_roles: [ROLE.ADMIN], for_user_ids: [],
@@ -8649,6 +8703,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // stale client. Checked against the EARLIEST scheduled trip in this
       // batch, matching the client-side check.
       const { trips: routeTrips, driver_coord } = action;
+      // Ownership check — every other action that writes to a trip row
+      // checks driverid against the caller; this one previously didn't, so
+      // any dispatch call naming someone else's trip_ids in `trips` could
+      // overwrite that driver's route sequence numbers and total km with
+      // attacker-controlled values.
+      const routeTripIds = routeTrips.map(t => t.trip_id);
+      const { data: routeOwnerRows } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
+      if ((routeOwnerRows || []).some(r => String(r.driverid) !== String(activeUserRef.current))) {
+        throw new Error("This trip isn't assigned to you.");
+      }
       const earliestScheduled = routeTrips
         .map(t => t.scheduled_time_epoch)
         .filter(Boolean)
@@ -8809,25 +8873,48 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // to them, so deleting by ID alone is safe.
       if (!action.ids || action.ids.length === 0) return;
       if (action.admin) {
-        // Admin path: delete purely by ID — no userid filter.
+        // Admin path: delete purely by ID — no userid filter. action.admin
+        // is client-supplied, so it must never be trusted on its own —
+        // verify the caller is actually an admin account first, or any
+        // logged-in agent/driver could pass admin:true and delete arbitrary
+        // notification rows (including other users' and system broadcasts).
+        const { data: actingUserDel } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
+        if (!actingUserDel || actingUserDel.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
         must(await supabase.from("notifications").delete().in("id", action.ids));
       } else {
-        // Agent/driver path: scope to their own userid for safety.
+        // Agent/driver path: scope to their own userid for safety. Uses
+        // activeUserRef.current (the actual authenticated caller), NOT
+        // action.user_id — that field is client-supplied and, like
+        // action.admin above, must never be trusted on its own, or any
+        // caller could pass someone else's user_id and delete that
+        // person's notifications instead of their own.
         const scopedRes = await supabase.from("notifications").delete()
           .in("id", action.ids)
-          .eq("userid", action.user_id);
-        if (scopedRes?.error) {
-          // RLS or other error — fall back to id-only
-          must(await supabase.from("notifications").delete().in("id", action.ids));
-        }
+          .eq("userid", activeUserRef.current);
+        // A real failure here must surface, not silently retry unscoped —
+        // that fallback would delete arbitrary rows for a non-admin caller,
+        // defeating the ownership check this branch exists to enforce.
+        if (scopedRes?.error) throw scopedRes.error;
       }
       await refetch();
       return;
     }
-    case "NOTIF/MARK_READ":
+    case "NOTIF/MARK_READ": {
+      // Ownership check — a caller may only mark their own notification
+      // read, or (if they're an admin) one addressed to admins broadly.
+      const { data: notifRow } = await supabase.from("notifications").select("userid, forroles").eq("id", action.id).single();
+      if (!notifRow) return;
+      const isOwn = notifRow.userid != null && String(notifRow.userid) === String(activeUserRef.current);
+      const isAdminBroadcast = notifRow.userid == null && (notifRow.forroles || []).includes(ROLE.ADMIN);
+      if (!isOwn) {
+        if (!isAdminBroadcast) throw new Error("You can't modify this notification.");
+        const { data: actingUserRead } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
+        if (!actingUserRead || actingUserRead.role !== ROLE.ADMIN) throw new Error("You can't modify this notification.");
+      }
       must(await supabase.from("notifications").update({ isread: true }).eq("id", action.id));
       await refetch();
       return;
+    }
     case "NOTIF/MARK_ALL_READ": {
       // Scoped to the caller (see the in-memory reducer's case) — the old
       // .neq("id", -1) matched every row, so any user clearing their
@@ -8837,8 +8924,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // rows, silently marking the entire notifications table read for
       // every user if neither was provided. Replaced with a safe no-op.
       if (action.user_id != null) {
-        must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.user_id));
+        // action.user_id is client-supplied, same as action.admin below —
+        // scope to the actual authenticated caller, not whatever id the
+        // client sent, or any caller could mark another user's
+        // notifications read (suppressing alerts meant for them).
+        must(await supabase.from("notifications").update({ isread: true }).eq("userid", activeUserRef.current));
       } else if (action.admin) {
+        // action.admin is client-supplied — verify the caller is actually
+        // an admin (any tier) before honoring it, same rationale as
+        // NOTIF/DELETE_SELECTED above.
+        const { data: actingUserMarkAll } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
+        if (!actingUserMarkAll || actingUserMarkAll.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
         // Two separate updates: broadcasts (userid IS NULL) AND anything
         // specifically targeted at this admin's own actor_id. Previously
         // only the broadcast case was cleared here — a targeted admin
@@ -11141,9 +11237,23 @@ function useWebRTCCall(currentUser) {
       // the ref, not the callState closure variable, since this effect no
       // longer re-runs on every state change (see comment above).
       if (callStateRef.current !== CALL_STATE.IDLE) {
-        supabase.channel(payload.callChannelName).subscribe((status) => {
+        // A re-ring of the call already ringing/active (the caller
+        // re-broadcasts its offer every 4s in case we were backgrounded
+        // — see the reRingInterval in startCall) is NOT a second incoming
+        // call — it's idempotent, just refresh the pending offer and
+        // ignore it. Without this check, our own first re-ring at ~4s
+        // was mistaken for a competing call and replied "busy" to
+        // ourselves, hanging up every unanswered (and some answered)
+        // calls right on schedule.
+        if (pcRef.current?.callChannelName === payload.callChannelName) {
+          if (pcRef.current) pcRef.current.pendingOffer = payload.offer;
+          return;
+        }
+        const busyChan = supabase.channel(payload.callChannelName);
+        busyChan.subscribe((status) => {
           if (status === "SUBSCRIBED") {
-            supabase.channel(payload.callChannelName).send({ type: "broadcast", event: "busy", payload: {} });
+            busyChan.send({ type: "broadcast", event: "busy", payload: {} });
+            setTimeout(() => supabase.removeChannel(busyChan), 500);
           }
         });
         return;
@@ -11240,6 +11350,15 @@ function useWebRTCCall(currentUser) {
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
       channel.on("broadcast", { event: "answer" }, async ({ payload }) => {
+        // Stop re-ringing now that it's been answered — otherwise a
+        // scheduled re-ring tick still fires later, the callee (now
+        // ACTIVE on this exact call) sees it as a stray offer and there
+        // was previously nothing distinguishing that from a real second
+        // call, so it could reply "busy" and hang up a live, connected call.
+        if (callChannelRef.current?._reRingInterval) {
+          clearInterval(callChannelRef.current._reRingInterval);
+          callChannelRef.current._reRingInterval = null;
+        }
         await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
         for (const c of pendingIceRef.current) await pc.addIceCandidate(new RTCIceCandidate(c));
         pendingIceRef.current = [];
@@ -12089,7 +12208,7 @@ function AdminTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
   const finalCoords = sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
@@ -12127,7 +12246,7 @@ function DriverTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
   const finalCoords = (sorted || dropCoords);
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -12778,7 +12897,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   // route: driver_start → pickup_home_A → pickup_home_B → ... → office (min km).
   // For OUTBOUND: no fixed destination — optimise drop sequence from office outward.
   const navDestination = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination);
+  // Earliest scheduled time across this batch of active trips — same
+  // "whichever pickup comes first" epoch used below to gate Start Trip —
+  // so TomTom optimises for the traffic conditions the driver will actually
+  // be in, not whatever traffic looks like right now.
+  const navDepartAtEpoch = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0] ?? null;
+  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination, navDepartAtEpoch);
   // Re-order the groups to match TomTom's coord sequence. Match by lat/lng
   // rounded to 4dp (same precision as the group key used above).
   let dropStops;
@@ -12895,7 +13019,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         await dispatch(action).catch(() => {});
         return;
       }
-      await dispatch(action);
+      try {
+        await dispatch(action);
+      } catch (dispatchErr) {
+        if (!isNetworkError(dispatchErr)) throw dispatchErr;
+        enqueueOfflineAction(action);
+        return;
+      }
     } catch (e) {
       setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
       return;
@@ -12929,7 +13059,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           enqueueOfflineAction(action);
           await dispatch(action).catch(() => {});
         } else {
-          await dispatch(action);
+          try {
+            await dispatch(action);
+          } catch (dispatchErr) {
+            if (!isNetworkError(dispatchErr)) throw dispatchErr;
+            enqueueOfflineAction(action);
+          }
         }
       }
     } catch (e) {
@@ -13922,7 +14057,7 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
   const destination = trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination);
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination, trip.scheduled_time_epoch);
   const finalCoords = sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
@@ -13962,9 +14097,9 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v12-one-way-not-round-trip";
+const _TOMTOM_CACHE_VERSION = "v13-scheduled-departure-traffic";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
-function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null) {
+function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null, departAtEpoch = null) {
   // TomTom optimisation applies to any multi-stop run regardless of direction —
   // the goal is always shortest total km, not direction-specific heuristics.
   const isMultiStop = coords && coords.length > 1;
@@ -13974,7 +14109,11 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   // cached result computed for someone else's home endpoint.
   const endKey = driverEndCoord?.lat != null ? `${driverEndCoord.lat.toFixed(4)},${driverEndCoord.lng.toFixed(4)}` : "none";
   const destKey = destinationCoord?.lat != null ? `dest:${destinationCoord.lat.toFixed(4)},${destinationCoord.lng.toFixed(4)}` : "nodest";
-  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + destKey + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  // Round to the nearest hour (same trick as routeCacheKey) so trips booked
+  // at 14:26 vs 14:58 for the same ~21:00 run share one cache entry, while a
+  // genuinely different scheduled hour gets its own traffic-aware result.
+  const hourBucket = departAtEpoch ? Math.floor(Number(departAtEpoch) / 3600000) : 0;
+  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + destKey + "|" + hourBucket + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
   const [sorted, setSorted] = React.useState(() => {
     if (!isMultiStop) return coords;
     if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
@@ -14010,7 +14149,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
     // For INBOUND: pass the company office as destination so TomTom optimises
     // the full chain: driver_start → home_A → home_B → ... → office (min total km)
     // For OUTBOUND: no destination — optimise dropoffs from the office outward.
-    tomtomOptimalStopOrder(anchorCoord, coords, null, destinationCoord).then(result => {
+    tomtomOptimalStopOrder(anchorCoord, coords, departAtEpoch, destinationCoord).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
@@ -18264,7 +18403,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       companies: (state.companies || []).filter(c => adminCompanyIds.some(id => String(id) === String(c.id))),
       users: scopeUsersToCompany(state.users, state.trips, adminCompanyIds),
       trips: scopeTripsToCompany(state.trips, state.users, adminCompanyIds),
-      tickets: scopeTicketsToCompany(state.tickets, state.users, adminCompanyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, adminCompanyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, adminCompanyIds),
     };
   }, [state, user]);
