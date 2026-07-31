@@ -149,6 +149,41 @@ function extractPublicKey(authData: Uint8Array): { x: Uint8Array; y: Uint8Array 
 }
 
 // ── Signature verification ─────────────────────────────────────────────────
+// WebAuthn ES256 assertion signatures come from the authenticator as
+// ASN.1 DER (SEQUENCE of two INTEGERs, r and s) — but WebCrypto's ECDSA
+// verify requires the raw fixed-length r‖s ("IEEE P1363") concatenation,
+// the same format crypto.subtle.sign produces. Without this conversion,
+// every real assertion fails verify() and authenticate() can never
+// succeed, no matter how correct the credential/challenge is.
+function derSignatureToRaw(der: Uint8Array): Uint8Array {
+  if (der[0] !== 0x30) throw new Error('Invalid DER signature: missing SEQUENCE tag');
+  let offset = 2;
+  if (der[1] & 0x80) offset = 2 + (der[1] & 0x7f); // long-form length
+
+  if (der[offset] !== 0x02) throw new Error('Invalid DER signature: missing INTEGER tag (r)');
+  offset++;
+  const rLen = der[offset]; offset++;
+  let r = der.slice(offset, offset + rLen); offset += rLen;
+
+  if (der[offset] !== 0x02) throw new Error('Invalid DER signature: missing INTEGER tag (s)');
+  offset++;
+  const sLen = der[offset]; offset++;
+  let s = der.slice(offset, offset + sLen);
+
+  const trimLeadingZeros = (b: Uint8Array) => {
+    let i = 0;
+    while (b.length - i > 32 && b[i] === 0) i++;
+    return b.slice(i);
+  };
+  r = trimLeadingZeros(r);
+  s = trimLeadingZeros(s);
+
+  const raw = new Uint8Array(64);
+  raw.set(r, 32 - r.length); // left-pad to 32 bytes each
+  raw.set(s, 64 - s.length);
+  return raw;
+}
+
 async function verifySignature(
   publicKeyB64: string,
   authData: Uint8Array,
@@ -168,9 +203,10 @@ async function verifySignature(
     const verifyData = new Uint8Array(authData.length + clientDataHash.length);
     verifyData.set(authData);
     verifyData.set(clientDataHash, authData.length);
+    const rawSig = derSignatureToRaw(sig);
     return await crypto.subtle.verify(
       { name: 'ECDSA', hash: 'SHA-256' },
-      cryptoKey, sig, verifyData
+      cryptoKey, rawSig, verifyData
     );
   } catch {
     return false;
@@ -400,7 +436,10 @@ async function authenticationOptions(username: string) {
   const supabase = db();
   const { data: user } = await supabase
     .from('users').select('id').eq('username', username).maybeSingle();
-  if (!user) return err('User not found');
+  // Same response for "no such user" and "user has no credentials" —
+  // returning a distinguishable error for the former lets a caller
+  // enumerate valid usernames, which login() deliberately avoids.
+  if (!user) return json({ hasCredentials: false });
   const { data: creds } = await supabase
     .from('webauthn_credentials').select('credential_id_b64, transports')
     .eq('app_user_id', user.id);
