@@ -12438,10 +12438,18 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             {/* Drop-off: per-agent for OUTBOUND — uses TomTom road-optimal ordering */}
             <DriverTripDropoffs trip={trip} state={state} />
             {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
-            {trip.driver_route_km != null && (
+            {(trip.route_total_km ?? trip.driver_route_km) != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
+                {/* Prefer route_total_km — recomputed from the driver's ACTUAL
+                    position when they tapped Start Trip, so it reflects the
+                    real route rather than the dispatch-time estimate (which
+                    can go stale, e.g. if it was computed before a routing fix
+                    shipped, or before the driver's day changed). Same
+                    fallback pattern used everywhere else this pair is shown —
+                    this was the one place that only ever read driver_route_km
+                    directly. */}
                 Driver's total route: <span style={{ color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, fontWeight: 700 }}>
-                  {trip.driver_route_km.toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
+                  {(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
                 </span>
               </div>
             )}
