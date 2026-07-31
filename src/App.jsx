@@ -707,12 +707,6 @@ const CPT_ADDRESS_DB = [
   { label: "Lady Grey Street, Paarl", area: "Paarl", lat: -33.7320, lng: 18.9650 },
 ];
 
-function coordForArea(areaName) {
-  const entry = CPT_ADDRESS_DB.find(a => a.area === areaName);
-  if (entry) return { lat: entry.lat, lng: entry.lng };
-  return { lat: -33.9249, lng: 18.4241 };
-}
-
 // Reacts to the viewport crossing the phone/tablet breakpoint — via
 // matchMedia's change event, not a one-time window.innerWidth read at
 // mount, so rotating a tablet or resizing a browser window updates the
@@ -1536,7 +1530,11 @@ console.log(
 
 // ── Insurance & compliance triggers ──────────────────────────────────────
 const COMPLIANCE_ROUTE_MAX_KM = 80;  // notify when driver route > 80 km
-const COMPLIANCE_MAX_SHIFT_HOURS = 10; // notify when driver online > 10h
+// A shift-duration compliance check (originally planned: notify when a
+// driver's been online > 10h) was never actually implemented below — there's
+// no shift-start timestamp anywhere in driver_status to check against
+// (only a plain isonline boolean), so it would need a real schema change,
+// not just wiring up existing pieces. Left out of scope for now.
 
 // Called inside TRIP/ASSIGN_DRIVER and TRIP/ADD_AGENT after route is computed.
 // Returns array of compliance issues (empty = all clear).
@@ -3291,7 +3289,6 @@ function buildSupportingPointsParam(coords) {
 // avoidUnpavedRoads: never route via informal-settlement unmaintained tracks
 // avoidTollRoads: no toll roads in Cape Town but good practice for future
 // (N1 east, N2 toll plazas if Pearce & Sons ever expands to Paarl/Stellenbosch)
-const TOMTOM_AVOID = "avoidAreas=&avoid=unpavedRoads";
 // Note: TomTom uses comma-separated values in the `avoid` param:
 //   avoid=tollRoads,unpavedRoads,ferries
 // Using unpavedRoads only for now — add tollRoads if needed.
@@ -3578,50 +3575,6 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     return [...best.order, ...invalid];
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
-    return null;
-  }
-}
-
-// ── FEATURE 4: TomTom Matrix Routing API ──────────────────────────────────
-// Replaces N sequential calculateRoute calls with a single matrix request
-// when we need distances from one origin to multiple destinations (or
-// multiple origins to one destination). Used during dispatch to evaluate
-// how far each available driver is from the company anchor — previously
-// this was N separate API calls fired sequentially; now it's one HTTP
-// request that returns all N distances in parallel.
-//
-// TomTom Matrix API: POST /routing/1/matrix/json?key=...
-// origins and destinations are arrays of { point: { latitude, longitude } }
-// Returns a matrix of summary objects — we only need lengthInMeters here.
-//
-// Falls back to haversineKm × ROAD_FACTOR if TomTom is unavailable.
-async function tomtomMatrixDistances(origin, destinations, departAtEpoch = null) {
-  if (!TOMTOM_API_KEY || !origin || !destinations?.length) return null;
-  try {
-    const departAtParam = departAtEpoch
-      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
-      : "";
-    const url = `https://api.tomtom.com/routing/1/matrix/json?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}`;
-    const body = {
-      origins: [{ point: { latitude: origin.lat, longitude: origin.lng } }],
-      destinations: destinations.map(d => ({ point: { latitude: d.lat, longitude: d.lng } })),
-    };
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`TomTom matrix returned ${res.status}`);
-    const data = await res.json();
-    // data.matrix is a 2D array [originIndex][destinationIndex]
-    // We have 1 origin so it's always data.matrix[0][destIndex]
-    return destinations.map((_, i) => {
-      const cell = data.matrix?.[0]?.[i];
-      const m = cell?.response?.routeSummary?.lengthInMeters;
-      return m != null ? m / 1000 : null; // → km, or null if unreachable
-    });
-  } catch (e) {
-    console.warn("[TomTom] matrix distances failed, falling back to haversine:", e.message);
     return null;
   }
 }
@@ -9484,7 +9437,45 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   );
 }
 
-function LocationSelector({ mode, setMode, companyId, setCompanyId, state, streetValue, streetCoord, onStreetChange, manualAddress, onManualAddressChange, error, errMsg }) {
+function LocationSelector({ mode, setMode, companyId, setCompanyId, state, streetValue, streetCoord, onStreetChange, error, errMsg }) {
+  // BUGFIX (2026-07-31): this component used to take manualAddress/
+  // onManualAddressChange as props, but no caller anywhere in the app ever
+  // provided them — every real usage only wires up onStreetChange. That
+  // meant clicking "Type Address" and typing crashed immediately
+  // (calling onManualAddressChange, which was always undefined). Made
+  // manual-entry self-contained instead: manages its own text state here
+  // and reuses the SAME onStreetChange callback every caller already
+  // supplies, geocoding in the background via tomtomGeocodeAddress
+  // (previously written but never actually called anywhere) exactly as
+  // this mode's own help text always claimed it would.
+  const [manualAddress, setManualAddress] = useState(mode === "manual" ? (streetValue || "") : "");
+  const [manualGeocoding, setManualGeocoding] = useState(false);
+  React.useEffect(() => {
+    if (mode !== "manual") return;
+    const trimmed = manualAddress.trim();
+    if (trimmed.length < 8) {
+      onStreetChange({ street: trimmed, area: null, coord: null, confirmed: false });
+      return;
+    }
+    // Usable immediately once it looks like a real address — Waze can
+    // search the raw typed text even without a resolved coordinate (per
+    // the help text below), so typing shouldn't block the user from
+    // proceeding while geocoding is still in flight.
+    onStreetChange({ street: trimmed, area: null, coord: null, confirmed: true });
+    let cancelled = false;
+    setManualGeocoding(true);
+    const handle = setTimeout(() => {
+      tomtomGeocodeAddress(trimmed).then(result => {
+        if (cancelled || !result) return;
+        // Upgrade with a precise pin once found — same street text, now
+        // with real coordinates attached.
+        onStreetChange({ street: trimmed, area: result.area, coord: { lat: result.lat, lng: result.lng }, confirmed: true });
+      }).finally(() => { if (!cancelled) setManualGeocoding(false); });
+    }, 600); // debounce — avoid geocoding on every keystroke
+    return () => { cancelled = true; clearTimeout(handle); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manualAddress, mode]);
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       <div style={{ display: "flex", gap: 6 }}>
@@ -9526,11 +9517,13 @@ function LocationSelector({ mode, setMode, companyId, setCompanyId, state, stree
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <TextField
             label="Full address (typed exactly as it should appear in Waze)"
-            value={manualAddress} onChange={e => onManualAddressChange(e.target.value)}
+            value={manualAddress} onChange={e => setManualAddress(e.target.value)}
             placeholder="e.g. 14 Bokmakierie Street, Rocklands, Cape Town, 7100"
           />
           <span style={{ fontSize: 9, color: COLORS.ghost }}>
-            No dropdown search — type the exact address and it'll be looked up in the background to give your driver a precise pin in Waze. If it can't be found, Waze will fall back to searching this text directly when navigation opens. Include the suburb and postal code for the best match.
+            {manualGeocoding
+              ? "Looking up a precise pin for this address…"
+              : "No dropdown search — type the exact address and it'll be looked up in the background to give your driver a precise pin in Waze. If it can't be found, Waze will fall back to searching this text directly when navigation opens. Include the suburb and postal code for the best match."}
           </span>
           {errMsg ? <span style={{ fontSize: 10, color: COLORS.red }}>{errMsg}</span> : null}
         </div>
@@ -11581,31 +11574,6 @@ function setAlertSoundMuted(muted) {
 }
 
 let sharedAudioCtx = null;
-// Every selectable sound for ringtone / message tone. "synth" options
-// Built-in options only — the app's own original, always-available
-// tones (zero setup, already proven copyright-clear per the app's own
-// compliance rules).
-const RINGTONE_OPTIONS = [
-  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
-];
-const MESSAGE_TONE_OPTIONS = [
-  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
-];
-
-function getUserSoundPref(userId, kind) {
-  // kind is "ringtone" or "messageTone" — stored per-user, like every
-  // other per-user preference in this app (see usePersistedTab).
-  try {
-    return localStorage.getItem(`transitos_sound_${kind}_${userId}`) || "synth_chime";
-  } catch (e) {
-    return "synth_chime";
-  }
-}
-function setUserSoundPref(userId, kind, optionId) {
-  try {
-    localStorage.setItem(`transitos_sound_${kind}_${userId}`, optionId);
-  } catch (e) { /* ignore — worst case, preference doesn't persist */ }
-}
 
 function playAlertSound() {
   if (isAlertSoundMuted()) return;
