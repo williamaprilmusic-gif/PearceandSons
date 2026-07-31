@@ -1,11 +1,24 @@
 // daily-trip-sheet/index.ts
 // Sends a daily trip sheet email to app@pearceandsons.co.za via Resend.
+//
+// SYNCED FROM DEPLOYED SOURCE (2026-07-31) — the version that was actually
+// live (v46) had diverged from what was committed here (someone had edited
+// it directly via the dashboard/CLI without ever syncing back), and the
+// committed version had its own separate bugs (referenced the `Resend` SDK
+// class without importing it, and read `process.env.RESEND_API_KEY` —
+// `process` isn't a populated global in Deno's edge runtime — so it would
+// have thrown immediately on the very first line if it had ever actually
+// been the deployed code). The real deployed version instead called the
+// Resend HTTP API directly via fetch(), no SDK needed, and that part
+// worked — except its Resend API key was a live secret hardcoded directly
+// in the source rather than read from the `Resend_API_Key` env secret that
+// was already configured for exactly this. Fixed to read from env.
 
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
 serve(async (_req) => {
-  const resend = new Resend(process.env.RESEND_API_KEY);
+  const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
   const TO = "app@pearceandsons.co.za";
   const FROM = "TransitOS <onboarding@resend.dev>";
 
@@ -15,6 +28,9 @@ serve(async (_req) => {
   console.log("daily-trip-sheet: starting");
   console.log("FROM:", FROM, "| TO:", TO);
 
+  if (!RESEND_KEY) {
+    return json({ error: "Missing Resend_API_Key secret" }, 500);
+  }
   if (!SUPABASE_URL || !SERVICE_KEY) {
     return json({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }, 500);
   }
