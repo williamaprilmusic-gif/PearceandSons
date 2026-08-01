@@ -11628,8 +11628,24 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
               geofenceTriggeredRef.current.add(geoKey);
               console.log(`[Geofence] Auto-confirming pickup for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
-              dispatch({ type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: trip.trip_id, agent_id: aid,
-                driver_coord: { lat: latitude, lng: longitude } }).catch(() => {});
+              const geoAction = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: trip.trip_id, agent_id: aid,
+                driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
+              dispatch(geoAction).catch((err) => {
+                // Unlike the manual confirm buttons (which enqueue for
+                // offline replay on a network-shaped failure), this used to
+                // just swallow the error — geofenceTriggeredRef permanently
+                // blocked any retry for this exact stop even though GPS
+                // keeps ticking every few seconds while the vehicle is
+                // still right there. Queue for replay on reconnect AND free
+                // the geoKey so the very next GPS tick can also retry live
+                // while still in range — CONFIRM_AGENT_PICKUP is already
+                // safely idempotent, so a duplicate fire from both racing
+                // is harmless.
+                if (isNetworkError(err)) {
+                  enqueueOfflineAction(geoAction);
+                  geofenceTriggeredRef.current.delete(geoKey);
+                }
+              });
             }
           }
           // Check dropoffs — agents confirmed picked up but not yet dropped
@@ -11653,8 +11669,17 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
               geofenceTriggeredRef.current.add(geoKey);
               console.log(`[Geofence] Auto-confirming dropoff for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
-              dispatch({ type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: trip.trip_id, agent_id: aid,
-                driver_coord: { lat: latitude, lng: longitude } }).catch(() => {});
+              const geoAction = { type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: trip.trip_id, agent_id: aid,
+                driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
+              dispatch(geoAction).catch((err) => {
+                // See the identical fix/reasoning on the pickup geofence
+                // loop above — a network-shaped failure must not
+                // permanently block this stop's auto-confirm.
+                if (isNetworkError(err)) {
+                  enqueueOfflineAction(geoAction);
+                  geofenceTriggeredRef.current.delete(geoKey);
+                }
+              });
             }
           }
         }
