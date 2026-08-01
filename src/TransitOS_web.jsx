@@ -14737,7 +14737,12 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
 
   const escapeCsv = (val) => {
     const s = val == null ? "" : String(val);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    // Must also catch a lone \r (not just \r\n) — matches the other CSV
+    // escaper in this file (csvCell, compliance audit export) which
+    // already checks for it; this one didn't, so a field containing a
+    // bare carriage return could slip through unquoted and corrupt row
+    // boundaries for CSV parsers that treat lone \r as a line break.
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const userName = (id) => users?.find(u => String(u.id) === String(id))?.name || (id ?? "");
   const userStaffNum = (id) => users?.find(u => String(u.id) === String(id))?.staff_number || "";
@@ -17138,7 +17143,12 @@ function usersToCsv(users, driverStatusList) {
   ];
   const escapeCsv = (val) => {
     const s = val == null ? "" : String(val);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    // Must also catch a lone \r (not just \r\n) — matches the other CSV
+    // escaper in this file (csvCell, compliance audit export) which
+    // already checks for it; this one didn't, so a field containing a
+    // bare carriage return could slip through unquoted and corrupt row
+    // boundaries for CSV parsers that treat lone \r as a line break.
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const rows = users.map(u => {
     const ds = u.role === ROLE.DRIVER ? driverStatusList.find(d => String(d.driver_id) === String(u.id)) : null;
