@@ -2804,7 +2804,14 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
   };
   const fmtEpoch = (ep) => {
     if (!ep) return "";
-    try { return new Date(Number(ep)).toLocaleString("en-ZA"); } catch { return String(ep); }
+    // timeZone pinned explicitly — "en-ZA" only controls the DD/MM/YYYY
+    // string FORMAT, not which timezone the epoch is converted through,
+    // which otherwise silently follows the exporting device's own OS
+    // clock. This export is for regulatory/compliance submissions, so a
+    // misconfigured or traveling admin's device must never silently shift
+    // every timestamp in the file. Africa/Johannesburg = SAST (UTC+2,
+    // no DST), matching Cape Town year-round.
+    try { return new Date(Number(ep)).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }); } catch { return String(ep); }
   };
 
   const inRange = trips.filter(t => {
@@ -2871,7 +2878,9 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
     ].map(csvCell);
   });
 
-  const now = new Date().toLocaleString("en-ZA");
+  // Pinned to SAST — see fmtEpoch above for why this document's timestamps
+  // can't be allowed to silently follow the exporting device's own clock.
+  const now = new Date().toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" });
   const csvLines = [
     csvCell(`# TransitOS Compliance Audit Export — Generated: ${now}`),
     csvCell(`# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`),
@@ -15416,8 +15425,13 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
   const userName = (id) => users?.find(u => String(u.id) === String(id))?.name || (id ?? "");
   const userStaffNum = (id) => users?.find(u => String(u.id) === String(id))?.staff_number || "";
   const driverVehicle = (id) => (driverStatusList || []).find(d => String(d.driver_id) === String(id))?.vehicle || "";
-  // en-ZA gives DD/MM/YYYY, HH:MM:SS — readable in Excel.
-  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA") : "";
+  // en-ZA gives DD/MM/YYYY, HH:MM:SS — readable in Excel. timeZone pinned
+  // explicitly — "en-ZA" alone only controls the string FORMAT, not which
+  // timezone the epoch is converted through, which otherwise silently
+  // follows the exporting device's own OS clock rather than Cape Town's.
+  // Africa/Johannesburg = SAST (UTC+2, no DST), matching Cape Town
+  // year-round, so exports stay deterministic regardless of the device.
+  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
   const fmtCoord = (loc) => loc ? `${loc.lat.toFixed(5)},${loc.lng.toFixed(5)}` : "";
 
   // Multiple delay reports joined into one cell — one row per PASSENGER
