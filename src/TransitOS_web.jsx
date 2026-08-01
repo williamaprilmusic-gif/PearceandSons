@@ -10279,16 +10279,25 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   // pickup point — [0] is the PRIMARY agent's, so a secondary passenger
   // was being shown distance/ETA to someone else's address. Falls back
   // to [0] for the primary agent / legacy coords without agent_id.
+  // pickup_sequence_coords/dropoff_sequence_coords hydrated from Supabase
+  // carry no agent_id — falling straight back to index 0 (as myPickupCoord
+  // used to do, unconditionally) resolves every non-primary agent's "my
+  // pickup" against the PRIMARY agent's address instead of their own,
+  // exactly the bug this comment block already warned about. Resolve by
+  // this agent's actual position in agent_ids instead of always [0].
+  const myAgentIdx = trip?.agent_ids ? trip.agent_ids.findIndex(a => String(a) === String(user.id)) : -1;
   const myPickupCoord = trip
-    ? (trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(user.id)) ?? trip.pickup_sequence_coords?.[0]) ?? null
+    ? (trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(user.id))
+        ?? (myAgentIdx >= 0 ? trip.pickup_sequence_coords?.[myAgentIdx] : null)) ?? null
     : null;
   // Per-agent dropoff: find this agent's specific dropoff (their home for OUTBOUND).
-  // Falls back to [0] for primary agent on legacy coords, then to the user's
-  // home_address for OUTBOUND trips where extradropoffs wasn't stored yet
-  // (trips dispatched before the per-agent dropoff feature was added).
+  // Falls back to this agent's position in agent_ids on legacy/untagged
+  // coords, then to the user's home_address for OUTBOUND trips where
+  // extradropoffs wasn't stored yet (trips dispatched before the per-agent
+  // dropoff feature was added).
   const myDropoffCoord = trip
     ? (trip.dropoff_sequence_coords?.find(c => String(c.agent_id) === String(user.id))
-        ?? (String(trip.agent_ids[0]) === String(user.id) ? trip.dropoff_sequence_coords?.[0] : null)
+        ?? (myAgentIdx >= 0 ? trip.dropoff_sequence_coords?.[myAgentIdx] : null)
         ?? (trip.direction === "OUTBOUND" && state.users.find(u => String(u.id) === String(user.id))?.home_address
             ? state.users.find(u => String(u.id) === String(user.id)).home_address
             : null))
@@ -10976,7 +10985,19 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           // Check pickups first — agents not yet confirmed picked up
           for (const aid of agentIds) {
             if (completedPickups.some(c => String(c) === String(aid))) continue;
+            const aidIdx = agentIds.indexOf(aid);
+            // pickup_sequence_coords hydrated from Supabase carries no
+            // agent_id at all — falling straight back to index 0 (as this
+            // used to) resolves EVERY non-first agent's geofence check
+            // against agent #1's coordinate instead of their own. Since
+            // this loop auto-fires TRIP/CONFIRM_AGENT_PICKUP with no human
+            // confirmation, that meant driving near agent #1's pickup could
+            // silently auto-confirm agent #2 as picked up while they were
+            // never actually in the vehicle. Match the positional-fallback
+            // convention used elsewhere in this codebase for this exact
+            // data shape (find by agent_id, else by position, else [0]).
             const pCoord = trip.pickup_sequence_coords?.find(p => String(p.agent_id) === String(aid))
+              || trip.pickup_sequence_coords?.[aidIdx]
               || trip.pickup_sequence_coords?.[0];
             if (!pCoord?.lat) continue;
             const distKm = haversineKm(latitude, longitude, pCoord.lat, pCoord.lng);
@@ -10992,7 +11013,16 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           for (const aid of agentIds) {
             if (!completedPickups.some(c => String(c) === String(aid))) continue;
             if (completedDropoffs.some(c => String(c) === String(aid))) continue;
+            const aidIdx = agentIds.indexOf(aid);
+            // Same fix as the pickup loop above — dropoff_sequence_coords
+            // hydrated from Supabase carries no agent_id, so this used to
+            // resolve every non-first agent's geofence check against
+            // agent #1's dropoff address. Since this auto-fires
+            // TRIP/CONFIRM_AGENT_DROPOFF with no human confirmation,
+            // driving near agent #1's home could silently mark agent #2 as
+            // dropped off while they were still in the vehicle.
             const dCoord = trip.dropoff_sequence_coords?.find(d => String(d.agent_id) === String(aid))
+              || trip.dropoff_sequence_coords?.[aidIdx]
               || trip.dropoff_sequence_coords?.[0];
             if (!dCoord?.lat) continue;
             const distKm = haversineKm(latitude, longitude, dCoord.lat, dCoord.lng);
@@ -12926,21 +12956,30 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       // Each coord entry has an agent_id when built from extradropoffs —
       // attach only that specific agent to this stop. Fall back to all
       // trip agents for single-dropoff trips (INBOUND / legacy data).
-      if (coord.agent_id) {
-        const u = state.users.find(x => String(x.id) === String(coord.agent_id));
-        if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(coord.agent_id) && p.trip_id === trip.trip_id)) {
-          dropoffGroups[key].passengers.push({ id: coord.agent_id, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
+      //
+      // dropoff_sequence_coords hydrated straight from Supabase (i.e. any
+      // trip loaded normally, not built up via ADD_AGENT this session)
+      // carries NO agent_id at all — the backfill above only covers the
+      // case where entries are MISSING outright (dropCoords.length <
+      // agent_ids.length); it doesn't tag existing-but-untagged entries.
+      // The old `coordIdx === 0` special case attached every trip agent to
+      // the FIRST stop only and left every other untagged stop with zero
+      // passengers, which then read as "done" (Array.every vacuous truth
+      // on an empty array) — a driver on a real multi-dropoff OUTBOUND trip
+      // could see later stops as already complete. Fall back to positional
+      // correspondence with agent_ids for a genuine multi-stop untagged
+      // trip; a single untagged entry still means "everyone drops here."
+      const resolvedDropAgentIds = coord.agent_id
+        ? [coord.agent_id]
+        : dropCoords.length === 1
+          ? (trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null])
+          : [trip.agent_ids?.[coordIdx]].filter(Boolean);
+      resolvedDropAgentIds.forEach(aid => {
+        const u = state.users.find(x => String(x.id) === String(aid));
+        if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(aid) && p.trip_id === trip.trip_id)) {
+          dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
         }
-      } else if (coordIdx === 0) {
-        // Legacy single-dropoff: attach all trip agents to this one stop.
-        const tripAgentIds = trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null];
-        tripAgentIds.forEach(aid => {
-          const u = state.users.find(x => String(x.id) === String(aid));
-          if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(aid) && p.trip_id === trip.trip_id)) {
-            dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
-          }
-        });
-      }
+      });
     });
   });
   Object.values(dropoffGroups).forEach(group => {
