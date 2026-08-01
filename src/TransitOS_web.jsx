@@ -126,9 +126,9 @@ input, select, textarea { font-family: inherit; }
 
 const ROLE = Object.freeze({ ADMIN: "ADMIN", AGENT: "AGENT", DRIVER: "DRIVER", CLIENT: "CLIENT" });
 
-const ADMIN_LEVEL = Object.freeze({ FLEET_OPS: "FLEET_OPS", STANDARD: "STANDARD", VIEWER: "VIEWER" });
+const ADMIN_LEVEL = Object.freeze({ FLEET_OPS: "FLEET_OPS", STANDARD: "STANDARD", FINANCIAL: "FINANCIAL", VIEWER: "VIEWER" });
 
-// Central permission table for the 3 admin sub-roles. Checked in BOTH the
+// Central permission table for the 4 admin sub-roles. Checked in BOTH the
 // UI (to hide controls) and inside handleSupabaseAction (to actually block
 // the write) — a hidden button is not security, since anyone with devtools
 // can still fire the underlying dispatch call directly.
@@ -136,10 +136,28 @@ const ADMIN_PERMISSIONS = {
   [ADMIN_LEVEL.FLEET_OPS]: {
     viewUsers: true, manageAgentsDrivers: true, manageAdmins: true,
     manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
+    // manageFeeRates: only Fleet Ops sets the 4 per-category trip fee
+    // rates (normal/late booking/late cancellation/no show). viewTripFees
+    // gates both seeing those rates and downloading the trips CSV that
+    // includes the computed Trip Fee column + total — per explicit
+    // decision, restricted to Fleet Ops and Financial only.
+    manageFeeRates: true, viewTripFees: true,
   },
   [ADMIN_LEVEL.STANDARD]: {
     viewUsers: true, manageAgentsDrivers: true, manageAdmins: false,
     manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
+    manageFeeRates: false, viewTripFees: false,
+  },
+  [ADMIN_LEVEL.FINANCIAL]: {
+    // Read-only reporting/finance role, per explicit decision — can search
+    // and view agents/drivers/trip detail and download the fee-bearing
+    // trips CSV, but nothing operational: no dispatch, no cancelling, no
+    // editing users, no managing anything. Cannot set the fee rates
+    // themselves (manageFeeRates stays Fleet-Ops-only) even though this
+    // tier can VIEW them (needs to, to make sense of the CSV totals).
+    viewUsers: true, manageAgentsDrivers: false, manageAdmins: false,
+    manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: true,
+    manageFeeRates: false, viewTripFees: true,
   },
   [ADMIN_LEVEL.VIEWER]: {
     // Viewer can see that a driver was ASSIGNED to a trip (name only,
@@ -153,6 +171,7 @@ const ADMIN_PERMISSIONS = {
     // already embedded in trip records.
     viewUsers: false, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: false,
+    manageFeeRates: false, viewTripFees: false,
   },
 };
 
@@ -212,9 +231,11 @@ function isMasterAdmin(user, companies) {
 
 function getAdminCompanyIds(user, companies) {
   if (!user || user.role !== ROLE.ADMIN) return [];
-  // FLEET_OPS and STANDARD both see all companies — they're the same operational
-  // tier, just STANDARD can't manage other admin accounts.
-  if (user.admin_level === ADMIN_LEVEL.FLEET_OPS || user.admin_level === ADMIN_LEVEL.STANDARD) {
+  // FLEET_OPS, STANDARD, and FINANCIAL all see all companies — Financial
+  // is read-only on WRITE permissions (see ADMIN_PERMISSIONS) but needs
+  // fleet-wide visibility to produce accurate trip-fee CSV totals; scoping
+  // it down to individual companies like Viewer would defeat that.
+  if (user.admin_level === ADMIN_LEVEL.FLEET_OPS || user.admin_level === ADMIN_LEVEL.STANDARD || user.admin_level === ADMIN_LEVEL.FINANCIAL) {
     return []; // [] = unrestricted — sees all trips, agents, drivers
   }
   // VIEWER → scoped to their explicit companies (read-only limited view)
@@ -7372,6 +7393,30 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else await refetch();
       return;
     }
+    case "ADMIN/UPDATE_FEE_RATES": {
+      // Fleet-Ops-only, per explicit decision — Financial admins can VIEW
+      // these rates (they need to, to make sense of the CSV totals) but
+      // never set them.
+      const actingAdminFee = await assertAdminPermission(activeUserRef, "manageFeeRates");
+      const rateFields = { normalzar: action.normal_zar, latebookingzar: action.late_booking_zar, latecancellationzar: action.late_cancellation_zar, noshowzar: action.no_show_zar };
+      for (const [k, v] of Object.entries(rateFields)) {
+        if (v == null || typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+          throw new Error("All four fee rates must be zero or a positive number.");
+        }
+      }
+      const feeNowTs = nowEpoch();
+      const { error: feeErr } = await supabase.from("trip_fee_rates").update({
+        ...rateFields, updatedat: feeNowTs, updatedby: actingAdminFee.id,
+      }).eq("id", 1);
+      if (feeErr) throw feeErr;
+      await logAuditAction({
+        actorId: actingAdminFee.id, actorName: actingAdminFee.name, actionType: "ADMIN/UPDATE_FEE_RATES",
+        details: `Updated trip fee rates — Normal: R${action.normal_zar}, Late Booking: R${action.late_booking_zar}, Late Cancellation: R${action.late_cancellation_zar}, No Show: R${action.no_show_zar}`,
+      });
+      if (extraRefetchers.fetchFeeRates) await extraRefetchers.fetchFeeRates();
+      else await refetch();
+      return;
+    }
     case "ADMIN/CREATE_CAMPAIGN": {
       const actingAdminCampC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
       if (!action.name?.trim()) throw new Error("Campaign name is required.");
@@ -9555,6 +9600,7 @@ function useAppStore() {
   const [companies, setCompanies] = useState([]); // [{ id, name, active, address }]
   const [tickets, setTickets] = useState([]);
   const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
+  const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
 
   const refetch = useCallback(async () => {
     if (!supabase) return;
@@ -9654,6 +9700,20 @@ function useAppStore() {
     setHighRiskAvoidZones(mapped);
   }, []);
 
+  // Trip fee rates — admin-configurable (Fleet Ops only) per-category
+  // rates used to compute the trips CSV's Trip Fee column + total,
+  // visible only to Fleet Ops/Financial. Same "own fetch cycle" pattern
+  // as high_risk_zones/campaigns/companies/tickets above.
+  const fetchFeeRates = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("trip_fee_rates").select("*").eq("id", 1).maybeSingle();
+    if (error || !data) return;
+    setFeeRates({
+      normal_zar: Number(data.normalzar) || 0, late_booking_zar: Number(data.latebookingzar) || 0,
+      late_cancellation_zar: Number(data.latecancellationzar) || 0, no_show_zar: Number(data.noshowzar) || 0,
+    });
+  }, []);
+
   useEffect(() => {
     if (!supabase) return;
     refetch();
@@ -9750,6 +9810,16 @@ function useAppStore() {
     return () => { supabase.removeChannel(channel); };
   }, [fetchHighRiskZones]);
 
+  useEffect(() => {
+    if (!supabase) return;
+    fetchFeeRates();
+    const channel = supabase
+      .channel("transitos-fee-rates")
+      .on("postgres_changes", { event: "*", schema: "public", table: "trip_fee_rates" }, fetchFeeRates)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchFeeRates]);
+
   const dispatch = useCallback(async (action) => {
     if (useFallback || !supabase) {
       // appReducer never throws — a failed action just comes back with
@@ -9803,7 +9873,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -9815,12 +9885,12 @@ function useAppStore() {
       setSupaError(e.message);
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -15509,7 +15579,35 @@ function exceptionLabel(t) {
   return labels.join(" + ");
 }
 
-function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}) {
+// Precedence when more than one billing category applies to the same
+// trip: ARCHIVED_CANCELLED (late cancellation) means the trip never
+// actually ran, so it's mutually exclusive with the others by
+// construction (only a LATE cancellation gets archived — an on-time one
+// deletes cleanly, never reaching this state). A completed trip that was
+// both booked late AND had a no-show is billed as a no-show — the more
+// consequential outcome — rather than double-counted or picking one
+// arbitrarily.
+function tripFeeCategory(t) {
+  if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) return "late_cancellation";
+  if (t.no_shows && t.no_shows.length > 0) return "no_show";
+  if (t.late_booking_flag) return "late_booking";
+  return "normal";
+}
+function tripFeeAmount(t, feeRates) {
+  if (!feeRates) return null;
+  const cat = tripFeeCategory(t);
+  return cat === "late_cancellation" ? feeRates.late_cancellation_zar
+    : cat === "no_show" ? feeRates.no_show_zar
+    : cat === "late_booking" ? feeRates.late_booking_zar
+    : feeRates.normal_zar;
+}
+
+// feeRates ({ normal_zar, late_booking_zar, late_cancellation_zar,
+// no_show_zar }) is optional — only Fleet Ops/Financial admins ever pass
+// it (gated by the "viewTripFees" permission at each call site), so a
+// caller without that permission gets the exact same CSV as before, with
+// no Trip Fee column at all.
+function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}, feeRates = null) {
   // ── Column headers ────────────────────────────────────────────────────────
   // Ordered: identity → scheduling → people → locations → timing → financials
   // → route stats → status flags → operational detail
@@ -15544,6 +15642,9 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     "Agent Dropped Off At", "Actual Dropoff Address", "GPS at Dropoff (lat,lng)",
     // Operational
     "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note",
+    // Trip Fee — only present when the caller has viewTripFees permission
+    // (Fleet Ops/Financial); see feeRates param.
+    ...(feeRates ? ["Fee Category", "Trip Fee (ZAR)"] : []),
   ];
 
   const escapeCsv = (val) => {
@@ -15695,9 +15796,35 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
         t.admin_note || "",
+        // Trip Fee — same value repeats on every passenger row for a
+        // multi-passenger trip (matches how every other trip-level field
+        // in this export already repeats per row), NOT split per agent.
+        // The TOTAL row below sums per unique trip, not per row, so a
+        // multi-passenger trip's fee is never double-counted in the total.
+        ...(feeRates ? [
+          { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal" }[tripFeeCategory(t)],
+          tripFeeAmount(t, feeRates).toFixed(2),
+        ] : []),
       ]);
     });
   });
+
+  if (feeRates) {
+    // Sum per UNIQUE trip_id, not per row — a multi-passenger trip's fee
+    // must only be counted once even though it appears on several rows.
+    const seenTripIds = new Set();
+    let totalFee = 0;
+    trips.forEach(t => {
+      if (seenTripIds.has(t.trip_id)) return;
+      seenTripIds.add(t.trip_id);
+      totalFee += tripFeeAmount(t, feeRates);
+    });
+    const blankRow = headers.map(() => "");
+    const totalRow = headers.map(() => "");
+    totalRow[headers.length - 2] = "TOTAL";
+    totalRow[headers.length - 1] = totalFee.toFixed(2);
+    rows.push(blankRow, totalRow);
+  }
 
   // BOM prefix so Excel opens UTF-8 CSVs correctly.
   const csv = [headers, ...rows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
@@ -15753,7 +15880,11 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   const displayTripsByState = filter === "ALL" ? visibleStateTrips : visibleStateTrips.filter(t => t.state === filter);
   const displayTrips = dateFilter ? displayTripsByState.filter(t => t.scheduled_date === dateFilter) : displayTripsByState;
   const availableTripDates = [...new Set(state.trips.map(t => t.scheduled_date).filter(Boolean))].sort();
-  const canExport = hasAdminPermission(user, "exportCsv");
+  // Per explicit decision: this trips CSV always includes the Trip Fee
+  // column/total now, so access to it is gated by viewTripFees (Fleet
+  // Ops/Financial only) rather than the general exportCsv permission
+  // Standard admins still have for other exports.
+  const canExport = hasAdminPermission(user, "viewTripFees");
   const canEditTrips = hasAdminPermission(user, "manageTrips");
   const toggleTripSelect = (tripId) => {
     setSelectedTripIds(prev => {
@@ -15859,7 +15990,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                   fetchDelaysForTrips(tripIds),
                   fetchAuditLogsForTrips(tripIds),
                 ]);
-                exportTripsToCsv(displayTrips, state.users, state.driver_status, filter === "ALL" ? "all_trips" : `trips_${filter.toLowerCase()}`, delaysByTrip, auditByTrip);
+                exportTripsToCsv(displayTrips, state.users, state.driver_status, filter === "ALL" ? "all_trips" : `trips_${filter.toLowerCase()}`, delaysByTrip, auditByTrip, state.fee_rates);
               } catch (e) {
                 // Without this catch, a throw here (e.g. CSV/Blob build
                 // failing) escaped the onClick as an unhandled rejection
@@ -16078,7 +16209,7 @@ function AdminProfileSearch({ state, user, dispatch }) {
               )}
             </div>
             <span style={{ fontSize: 8, color: COLORS.ghost }}>Counts here cover this person's FULL history (fetched on demand) — the profile panel above only shows the live current+previous-month window, same as the rest of the app.</span>
-            {hasAdminPermission(user, "exportCsv") && allTrips.length > 0 && (
+            {hasAdminPermission(user, "viewTripFees") && allTrips.length > 0 && (
               <Button size="sm" variant="ghost" title={exporting ? "EXPORTING…" : "⬇ EXPORT THIS PERSON'S BOOKINGS"} disabled={exporting} onClick={async () => {
                 setExporting(true);
                 try {
@@ -16087,7 +16218,7 @@ function AdminProfileSearch({ state, user, dispatch }) {
                     fetchDelaysForTrips(tripIds),
                     fetchAuditLogsForTrips(tripIds),
                   ]);
-                  exportTripsToCsv(allTrips, state.users, state.driver_status, `${selectedUser.name.replace(/\s+/g, "_")}_trips`, delaysByTrip, auditByTrip);
+                  exportTripsToCsv(allTrips, state.users, state.driver_status, `${selectedUser.name.replace(/\s+/g, "_")}_trips`, delaysByTrip, auditByTrip, state.fee_rates);
                 } finally {
                   setExporting(false);
                 }
@@ -16109,7 +16240,84 @@ function AdminProfileSearch({ state, user, dispatch }) {
   );
 }
 
-function AdminHistory({ state, user }) {
+// Fleet-Ops-only settings panel for the 4 per-category trip fee rates used
+// to compute the trips CSV's Trip Fee column/total (visible to Fleet Ops
+// and Financial admins only, via viewTripFees). Financial admins can see
+// the resulting totals in their CSV but never edit the rates themselves —
+// this panel isn't shown to them at all, only to manageFeeRates holders.
+function FeeRatesPanel({ state, user, dispatch }) {
+  const rates = state.fee_rates;
+  const [normal, setNormal] = useState("");
+  const [lateBooking, setLateBooking] = useState("");
+  const [lateCancellation, setLateCancellation] = useState("");
+  const [noShow, setNoShow] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState(null);
+  const [edited, setEdited] = useState(false);
+
+  // Pre-fill from the live rates once loaded — but only until the admin
+  // starts actually editing, so a realtime update from another admin's
+  // save doesn't yank the field out from under whatever this admin is
+  // mid-typing.
+  useEffect(() => {
+    if (edited || !rates) return;
+    setNormal(String(rates.normal_zar));
+    setLateBooking(String(rates.late_booking_zar));
+    setLateCancellation(String(rates.late_cancellation_zar));
+    setNoShow(String(rates.no_show_zar));
+  }, [rates, edited]);
+
+  if (!hasAdminPermission(user, "manageFeeRates")) return null;
+
+  const save = async () => {
+    setSaving(true);
+    setSaveMsg(null);
+    try {
+      await dispatch({
+        type: "ADMIN/UPDATE_FEE_RATES",
+        normal_zar: parseFloat(normal) || 0, late_booking_zar: parseFloat(lateBooking) || 0,
+        late_cancellation_zar: parseFloat(lateCancellation) || 0, no_show_zar: parseFloat(noShow) || 0,
+      });
+      setEdited(false);
+      setSaveMsg("Saved.");
+      setTimeout(() => setSaveMsg(null), 3000);
+    } catch (e) {
+      setSaveMsg(e.message || "Couldn't save the fee rates.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const field = (label, value, setValue) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1, minWidth: 110 }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost }}>{label}</span>
+      <input type="number" min="0" step="0.01" value={value}
+        onChange={e => { setValue(e.target.value); setEdited(true); }}
+        style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "6px 8px", fontSize: 12 }} />
+    </div>
+  );
+
+  return (
+    <div style={{ background: "rgba(245,166,35,.06)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 6, padding: "10px 14px", display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>💰 TRIP FEE RATES</div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>Sets the Trip Fee (ZAR) column/total on the trips CSV — visible to Fleet Ops and Financial admins only.</div>
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        {field("Normal", normal, setNormal)}
+        {field("Late Booking", lateBooking, setLateBooking)}
+        {field("Late Cancellation", lateCancellation, setLateCancellation)}
+        {field("No Show", noShow, setNoShow)}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <Button title={saving ? "SAVING…" : "SAVE RATES"} variant="amber" size="sm" disabled={saving || !rates} onClick={save} />
+        {saveMsg && <span style={{ fontSize: 10, color: COLORS.ghost }}>{saveMsg}</span>}
+      </div>
+    </div>
+  );
+}
+
+function AdminHistory({ state, user, dispatch }) {
   const today = new Date();
   // Viewer is capped at 60 days of trip history; other tiers keep the
   // existing 90-day default (which was never a hard cap for them, just a
@@ -16240,6 +16448,7 @@ function AdminHistory({ state, user }) {
 
   return (
     <div className="pad">
+      <FeeRatesPanel state={state} user={user} dispatch={dispatch} />
       <AuditExportPanel state={state} />
       <SectionHeader label="SLA Report (On-Time Performance)" />
       <SlaReportPanel trips={results || state.trips} users={state.users} />
@@ -16335,7 +16544,7 @@ function AdminHistory({ state, user }) {
               {filteredResults.length !== results.length ? ` (${results.length} total before filter)` : ""}
               {results.length === 500 ? " (capped at 500 — narrow the date range for a complete list)" : ""}
             </div>
-            {filteredResults.length > 0 && hasAdminPermission(user, "exportCsv") && (
+            {filteredResults.length > 0 && hasAdminPermission(user, "viewTripFees") && (
               <Button size="sm" variant="amber" title={exporting ? "SAVING…" : "💾 SAVE TRIP SHEET (CSV)"} disabled={exporting} onClick={async () => {
                 setExporting(true);
                 try {
@@ -16347,7 +16556,7 @@ function AdminHistory({ state, user }) {
                   const companyLabel = companyFilter.length
                     ? `_${companyFilter.map(id => (state.companies || []).find(c => String(c.id) === String(id))?.name.replace(/\s+/g, "_")).filter(Boolean).join("-") || "company"}`
                     : "";
-                  exportTripsToCsv(filteredResults, state.users, state.driver_status, `trip_history_${fromDate}_to_${toDate}${companyLabel}`, delaysByTrip, auditByTrip);
+                  exportTripsToCsv(filteredResults, state.users, state.driver_status, `trip_history_${fromDate}_to_${toDate}${companyLabel}`, delaysByTrip, auditByTrip, state.fee_rates);
                 } catch (e) {
                   // Surfaced in the tab's existing error banner instead of
                   // escaping the onClick as an unhandled rejection.
@@ -19514,7 +19723,7 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
 
 const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
-const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", VIEWER: "Viewer Administrator" };
+const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
 function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // Viewer Administrators don't get Dispatch or Users at all (per the
@@ -19668,7 +19877,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
-      {tab === "history" && <AdminHistory state={scopedState} user={user} />}
+      {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
