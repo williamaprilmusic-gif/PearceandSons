@@ -6643,6 +6643,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (loggedOutUserRow?.role === ROLE.DRIVER) {
           await supabase.from("driver_status").update({ isonline: false }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
         }
+        // The push_subscriptions row for THIS device deliberately survives
+        // logout (subscribeToPushNotifications re-associates the same
+        // endpoint to whoever logs in next, per push-handler.js's
+        // pushsubscriptionchange handling) — but that means a shared/kiosk
+        // device left logged out still silently receives the outgoing
+        // user's pushes until someone logs back in on it. Delete this
+        // device's row now; the next login on this device recreates it.
+        try {
+          if ("serviceWorker" in navigator && "PushManager" in window) {
+            const loggedOutReg = await navigator.serviceWorker.ready;
+            const loggedOutSub = await loggedOutReg.pushManager.getSubscription();
+            if (loggedOutSub) {
+              await supabase.from("push_subscriptions").delete().eq("endpoint", loggedOutSub.endpoint).eq("userid", loggedOutUserId);
+            }
+          }
+        } catch (e) { /* best-effort — logout must still succeed even if this fails */ }
       }
       activeUserRef.current = null;
       persistActiveUserId(null);
