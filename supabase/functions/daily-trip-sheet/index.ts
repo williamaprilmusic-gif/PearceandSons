@@ -1,55 +1,43 @@
 // daily-trip-sheet/index.ts
-// Sends a daily trip sheet email to app@pearceandsons.co.za via Resend.
+// Sends a daily trip sheet email (with a CSV attachment) to
+// app@pearceandsons.co.za via Resend.
 //
-// SYNCED FROM DEPLOYED SOURCE (2026-07-31) — the version that was actually
-// live (v46) had diverged from what was committed here (someone had edited
-// it directly via the dashboard/CLI without ever syncing back), and the
-// committed version had its own separate bugs (referenced the `Resend` SDK
-// class without importing it, and read `process.env.RESEND_API_KEY` —
-// `process` isn't a populated global in Deno's edge runtime — so it would
-// have thrown immediately on the very first line if it had ever actually
-// been the deployed code). The real deployed version instead called the
-// Resend HTTP API directly via fetch(), no SDK needed, and that part
-// worked — except its Resend API key was a live secret hardcoded directly
-// in the source rather than read from the `Resend_API_Key` env secret that
-// was already configured for exactly this. Fixed to read from env.
+// SYNCED FROM DEPLOYED SOURCE (2026-08-01, v55) — keep this in sync with
+// whatever's actually deployed. A prior drift here (committed source vs.
+// live code) caused real confusion; don't let it happen again.
+//
+// TEMPORARY STOPGAP (2026-08-01): FROM is still onboarding@resend.dev,
+// Resend's sandbox domain — confirmed live against the real API that it
+// can ONLY deliver to the Resend account's own verified email, never to
+// an arbitrary address. app@pearceandsons.co.za bounced with a 403 ("You
+// can only send testing emails to your own email address..."). User's
+// explicit choice: send to their own verified address for now rather
+// than block on domain verification. TO DO once a real sending domain is
+// verified at resend.com/domains: change FROM to an address on that
+// domain and TO back to app@pearceandsons.co.za.
 
 import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+import { encodeBase64 } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
 serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
-  // TEMPORARY STOPGAP (2026-08-01): FROM is still onboarding@resend.dev,
-  // Resend's sandbox domain — confirmed live against the real API that it
-  // can ONLY deliver to the Resend account's own verified email, never to
-  // an arbitrary address. app@pearceandsons.co.za bounced with a 403
-  // ("You can only send testing emails to your own email address...").
-  // User's explicit choice: send to their own verified address for now
-  // rather than block on domain verification. TO DO once a real sending
-  // domain is verified at resend.com/domains: change FROM to an address
-  // on that domain and TO back to app@pearceandsons.co.za.
   const TO = "williamaprilmusic@gmail.com";
   const FROM = "TransitOS <onboarding@resend.dev>";
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
   // Dedicated shared secret for authenticating the pg_cron caller — NOT the
-  // service role key (that was the original fix here, but it silently
-  // broke: confirmed via edge-function logs that every single scheduled
-  // invocation of this function has been returning 401 for hours — this
-  // project has since migrated to the newer sb_publishable_/sb_secret_ key
-  // format, and the platform-injected SUPABASE_SERVICE_ROLE_KEY this
-  // function reads at runtime no longer matches the legacy-JWT-format
-  // token hardcoded in the pg_cron job's Authorization header. The daily
-  // trip sheet email has likely never actually sent as a result. A literal
-  // constant here, matched by the literal value in the pg_cron job's SQL
-  // — both under this codebase's direct control — can't drift like this.
+  // service role key (that was the original approach here, but it silently
+  // broke: this project has since migrated to the newer sb_publishable_/
+  // sb_secret_ key format, and the platform-injected
+  // SUPABASE_SERVICE_ROLE_KEY this function reads at runtime no longer
+  // matches the legacy-JWT-format token hardcoded in the pg_cron job's
+  // Authorization header. A literal constant here, matched by the literal
+  // value in the pg_cron job's SQL — both under this codebase's direct
+  // control — can't drift the same way.
   const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
 
-  // Platform verify_jwt is off (needed since pg_cron's http call carries no
-  // JWT format Supabase itself recognises) and there was previously no
-  // in-code check at all — meaning anyone with this function's URL could
-  // trigger a real Resend send and DB read, with no auth of any kind.
   if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
     return json({ error: "Unauthorized" }, 401);
   }
@@ -226,12 +214,44 @@ serve(async (req) => {
     ? `🚗 Trip Sheet — ${tomorrowTrips.length} trip${tomorrowTrips.length !== 1 ? "s" : ""} tomorrow (${humanDate(tomorrow)})`
     : `🚗 Trip Sheet — No trips booked for tomorrow (${humanDate(tomorrow)})`;
 
-  console.log("Sending email:", subject);
+  // ── CSV attachment ────────────────────────────────────────────────────
+  // Same trip set as the HTML tables above (allTrips = today + tomorrow,
+  // already sorted by scheduledtime via the query's .order() above) but
+  // as a real downloadable CSV, per explicit request — the HTML email is
+  // readable but not something you can filter/sort/import elsewhere.
+  const csvCell = (v: unknown) => {
+    const s = v == null ? "" : String(v);
+    // Matches the client app's own CSV escaping (csvCell/escapeCsv) — must
+    // catch a lone \r too, not just \r\n, or a stray carriage return in a
+    // user-editable field (agent name, pickup label, etc.) could slip
+    // through unquoted and corrupt row boundaries.
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csvHeaders = ["Trip ID", "Date", "Time", "Status", "Direction", "Agent", "Extra Passengers", "Driver", "Pickup", "Drop-off"];
+  const csvRows = allTrips.map((t: Record<string, unknown>) => [
+    t.id, t.scheduleddate, t.scheduledtimestr ?? "",
+    statusLabel[t.status as string] ?? String(t.status ?? ""),
+    t.direction ?? "", t.agentname ?? "", t.extras as number,
+    t.drivername, t.pickup, t.dropoff,
+  ].map(csvCell).join(","));
+  const csvContent = "﻿" + [csvHeaders.map(csvCell).join(","), ...csvRows].join("\r\n"); // BOM for Excel
+  const csvFilename = `trip-sheet_${today.replace(/\//g, "-")}.csv`;
+  // Encode via TextEncoder first rather than handing encodeBase64 the raw
+  // string directly — explicit UTF-8 bytes, not dependent on however the
+  // library's string overload happens to treat multi-byte characters (the
+  // BOM prefix itself is multi-byte, and agent/driver names can contain
+  // accented characters).
+  const csvBase64 = encodeBase64(new TextEncoder().encode(csvContent));
+
+  console.log("Sending email:", subject, "| CSV rows:", csvRows.length);
 
   const resendRes = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: FROM, to: [TO], subject, html }),
+    body: JSON.stringify({
+      from: FROM, to: [TO], subject, html,
+      attachments: [{ filename: csvFilename, content: csvBase64 }],
+    }),
   });
 
   const resendBody = await resendRes.json();
