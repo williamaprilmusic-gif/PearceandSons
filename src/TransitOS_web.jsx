@@ -6831,7 +6831,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
 
       const { error } = await supabase.from("users").update(update).eq("id", action.user_id);
-      if (error) throw error;
+      if (error) {
+        // Unlike ADMIN/CREATE_USER, this path never pre-checked the new
+        // username for a collision at all — an admin renaming someone to
+        // an already-taken username used to succeed here with no error,
+        // then silently break login for BOTH accounts the next time either
+        // one signed in (AUTH/LOGIN's .maybeSingle() throws once two rows
+        // match). The users_username_key unique constraint now catches it
+        // here instead, at the point the admin can actually see and fix it.
+        if (error.code === "23505") throw new Error(`Username "${update.username}" is already taken — choose a different one.`);
+        throw error;
+      }
       if (target.role === ROLE.DRIVER && (action.vehicle !== undefined || action.capacity !== undefined)) {
         if (action.capacity !== undefined && (!Number.isInteger(action.capacity) || action.capacity < 1)) {
           throw new Error("Vehicle capacity must be a whole number of at least 1.");
@@ -7260,8 +7270,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       };
       // Real users.id is a DB-generated bigint, not an app-generated string —
       // insert and read the id back so driver_status can reference it.
+      // The existingUsername check above is TOCTOU-racy (two concurrent
+      // creates for the same username can both pass it) — a DB-level
+      // unique constraint on users.username is the real guard; 23505 here
+      // is that race actually landing, translated back to the same
+      // friendly message instead of a raw Postgres constraint error.
       const { data: inserted, error } = await supabase.from("users").insert(row).select("id").single();
-      if (error) throw error;
+      if (error) {
+        if (error.code === "23505") throw new Error(`Username "${action.auth.login}" is already taken — choose a different one.`);
+        throw error;
+      }
       if (action.role === ROLE.DRIVER) {
         const { error: dErr } = await supabase.from("driver_status").insert({
           driverid: inserted.id, state: DRIVER_STATE.AVAILABLE, currenttripid: null,
