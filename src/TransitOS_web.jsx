@@ -11573,6 +11573,14 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
   // Last time onPosition actually fired — read by the stale-watch
   // watchdog below.
   const lastPositionAtRef = useRef(Date.now());
+  // Accuracy fallback ladder — see startWatch below. "high" uses the GPS
+  // chip (precise, slow/power-hungry, can fail entirely with no signal
+  // e.g. deep urban canyon); "low" uses network/wifi positioning (fast,
+  // low-power, coarser) as a fallback so a driver with a poor GPS fix
+  // still shows SOME position instead of none.
+  const accuracyModeRef = useRef("high");
+  const consecutiveErrorsRef = useRef(0);
+  const lastAccuracyDowngradeRef = useRef(0);
 
   // Screen Wake Lock — the real, genuine improvement available for
   // keeping tracking alive longer while the app is open, per explicit
@@ -11595,6 +11603,15 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       try {
         if (released) return;
         wakeLockRef.current = await navigator.wakeLock.request("screen");
+        // The sentinel's own 'release' event covers releases beyond just
+        // backgrounding (which the visibilitychange listener below
+        // already handles) — some browsers/OS-level events can release
+        // the lock on their own. Reacquiring immediately here, if still
+        // visible, closes that gap instead of leaving the lock silently
+        // dropped until the next visibility change happens to fire.
+        wakeLockRef.current.addEventListener("release", () => {
+          if (!released && document.visibilityState === "visible") requestLock();
+        });
       } catch (e) {
         // Common and expected — some browsers require a very recent
         // user gesture, or don't support this at all. Never surface as
@@ -11640,6 +11657,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
     const onPosition = async (pos) => {
       const now = Date.now();
       lastPositionAtRef.current = now;
+      consecutiveErrorsRef.current = 0;
       const { latitude, longitude, heading, speed, accuracy } = pos.coords;
       const speedKmh = speed != null ? speed * 3.6 : null;
 
@@ -11912,12 +11930,33 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         : err.code === err.POSITION_UNAVAILABLE ? "Location unavailable."
         : "Location error."
       );
+      // Permission denials are pointless to retry — the driver has to
+      // grant it, no accuracy fallback fixes that. TIMEOUT/POSITION_UNAVAILABLE
+      // are exactly the cases a fallback CAN help with (weak/no GPS
+      // signal — deep urban canyon, dense cloud cover, indoors briefly).
+      if (err.code === err.PERMISSION_DENIED) return;
+      consecutiveErrorsRef.current++;
+      if (accuracyModeRef.current === "high" && consecutiveErrorsRef.current >= 2) {
+        console.warn("[GPS] High-accuracy fix failing repeatedly — falling back to network-based positioning so SOME position keeps flowing.");
+        accuracyModeRef.current = "low";
+        lastAccuracyDowngradeRef.current = Date.now();
+        consecutiveErrorsRef.current = 0;
+        startWatch();
+      }
     };
 
+    // Accuracy fallback ladder: enableHighAccuracy uses the GPS chip —
+    // precise, but can fail outright (no fix at all) in weak-signal
+    // conditions, or take longer to acquire after every watch restart.
+    // Dropping to network/wifi-based positioning after repeated failures
+    // (see onError above) trades precision for something rather than
+    // nothing — a coarser live position still beats a driver showing as
+    // completely untracked on the admin map. The watchdog below
+    // periodically retries high accuracy in case conditions improved.
     const startWatch = () => {
       if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = navigator.geolocation.watchPosition(onPosition, onError, {
-        enableHighAccuracy: true, maximumAge: 5000, timeout: 15000,
+        enableHighAccuracy: accuracyModeRef.current === "high", maximumAge: 5000, timeout: 15000,
       });
     };
     startWatch();
@@ -11941,14 +11980,57 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
     // staying stuck.
     lastPositionAtRef.current = Date.now();
     const WATCHDOG_STALE_MS = 60000;
+    const ACCURACY_RETRY_MS = 120000;
     const watchdogId = setInterval(() => {
       if (Date.now() - lastPositionAtRef.current > WATCHDOG_STALE_MS) {
         console.warn("[GPS] No position update in 60s — restarting watch.");
         startWatch();
+        return;
+      }
+      // Periodically retry high-accuracy after a fallback downgrade —
+      // conditions that caused it (weak signal, indoors) may have
+      // resolved. If it fails again, onError drops it right back to low
+      // accuracy after 2 more failures — bounded, self-correcting either
+      // way, never a tight loop (gated by this same 30s tick).
+      if (accuracyModeRef.current === "low" && Date.now() - lastAccuracyDowngradeRef.current > ACCURACY_RETRY_MS) {
+        console.warn("[GPS] Retrying high-accuracy positioning.");
+        accuracyModeRef.current = "high";
+        startWatch();
       }
     }, 30000);
 
+    // Last-gasp capture — the instant the tab is about to background
+    // (visibilitychange fires synchronously, before the OS actually
+    // suspends anything), grab one more fresh fix and push it out
+    // immediately, rather than leaving the admin map showing whatever
+    // was broadcast up to BROADCAST_INTERVAL_MS/DB_PERSIST_INTERVAL_MS
+    // ago. This is the freshest possible "last known position" for
+    // exactly the moment tracking is about to degrade — real value even
+    // though it's only ever one extra fix, not continuous tracking.
+    const onVisibilityHidden = () => {
+      if (document.visibilityState !== "hidden") return;
+      navigator.geolocation.getCurrentPosition((pos) => {
+        const capturedNow = Date.now();
+        lastPositionAtRef.current = capturedNow;
+        const { latitude, longitude, heading, speed, accuracy } = pos.coords;
+        const speedKmh = speed != null ? speed * 3.6 : null;
+        channel.send({
+          type: "broadcast", event: "pos",
+          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, ts: capturedNow },
+        });
+        supabase.from("driver_positions").upsert({
+          driverid: user.id, lat: latitude, lng: longitude,
+          heading: heading ?? null, speed_kmh: speedKmh, accuracy_m: accuracy ?? null,
+          tripid: currentTripId ?? null, updatedat: new Date(capturedNow).toISOString(),
+        }, { onConflict: "driverid" }).then(() => {}, () => {});
+      }, () => { /* best-effort — a failed last-gasp fix just means the last watchPosition update stands */ }, {
+        enableHighAccuracy: false, maximumAge: 10000, timeout: 5000,
+      });
+    };
+    document.addEventListener("visibilitychange", onVisibilityHidden);
+
     return () => {
+      document.removeEventListener("visibilitychange", onVisibilityHidden);
       clearInterval(watchdogId);
       if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
@@ -20011,7 +20093,11 @@ function AppInner() {
             <div style={{ width: 40, height: 40, borderRadius: 10, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, fontSize: 22 }}>🚌</div>
             <div style={{ flex: 1 }}>
               <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.chalk }}>Pearce &amp; Sons Transport</div>
-              <div style={{ fontSize: 11, color: COLORS.ghost }}>Add to your Home Screen for the best experience</div>
+              <div style={{ fontSize: 11, color: COLORS.ghost }}>
+                {activeUser?.role === ROLE.DRIVER
+                  ? "Add to Home Screen — keeps live GPS tracking more reliable during trips"
+                  : "Add to your Home Screen for the best experience"}
+              </div>
             </div>
             <button onClick={() => { try { localStorage.setItem("ios_install_dismissed","1"); } catch {} setIosBannerDismissed(true); }}
               style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 22, cursor: "pointer", padding: "0 4px", flexShrink: 0, lineHeight: 1 }}>✕</button>
