@@ -3635,7 +3635,13 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
       if (c && (!best || c.km < best.km)) best = c;
     }
     if (!best) return null;
-    const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
+    // Must be the exact complement of `valid` (isValidCoord) — see the
+    // matching comment on the hasRealDestination branch above. This is the
+    // OUTBOUND (no-destination) branch, the more commonly hit of the two,
+    // and the prior fix here didn't actually land: this line has 4-space
+    // indent vs. 6 for the other branch, so a replace_all on the identical
+    // old line only matched the other occurrence.
+    const invalid = stopCoords.filter(c => !isValidCoord(c));
     return [...best.order, ...invalid];
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
