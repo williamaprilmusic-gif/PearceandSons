@@ -2321,12 +2321,27 @@ function isDriverOnShift(ds, scheduledDateStr, scheduledTimeStr) {
   const [tripH, tripM] = scheduledTimeStr.split(":").map(Number);
   const tripMins = tripH * 60 + tripM;
   return schedule.some(slot => {
-    if (slot.day !== tripDow) return false;
     const [sh, sm] = slot.start.split(":").map(Number);
     const [eh, em] = slot.end.split(":").map(Number);
     const startMins = sh * 60 + sm;
     const endMins = eh * 60 + em;
-    return tripMins >= startMins && tripMins <= endMins;
+    if (endMins >= startMins) {
+      // Normal same-day shift.
+      return slot.day === tripDow && tripMins >= startMins && tripMins <= endMins;
+    }
+    // Shift crosses midnight (e.g. start:"22:00", end:"02:00" — a
+    // perfectly normal night shift). endMins < startMins used to make
+    // `tripMins >= startMins && tripMins <= endMins` impossible to
+    // satisfy for ANY minute of the day, so a night-shift driver was
+    // silently treated as off-shift for their entire actual shift,
+    // including hours they explicitly configured as available —
+    // excluded from real dispatch candidate lists and undercounted in
+    // staffing-gap forecasts. A midnight-crossing shift actually covers
+    // two segments: the late-night portion on slot.day itself, and the
+    // early-morning portion on the calendar day AFTER slot.day.
+    const nextDow = (slot.day + 1) % 7;
+    return (slot.day === tripDow && tripMins >= startMins)
+        || (nextDow === tripDow && tripMins <= endMins);
   });
 }
 
