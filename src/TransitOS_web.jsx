@@ -3387,35 +3387,6 @@ function routeCacheSet(key, km) {
   _routeCache.set(key, { km, ts: Date.now() });
 }
 
-// ── FEATURE: Supporting points — preferred arterial corridors for Cape Flats ──
-// These coords snap TomTom's route onto the M5 → Baden Powell → Weltevreden
-// corridor that Pearce & Sons drivers use for evening outbound runs.
-// TomTom's supportingPoints param says "pass through these road segments"
-// without forcing exact stops — the engine still optimises around them.
-// Only injected when the route's bounding box overlaps the Cape Flats
-// (roughly south of -33.88 and east of 18.48) to avoid corrupting
-// non-Cape-Flats routes (e.g. a future Atlantic Seaboard branch).
-const CAPE_FLATS_CORRIDOR = [
-  { lat: -33.9200, lng: 18.4950 }, // M5 southern entry near Mowbray
-  { lat: -33.9550, lng: 18.5100 }, // M5 mid — past Ottery
-  { lat: -33.9800, lng: 18.5600 }, // Baden Powell junction near Marina da Gama
-  { lat: -34.0100, lng: 18.5800 }, // Baden Powell heading east toward Rocklands
-  { lat: -34.0350, lng: 18.5650 }, // Weltevreden Road turn-off toward Lentegeur
-];
-
-function isCapeFlatsBoundingBox(coords) {
-  return coords.some(c => c.lat < -33.88 && c.lng > 18.48);
-}
-
-function buildSupportingPointsParam(coords) {
-  if (!isCapeFlatsBoundingBox(coords)) return "";
-  // TomTom calculateRoute path param is latitude,longitude (confirmed against
-  // official docs — do not swap this; a prior attempt to "fix" it to lng,lat
-  // silently sent every real Cape Town coordinate into the Atlantic Ocean).
-  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lat},${c.lng}`).join(":");
-  return `&supportingPoints=${encodeURIComponent(pts)}`;
-}
-
 // ── FEATURE: Road-type avoidance ───────────────────────────────────────────
 // avoidUnpavedRoads: never route via informal-settlement unmaintained tracks
 // avoidTollRoads: no toll roads in Cape Town but good practice for future
@@ -3555,11 +3526,31 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     const cacheKey = routeCacheKey(dedupedCoords, departAtEpoch);
     const cached = routeCacheGet(cacheKey);
     if (cached != null) { console.log("[TomTom] route cache hit"); return cached; }
-    // Feature 2: supporting points — nudge TomTom onto preferred arterials.
-    const supportingPtsParam = buildSupportingPointsParam(dedupedCoords);
     // Feature 3: avoid unpaved roads.
+    // NOTE: this request previously also appended a "supportingPoints"
+    // query-string param (a preferred-arterial-corridor nudge for Cape
+    // Flats routes). Removed 2026-08-01 — confirmed live against TomTom's
+    // API that supportingPoints is rejected outright as a query-string
+    // parameter ("Invalid request: parameter [supportingPoints] not
+    // supported", HTTP 400) regardless of whether avoidAreas is also
+    // present, so it had NEVER actually worked: every Cape Flats route
+    // silently 400'd and fell back to a less-accurate haversine estimate.
+    // Worse, since most real high-risk-zone candidates ARE in the Cape
+    // Flats, the same 400 also poisoned the entire request whenever a
+    // zone was active, meaning avoidAreas (the actual safety feature)
+    // never even reached TomTom for evaluation on exactly the routes it
+    // matters most for. Removing this broken param fixes both: real
+    // routes now get TomTom's actual computed distance instead of the
+    // haversine fallback, AND avoidAreas can now actually take effect.
+    // Re-adding a working corridor nudge later requires moving
+    // supportingPoints into the POST body (confirmed that shape IS
+    // accepted) AND re-deriving real drivable waypoints first — a live
+    // test of the old hardcoded CAPE_FLATS_CORRIDOR points showed TomTom
+    // routing part of that path through a non-car travel segment, nearly
+    // doubling the distance — so don't just move the same points into the
+    // body without re-validating them.
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
+      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
     // High-risk-zone avoidance requires a POST body — avoidAreas is not a
     // GET query parameter (confirmed against TomTom's docs) — with every
     // other parameter still on the query string as normal, since a
@@ -3596,17 +3587,11 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   const departAtParam = departAtEpoch
     ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
     : "";
-  // CRITICAL — confirmed against the live API: TomTom rejects supportingPoints
-  // outright when combined with computeBestOrder=true ("Invalid request:
-  // parameter [supportingPoints] not supported", HTTP 400) — the two are not
-  // supported together, full stop. Since almost every real Pearce & Sons
-  // route runs through the Cape Flats (which is exactly what
-  // buildSupportingPointsParam triggers on), this meant EVERY real
-  // route-optimization request was hitting a hard 400 and silently falling
-  // back to the haversine estimate — independent of, and in addition to, the
-  // fixed-last-waypoint bug fixed earlier. supportingPoints is still used
-  // for the actual distance calculation (tomtomRealRouteKm, which never sets
-  // computeBestOrder) — just not here.
+  // This request never included a supportingPoints param to begin with —
+  // confirmed against the live API that TomTom rejects it outright as a
+  // query-string parameter regardless of computeBestOrder, so there was
+  // never anything to strip here. (tomtomRealRouteKm above USED to send
+  // one — see its comment for why that was removed entirely.)
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
     `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
   // High-risk-zone avoidance requires a POST body — see the identical
