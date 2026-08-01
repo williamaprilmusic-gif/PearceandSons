@@ -1256,8 +1256,8 @@ function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropof
 // rather than being one fixed number regardless of vehicle load.
 // Deliberately a SEPARATE number from the existing 40km single-leg
 // threshold (which flags one agent's individual pickup->dropoff
-// distance for a surcharge) — this caps the driver's WHOLE multi-stop
-// route instead.
+// distance as a long-distance trip) — this caps the driver's WHOLE
+// multi-stop route instead.
 function companyPolicyDistanceCapKm(totalAgentCount) {
   return 40 * Math.max(1, totalAgentCount);
 }
@@ -2174,79 +2174,6 @@ function driverAvgRating(driverId, allTrips) {
   }
   if (ratings.length === 0) return null;
   return { avg: ratings.reduce((a, b) => a + b, 0) / ratings.length, count: ratings.length };
-}
-
-// ── Surcharge auto-invoicing ──────────────────────────────────────────────
-// Generates a per-agent, per-month surcharge summary as a downloadable CSV.
-// R8 base + R3.50/km standard; R20/km surcharge for every km over 40.
-const RATE_BASE_ZAR = 8;
-const RATE_PER_KM_ZAR = 3.5;
-const SURCHARGE_THRESHOLD_KM = 40;
-const SURCHARGE_RATE_ZAR = 20;
-
-function computeSurchargeInvoice(trips, users, monthPrefix) {
-  // monthPrefix: "YYYY/MM"
-  const inMonth = trips.filter(t =>
-    t.state === TRIP_STATE.ARCHIVED_COMPLETED &&
-    t.scheduled_date?.startsWith(monthPrefix) &&
-    t.long_distance_flag
-  );
-  const rows = [];
-  for (const t of inMonth) {
-    const km = (t.actual_distance_km ?? t.est_distance_km ?? 0) * ROAD_FACTOR;
-    if (km <= SURCHARGE_THRESHOLD_KM) continue;
-    const billableKm = km - SURCHARGE_THRESHOLD_KM;
-    const baseCost = RATE_BASE_ZAR + km * RATE_PER_KM_ZAR;
-    const surcharge = billableKm * SURCHARGE_RATE_ZAR;
-    const total = baseCost + surcharge;
-    const agentIds = t.agent_ids || [];
-    for (const aid of agentIds) {
-      const agent = users.find(u => String(u.id) === String(aid));
-      rows.push({
-        tripId: t.trip_id,
-        date: t.scheduled_date,
-        agent: agent?.name || aid,
-        staffNum: agent?.staff_number || "",
-        km: km.toFixed(1),
-        billableKm: billableKm.toFixed(1),
-        baseCostZar: baseCost.toFixed(2),
-        surchargeZar: surcharge.toFixed(2),
-        totalZar: total.toFixed(2),
-      });
-    }
-  }
-  return rows;
-}
-
-function exportSurchargeInvoice(trips, users, monthPrefix) {
-  const rows = computeSurchargeInvoice(trips, users, monthPrefix);
-  if (rows.length === 0) { alert("No long-distance surcharge trips found for " + monthPrefix); return; }
-  // Matches csvCell elsewhere in this file — the old `"${r.agent}"` wrap
-  // only quoted the agent field and never escaped an embedded quote
-  // character inside it, which would silently terminate the cell early
-  // and corrupt every column after it for that row. Every field now goes
-  // through the same proper escaping, not just agent.
-  const csvCell = (v) => {
-    const s = v == null ? "" : String(v);
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const headers = ["Trip ID","Date","Agent","Staff #","Road km","Billable km (over 40)","Base cost (ZAR)","Surcharge (ZAR)","Total (ZAR)"];
-  const totalSurcharge = rows.reduce((n, r) => n + parseFloat(r.surchargeZar), 0);
-  const csv = [
-    headers.map(csvCell).join(","),
-    ...rows.map(r => [r.tripId, r.date, r.agent, r.staffNum, r.km, r.billableKm, r.baseCostZar, r.surchargeZar, r.totalZar].map(csvCell).join(",")),
-    "",
-    `,,,,,,TOTAL SURCHARGE:,${totalSurcharge.toFixed(2)},`,
-  ].join("\r\n"); // CRLF for Excel compatibility, matching the other CSV exports
-  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.setAttribute("download", `surcharge_invoice_${monthPrefix.replace("/","-")}.csv`);
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ── Capacity forecasting ──────────────────────────────────────────────────
@@ -4353,7 +4280,6 @@ function appReducer(state, action) {
       const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
       const dropCoord = action.dropoff_coord || defaultCompanyAnchor(state);
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
-      const estCostZar = parseFloat((8 + (estDistKm * ROAD_FACTOR) * 3.5).toFixed(2));
       // Road-distance estimate (same 1.35 correction factor used everywhere
       // else in the UI to turn straight-line Haversine km into an approximate
       // driving distance) — thresholds below are checked against THIS value
@@ -4422,7 +4348,6 @@ function appReducer(state, action) {
         drop_sequence_num: null,
         pickup_order_num: null,
         est_distance_km: estDistKm,
-        est_cost_zar: estCostZar,
         actual_distance_km: null,
         driverAccepted: false,
         acceptedAt: null,
@@ -4449,17 +4374,6 @@ function appReducer(state, action) {
         notifs.unshift({
           id: mkId(), type: "LONG_DISTANCE_TRIP", for_roles: [ROLE.ADMIN],
           message: `⚠ Trip ${tripId} for ${action.agent_name} is ${roadDistKm.toFixed(1)} km — exceeds the 40 km threshold.`,
-          trip_id: tripId, ts: nowTs, read: false,
-        });
-      }
-
-      // ── Surcharge notification (>42 km): R20 for every km over 40, uncapped ──
-      if (roadDistKm > 42) {
-        const billableKm = roadDistKm - 40;
-        const surcharge = Math.round(billableKm * 20);
-        notifs.unshift({
-          id: mkId(), type: "DISTANCE_SURCHARGE", for_roles: [ROLE.ADMIN],
-          message: `💰 Trip ${tripId} (${roadDistKm.toFixed(1)} km) qualifies for a distance surcharge: R${surcharge} (${billableKm.toFixed(1)} km over 40 km @ R20/km) — for invoicing.`,
           trip_id: tripId, ts: nowTs, read: false,
         });
       }
@@ -5860,7 +5774,7 @@ function tripRowToApp(row, chatByTrip) {
     in_transit_at_epoch: row.intransitat || null, completed_at_epoch: row.completedat || null, cancelled_at: epochToDisplay(row.cancelledat),
     late_booking_flag: row.latebookingflag || false,
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
-    est_distance_km: row.estdistancekm, est_cost_zar: row.estcostzar, actual_distance_km: row.actualdistancekm,
+    est_distance_km: row.estdistancekm, actual_distance_km: row.actualdistancekm,
     driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), accepted_at_epoch: row.acceptedat || null,
     declinedBy: row.declinedby || [],
     rejection_reason: row.rejectionreason || null,
@@ -7680,7 +7594,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         dropCoord = fallbackAddr || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
       }
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
-      const estCostZar = parseFloat((8 + estDistKm * ROAD_FACTOR * 3.5).toFixed(2));
       const roadDistKm = estDistKm * ROAD_FACTOR;
       const nowTs = nowEpoch();
 
@@ -7737,7 +7650,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         triptype: action.trip_type, weekgroupid: action.week_group_id || null, weekdaynum: action.week_day_num || null,
         scheduleddate: action.scheduled_date, scheduledtime: scheduledTimeEpoch, scheduledtimestr: action.scheduled_time,
         bookedat: nowTs, agentname: action.agent_name, phone: action.phone,
-        estdistancekm: estDistKm, estcostzar: estCostZar, driveraccepted: false, declinedby: [], remindersent: false,
+        estdistancekm: estDistKm, driveraccepted: false, declinedby: [], remindersent: false,
         longdistanceflag: roadDistKm > 40,
         adminnote: roadDistKm > 42 ? `Booking distance ${roadDistKm.toFixed(1)} km exceeds 42 km threshold.` : null,
       }).select("id").single();
@@ -7766,16 +7679,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
       }
 
-      // Surcharge: R20 for every km over 40, uncapped.
-      if (roadDistKm > 42) {
-        const billableKm = roadDistKm - 40;
-        const surcharge = Math.round(billableKm * 20);
-        notifRows.push({
-          type: "DISTANCE_SURCHARGE", for_roles: [ROLE.ADMIN],
-          message: `💰 Trip ${tripId} (${roadDistKm.toFixed(1)} km) qualifies for a distance surcharge: R${surcharge} (${billableKm.toFixed(1)} km over 40 km @ R20/km) — for invoicing.`,
-          trip_id: tripId, ts: nowTs, read: false,
-        });
-      }
 
       try {
         const scheduledDt = parseScheduledDateTime(action.scheduled_date, action.scheduled_time);
@@ -9102,6 +9005,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Ownership check — see TRIP/DRIVER_CONFIRM.
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      // Must be picked up before being dropped off — without this, a
+      // pickup confirmation that's still stuck in the offline-sync queue
+      // (e.g. failed once, waiting on the next reconnect) couldn't block
+      // a LATER-queued dropoff for the same agent from going through
+      // first, since the replay loop doesn't stop processing on one
+      // item's failure. That would record a dropoff with no
+      // corresponding pickup ever confirmed — a real, silent data
+      // inconsistency in the trip's own record, not just a display bug.
+      const dropoffCompletedPickups = tripRow.completedpickups || [];
+      if (!dropoffCompletedPickups.some(c => String(c) === String(action.agent_id))) {
+        throw new Error("This agent hasn't been confirmed picked up yet.");
+      }
       const nowTs = nowEpoch();
       // Reverse-geocode the driver's GPS to get a readable street address
       const dropoffLabel = action.driver_coord
@@ -16180,27 +16095,6 @@ function AdminProfileSearch({ state, user, dispatch }) {
   );
 }
 
-function SurchargeInvoicePanel({ state }) {
-  const months = [...new Set(state.trips
-    .filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED && t.long_distance_flag && t.scheduled_date)
-    .map(t => t.scheduled_date.slice(0, 7))
-  )].sort().reverse().slice(0, 6);
-  if (months.length === 0) return null;
-  return (
-    <div style={{ background: "rgba(245,166,35,.06)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 6, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
-      <div>
-        <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber }}>💰 SURCHARGE INVOICING</div>
-        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>Download a monthly surcharge CSV for billing.</div>
-      </div>
-      <select onChange={e => { if (e.target.value) exportSurchargeInvoice(state.trips, state.users, e.target.value); e.target.value = ""; }}
-        defaultValue="" style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 3, padding: "6px 10px", fontSize: 11 }}>
-        <option value="">Select month…</option>
-        {months.map(m => <option key={m} value={m}>{m}</option>)}
-      </select>
-    </div>
-  );
-}
-
 function AdminHistory({ state, user }) {
   const today = new Date();
   // Viewer is capped at 60 days of trip history; other tiers keep the
@@ -16332,7 +16226,6 @@ function AdminHistory({ state, user }) {
 
   return (
     <div className="pad">
-      <SurchargeInvoicePanel state={state} />
       <AuditExportPanel state={state} />
       <SectionHeader label="SLA Report (On-Time Performance)" />
       <SlaReportPanel trips={results || state.trips} users={state.users} />
@@ -19331,7 +19224,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
