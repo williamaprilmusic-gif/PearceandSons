@@ -157,15 +157,17 @@ const ADMIN_PERMISSIONS = {
     manageFeeRates: false, viewTripFees: false,
   },
   [ADMIN_LEVEL.FINANCIAL]: {
-    // Read-only reporting/finance role, per explicit decision — can search
-    // and view agents/drivers/trip detail and download the fee-bearing
-    // trips CSV, but nothing operational: no dispatch, no cancelling, no
-    // editing users, no managing anything. Cannot set the fee rates
-    // themselves (manageFeeRates stays Fleet-Ops-only) even though this
-    // tier can VIEW them (needs to, to make sense of the CSV totals).
+    // Read-only reporting/finance role otherwise — can search and view
+    // agents/drivers/trip detail and download the fee-bearing trips CSV,
+    // but nothing operational: no dispatch, no cancelling, no editing
+    // users, no managing anything. manageFeeRates is the one deliberate
+    // carve-out from "read-only," per explicit request — setting trip
+    // fee/driver-payment rates IS this tier's actual job function, not an
+    // operational action in the same sense as dispatch/user management.
+    // Fleet Ops keeps the same ability too (not exclusive to Financial).
     viewUsers: true, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: true,
-    manageFeeRates: false, viewTripFees: true,
+    manageFeeRates: true, viewTripFees: true,
   },
   [ADMIN_LEVEL.VIEWER]: {
     // Viewer can see that a driver was ASSIGNED to a trip (name only,
@@ -7472,14 +7474,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "ADMIN/UPDATE_FEE_RATES": {
-      // Fleet-Ops-only, per explicit decision — Financial admins can VIEW
-      // these rates (they need to, to make sense of the CSV totals) but
-      // never set them.
+      // Fleet Ops + Financial, per explicit decision — setting these rates
+      // is Financial's actual job function, not an operational action.
       const actingAdminFee = await assertAdminPermission(activeUserRef, "manageFeeRates");
-      const rateFields = { normalzar: action.normal_zar, latebookingzar: action.late_booking_zar, latecancellationzar: action.late_cancellation_zar, noshowzar: action.no_show_zar };
+      const rateFields = {
+        normalzar: action.normal_zar, latebookingzar: action.late_booking_zar,
+        latecancellationzar: action.late_cancellation_zar, noshowzar: action.no_show_zar,
+        // Driver payment reference rates — per agent successfully
+        // transported, and per km beyond the existing 40km "long
+        // distance" threshold already used elsewhere (LONG_DISTANCE_TRIP).
+        // Distinct from the four rates above, which are billed TO the
+        // client — these are what TransitOS pays the DRIVER.
+        driverpayperagentzar: action.driver_pay_per_agent_zar, driverpayperextrakmzar: action.driver_pay_per_extra_km_zar,
+      };
       for (const [k, v] of Object.entries(rateFields)) {
         if (v == null || typeof v !== "number" || !Number.isFinite(v) || v < 0) {
-          throw new Error("All four fee rates must be zero or a positive number.");
+          throw new Error("All fee/payment rates must be zero or a positive number.");
         }
       }
       const feeNowTs = nowEpoch();
@@ -7489,7 +7499,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (feeErr) throw feeErr;
       await logAuditAction({
         actorId: actingAdminFee.id, actorName: actingAdminFee.name, actionType: "ADMIN/UPDATE_FEE_RATES",
-        details: `Updated trip fee rates — Normal: R${action.normal_zar}, Late Booking: R${action.late_booking_zar}, Late Cancellation: R${action.late_cancellation_zar}, No Show: R${action.no_show_zar}`,
+        details: `Updated trip fee rates — Normal: R${action.normal_zar}, Late Booking: R${action.late_booking_zar}, Late Cancellation: R${action.late_cancellation_zar}, No Show: R${action.no_show_zar}, Driver Pay/Agent: R${action.driver_pay_per_agent_zar}, Driver Pay/Extra KM: R${action.driver_pay_per_extra_km_zar}`,
       });
       if (extraRefetchers.fetchFeeRates) await extraRefetchers.fetchFeeRates();
       else await refetch();
@@ -9858,6 +9868,8 @@ function useAppStore() {
     setFeeRates({
       normal_zar: Number(data.normalzar) || 0, late_booking_zar: Number(data.latebookingzar) || 0,
       late_cancellation_zar: Number(data.latecancellationzar) || 0, no_show_zar: Number(data.noshowzar) || 0,
+      driver_pay_per_agent_zar: Number(data.driverpayperagentzar) || 0,
+      driver_pay_per_extra_km_zar: Number(data.driverpayperextrakmzar) || 0,
     });
   }, []);
 
@@ -15964,11 +15976,35 @@ function tripFeeAmount(t, feeRates) {
     : feeRates.normal_zar;
 }
 
+// Driver payment reference — what TransitOS pays the DRIVER for this trip,
+// distinct from tripFeeAmount above (what's billed TO the client). Only
+// defined for a genuinely completed trip — "per agent SUCCESSFUL trip"
+// means an agent actually transported, not merely booked, so a cancelled
+// or still-in-progress trip earns nothing here (yet). Agent count prefers
+// completed_dropoffs (who was actually successfully dropped off) over the
+// raw agent_ids list, so a no-show on an otherwise-completed multi-agent
+// trip correctly doesn't count toward driver pay for that one seat.
+// "Extra km" reuses the same 40km threshold already established elsewhere
+// in this file for the LONG_DISTANCE_TRIP flag, not a separate number.
+function tripDriverPayment(t, feeRates) {
+  if (!feeRates) return null;
+  if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { perAgent: 0, perExtraKm: 0, total: 0 };
+  const successfulAgentCount = (t.completed_dropoffs && t.completed_dropoffs.length > 0)
+    ? t.completed_dropoffs.length : (t.agent_ids || []).length;
+  const roadKm = t.actual_distance_km != null ? t.actual_distance_km * ROAD_FACTOR
+    : t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0;
+  const extraKm = Math.max(0, roadKm - 40);
+  const perAgent = successfulAgentCount * feeRates.driver_pay_per_agent_zar;
+  const perExtraKm = extraKm * feeRates.driver_pay_per_extra_km_zar;
+  return { perAgent, perExtraKm, total: perAgent + perExtraKm };
+}
+
 // feeRates ({ normal_zar, late_booking_zar, late_cancellation_zar,
-// no_show_zar }) is optional — only Fleet Ops/Financial admins ever pass
-// it (gated by the "viewTripFees" permission at each call site), so a
-// caller without that permission gets the exact same CSV as before, with
-// no Trip Fee column at all.
+// no_show_zar, driver_pay_per_agent_zar, driver_pay_per_extra_km_zar }) is
+// optional — only Fleet Ops/Financial admins ever pass it (gated by the
+// "viewTripFees" permission at each call site), so a caller without that
+// permission gets the exact same CSV as before, with no fee/payment
+// columns at all.
 function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = "trips", delaysByTrip = {}, auditByTrip = {}, feeRates = null) {
   // ── Column headers ────────────────────────────────────────────────────────
   // Ordered: identity → scheduling → people → locations → timing → financials
@@ -16006,7 +16042,12 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     "No Show", "Delay/Detour Reported", "Admin Edits", "Admin Note",
     // Trip Fee — only present when the caller has viewTripFees permission
     // (Fleet Ops/Financial); see feeRates param.
-    ...(feeRates ? ["Fee Category", "Trip Fee (ZAR)"] : []),
+    ...(feeRates ? [
+      "Fee Category", "Trip Fee (ZAR)",
+      // Driver payment — reference only, not billed to the client; see
+      // tripDriverPayment().
+      "Driver Pay - Per Agent (ZAR)", "Driver Pay - Extra KM (ZAR)", "Driver Pay - Total (ZAR)",
+    ] : []),
   ];
 
   const escapeCsv = (val) => {
@@ -16166,6 +16207,12 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         ...(feeRates ? [
           { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal" }[tripFeeCategory(t)],
           tripFeeAmount(t, feeRates).toFixed(2),
+          // Driver payment — same per-trip value repeats on every passenger
+          // row (matches the Trip Fee convention above); the TOTAL row sums
+          // per unique trip, never per row.
+          tripDriverPayment(t, feeRates).perAgent.toFixed(2),
+          tripDriverPayment(t, feeRates).perExtraKm.toFixed(2),
+          tripDriverPayment(t, feeRates).total.toFixed(2),
         ] : []),
       ]);
     });
@@ -16176,15 +16223,20 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     // must only be counted once even though it appears on several rows.
     const seenTripIds = new Set();
     let totalFee = 0;
+    let totalDriverPay = 0;
     trips.forEach(t => {
       if (seenTripIds.has(t.trip_id)) return;
       seenTripIds.add(t.trip_id);
       totalFee += tripFeeAmount(t, feeRates);
+      totalDriverPay += tripDriverPayment(t, feeRates).total;
     });
     const blankRow = headers.map(() => "");
     const totalRow = headers.map(() => "");
-    totalRow[headers.length - 2] = "TOTAL";
-    totalRow[headers.length - 1] = totalFee.toFixed(2);
+    // Column order (see headers above): Fee Category, Trip Fee (ZAR),
+    // Driver Pay - Per Agent, Driver Pay - Extra KM, Driver Pay - Total.
+    totalRow[headers.length - 5] = "TOTAL";
+    totalRow[headers.length - 4] = totalFee.toFixed(2);
+    totalRow[headers.length - 1] = totalDriverPay.toFixed(2);
     rows.push(blankRow, totalRow);
   }
 
@@ -16613,6 +16665,8 @@ function FeeRatesPanel({ state, user, dispatch }) {
   const [lateBooking, setLateBooking] = useState("");
   const [lateCancellation, setLateCancellation] = useState("");
   const [noShow, setNoShow] = useState("");
+  const [driverPayPerAgent, setDriverPayPerAgent] = useState("");
+  const [driverPayPerExtraKm, setDriverPayPerExtraKm] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState(null);
   const [edited, setEdited] = useState(false);
@@ -16627,6 +16681,8 @@ function FeeRatesPanel({ state, user, dispatch }) {
     setLateBooking(String(rates.late_booking_zar));
     setLateCancellation(String(rates.late_cancellation_zar));
     setNoShow(String(rates.no_show_zar));
+    setDriverPayPerAgent(String(rates.driver_pay_per_agent_zar));
+    setDriverPayPerExtraKm(String(rates.driver_pay_per_extra_km_zar));
   }, [rates, edited]);
 
   if (!hasAdminPermission(user, "manageFeeRates")) return null;
@@ -16639,6 +16695,8 @@ function FeeRatesPanel({ state, user, dispatch }) {
         type: "ADMIN/UPDATE_FEE_RATES",
         normal_zar: parseFloat(normal) || 0, late_booking_zar: parseFloat(lateBooking) || 0,
         late_cancellation_zar: parseFloat(lateCancellation) || 0, no_show_zar: parseFloat(noShow) || 0,
+        driver_pay_per_agent_zar: parseFloat(driverPayPerAgent) || 0,
+        driver_pay_per_extra_km_zar: parseFloat(driverPayPerExtraKm) || 0,
       });
       setEdited(false);
       setSaveMsg("Saved.");
@@ -16670,6 +16728,14 @@ function FeeRatesPanel({ state, user, dispatch }) {
         {field("Late Booking", lateBooking, setLateBooking)}
         {field("Late Cancellation", lateCancellation, setLateCancellation)}
         {field("No Show", noShow, setNoShow)}
+      </div>
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, marginTop: 4 }}>🚗 DRIVER PAYMENT (REFERENCE)</div>
+        <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>What the driver earns — shown as reference columns on the same CSV, separate from the client-billed Trip Fee above. "Extra km" is distance beyond the existing 40km long-distance threshold.</div>
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+        {field("Per Agent / Trip", driverPayPerAgent, setDriverPayPerAgent)}
+        {field("Per Extra KM", driverPayPerExtraKm, setDriverPayPerExtraKm)}
       </div>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <Button title={saving ? "SAVING…" : "SAVE RATES"} variant="amber" size="sm" disabled={saving || !rates} onClick={save} />
