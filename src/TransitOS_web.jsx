@@ -5489,11 +5489,18 @@ function appReducer(state, action) {
       const ticket = (state.tickets || []).find(t => String(t.id) === String(action.ticket_id));
       if (!ticket) return { ...state, _error: "Ticket not found" };
       const updNowTs = nowEpoch();
+      // See the Supabase handler's identical fix/reasoning — adminreply
+      // was a single overwritable field, silently destroying any prior
+      // reply (worse given RE-OPEN explicitly invites replying again).
+      const hasNewReply = action.admin_reply !== undefined && action.admin_reply.trim();
       const newTickets = state.tickets.map(t => String(t.id) === String(action.ticket_id) ? {
         ...t,
         status: action.status !== undefined ? action.status : t.status,
-        admin_reply: action.admin_reply !== undefined ? action.admin_reply : t.admin_reply,
-        admin_id: action.admin_id !== undefined ? action.admin_id : t.admin_id,
+        admin_reply: hasNewReply ? action.admin_reply.trim() : t.admin_reply,
+        admin_id: hasNewReply ? (action.admin_id ?? t.admin_id) : t.admin_id,
+        replies: hasNewReply
+          ? [...(t.replies || []), { admin_id: action.admin_id ?? t.admin_id, message: action.admin_reply.trim(), ts: updNowTs }]
+          : (t.replies || []),
         updated_at: updNowTs,
         resolved_at: action.status === "RESOLVED" ? updNowTs : t.resolved_at,
       } : t);
@@ -7532,8 +7539,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nowTs = nowEpoch();
       const update = { updatedat: nowTs };
       if (action.status !== undefined) update.status = action.status;
-      if (action.admin_reply !== undefined) update.adminreply = action.admin_reply;
-      if (action.admin_id !== undefined) update.adminid = action.admin_id;
+      // adminreply/adminid are kept in place, mirrored to the LATEST reply,
+      // so anything still reading them directly keeps working — but the
+      // real record now lives in `replies` (a history array). Previously
+      // adminreply was a single overwritable column: a second reply (or a
+      // reply after RE-OPENing a resolved ticket, which this app
+      // explicitly supports) silently destroyed the first with zero trace
+      // anywhere, not even the audit log, which only ever recorded the
+      // literal string "— replied", never the actual content.
+      if (action.admin_reply !== undefined && action.admin_reply.trim()) {
+        update.adminreply = action.admin_reply.trim();
+        update.adminid = action.admin_id ?? actingAdminTicket.id;
+        const { data: ticketForReply } = await supabase.from("tickets").select("replies").eq("id", action.ticket_id).maybeSingle();
+        const priorReplies = Array.isArray(ticketForReply?.replies) ? ticketForReply.replies : [];
+        update.replies = [...priorReplies, {
+          admin_id: update.adminid, admin_name: actingAdminTicket.name,
+          message: update.adminreply, ts: nowTs,
+        }];
+      }
       if (action.status === "RESOLVED") update.resolvedat = nowTs;
       const { error } = await supabase.from("tickets").update(update).eq("id", action.ticket_id);
       if (error) throw error;
@@ -7550,7 +7573,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           await logAuditAction({
             actorId: actingAdminTicket.id, actorName: actingAdminTicket.name, actionType: "TICKET/UPDATE",
             tripId: ticketRow.tripid, targetUserId: ticketRow.agentid,
-            details: `Ticket #${action.ticket_id} (${ticketRow.category})${action.status !== undefined ? ` — status set to ${action.status}` : ""}${action.admin_reply !== undefined ? " — replied" : ""}`,
+            details: `Ticket #${action.ticket_id} (${ticketRow.category})${action.status !== undefined ? ` — status set to ${action.status}` : ""}${update.adminreply !== undefined ? ` — replied: "${update.adminreply.slice(0, 100)}"` : ""}`,
           });
         }
       }
@@ -9686,7 +9709,7 @@ function useAppStore() {
     if (error) return;
     setTickets((data || []).map(t => ({
       id: t.id, agent_id: t.agentid, trip_id: t.tripid, category: t.category, message: t.message,
-      status: t.status, admin_id: t.adminid, admin_reply: t.adminreply, role: t.role || ROLE.AGENT,
+      status: t.status, admin_id: t.adminid, admin_reply: t.adminreply, replies: t.replies || [], role: t.role || ROLE.AGENT,
       created_at: t.createdat, updated_at: t.updatedat, resolved_at: t.resolvedat,
     })));
   }, []);
@@ -11389,12 +11412,12 @@ function HelpTab({ state, user, dispatch }) {
           </div>
           {t.trip_id && <div style={{ fontSize: 9, color: COLORS.ghost }}>Re: Trip {t.trip_id}</div>}
           <div style={{ fontSize: 11, lineHeight: 1.5 }}>{t.message}</div>
-          {t.admin_reply && (
-            <div style={{ background: COLORS.surface, borderRadius: 4, padding: 10, marginTop: 4 }}>
-              <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>ADMIN REPLY</div>
-              <div style={{ fontSize: 11 }}>{t.admin_reply}</div>
+          {(t.replies && t.replies.length > 0 ? t.replies : t.admin_reply ? [{ message: t.admin_reply, ts: t.updated_at }] : []).map((r, i) => (
+            <div key={i} style={{ background: COLORS.surface, borderRadius: 4, padding: 10, marginTop: 4 }}>
+              <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>ADMIN REPLY{r.ts ? ` — ${epochToDisplay(r.ts)}` : ""}</div>
+              <div style={{ fontSize: 11 }}>{r.message}</div>
             </div>
-          )}
+          ))}
           <div style={{ fontSize: 9, color: COLORS.dim }}>{epochToDisplay(t.created_at)}</div>
         </Card>
       ))}
@@ -19372,12 +19395,14 @@ function AdminTickets({ state, dispatch, user }) {
                 Re: Trip {t.trip_id}{trip ? ` — Driver: ${state.users.find(u => String(u.id) === String(trip.driver_id))?.name || "unassigned"}` : ""}
               </div>
             )}
-            {t.admin_reply && (
-              <div style={{ background: COLORS.surface, borderRadius: 4, padding: 10 }}>
-                <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>YOUR REPLY</div>
-                <div style={{ fontSize: 11 }}>{t.admin_reply}</div>
+            {(t.replies && t.replies.length > 0 ? t.replies : t.admin_reply ? [{ admin_name: null, message: t.admin_reply, ts: t.updated_at }] : []).map((r, i) => (
+              <div key={i} style={{ background: COLORS.surface, borderRadius: 4, padding: 10 }}>
+                <div style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700, marginBottom: 3 }}>
+                  {r.admin_name ? `REPLY — ${r.admin_name}` : "REPLY"}{r.ts ? ` — ${epochToDisplay(r.ts)}` : ""}
+                </div>
+                <div style={{ fontSize: 11 }}>{r.message}</div>
               </div>
-            )}
+            ))}
             {isExpanded && canAction && (
               <div style={{ display: "flex", flexDirection: "column", gap: 8, borderTop: `1px solid ${COLORS.wire}`, paddingTop: 10 }}>
                 <textarea
