@@ -11923,16 +11923,22 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
     startWatch();
     setTracking(true);
 
-    // Watchdog — Android's geolocation watch is documented to sometimes
-    // silently stop delivering updates after the tab is backgrounded or
-    // the screen locks for a while, WITHOUT ever firing onError, so
-    // there's nothing else to react to. If tracking should be live but
-    // no position has arrived in over a minute, force a fresh
-    // watchPosition registration rather than leaving the driver silently
-    // untracked until they happen to background/foreground the app again
-    // (or reload it). Can't fire while the tab is fully suspended (JS
-    // itself is paused then, same platform limit noted above) — this
-    // recovers once execution resumes, instead of staying stuck.
+    // Watchdog — platform-agnostic (Android Chrome, iOS Safari, and
+    // desktop browsers all use the exact same standard Geolocation API
+    // here, nothing OS-specific in this code). Mobile geolocation watches
+    // are documented to sometimes silently stop delivering updates after
+    // the tab is backgrounded or the screen locks for a while, WITHOUT
+    // ever firing onError, so there's nothing else to react to — this is
+    // a known behavior on both Android Chrome and iOS Safari, not one or
+    // the other. If tracking should be live but no position has arrived
+    // in over a minute, force a fresh watchPosition registration rather
+    // than leaving the driver silently untracked until they happen to
+    // background/foreground the app again (or reload it). Can't fire
+    // while the tab is fully suspended (JS itself is paused then, same
+    // platform limit noted above — iOS in particular suspends a
+    // backgrounded PWA's JS at least as aggressively as Android, often
+    // more so) — this recovers once execution resumes, instead of
+    // staying stuck.
     lastPositionAtRef.current = Date.now();
     const WATCHDOG_STALE_MS = 60000;
     const watchdogId = setInterval(() => {
@@ -11955,16 +11961,17 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
     // DriverApp re-renders on every realtime trips update fleet-wide, not
     // just this driver's own trips. With those in the dependency array,
     // this effect was tearing down and recreating navigator.geolocation.
-    // watchPosition() — forcing a full GPS cold-reacquisition, which on
-    // Android with enableHighAccuracy can take many seconds — and the
-    // Supabase broadcast channel, potentially many times per hour during
-    // busy periods, with nothing to do with this specific driver. On a
-    // real Android device this manifested as GPS tracking appearing to
-    // silently stop/never settle, since the watch rarely stayed alive
-    // long enough to deliver a steady stream of fixes. Now the watch and
-    // channel only restart on an actual identity/login change or a
-    // genuinely new tracked trip (currentTripId), both real primitive
-    // values, not object references that change every render.
+    // watchPosition() — forcing a full GPS cold-reacquisition (slow with
+    // enableHighAccuracy on ANY mobile device, Android or iOS — this is
+    // React re-render behavior, not an OS-specific code path, so it hit
+    // every platform equally) — and the Supabase broadcast channel,
+    // potentially many times per hour during busy periods, with nothing
+    // to do with this specific driver. This manifested as GPS tracking
+    // appearing to silently stop/never settle, since the watch rarely
+    // stayed alive long enough to deliver a steady stream of fixes. Now
+    // the watch and channel only restart on an actual identity/login
+    // change or a genuinely new tracked trip (currentTripId), both real
+    // primitive values, not object references that change every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoggedIn, user?.id, currentTripId]);
 
