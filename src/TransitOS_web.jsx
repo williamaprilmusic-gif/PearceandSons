@@ -8650,11 +8650,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Ownership check — DisputeFilingModal always sends agent_id: user.id,
       // but nothing server-side enforced that. Without this, any caller
       // could file a dispute "as" an arbitrary agent on any trip.
-      const { data: fdTripRow } = await supabase.from("trips").select("agentid, extraagentids").eq("id", action.trip_id).single();
+      const { data: fdTripRow } = await supabase.from("trips").select("agentid, extraagentids, dispute").eq("id", action.trip_id).single();
       if (!fdTripRow) throw new Error("Trip not found");
       if (String(action.agent_id) !== String(activeUserRef.current)) throw new Error("You can only file a dispute as yourself.");
       const fdAgentIds = [fdTripRow.agentid, ...(fdTripRow.extraagentids || [])].filter(Boolean);
       if (!fdAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
+      // trips.dispute is a single object column, not a history array — an
+      // unconditional overwrite here would silently destroy a still-open
+      // dispute's category/description/filed_at with no trace (e.g. a
+      // double-tap, or a second complaint on the same trip), matching the
+      // exact class of bug RESOLVE_DISPUTE's own OPEN-state guard already
+      // exists to prevent on the resolution side.
+      if (fdTripRow.dispute?.state === "OPEN") {
+        throw new Error("This trip already has an open dispute pending review.");
+      }
       must(await supabase.from("trips").update({
         dispute: {
           agent_id: action.agent_id, category: action.category,
@@ -8694,10 +8703,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripForDispute?.dispute || tripForDispute.dispute.state !== "OPEN") {
         throw new Error("This trip has no open dispute to resolve.");
       }
+      const rdResolvedTs = nowEpoch();
       must(await supabase.from("trips").update({
-        dispute: { ...tripForDispute.dispute, state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
-        updatedat: nowEpoch(),
+        dispute: { ...tripForDispute.dispute, state: action.outcome, resolution_note: action.resolution_note, resolved_at: rdResolvedTs },
+        updatedat: rdResolvedTs,
       }).eq("id", action.trip_id));
+      // The filing agent previously had no way to learn the outcome except
+      // manually re-opening this trip's detail screen — FILE_DISPUTE
+      // already notifies admins, but nothing notified back the other way.
+      if (tripForDispute.dispute.agent_id != null) {
+        await insertNotification({
+          type: "DISPUTE_RESOLVED", for_roles: [ROLE.AGENT], for_user_ids: [tripForDispute.dispute.agent_id],
+          message: `Your dispute on trip ${action.trip_id} has been ${action.outcome}${action.resolution_note ? `: "${action.resolution_note}"` : ""}.`,
+          trip_id: action.trip_id, ts: rdResolvedTs, read: false,
+        });
+      }
       await logAuditAction({
         actorId: actingAdminDispute.id, actorName: actingAdminDispute.name, actionType: "TRIP/RESOLVE_DISPUTE",
         tripId: action.trip_id, details: `Resolved dispute — outcome: ${action.outcome}${action.resolution_note ? ` — "${action.resolution_note}"` : ""}`,
@@ -11147,7 +11167,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -19129,7 +19149,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
