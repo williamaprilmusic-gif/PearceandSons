@@ -6272,6 +6272,15 @@ async function fetchCompanyAnchor() {
 // No admin sidebar, no tabs — just the portal view for their company,
 // a small header with their name and a logout button.
 function ViewerPortal({ state, dispatch, user }) {
+  // Search Profiles is its own top-level tab here (not folded into
+  // ClientPortalApp) deliberately — ClientPortalApp is also used
+  // as-is by real external client-company users, who must never get an
+  // internal "search any agent's full profile + trip history" tool.
+  // AdminProfileSearch already correctly restricts itself for Viewer
+  // (agent profiles only, no driver profiles, no CSV export — all via
+  // the same hasAdminPermission checks used everywhere else), it just
+  // was never actually reachable from here before.
+  const [viewerTab, setViewerTab] = React.useState("portal");
   // Scope state to this viewer's companies (same logic as AdminApp scopedState)
   const scopedState = React.useMemo(() => {
     const companyIds = user.scoped_company_ids || [];
@@ -6316,14 +6325,27 @@ function ViewerPortal({ state, dispatch, user }) {
           LOG OUT
         </button>
       </div>
-      {/* Full-height portal — no sidebar, no tabs chrome */}
+      {/* Top-level tab bar — Portal (trips/SLA/exceptions) vs Search Profiles */}
+      <div style={{ display: "flex", borderBottom: `1px solid ${COLORS.wire}`, background: COLORS.panel, flexShrink: 0 }}>
+        {[["portal", "◈", "Portal"], ["profiles", "🔍", "Search Profiles"]].map(([id, icon, label]) => (
+          <button key={id} onClick={() => setViewerTab(id)}
+            style={{ flex: 1, padding: "10px 4px", background: "none", border: "none", borderBottom: viewerTab === id ? `2px solid ${COLORS.amber}` : "2px solid transparent", color: viewerTab === id ? COLORS.amber : COLORS.ghost, fontSize: 9, fontWeight: 700, cursor: "pointer", letterSpacing: 0.5 }}>
+            {icon} {label}
+          </button>
+        ))}
+      </div>
+      {/* Full-height portal — no sidebar, no further tabs chrome */}
       <div style={{ flex: 1, overflow: "auto" }}>
-        <ClientPortalApp
-          state={scopedState}
-          dispatch={dispatch}
-          user={{ ...user, is_master_client: true }}
-          hideHeader={true}
-        />
+        {viewerTab === "portal" ? (
+          <ClientPortalApp
+            state={scopedState}
+            dispatch={dispatch}
+            user={{ ...user, is_master_client: true }}
+            hideHeader={true}
+          />
+        ) : (
+          <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />
+        )}
       </div>
     </div>
   );
