@@ -16377,14 +16377,22 @@ function AdminDispatch({ state, dispatch }) {
     const tripTimeStr = primaryTrip?.scheduled_time || null;
     const tripDateStr = primaryTrip?.scheduled_date || null;
     if (!isDriverOnShift(ds, tripDateStr, tripTimeStr)) return false;
+    // Real per-vehicle capacity, not the bare DRIVER_CAPACITY default —
+    // matches the pattern every other capacity check in this file already
+    // uses. Without this, a driver with a bigger vehicle got wrongly
+    // EXCLUDED from the available list once loaded past the default of 4
+    // (even with real room left), and a driver with a smaller vehicle
+    // (e.g. a 2-seat sedan) showed as available for a booking their real
+    // car can't fit.
+    const driverCapacity = ds.capacity || DRIVER_CAPACITY;
     if (isWeekBookingSelection) {
       return selectedTrips.every(t => {
         if (!isDriverOnShift(ds, t.scheduled_date, tripTimeStr)) return false;
-        return getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= DRIVER_CAPACITY;
+        return getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= driverCapacity;
       });
     }
     const checkDate = primaryTrip?.scheduled_date;
-    return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= DRIVER_CAPACITY;
+    return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= driverCapacity;
   });
 
   const toggleTrip = (tripId) => {
