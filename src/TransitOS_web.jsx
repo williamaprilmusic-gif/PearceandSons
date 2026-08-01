@@ -1520,7 +1520,7 @@ function staticSearch(query) {
 const TOMTOM_API_KEY = import.meta.env?.VITE_TOMTOM_API_KEY || null;
 console.log(
   TOMTOM_API_KEY
-    ? `[TomTom] API key loaded (starts with: ${TOMTOM_API_KEY.slice(0, 8)}...)`
+    ? "[TomTom] API key loaded."
     : "[TomTom] No VITE_TOMTOM_API_KEY found in env — falling back to Nominatim. Check your .env file and restart 'npm run dev'."
 );
 
