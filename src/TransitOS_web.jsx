@@ -9080,6 +9080,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       const newCompletedDropoffs = [...new Set([...(tripRow.completeddropoffs || []), action.agent_id])];
       const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) {
+        // Already completed — a replayed/duplicate confirmation (e.g. the
+        // offline-sync queue retrying this exact action after its success
+        // response was lost over a dropped connection, a common real-world
+        // case for a driver on patchy signal). Without this guard,
+        // assertTripTransition below throws ARCHIVED_COMPLETED ->
+        // ARCHIVED_COMPLETED as "ILLEGAL", and since the offline-replay
+        // loop has no special-case for that error, this action gets
+        // re-queued and retried — and fails identically — on every future
+        // reconnect, forever, even though the trip completed successfully
+        // the first time. Treat a replay against an already-completed trip
+        // as a no-op success instead. Matches CONFIRM_AGENT_PICKUP's
+        // equivalent status guard just above.
+        await refetch();
+        return;
+      }
       if (allDroppedOff) {
         // All agents dropped off — complete the trip
         assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
