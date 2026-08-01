@@ -9,11 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.50.0",
+    "leaflet": "^1.9.4",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0",
-    "@supabase/supabase-js": "^2.50.0"
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@babel/parser": "^7.29.8",
     "@vitejs/plugin-react": "^6.0.3",
     "vite": "^8.1.1"
   }

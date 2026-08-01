@@ -1,4 +1,12 @@
 import React, { useState, useReducer, useEffect, useRef, useCallback } from "react";
+// In-app driver navigation (DriverNavMap) — Leaflet chosen over TomTom's own
+// Maps SDK for Web, which is deprecated (v6 withdrawal Feb 2026) with its
+// replacement still an unstable public preview. Leaflet is mature/stable
+// and pairs with TomTom's plain raster tile REST endpoint (same API key
+// already used for routing elsewhere in this file), so no new account/key
+// is needed.
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 /* ============================================================
    Pearce & Sons — Corporate Transport Operations Platform (Web)
@@ -1724,40 +1732,6 @@ function checkBookingRateLimit(userId) {
   }
 }
 
-// ── Offline navigation queue ──────────────────────────────────────────────
-// When a driver taps "OPEN IN WAZE" while offline, we can't launch Waze
-// immediately (some devices block deep-links without network). Queue the
-// destination and fire it automatically when connectivity returns.
-const OFFLINE_NAV_KEY = "transitos_offline_nav";
-
-function queueOfflineNav(lat, lng, label) {
-  try {
-    localStorage.setItem(OFFLINE_NAV_KEY, JSON.stringify({ lat, lng, label, queuedAt: Date.now() }));
-    console.log("[Offline] Waze destination queued:", label);
-  } catch {}
-}
-
-function consumeOfflineNav() {
-  try {
-    const raw = localStorage.getItem(OFFLINE_NAV_KEY);
-    if (!raw) return null;
-    localStorage.removeItem(OFFLINE_NAV_KEY);
-    const nav = JSON.parse(raw);
-    // Stale if queued more than 30 min ago (driver may have resolved it)
-    if (Date.now() - nav.queuedAt > 30 * 60 * 1000) return null;
-    return nav;
-  } catch { return null; }
-}
-
-// Extended smartOpenWazeOfflineAware: queues if offline, opens if online
-function smartOpenWazeWithOfflineFallback(lat, lng, label, isManual) {
-  if (!navigator.onLine) {
-    queueOfflineNav(lat, lng, label);
-    alert("You\'re offline. Waze will open automatically when you\'re back online.");
-    return;
-  }
-  smartOpenWaze(lat, lng, label, isManual);
-}
 
 
 
@@ -2083,12 +2057,10 @@ function useOfflineSync(dispatch) {
   React.useEffect(() => {
     const goOnline = async () => {
       setIsOnline(true);
-      // Replay queued Waze navigation first — driver needs to know where to go
-      const pendingNav = consumeOfflineNav();
-      if (pendingNav) {
-        console.log("[Offline] Replaying queued Waze nav:", pendingNav.label);
-        smartOpenWaze(pendingNav.lat, pendingNav.lng, pendingNav.label, false);
-      }
+      // Queued-Waze-nav replay was removed along with the external Waze
+      // handoff itself — navigation now happens entirely in-app
+      // (DriverNavMap), which handles "no connection yet" on its own via
+      // its own error/retry state rather than needing an offline queue.
       const q = getOfflineQueue();
       if (q.length === 0) return;
       setSyncing(true);
@@ -2480,7 +2452,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
 // that shows: current stop details, one-tap launch into Waze pre-loaded
 // with the destination, and trip progress — so it FEELS embedded.
 // This is the same technique Bolt and inDriver use on Android/iOS.
-function WazeNavPanel({ trip, user, state }) {
+function WazeNavPanel({ trip, user, state, setNavTarget }) {
   if (!trip) return null;
   const agentIds = trip.agent_ids || [];
   // completed_pickups/completed_dropoffs are arrays of agent IDs who were confirmed
@@ -2534,10 +2506,10 @@ function WazeNavPanel({ trip, user, state }) {
             {current.coord.label || "Address not available"}
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button onClick={() => smartOpenWazeWithOfflineFallback(current.coord.lat, current.coord.lng, current.coord.label, false)}
+            <button onClick={() => setNavTarget({ lat: current.coord.lat, lng: current.coord.lng, label: current.coord.label, isManual: false })}
               style={{ flex: 1, background: "#00CCFF", border: "none", borderRadius: 5, padding: "10px 0",
                 fontWeight: 800, fontSize: 12, cursor: "pointer", color: "#000", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <span style={{ fontSize: 16 }}>🗺</span> OPEN IN WAZE
+              <span style={{ fontSize: 16 }}>🗺</span> NAVIGATE
             </button>
             {remaining.length > 1 && (
               <div style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.wire}`,
@@ -3535,6 +3507,55 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     return km; // → km
   } catch (e) {
     console.warn("[TomTom] real route km failed:", e.message);
+    return null;
+  }
+}
+
+// ── In-app driver navigation (Feature: replaces the external Waze handoff) ──
+// Fetches a real drivable route + turn-by-turn text instructions for the
+// embedded nav map (DriverNavMap) — a single from→to leg, unlike
+// tomtomRealRouteKm above (which stitches a driver's WHOLE multi-stop day
+// together for distance/compliance purposes, not for live turn-by-turn).
+// Respects the same high-risk-zone avoidance as every other routing call in
+// this file — a driver actively navigating should never be routed through a
+// flagged area any more than the background distance calculations should.
+// Returns null on any failure; caller falls back to a straight line /
+// haversine estimate rather than breaking navigation entirely.
+async function tomtomNavRoute(fromCoord, toCoord) {
+  if (!TOMTOM_API_KEY || !fromCoord?.lat || !toCoord?.lat) return null;
+  try {
+    const locations = `${fromCoord.lat},${fromCoord.lng}:${toCoord.lat},${toCoord.lng}`; // lat,lng — see the standing warning elsewhere in this file
+    const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
+      `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car` +
+      `&instructionsType=text&language=en-GB${TOMTOM_AVOID_PARAM}`;
+    const res = _highRiskAvoidRectangles
+      ? await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
+        })
+      : await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const route = data.routes?.[0];
+    if (!route) return null;
+    const points = (route.legs || []).flatMap(leg => (leg.points || []).map(p => ({ lat: p.latitude, lng: p.longitude })));
+    if (points.length < 2) return null;
+    const instructions = (route.guidance?.instructions || []).map(ins => ({
+      offsetM: ins.routeOffsetInMeters ?? 0,
+      lat: ins.point?.latitude, lng: ins.point?.longitude,
+      maneuver: ins.maneuver || null, message: ins.message || ins.combinedMessage || "Continue",
+      street: ins.street || null,
+    })).filter(ins => ins.lat != null);
+    const metres = route.summary?.lengthInMeters;
+    const seconds = route.summary?.travelTimeInSeconds;
+    return {
+      points, instructions,
+      distanceKm: metres != null ? metres / 1000 : null,
+      etaMin: seconds != null ? Math.max(1, Math.round(seconds / 60)) : null,
+    };
+  } catch (e) {
+    console.warn("[TomTom] nav route failed:", e.message);
     return null;
   }
 }
@@ -11661,6 +11682,10 @@ function useAwayDetection(userId, isLoggedIn) {
 function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null, highRiskZones = []) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
+  // Raw current position, exposed for the in-app nav map (DriverNavMap) —
+  // everything else in this hook only ever broadcasts/persists it, nothing
+  // previously returned the actual lat/lng back up to the component tree.
+  const [position, setPosition] = useState(null);
   const watchIdRef = useRef(null);
   const lastBroadcastRef = useRef(0);
   const lastPersistRef = useRef(0);
@@ -11771,6 +11796,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       consecutiveErrorsRef.current = 0;
       const { latitude, longitude, heading, speed, accuracy } = pos.coords;
       const speedKmh = speed != null ? speed * 3.6 : null;
+      setPosition({ lat: latitude, lng: longitude, heading: heading ?? null, speedKmh, accuracy: accuracy ?? null });
 
       // Fast path: broadcast every ~4s. Deliberately minimal payload —
       // short keys, only the fields anything actually needs, no wrapper
@@ -12168,7 +12194,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isLoggedIn, user?.id, currentTripId]);
 
-  return { tracking, lastError };
+  return { tracking, lastError, position };
 }
 
 // Agent-side consumer of the driver's lightweight broadcast — this is
@@ -13549,7 +13575,7 @@ function DriverDeclineModal({ trip, user, dispatch, onClose }) {
   );
 }
 
-function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
+function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTarget }) {
   const myStatus = state.driver_status.find(d => String(d.driver_id) === String(user.id));
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const active = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
@@ -13749,7 +13775,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             )}
             {trip.driverAccepted && <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ ACCEPTED — {trip.acceptedAt}</span>}
             <div style={{ display: "flex", gap: 8 }}>
-              {pickupCoord && <Button title="WAZE ↗" variant="waze" style={{ flex: 1 }} onClick={() => smartOpenWaze(pickupCoord.lat, pickupCoord.lng, trip.custom_pickup, trip.pickup_is_manual)} />}
+              {pickupCoord && <Button title="NAVIGATE ↗" variant="waze" style={{ flex: 1 }} onClick={() => { setNavTarget({ lat: pickupCoord.lat, lng: pickupCoord.lng, label: trip.custom_pickup, isManual: trip.pickup_is_manual }); setTab("navigate"); }} />}
               {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state) && <Button title="NAV →" variant="amber" onClick={() => setTab("navigate")} />}
             </div>
               </>
@@ -13912,7 +13938,194 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
   );
 }
 
-function DriverNavTab({ state, dispatch, user, call, myTrips }) {
+// Embedded in-app navigation — replaces the external Waze handoff for the
+// driver's own active-navigation flow (see the memory note on this feature
+// for the full architecture/fidelity decision: map + live position + text
+// turn instructions, deliberately NOT voice guidance or full Waze parity,
+// neither of which is realistically buildable in a web app).
+// Deliberately remounts fresh every time the driver switches back to this
+// tab (DriverNavTab conditionally mounts it, doesn't hide it via CSS) —
+// simpler than caching state across mounts, avoids Leaflet's known
+// zero-height-container gotcha from mounting behind display:none, and gets
+// a genuinely fresh route/ETA each time rather than a stale cached one.
+function DriverNavMap({ destination, driverPosition, onExit }) {
+  const mapContainerRef = useRef(null);
+  const mapRef = useRef(null);
+  const routeLayerRef = useRef(null);
+  const driverMarkerRef = useRef(null);
+  const destMarkerRef = useRef(null);
+  const [route, setRoute] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [currentInstructionIdx, setCurrentInstructionIdx] = useState(0);
+  const [followMode, setFollowMode] = useState(true);
+  const lastRouteFetchAtRef = useRef(0);
+
+  const fetchRoute = useCallback(async (fromCoord) => {
+    if (!fromCoord?.lat || !destination?.lat) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await tomtomNavRoute(fromCoord, destination);
+      if (!r) { setError("Couldn't calculate a route — check your connection."); return; }
+      setRoute(r);
+      setCurrentInstructionIdx(0);
+      lastRouteFetchAtRef.current = Date.now();
+    } catch (e) {
+      setError(e.message || "Couldn't calculate a route.");
+    } finally {
+      setLoading(false);
+    }
+  }, [destination?.lat, destination?.lng]);
+
+  // Initial route fetch, once a starting position is available.
+  useEffect(() => {
+    if (driverPosition?.lat) fetchRoute(driverPosition);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Map init — once, on mount.
+  useEffect(() => {
+    if (!mapContainerRef.current || mapRef.current) return;
+    const map = L.map(mapContainerRef.current, { zoomControl: false, attributionControl: true });
+    map.setView([driverPosition?.lat || -33.9249, driverPosition?.lng || 18.4241], 15);
+    L.tileLayer(`https://api.tomtom.com/map/1/tile/basic/main/{z}/{x}/{y}.png?key=${TOMTOM_API_KEY}`, {
+      maxZoom: 22, attribution: "© TomTom",
+    }).addTo(map);
+    mapRef.current = map;
+    // A driver manually panning/zooming turns off auto-follow, so the view
+    // stops jumping back to their live position mid-look — the RECENTER
+    // button below turns it back on.
+    map.on("dragstart", () => setFollowMode(false));
+    // Leaflet's classic zero-height-container gotcha — the flex layout
+    // this mounts into may not have resolved its final height on the very
+    // first paint, which Leaflet has no way to detect on its own.
+    setTimeout(() => map.invalidateSize(), 100);
+    return () => { map.remove(); mapRef.current = null; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Draw/redraw the route line + destination pin whenever a route arrives.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !route?.points?.length) return;
+    if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
+    const latlngs = route.points.map(p => [p.lat, p.lng]);
+    routeLayerRef.current = L.polyline(latlngs, { color: "#2D8CF0", weight: 6, opacity: 0.85 }).addTo(map);
+    if (!destMarkerRef.current && destination?.lat) {
+      destMarkerRef.current = L.marker([destination.lat, destination.lng], {
+        icon: L.divIcon({ className: "", iconSize: [16, 16], html: `<div style="background:${COLORS.red};width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>` }),
+      }).addTo(map);
+    }
+    map.fitBounds(routeLayerRef.current.getBounds(), { padding: [40, 40] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [route]);
+
+  // Move (or create) the driver's own marker, and recenter while following.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !driverPosition?.lat) return;
+    const latlng = [driverPosition.lat, driverPosition.lng];
+    const icon = L.divIcon({
+      className: "", iconSize: [22, 22],
+      html: `<div style="width:22px;height:22px;border-radius:50%;background:${COLORS.amber};border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.6);transform:rotate(${driverPosition.heading || 0}deg)"></div>`,
+    });
+    if (!driverMarkerRef.current) driverMarkerRef.current = L.marker(latlng, { icon }).addTo(map);
+    else { driverMarkerRef.current.setLatLng(latlng); driverMarkerRef.current.setIcon(icon); }
+    if (followMode) map.panTo(latlng, { animate: true });
+  }, [driverPosition?.lat, driverPosition?.lng, driverPosition?.heading, followMode]);
+
+  // Advance past each maneuver point the driver reaches, and re-route if
+  // they've strayed far off the planned path. Simplified nearest-point
+  // matching, not full route-snapping — matches the "text turn
+  // instructions" fidelity this feature was deliberately scoped to.
+  useEffect(() => {
+    if (!route?.instructions?.length || !driverPosition?.lat) return;
+    const PASS_THRESHOLD_KM = 0.04; // 40m — close enough to count as reached
+    const REROUTE_THRESHOLD_KM = 0.4; // 400m off the planned route
+    const REROUTE_COOLDOWN_MS = 30000;
+
+    let idx = currentInstructionIdx;
+    while (idx < route.instructions.length - 1) {
+      const ins = route.instructions[idx];
+      if (haversineKm(driverPosition.lat, driverPosition.lng, ins.lat, ins.lng) <= PASS_THRESHOLD_KM) idx++;
+      else break;
+    }
+    if (idx !== currentInstructionIdx) setCurrentInstructionIdx(idx);
+
+    let nearestKm = Infinity;
+    for (const p of route.points) {
+      const d = haversineKm(driverPosition.lat, driverPosition.lng, p.lat, p.lng);
+      if (d < nearestKm) nearestKm = d;
+      if (nearestKm <= REROUTE_THRESHOLD_KM) break;
+    }
+    if (nearestKm > REROUTE_THRESHOLD_KM && Date.now() - lastRouteFetchAtRef.current > REROUTE_COOLDOWN_MS) {
+      fetchRoute(driverPosition);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [driverPosition?.lat, driverPosition?.lng]);
+
+  const currentInstruction = route?.instructions?.[currentInstructionIdx] || null;
+  const distToNextKm = currentInstruction && driverPosition?.lat
+    ? haversineKm(driverPosition.lat, driverPosition.lng, currentInstruction.lat, currentInstruction.lng) : null;
+  const distToDestKm = driverPosition?.lat && destination?.lat
+    ? haversineKm(driverPosition.lat, driverPosition.lng, destination.lat, destination.lng) : null;
+  const fmtDist = (km) => km == null ? "—" : km < 1 ? `${Math.round(km * 1000)}m` : `${km.toFixed(1)}km`;
+
+  const MANEUVER_ICONS = {
+    TURN_LEFT: "⬅", TURN_RIGHT: "➡", SHARP_LEFT: "↖", SHARP_RIGHT: "↗",
+    BEAR_LEFT: "↖", BEAR_RIGHT: "↗", KEEP_LEFT: "↖", KEEP_RIGHT: "↗",
+    STRAIGHT: "⬆", ARRIVE: "🏁", ARRIVE_LEFT: "🏁", ARRIVE_RIGHT: "🏁",
+    ROUNDABOUT_CROSS: "↻", ROUNDABOUT_LEFT: "↻", ROUNDABOUT_RIGHT: "↻",
+    UTURN_LEFT: "↩", UTURN_RIGHT: "↪",
+  };
+
+  return (
+    <div style={{ position: "relative", height: "100%", minHeight: 320, display: "flex", flexDirection: "column" }}>
+      <div ref={mapContainerRef} style={{ flex: 1, minHeight: 240, background: "#111" }} />
+      {currentInstruction && (
+        <div style={{ position: "absolute", top: 10, left: 10, right: 54, background: "rgba(10,10,10,.92)", border: `1px solid ${COLORS.wire}`, borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, zIndex: 500 }}>
+          <span style={{ fontSize: 26, flexShrink: 0 }}>{MANEUVER_ICONS[currentInstruction.maneuver] || "⬆"}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.chalk }}>{currentInstruction.message}</div>
+            {distToNextKm != null && <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>in {fmtDist(distToNextKm)}</div>}
+          </div>
+        </div>
+      )}
+      <div style={{ position: "absolute", bottom: 10, left: 10, right: 10, display: "flex", gap: 8, zIndex: 500 }}>
+        <div style={{ flex: 1, background: "rgba(10,10,10,.92)", border: `1px solid ${COLORS.wire}`, borderRadius: 8, padding: "10px 14px" }}>
+          <div style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{destination?.label || "Destination"}</div>
+          <div style={{ fontSize: 14, fontWeight: 800, color: COLORS.chalk }}>
+            {fmtDist(distToDestKm ?? route?.distanceKm)}
+            {route?.etaMin != null && <span style={{ fontSize: 10, color: COLORS.ghost, fontWeight: 600 }}> · ~{route.etaMin} min</span>}
+          </div>
+        </div>
+        {!followMode && (
+          <button onClick={() => setFollowMode(true)} style={{ background: COLORS.amber, border: "none", borderRadius: 8, padding: "0 16px", color: "#000", fontWeight: 800, fontSize: 11, cursor: "pointer" }}>
+            ⊙ RECENTER
+          </button>
+        )}
+      </div>
+      {loading && !route && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(10,10,10,.7)", zIndex: 600 }}>
+          <span style={{ fontSize: 11, color: COLORS.ghost }}>Calculating route…</span>
+        </div>
+      )}
+      {error && (
+        <div style={{ position: "absolute", top: 10, left: 10, right: 54, background: "rgba(232,58,58,.15)", border: `1px solid ${COLORS.red}`, borderRadius: 8, padding: 10, zIndex: 500 }}>
+          <span style={{ fontSize: 11, color: COLORS.red }}>{error}</span>
+        </div>
+      )}
+      {onExit && (
+        <button onClick={onExit} style={{ position: "absolute", top: 10, right: 10, background: "rgba(10,10,10,.85)", border: `1px solid ${COLORS.wire}`, borderRadius: 20, width: 34, height: 34, color: COLORS.chalk, fontSize: 16, cursor: "pointer", zIndex: 500 }}>
+          ✕
+        </button>
+      )}
+    </div>
+  );
+}
+
+function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, driverPosition }) {
   const [tripStarted, setTripStarted] = useState(false);
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
@@ -14137,7 +14350,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       // way to tell what had gone wrong.
       setTripStarted(true);
       const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
-      if (firstPickup?.lat && firstPickup?.lng) smartOpenWaze(firstPickup.lat, firstPickup.lng, firstPickup.label, firstPickup.isManual);
+      if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual });
     } catch (e) {
       setStartTripError(e.message || "Couldn't start the trip — please try again.");
     }
@@ -14205,11 +14418,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     const remaining = pickupStops.filter(s => String(s.trip_id) !== String(trip_id) || String(s.agent_id) !== String(agent_id)).filter(s => !s.done);
     const next = remaining[0];
     if (next?.lat && next?.lng) {
-      smartOpenWaze(next.lat, next.lng, next.label, next.isManual);
+      setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual });
       return;
     }
     const firstDrop = dropStops.find(s => !s.done);
-    if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
   };
 
   // OUTBOUND trips: all agents board at ONE location (company/work site).
@@ -14248,7 +14461,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     }
     // Navigate to first home dropoff
     const firstDrop = dropStops.find(s => !s.done);
-    if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
   };
   const confirmDropoff = async (group) => {
     try {
@@ -14308,8 +14521,19 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
     }
     const remaining = dropStops.filter(s => s !== group).filter(s => !s.done);
     const next = remaining[0];
-    if (next?.lat && next?.lng) smartOpenWaze(next.lat, next.lng, next.label, next.isManual);
+    if (next?.lat && next?.lng) setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual });
   };
+
+  // In-app navigation view takes over the whole tab whenever a target is
+  // set — safe to early-return here since every hook in this component is
+  // already called above this point (no hooks below).
+  if (navTarget) {
+    return (
+      <div style={{ height: "calc(100dvh - 130px)" }}>
+        <DriverNavMap destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)} />
+      </div>
+    );
+  }
 
   if (myActiveTrips.length === 0) return <div className="pad"><div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div><Empty icon="◉" text="No active trips. Accept trips from the Trips tab first." /></div>;
 
@@ -14321,7 +14545,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
       </div>
       {/* Feature B: Waze nav panel — persistent stop-by-stop guide */}
-      {myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} />}
+      {myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} setNavTarget={setNavTarget} />}
       {startTripError && (
         <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
           <span style={{ fontSize: 11, color: COLORS.red }}>{startTripError}</span>
@@ -14392,11 +14616,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
             const remainingPickups = pickupStops.filter(s => !(s.trip_id === noShowFor.trip_id && String(s.agent_id) === String(noShowFor.agent_id))).filter(s => !s.done);
             const nextPickup = remainingPickups[0];
             if (nextPickup?.lat && nextPickup?.lng) {
-              smartOpenWaze(nextPickup.lat, nextPickup.lng, nextPickup.label, nextPickup.isManual);
+              setNavTarget({ lat: nextPickup.lat, lng: nextPickup.lng, label: nextPickup.label, isManual: nextPickup.isManual });
               return;
             }
             const firstDrop = dropStops.find(s => !s.done);
-            if (firstDrop?.lat && firstDrop?.lng) smartOpenWaze(firstDrop.lat, firstDrop.lng, firstDrop.label, firstDrop.isManual);
+            if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
           }}
         />
       )}
@@ -14434,8 +14658,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
                   </div>
                 ))}
               </div>
-              <Button title={`🧭 WAZE → PICKUP`} variant="waze" full
-                onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)}
+              <Button title={`🧭 NAVIGATE → PICKUP`} variant="waze" full
+                onClick={() => setNavTarget({ lat: curPickup.lat, lng: curPickup.lng, label: curPickup.label, isManual: curPickup.isManual })}
                 style={{ padding: 14, fontSize: 13 }} />
               <Button
                 title={`✓ ALL ${pickupStops.filter(s => !s.done).length} PASSENGERS ON BOARD`}
@@ -14481,7 +14705,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
                   <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP ADDRESS</div>
                   <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
                 </div>
-                <Button title={`🧭 WAZE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curPickup.lat, curPickup.lng, curPickup.label, curPickup.isManual)} style={{ padding: 16, fontSize: 14 }} />
+                <Button title={`🧭 NAVIGATE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => setNavTarget({ lat: curPickup.lat, lng: curPickup.lng, label: curPickup.label, isManual: curPickup.isManual })} style={{ padding: 16, fontSize: 14 }} />
                 <div style={{ display: "flex", gap: 8 }}>
                   <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} style={{ flex: 2 }} />
                   <Button title="🚫 NO SHOW" variant="danger" full onClick={() => setNoShowFor({ trip_id: curPickup.trip_id, agent_id: curPickup.agent_id, agent_name: curPickup.agent_name })} style={{ flex: 1 }} />
@@ -14539,7 +14763,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
               <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>DROP-OFF ADDRESS</div>
               <div style={{ fontSize: 13, fontWeight: 700 }}>{curDrop.label}</div>
             </div>
-            <Button title={`🧭 WAZE → DROP-OFF ${curDropIdx + 1}`} variant="waze" full onClick={() => smartOpenWaze(curDrop.lat, curDrop.lng, curDrop.label, curDrop.isManual)} style={{ padding: 16, fontSize: 14 }} />
+            <Button title={`🧭 NAVIGATE → DROP-OFF ${curDropIdx + 1}`} variant="waze" full onClick={() => setNavTarget({ lat: curDrop.lat, lng: curDrop.lng, label: curDrop.label, isManual: curDrop.isManual })} style={{ padding: 16, fontSize: 14 }} />
             <Button
               title={curDrop.passengers.length === 1
                 ? `🏁 DROPPED OFF — ${curDrop.passengers[0].name}`
@@ -14827,6 +15051,10 @@ const DRIVER_TABS = [["trips", "⊟", "Trips"], ["navigate", "◉", "Navigate"],
 
 function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [tab, setTab] = usePersistedTab("driver", user.id, "trips", DRIVER_TABS.map(t => t[0]));
+  // In-app navigation target — lifted here (not local to DriverNavTab) so
+  // switching to another tab (Messages, Alerts, etc.) and back to Navigate
+  // doesn't lose the active route; { lat, lng, label, isManual } | null.
+  const [navTarget, setNavTarget] = useState(null);
 
   // Register handler for NOTIFICATION_CLICKED — drivers mostly get
   // trip notifications and DMs. Jump to Navigate for an active trip
@@ -14836,7 +15064,11 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (!notifClickHandlerRef) return;
     notifClickHandlerRef.current = (data) => {
       if (data.notifType === "INCOMING_CALL") {
-        setTab("nav"); // call overlay covers this — sensible context behind it for a driver
+        // Real bug fix: DRIVER_TABS' actual id is "navigate", not "nav" —
+        // this silently landed on a blank tab (with the call overlay on
+        // top, which masked it from ever being noticed) instead of the
+        // Navigate tab it was actually meant to sit behind.
+        setTab("navigate"); // call overlay covers this — sensible context behind it for a driver
       } else if (data.tripId) {
         setTab("trips");
       } else if (data.notifType === "DIRECT_MESSAGE") {
@@ -14913,8 +15145,8 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
         </div>
       </div>
       <div style={{ flex: 1, overflowY: "auto" }}>
-        {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} />}
-        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} />}
+        {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} setNavTarget={setNavTarget} />}
+        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} navTarget={navTarget} setNavTarget={setNavTarget} driverPosition={location.position} />}
         {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "history" && <DriverHistoryTab myTrips={myTrips} state={state} />}
