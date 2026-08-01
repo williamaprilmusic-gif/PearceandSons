@@ -8923,6 +8923,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // could decline (and get added to declinedby on) a trip assigned to
       // someone else.
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
+      // The ownership check above verifies the TRIP's driver, but every
+      // write below still read the unverified action.driver_id — a caller
+      // could pass an arbitrary driver_id and have IT flagged in
+      // declinedby/rejectiondriverid/the audit log, and worse, have a
+      // completely unrelated driver's driver_status row silently reset to
+      // AVAILABLE (the "remaining trips" query below was scoped to
+      // action.driver_id too). Re-point to the verified value once.
+      action = { ...action, driver_id: tripRow.driverid };
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
