@@ -7549,24 +7549,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Agent/driver side of a DM conversation — no admin-permission
       // gate (unlike DM/SEND), since this has to work for whichever
       // staff member the conversation belongs to, not just admins.
-      // Matches TRIP/SEND_CHAT's existing security model: trusts
-      // action.sender_id the same way every other agent/driver-
-      // initiated action in this codebase already does, rather than
-      // inventing a stricter re-check for this one action alone.
+      // Sender identity is still verified server-side against
+      // activeUserRef below — action.sender_id/name/role used to be
+      // inserted directly from the client, letting any authenticated
+      // user impersonate any name/role in a DM (and DM/REPLY had zero
+      // ownership check at all beyond that).
       if (!action.message?.trim()) throw new Error("Message can't be empty.");
+      const { data: dmReplySender, error: dmReplySenderErr } = await supabase.from("users").select("id, fullname, role").eq("id", activeUserRef.current).single();
+      if (dmReplySenderErr || !dmReplySender) throw new Error("Could not verify sender.");
       const dmReplyTs = nowEpoch();
       const { error: dmReplyError } = await supabase.from("direct_messages").insert({
-        senderid: action.sender_id, sendername: action.sender_name, senderrole: action.sender_role,
+        senderid: dmReplySender.id, sendername: dmReplySender.fullname, senderrole: dmReplySender.role,
         recipientid: action.recipient_id, content: action.message.trim(), timestamp: dmReplyTs,
       });
       if (dmReplyError) throw dmReplyError;
       await insertNotification({
         type: "DIRECT_MESSAGE", for_roles: [], for_user_ids: [action.recipient_id],
-        message: `💬 Message from ${action.sender_name}: ${action.message.trim().slice(0, 80)}`,
+        message: `💬 Message from ${dmReplySender.fullname}: ${action.message.trim().slice(0, 80)}`,
         ts: dmReplyTs, read: false,
       });
       await logAuditAction({
-        actorId: action.sender_id, actorName: action.sender_name, actionType: "DM/REPLY",
+        actorId: dmReplySender.id, actorName: dmReplySender.fullname, actionType: "DM/REPLY",
         targetUserId: action.recipient_id, details: `Sent direct message: "${action.message.trim().slice(0, 100)}"`,
       });
       await refetch();
@@ -7581,14 +7584,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const actingAdminDm = await assertAdminPermission(activeUserRef, "manageTrips");
       if (!action.message?.trim()) throw new Error("Message can't be empty.");
       const dmNowTs = nowEpoch();
+      // Sender identity comes from the already-verified admin (actingAdminDm),
+      // never from the client — action.sender_id/name/role used to be
+      // inserted directly, letting any admin impersonate a different
+      // admin (or fabricate a role) in the message and its notification.
       const { error: dmError } = await supabase.from("direct_messages").insert({
-        senderid: action.sender_id, sendername: action.sender_name, senderrole: action.sender_role,
+        senderid: actingAdminDm.id, sendername: actingAdminDm.name, senderrole: ROLE.ADMIN,
         recipientid: action.recipient_id, content: action.message.trim(), timestamp: dmNowTs,
       });
       if (dmError) throw dmError;
       await insertNotification({
         type: "DIRECT_MESSAGE", for_roles: [], for_user_ids: [action.recipient_id],
-        message: `💬 Message from ${action.sender_name}: ${action.message.trim().slice(0, 80)}`,
+        message: `💬 Message from ${actingAdminDm.name}: ${action.message.trim().slice(0, 80)}`,
         ts: dmNowTs, read: false,
       });
       await logAuditAction({
@@ -9269,9 +9276,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // trip, since the read-side filter only checked sender_id against
       // both parties — a message meant for Agent A would visibly leak
       // into a separate chat with Agent B on the same trip.
+      //
+      // Ownership + sender identity are both verified server-side here —
+      // this previously trusted action.trip_id/sender_id/sender_name/
+      // sender_role entirely from the client, letting any authenticated
+      // user post into ANY trip's chat as anyone (same class of bug fixed
+      // on DM/REPLY and DM/SEND above).
+      const { data: chatTripRow } = await supabase.from("trips").select("driverid, agentid, extraagentids").eq("id", action.trip_id).maybeSingle();
+      if (!chatTripRow) throw new Error("Trip not found");
+      const chatParticipantIds = [chatTripRow.driverid, chatTripRow.agentid, ...(chatTripRow.extraagentids || [])].filter(Boolean).map(String);
+      if (!chatParticipantIds.includes(String(activeUserRef.current))) throw new Error("You're not on this trip.");
+      const { data: chatSender, error: chatSenderErr } = await supabase.from("users").select("id, fullname, role").eq("id", activeUserRef.current).single();
+      if (chatSenderErr || !chatSender) throw new Error("Could not verify sender.");
       must(await supabase.from("messages").insert({
-        tripid: action.trip_id, senderid: action.sender_id, sendername: action.sender_name,
-        senderrole: action.sender_role, recipientid: action.recipient_id ?? null,
+        tripid: action.trip_id, senderid: chatSender.id, sendername: chatSender.fullname,
+        senderrole: chatSender.role, recipientid: action.recipient_id ?? null,
         content: action.text, timestamp: nowEpoch(),
       }));
       await refetch();
@@ -9450,6 +9469,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // actually sends the hourly notifications from here on.
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow || tripRow.remindersent) return;
+      // Agent-initiated (the only call site is an agent's own "myTrips"
+      // list), not admin-gated — but must still be one of the agents
+      // actually on this trip, or any authenticated user could spam
+      // "reminder" notifications for a trip that isn't theirs.
+      const reminderAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean).map(String);
+      if (!reminderAgentIds.includes(String(activeUserRef.current))) throw new Error("You're not on this trip.");
       const nowTs = nowEpoch();
       // lastreminderat set to NOW, not null — the notification below IS the
       // first reminder, so the automatic hourly check shouldn't fire again
