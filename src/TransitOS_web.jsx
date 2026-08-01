@@ -6158,7 +6158,11 @@ async function insertNotification(n) {
         "Content-Type": "application/json",
         ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
       },
-      body: JSON.stringify({ user_ids: pushTargets, title, message: n.message, type: n.type, trip_id: n.trip_id ?? null }),
+      // ts is included so the edge function can verify this push matches
+      // a notification row that was ACTUALLY just inserted above, not
+      // arbitrary content POSTed straight to the function's URL — see
+      // that function's own comment for the full rationale.
+      body: JSON.stringify({ user_ids: pushTargets, title, message: n.message, type: n.type, trip_id: n.trip_id ?? null, ts: n.ts }),
     }).catch(() => { /* best-effort — see rationale above */ });
   }
   return result;
