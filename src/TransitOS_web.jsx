@@ -7624,6 +7624,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/BOOK": {
+      // Booking agent identity is verified server-side, never trusted from
+      // the client — action.agent_id/agent_name previously went straight
+      // into the duplicate-booking check and the trip row itself, so any
+      // authenticated user could book a trip "as" an arbitrary agent: it
+      // would consume that victim agent's duplicate-booking slot for the
+      // date/direction (blocking their real booking), show up on their
+      // record, and notify admins under their name, all without their
+      // knowledge. The only real call site (AgentBookTab) always books for
+      // the logged-in user themselves — there's no admin-on-behalf-of-agent
+      // booking flow anywhere in the app — so re-pointing to the verified
+      // caller can't break any legitimate use.
+      if (activeUserRef.current == null) throw new Error("Not logged in.");
+      const { data: bookingAgentRow, error: bookingAgentErr } = await supabase.from("users").select("id, fullname").eq("id", activeUserRef.current).single();
+      if (bookingAgentErr || !bookingAgentRow) throw new Error("Could not verify booking agent.");
+      action = { ...action, agent_id: bookingAgentRow.id, agent_name: bookingAgentRow.fullname };
       const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
       // Fallback only used if the booking form somehow omitted
       // dropoff_coord (the real UI always supplies it) — queries the
