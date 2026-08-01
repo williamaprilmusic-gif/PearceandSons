@@ -7411,11 +7411,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
 
       // ── Duplicate booking check ──────────────────────────────────────────
       // An agent cannot have two active/pending bookings for the same
-      // date AND direction. Catches both primary agent and extra agent slots.
+      // date AND direction. Catches both primary agent and extra agent
+      // slots — the comment always claimed this, but the query only ever
+      // checked agentid (the primary booker column), never extraagentids.
+      // An agent added as an EXTRA passenger on someone else's trip (via
+      // ADD_AGENT) could independently book their own separate trip for
+      // that same date/direction with no rejection at all. Matches the
+      // .contains("extraagentids", [...]) pattern already used elsewhere
+      // in this codebase for the same array column.
       const { data: existingBookings } = await supabase
         .from("trips")
         .select("id, status, direction")
-        .eq("agentid", action.agent_id)
+        .or(`agentid.eq.${action.agent_id},extraagentids.cs.{${action.agent_id}}`)
         .eq("scheduleddate", action.scheduled_date)
         .in("status", [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       const dupTrip = (existingBookings || []).find(t => t.direction === action.direction);
