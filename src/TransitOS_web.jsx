@@ -7304,6 +7304,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
     case "ADMIN/UPDATE_COMPANY": {
       const actingAdminCoU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      // ADMIN/CREATE_COMPANY already rejects an empty/whitespace-only name
+      // — this rename path didn't, so an admin could blank out a real
+      // company's name via edit with no error.
+      if (action.name !== undefined && !action.name.trim()) throw new Error("Company name is required.");
       const update = {};
       if (action.name !== undefined) update.name = action.name.trim();
       if (action.active !== undefined) update.active = action.active;
@@ -7437,6 +7441,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
     case "ADMIN/UPDATE_CAMPAIGN": {
       const actingAdminCampU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      // Same gap as ADMIN/UPDATE_COMPANY — CREATE already rejects an
+      // empty name, this rename path didn't.
+      if (action.name !== undefined && !action.name.trim()) throw new Error("Campaign name is required.");
       const update = {};
       if (action.name !== undefined) update.name = action.name.trim();
       if (action.active !== undefined) update.active = action.active;
