@@ -6526,28 +6526,26 @@ async function fetchSessionToken(username, password) {
   if (data.error) throw new Error(data.error);
   return data;
 }
-// refresh_token has no real GoTrue-backed counterpart for a custom-signed
-// token — passing the access token itself is a harmless placeholder;
-// supabase-js's background auto-refresh will simply fail silently against
-// it near the 24h expiry (the old token just keeps working until then)
-// rather than throwing, since autoRefreshToken is on for this client.
-//
-// Cached separately from whatever supabase.auth.setSession() does
-// internally — that propagation path was never actually verified to work
-// end-to-end in a real browser (see the RLS-lockdown rollback), so any code
-// that needs to explicitly attach the current token to a fetch() (e.g.
-// send-push-notification, which isn't a supabase.from() call and doesn't
-// go through PostgREST's automatic header handling at all) reads this
-// plain variable instead of depending on that mechanism.
+// This is a custom edge-function-signed token, not a real GoTrue session —
+// it has no valid counterpart in Supabase Auth's own user store, so
+// supabase.auth.setSession() used to be called here hoping to bridge it
+// into auth.uid() for RLS. Confirmed in production this never worked:
+// GoTrue's own /auth/v1/user validation call (which setSession() makes
+// internally) rejects the token with 400 every single login, so
+// auth.uid() was always NULL for every request regardless. That silently
+// broke the one table that had a real per-user RLS policy depending on
+// it (push_subscriptions — see the migration fixing its policy to match
+// every other table's "allow all" convention) and did nothing for the
+// rest of the schema, which was never gated on auth.uid() to begin with.
+// Removed the setSession() call entirely — nothing depends on it anymore.
+// Any code that needs to explicitly attach the current token to a
+// fetch() (e.g. send-push-notification, which isn't a supabase.from()
+// call and doesn't go through PostgREST's header handling at all) reads
+// this plain variable instead.
 let _cachedSessionToken = null;
 async function applySessionToken(token) {
   if (!token) return;
   _cachedSessionToken = token;
-  try {
-    await supabase.auth.setSession({ access_token: token, refresh_token: token });
-  } catch (e) {
-    console.warn("[Auth] applying session token failed (login still proceeds on the existing trust model):", e.message);
-  }
 }
 
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
@@ -12042,7 +12040,18 @@ function useWebRTCCall(currentUser) {
       if (e.candidate) channel.send({ type: "broadcast", event: "ice-candidate", payload: { candidate: e.candidate } });
     };
     pc.ontrack = (e) => {
-      if (remoteAudioRef.current) remoteAudioRef.current.srcObject = e.streams[0];
+      // ontrack can legitimately fire more than once per call (renegotiation,
+      // ICE restart) — reassigning srcObject while the <audio autoPlay>
+      // element's PREVIOUS implicit play() is still pending makes the
+      // browser abort that old promise, which (since nothing was attached
+      // to catch it) surfaced as a real "Uncaught (in promise) AbortError:
+      // The play() request was interrupted by a call to pause()" in
+      // production. Calling play() explicitly here gives us a promise to
+      // catch on every reassignment, autoPlay or not.
+      if (remoteAudioRef.current) {
+        remoteAudioRef.current.srcObject = e.streams[0];
+        remoteAudioRef.current.play().catch(() => {});
+      }
     };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "connected") {
