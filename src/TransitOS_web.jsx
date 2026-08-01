@@ -7967,14 +7967,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // New capability: an agent cancelling their spot on a trip that
       // ALREADY has a driver assigned (TRIP/CANCEL above is limited to
       // still-unassigned bookings). No admin-permission gate — this has
-      // to work for whichever agent it belongs to, matching TRIP/SEND_CHAT
-      // and DM/REPLY's existing pattern (trusts action.agent_id the same
-      // way every other agent-initiated action already does).
+      // to work for whichever agent it belongs to. Identity is verified
+      // against activeUserRef, not the client-supplied action.agent_id —
+      // the old check only confirmed action.agent_id was SOME agent on
+      // the trip, not that it was the caller, so any agent sharing a
+      // merged trip could cancel a DIFFERENT agent's spot (same spoofing
+      // class fixed on DM/REPLY, DM/SEND, and TRIP/SEND_CHAT).
       const { data: acTripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!acTripRow) throw new Error("Trip not found");
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(acTripRow.status)) throw new Error("This trip has already been completed or cancelled.");
       const acAgentIds = [acTripRow.agentid, ...(acTripRow.extraagentids || [])].filter(Boolean);
-      if (!acAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
+      if (!acAgentIds.some(id => String(id) === String(activeUserRef.current))) throw new Error("You're not on this trip.");
+      // Every use of action.agent_id below (name lookup, array filtering,
+      // audit log) must resolve to the verified CALLER, never whatever the
+      // client happened to send — re-point it here once instead of
+      // touching every downstream reference individually.
+      action = { ...action, agent_id: activeUserRef.current };
 
       const { data: cancellingAgentRow } = await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle();
       const cancellingAgentName = cancellingAgentRow?.fullname || "An agent";
