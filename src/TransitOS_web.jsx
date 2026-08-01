@@ -7028,6 +7028,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           patch.driverroutekm = routeDistanceKmRem; patch.driverroutecapkm = policyCapKmRem; patch.driverrouteexceedspolicy = exceedsPolicyRem;
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
+        // Feature 13: compliance checks — same gap as TRIP/ADD_AGENT
+        // (already fixed elsewhere this session): removing a passenger
+        // re-sequences the driver's whole route, which can push it over
+        // the insurance-notification distance threshold or (less
+        // intuitively, but a route can get LONGER after a removal if the
+        // optimal order changes) vehicle capacity just as easily as
+        // adding one can. This call was missing here too.
+        const { data: driverUserForComplianceRem } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+        const { data: driverStatusForComplianceRem } = await supabase.from("driver_status").select("capacity").eq("driverid", tripRow.driverid).maybeSingle();
+        const complianceIssuesRem = checkComplianceTriggers(
+          { name: driverUserForComplianceRem?.fullname }, driverStatusForComplianceRem, routeDistanceKmRem, totalAgentCountRem
+        );
+        for (const issue of complianceIssuesRem) {
+          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false });
+        }
       }
 
       // Notify everyone genuinely affected, per explicit decision — the
@@ -7129,6 +7144,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (dropMap[t.id] != null && dropMap[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMap[t.id];
           patch.driverroutekm = routeDistanceKmReloc; patch.driverroutecapkm = policyCapKmReloc; patch.driverrouteexceedspolicy = exceedsPolicyReloc;
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
+        }
+        // Feature 13: compliance checks — same gap as TRIP/ADD_AGENT/
+        // TRIP/REMOVE_AGENT (already fixed elsewhere this session):
+        // relocating a pickup point re-sequences the driver's whole
+        // route, which can push it over the insurance-notification
+        // distance threshold just as easily as adding/removing a
+        // passenger can. This call was missing here too.
+        const { data: driverUserForComplianceReloc } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+        const { data: driverStatusForComplianceReloc } = await supabase.from("driver_status").select("capacity").eq("driverid", tripRow.driverid).maybeSingle();
+        const complianceIssuesReloc = checkComplianceTriggers(
+          { name: driverUserForComplianceReloc?.fullname }, driverStatusForComplianceReloc, routeDistanceKmReloc, totalAgentCountReloc
+        );
+        for (const issue of complianceIssuesReloc) {
+          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false });
         }
       }
 
@@ -11641,6 +11670,13 @@ function useWebRTCCall(currentUser) {
     // place the current call's channel name (used as the notification
     // tag) is stored, needed to close the right notification.
     const callChannelNameForNotifClose = pcRef.current?.callChannelName;
+    // Clear any pending "disconnected" grace-period timer (see
+    // onconnectionstatechange) before closing — otherwise it could fire
+    // later and call setCallState(FAILED) against a call that's already
+    // been properly torn down (or worse, against a NEW call that started
+    // in the meantime, since callState is shared hook state, not scoped
+    // per-pc).
+    if (pcRef.current?._disconnectTimer) { clearTimeout(pcRef.current._disconnectTimer); pcRef.current._disconnectTimer = null; }
     if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
     if (localStreamRef.current) { localStreamRef.current.getTracks().forEach(t => t.stop()); localStreamRef.current = null; }
     if (callChannelRef.current) {
@@ -11770,10 +11806,35 @@ function useWebRTCCall(currentUser) {
       if (remoteAudioRef.current) remoteAudioRef.current.srcObject = e.streams[0];
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === "connected") setCallState(CALL_STATE.ACTIVE);
-      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
-        setErrorMsg(pc.connectionState === "failed" ? "Call connection failed — this can happen on restrictive networks." : null);
-        if (pc.connectionState === "failed") setCallState(CALL_STATE.FAILED);
+      if (pc.connectionState === "connected") {
+        setCallState(CALL_STATE.ACTIVE);
+        // Recovered from a "disconnected" blip — cancel any pending
+        // failure timer below.
+        if (pc._disconnectTimer) { clearTimeout(pc._disconnectTimer); pc._disconnectTimer = null; }
+      }
+      if (pc.connectionState === "failed") {
+        if (pc._disconnectTimer) { clearTimeout(pc._disconnectTimer); pc._disconnectTimer = null; }
+        setErrorMsg("Call connection failed — this can happen on restrictive networks.");
+        setCallState(CALL_STATE.FAILED);
+      }
+      if (pc.connectionState === "disconnected") {
+        // "disconnected" fires on a real network drop mid-call (tunnel,
+        // elevator, signal loss) and can persist indefinitely on some
+        // browsers without ever escalating to "failed" on its own — this
+        // used to leave the UI stuck showing "On call" with genuinely
+        // dead audio, no recovery path, same bug shape as the re-ring
+        // timeout already fixed this session. But a brief blip commonly
+        // self-recovers via ICE restart without any user action, so
+        // don't fail immediately — give it a grace period first.
+        if (!pc._disconnectTimer) {
+          pc._disconnectTimer = setTimeout(() => {
+            pc._disconnectTimer = null;
+            if (pc.connectionState === "disconnected") {
+              setErrorMsg("Call connection lost.");
+              setCallState(CALL_STATE.FAILED);
+            }
+          }, 8000);
+        }
       }
     };
     return pc;
@@ -11915,6 +11976,18 @@ function useWebRTCCall(currentUser) {
       await pc.setLocalDescription(answer);
       channel.send({ type: "broadcast", event: "answer", payload: { answer } });
 
+      // If the caller hung up (or the re-ring timeout fired) while this
+      // async accept flow was still awaiting setRemoteDescription/
+      // createAnswer/setLocalDescription/send above, the "hangup"
+      // listener registered a few lines up already fired hangUp(false) →
+      // cleanup() → nulled pcRef.current and reset state to IDLE — but
+      // nothing then stopped this function from finishing and
+      // unconditionally overwriting that back to CONNECTING, leaving the
+      // callee stuck on "Connecting…" to a call the caller had already
+      // abandoned, with the underlying connection already torn down.
+      // pcRef.current !== pc detects exactly that: if cleanup() ran,
+      // pcRef.current is no longer the pc this flow built.
+      if (pcRef.current !== pc) return;
       setCallState(CALL_STATE.CONNECTING);
     } catch (e) {
       setErrorMsg(e.name === "NotAllowedError" ? "Microphone access denied." : (e.message || "Could not accept call."));
