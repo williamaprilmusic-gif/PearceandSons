@@ -1582,8 +1582,16 @@ function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
   const tripRows = driverTrips.flatMap(t => {
     const agentIds = t.agent_ids || [];
     return agentIds.map((aid, idx) => {
-      const pickup = t.pickup_sequence_coords?.find(p => String(p.agent_id) === String(aid)) || t.pickup_sequence_coords?.[0];
-      const dropoff = t.dropoff_sequence_coords?.find(d => String(d.agent_id) === String(aid)) || t.dropoff_sequence_coords?.[0];
+      // "find by agent_id, else by position, else index 0" — matches the
+      // convention already established/fixed everywhere else this
+      // session. This function still had the OLD, narrower "find by
+      // agent_id, else index 0" pattern (missing the middle positional
+      // fallback), which for any untagged coord (still possible for
+      // legacy data) meant every non-first passenger on a multi-passenger
+      // trip got the FIRST passenger's pickup/dropoff address printed on
+      // their own waybill row.
+      const pickup = t.pickup_sequence_coords?.find(p => String(p.agent_id) === String(aid)) || t.pickup_sequence_coords?.[idx] || t.pickup_sequence_coords?.[0];
+      const dropoff = t.dropoff_sequence_coords?.find(d => String(d.agent_id) === String(aid)) || t.dropoff_sequence_coords?.[idx] || t.dropoff_sequence_coords?.[0];
       return {
         tripId: t.trip_id,
         agent: agentName(aid),
@@ -1599,7 +1607,17 @@ function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
     });
   });
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Waybill — ${driverUser.name} — ${dateStr}</title>
+  // Agent name, pickup/dropoff labels, vehicle, phone all ultimately come
+  // from user-editable text (profile fields, manual "Type Address"
+  // entry) — this is written via document.write() into a real browser
+  // window (see printWaybill), so unescaped HTML here is a genuine XSS
+  // vector, same class as the daily-trip-sheet email bug already fixed
+  // this session. That fix's esc() helper had no counterpart here at all.
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Waybill — ${esc(driverUser.name)} — ${esc(dateStr)}</title>
 <style>
   body { font-family: Arial, sans-serif; font-size: 12px; color: #000; padding: 20px; }
   h1 { font-size: 18px; margin: 0 0 4px; }
@@ -1615,8 +1633,8 @@ function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
 </style></head><body>
 <h1>Pearce &amp; Sons — Driver Waybill</h1>
 <div class="meta">
-  <strong>${driverUser.name}</strong> | ${driverStatus?.vehicle || "—"} | ${driverStatus?.phone || "—"}<br>
-  Date: <strong>${dateStr}</strong> | Trips: <strong>${driverTrips.length}</strong> | Passengers: <strong>${tripRows.length}</strong>
+  <strong>${esc(driverUser.name)}</strong> | ${esc(driverStatus?.vehicle || "—")} | ${esc(driverStatus?.phone || "—")}<br>
+  Date: <strong>${esc(dateStr)}</strong> | Trips: <strong>${driverTrips.length}</strong> | Passengers: <strong>${tripRows.length}</strong>
 </div>
 <table>
   <thead><tr>
@@ -1625,14 +1643,14 @@ function generateWaybillHtml(driverUser, driverStatus, trips, users, dateStr) {
   <tbody>
   ${tripRows.map((r, i) => "<tr>" +
     "<td>" + (i + 1) + "</td>" +
-    "<td>" + r.time + "</td>" +
-    "<td>" + r.agent + "</td>" +
-    "<td>" + r.staff + "</td>" +
-    "<td><span class=\"badge " + (r.direction?.toLowerCase() || '') + "\">" + r.type + " " + r.direction + "</span></td>" +
-    "<td>" + r.pickup + "</td>" +
-    "<td>" + r.dropoff + "</td>" +
-    "<td>" + r.pickupSeq + "</td>" +
-    "<td>" + r.dropSeq + "</td>" +
+    "<td>" + esc(r.time) + "</td>" +
+    "<td>" + esc(r.agent) + "</td>" +
+    "<td>" + esc(r.staff) + "</td>" +
+    "<td><span class=\"badge " + esc(r.direction?.toLowerCase() || '') + "\">" + esc(r.type) + " " + esc(r.direction) + "</span></td>" +
+    "<td>" + esc(r.pickup) + "</td>" +
+    "<td>" + esc(r.dropoff) + "</td>" +
+    "<td>" + esc(r.pickupSeq) + "</td>" +
+    "<td>" + esc(r.dropSeq) + "</td>" +
   "</tr>").join('')}
   </tbody>
 </table>
@@ -7833,6 +7851,57 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           currenttripid: remaining?.[0]?.id || null,
           updatedat: new Date(nowTs).toISOString(),
         }).eq("driverid", tripRow.driverid);
+        // Re-sequence + recompute driver_route_km/driver_route_exceeds_policy
+        // for whatever's left, same as ADD_AGENT/REMOVE_AGENT/
+        // RELOCATE_AGENT/ASSIGN_DRIVER already do on any change to a
+        // driver's route — this handler was missing it entirely. Without
+        // this, a driver with two merged trips whose combined route was
+        // computed together would keep the OLD, now-stale (inflated)
+        // driver_route_km/driver_route_exceeds_policy on the surviving
+        // trip after cancelling the other one, with no compliance
+        // re-check firing either way (a route that's now genuinely fine
+        // could keep showing as exceeding policy, or vice versa).
+        if (remaining && remaining.length > 0) {
+          const { data: driverTripsRawCancel } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid)
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+          const allForDriverCancel = (driverTripsRawCancel || []).map(r => {
+            const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+            const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
+            const dropoffCoords = (() => {
+              const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+              const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+              return ed.length > 0 ? [...fd, ...ed] : fd;
+            })();
+            return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
+          });
+          const supaCoCancel = await fetchCompanyAnchor();
+          const departEpochCancel = allForDriverCancel.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
+          const orderedCancel = await buildPickupSequenceTomTom(allForDriverCancel, supaCoCancel, departEpochCancel);
+          const dropOrderedCancel = buildDropoffSequence(allForDriverCancel, dropoffAnchor(allForDriverCancel, orderedCancel, supaCoCancel));
+          const seqMapCancel = {}, dropMapCancel = {};
+          orderedCancel.forEach((o, i) => { seqMapCancel[o.trip.trip_id] = i + 1; });
+          dropOrderedCancel.forEach((t, i) => { dropMapCancel[t.trip_id] = i + 1; });
+          const totalAgentCountCancel = allForDriverCancel.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+          const tomtomKmCancel = await tomtomRealRouteKm(supaCoCancel, orderedCancel, dropOrderedCancel, departEpochCancel);
+          const routeDistanceKmCancel = tomtomKmCancel ?? computeDriverRouteDistanceKm(supaCoCancel, orderedCancel, dropOrderedCancel);
+          const policyCapKmCancel = companyPolicyDistanceCapKm(totalAgentCountCancel);
+          const exceedsPolicyCancel = routeDistanceKmCancel > policyCapKmCancel;
+          for (const t of driverTripsRawCancel || []) {
+            const patch = {};
+            if (seqMapCancel[t.id] != null && seqMapCancel[t.id] !== t.pickupordernum) patch.pickupordernum = seqMapCancel[t.id];
+            if (dropMapCancel[t.id] != null && dropMapCancel[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMapCancel[t.id];
+            patch.driverroutekm = routeDistanceKmCancel; patch.driverroutecapkm = policyCapKmCancel; patch.driverrouteexceedspolicy = exceedsPolicyCancel;
+            if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
+          }
+          const { data: driverUserForComplianceCancel } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+          const { data: driverStatusForComplianceCancel } = await supabase.from("driver_status").select("capacity").eq("driverid", tripRow.driverid).maybeSingle();
+          const complianceIssuesCancel = checkComplianceTriggers(
+            { name: driverUserForComplianceCancel?.fullname }, driverStatusForComplianceCancel, routeDistanceKmCancel, totalAgentCountCancel
+          );
+          for (const issue of complianceIssuesCancel) {
+            await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: remaining[0]?.id ?? action.trip_id, ts: nowTs, read: false });
+          }
+        }
       }
       // Safety net: also clear ANY OTHER driver_status row that might still
       // reference this trip_id as currenttripid (e.g. left over from an
