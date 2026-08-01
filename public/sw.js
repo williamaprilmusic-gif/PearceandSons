@@ -1,3 +1,5 @@
+importScripts('/push-handler.js');
+
 const CACHE = 'transitos-v1';
 const PRECACHE = ['/', '/index.html'];
 

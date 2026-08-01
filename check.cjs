@@ -1,7 +1,7 @@
 const fs = require('fs');
 const parser = require('@babel/parser');
 
-const code = fs.readFileSync('src/App.jsx', 'utf8');
+const code = fs.readFileSync('src/TransitOS_web.jsx', 'utf8');
 
 try {
   const ast = parser.parse(code, {

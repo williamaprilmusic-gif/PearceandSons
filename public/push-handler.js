@@ -19,8 +19,8 @@ self.addEventListener('push', (event) => {
   event.waitUntil(
     self.registration.showNotification(data.title || 'Pearce & Sons', {
       body: data.message || data.body || '',
-      icon: '/icons/icon-192.png',
-      badge: '/icons/icon-192.png',
+      icon: '/icon-192.png',
+      badge: '/icon-192.png',
       data: notificationData,
       // tag groups same-trip notifications so a burst doesn't pile up
       tag: data.trip_id ? `trip-${data.trip_id}` : (data.type || 'general'),
