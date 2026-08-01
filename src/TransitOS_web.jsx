@@ -8537,8 +8537,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // regardless of who sent it, and nothing was ever logged.
       const actingAdminDispute = await assertAdminPermission(activeUserRef, "manageTrips");
       const { data: tripForDispute } = await supabase.from("trips").select("dispute").eq("id", action.trip_id).single();
+      // A dispute must actually exist and still be OPEN — previously this
+      // unconditionally spread tripForDispute?.dispute || {} and
+      // overwrote state/resolution_note/resolved_at regardless, meaning
+      // (a) calling this on a trip with no dispute filed at all silently
+      // CREATED a dispute-shaped object out of nothing rather than
+      // erroring, and (b) the same dispute could be "resolved" twice — a
+      // second admin, a stale tab, or an accidental double-click silently
+      // overwrote the first resolution with no conflict warning and a
+      // duplicate audit-log entry for the same action. The client UI
+      // already only shows the resolve buttons while dispute.state ===
+      // OPEN, but that was never enforced server-side.
+      if (!tripForDispute?.dispute || tripForDispute.dispute.state !== "OPEN") {
+        throw new Error("This trip has no open dispute to resolve.");
+      }
       must(await supabase.from("trips").update({
-        dispute: { ...(tripForDispute?.dispute || {}), state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
+        dispute: { ...tripForDispute.dispute, state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
         updatedat: nowEpoch(),
       }).eq("id", action.trip_id));
       await logAuditAction({
@@ -9784,6 +9798,29 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   const [streetSuggestions, setStreetSuggestions] = useState([]);
   const inputRef = useRef(null);
   const wrapRef = useRef(null);
+
+  // Resync when the parent externally resets/changes value+preConfirmed —
+  // e.g. a "create new" form (CompanyManagerPanel, HighRiskZonesPanel)
+  // clearing back to an empty form after a successful submit, while this
+  // same StreetInput instance stays mounted (unlike the *edit*-row
+  // instances, which naturally remount per-row via conditional
+  // rendering). query/selected were only ever initialized from
+  // value/preConfirmed at MOUNT time (useState's initializer runs once)
+  // and never resynced afterward — the address field kept showing the
+  // old "✅ [confirmed address]" state with stale coordinates even after
+  // the parent's actual value had been reset to null, visually lying to
+  // the admin about what's currently entered. (Submission itself was
+  // still safe — the null-coord guard at each call site caught the
+  // mismatch before anything wrong got saved — this was a confusing-UX
+  // bug, not a data-corruption one.) Depends on preConfirmed's lat/lng
+  // specifically, not the object reference itself, since callers
+  // construct a brand-new preConfirmed object literal every render even
+  // when the underlying coordinate hasn't changed.
+  useEffect(() => {
+    setQuery(value || "");
+    setSelected(preConfirmed && value ? preConfirmed : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, preConfirmed?.lat, preConfirmed?.lng]);
 
   useEffect(() => {
     if (selected) return;
