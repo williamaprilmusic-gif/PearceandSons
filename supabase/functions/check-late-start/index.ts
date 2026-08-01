@@ -21,15 +21,30 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+// Dedicated shared secret for authenticating the pg_cron caller — NOT the
+// service role key. That was the original approach (matching
+// daily-trip-sheet's fix), but it silently broke: the platform-injected
+// SUPABASE_SERVICE_ROLE_KEY this function reads at runtime no longer
+// matches the legacy-JWT-format service role token hardcoded in the
+// pg_cron job's Authorization header (this project has since migrated to
+// the newer sb_publishable_/sb_secret_ key format — see the client's
+// SUPABASE_ANON_KEY constant, already on the new format). Confirmed via
+// Supabase edge-function logs: every single scheduled invocation of this
+// function was returning 401, silently, for hours — the late-start alert
+// system had completely stopped working, not just degraded. A literal
+// constant here, matched by the literal value in the pg_cron job's SQL
+// (both under this codebase's direct control, not dependent on guessing
+// which key format Supabase currently injects), can't drift the same way.
+const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
 
 Deno.serve(async (req) => {
   try {
     // The platform's verify_jwt only requires *some* valid Supabase JWT —
     // the public anon key (shipped in the client bundle) satisfies that,
-    // so it's not real access control. pg_cron's http call already sends
-    // the service-role key as its Authorization bearer (see schedule.sql);
-    // require that exact value, matching daily-trip-sheet's same fix.
-    if (req.headers.get("Authorization") !== `Bearer ${SERVICE_ROLE_KEY}`) {
+    // so it's not real access control. Require CRON_AUTH_TOKEN instead —
+    // see the comment on its declaration above for why this isn't the
+    // service role key.
+    if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401, headers: { "Content-Type": "application/json" },
       });

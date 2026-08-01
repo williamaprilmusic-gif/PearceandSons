@@ -24,15 +24,24 @@ serve(async (req) => {
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
+  // Dedicated shared secret for authenticating the pg_cron caller — NOT the
+  // service role key (that was the original fix here, but it silently
+  // broke: confirmed via edge-function logs that every single scheduled
+  // invocation of this function has been returning 401 for hours — this
+  // project has since migrated to the newer sb_publishable_/sb_secret_ key
+  // format, and the platform-injected SUPABASE_SERVICE_ROLE_KEY this
+  // function reads at runtime no longer matches the legacy-JWT-format
+  // token hardcoded in the pg_cron job's Authorization header. The daily
+  // trip sheet email has likely never actually sent as a result. A literal
+  // constant here, matched by the literal value in the pg_cron job's SQL
+  // — both under this codebase's direct control — can't drift like this.
+  const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
 
   // Platform verify_jwt is off (needed since pg_cron's http call carries no
   // JWT format Supabase itself recognises) and there was previously no
   // in-code check at all — meaning anyone with this function's URL could
-  // trigger a real Resend send and DB read, with no auth of any kind. The
-  // pg_cron job that's the function's only legitimate caller already sends
-  // the service-role key as its Authorization bearer (see schedule.sql) —
-  // require that same value here instead of accepting any request.
-  if (req.headers.get("Authorization") !== `Bearer ${SERVICE_KEY}`) {
+  // trigger a real Resend send and DB read, with no auth of any kind.
+  if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
     return json({ error: "Unauthorized" }, 401);
   }
 
