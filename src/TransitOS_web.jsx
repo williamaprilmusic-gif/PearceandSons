@@ -19679,10 +19679,19 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
 
   const isMaster = !!user.is_master_client;
 
-  // Get company IDs this client may see
+  // Get company IDs this client may see. `||` binds tighter than `?:`,
+  // so the old `(user.scoped_company_ids || user.branch_id) ? [user.
+  // branch_id] : []` collapsed to "if EITHER field is truthy, use
+  // branch_id only" — scoped_company_ids's actual array contents were
+  // never read. A client configured with a real multi-company
+  // scoped_company_ids array and no branch_id saw ZERO companies
+  // ([undefined]); one with both fields set got silently restricted to
+  // branch_id's single company regardless of what scoped_company_ids
+  // actually granted. Prefer the real array when it's non-empty, only
+  // fall back to branch_id when it isn't.
   const clientCompanyIds = isMaster
     ? state.companies.map(c => c.id?.toString())
-    : (user.scoped_company_ids || user.branch_id ? [user.branch_id] : []);
+    : (user.scoped_company_ids?.length ? user.scoped_company_ids.map(id => id?.toString()) : (user.branch_id ? [user.branch_id.toString()] : []));
 
   const visibleCompanies = isMaster
     ? state.companies
