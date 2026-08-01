@@ -4065,18 +4065,22 @@ function appReducer(state, action) {
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot remove a passenger from a completed or cancelled trip" };
 
       const newAgentIds = trip.agent_ids.filter(id => String(id) !== String(action.agent_id));
-      // Same index-0 fallback RELOCATE_AGENT uses: on trips created before
-      // the primary coord carried agent_id, position 0 belongs to the
-      // primary agent — without this, removing the primary agent left
-      // their pickup point in the sequence (a stop for nobody).
+      // Untagged-coord fallback: coords hydrated from Supabase carry no
+      // agent_id at all (fixed at the hydration source elsewhere this
+      // session, but existing trips saved before that fix — or coords that
+      // otherwise arrive untagged — still need this). Match by POSITION in
+      // agent_ids, not just index 0 — an untagged fallback scoped only to
+      // index 0 (the old code here) means removing any agent other than
+      // the primary from an untagged trip removes nothing from these
+      // arrays, leaving a stale stop nobody is actually going to.
       const newPickupCoords = trip.pickup_sequence_coords.filter((c, i) => {
-        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
       // Also remove this agent's per-agent dropoff entry if one exists —
       // keeps dropoff_sequence_coords in sync with agent_ids/pickup_sequence_coords.
       const newDropoffCoords = (trip.dropoff_sequence_coords || []).filter((c, i) => {
-        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
       const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
@@ -4141,9 +4145,19 @@ function appReducer(state, action) {
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot relocate a passenger on a completed or cancelled trip" };
 
       const newCoord = { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id };
+      // Untagged-coord fallback matched by POSITION in agent_ids, not just
+      // index 0 — see TRIP/REMOVE_AGENT's identical fix above for why an
+      // index-0-only fallback silently no-ops for any non-primary agent on
+      // an untagged trip.
       const newPickupCoords = trip.pickup_sequence_coords.map((c, i) => {
-        const belongsToThisAgent = String(c.agent_id) === String(action.agent_id) || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
-        return belongsToThisAgent ? { ...newCoord, agent_id: c.agent_id } : c;
+        const belongsToThisAgent = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
+        // newCoord already carries agent_id: action.agent_id — spreading it
+        // and then re-overwriting agent_id with the OLD c.agent_id was a
+        // no-op when c was already tagged (same value), but silently
+        // dropped the tag back to undefined whenever c was untagged and
+        // matched via the positional fallback above, undoing the very fix
+        // that fallback exists for.
+        return belongsToThisAgent ? newCoord : c;
       });
 
       let newTripsRelocate;
@@ -5332,13 +5346,17 @@ function appReducer(state, action) {
       // recompute across the driver's whole run), so the trip stays
       // correct for whoever's left.
       const newAgentIds = otherAgentIds;
+      // Untagged-coord fallback matched by POSITION in agent_ids, not just
+      // index 0 — see TRIP/REMOVE_AGENT's identical fix for why an
+      // index-0-only fallback silently no-ops for any non-primary agent on
+      // an untagged trip.
       const newPickupCoords = trip.pickup_sequence_coords.filter((c, i) => {
-        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
       // Remove this agent's dropoff entry too — mirrors TRIP/REMOVE_AGENT.
       const newDropoffCoordsAC = (trip.dropoff_sequence_coords || []).filter((c, i) => {
-        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (i === 0 && !c.agent_id && trip.agent_ids[0] === action.agent_id);
+        const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
       const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
@@ -6745,8 +6763,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (tripRow.driverid) {
         const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
         const allForDriver = (driverTripsRaw || []).map(r => {
-          const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
-          const extra = (String(r.id) === String(action.trip_id) ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+          const extra = (String(r.id) === String(action.trip_id) ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
           // Build dropoff coords with agent_id so buildDropoffSequence can sort them
           // correctly per-agent. For the trip being modified, use the newly updated
           // extradropoffs (which include the just-added agent's dropoff coord).
@@ -6854,12 +6872,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const allForDriver = (driverTripsRaw || []).map(r => {
           const isThisTrip = String(r.id) === String(action.trip_id);
           const first = (isThisTrip ? update.pickuplat ?? r.pickuplat : r.pickuplat) != null
-            ? [{ lat: isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (update.pickuplng ?? r.pickuplng) : r.pickuplng }]
+            ? [{ lat: isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (update.pickuplng ?? r.pickuplng) : r.pickuplng, agent_id: r.agentid }]
             : [];
-          const extra = (isThisTrip ? (update.extrapickups ?? newExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          const extra = (isThisTrip ? (update.extrapickups ?? newExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -6957,11 +6975,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const isThisTrip = String(r.id) === String(action.trip_id);
           const lat = isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat;
           const lng = isThisTrip ? (update.pickuplng ?? r.pickuplng) : r.pickuplng;
-          const first = lat != null ? [{ lat, lng }] : [];
-          const extra = (isThisTrip ? (update.extrapickups ?? r.extrapickups ?? []) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          const first = lat != null ? [{ lat, lng, agent_id: r.agentid }] : [];
+          const extra = (isThisTrip ? (update.extrapickups ?? r.extrapickups ?? []) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -7714,12 +7732,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const acAllForDriver = (acDriverTripsRaw || []).map(r => {
           const isThisTrip = String(r.id) === String(action.trip_id);
           const first = (isThisTrip ? acUpdate.pickuplat ?? r.pickuplat : r.pickuplat) != null
-            ? [{ lat: isThisTrip ? (acUpdate.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (acUpdate.pickuplng ?? r.pickuplng) : r.pickuplng }]
+            ? [{ lat: isThisTrip ? (acUpdate.pickuplat ?? r.pickuplat) : r.pickuplat, lng: isThisTrip ? (acUpdate.pickuplng ?? r.pickuplng) : r.pickuplng, agent_id: r.agentid }]
             : [];
-          const extra = (isThisTrip ? (acUpdate.extrapickups ?? acNewExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng }));
+          const extra = (isThisTrip ? (acUpdate.extrapickups ?? acNewExtraPickups) : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
           return {
             trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
-            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
+            dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
             direction: r.direction,
           };
         });
@@ -8099,8 +8117,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       const existingAssigned = (driverTripsRaw || []).filter(t => String(t.id) !== String(action.trip_id));
       const allForDriver = [...existingAssigned, { ...tripRow, driverid: action.driver_id }].map(r => {
-        const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng }] : [];
-        const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng }));
+        const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+        const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
         return {
           trip_id: r.id,
           // Multi-passenger trips need every pickup point represented here,
@@ -8108,7 +8126,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // assignment to an already-multi-agent trip ignores the extra
           // passengers entirely when computing nearest-neighbour order.
           pickup_sequence_coords: [...first, ...extra],
-          dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
+          dropoff_sequence_coords: (() => { const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : []; const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id })); return ed.length > 0 ? [...fd, ...ed] : fd; })(),
           scheduled_time: r.scheduledtimestr,
           direction: r.direction,
         };
