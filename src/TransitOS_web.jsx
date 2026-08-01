@@ -3614,7 +3614,15 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
       // The destination itself is never a real dropoff — exclude it from
       // the returned order (it was only needed to anchor the computation).
       const reordered = result.order.slice(0, -1);
-      const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
+      // Must be the exact complement of `valid` (isValidCoord), not just a
+      // null-check — a stop rejected for being {0,0}, NaN, or outside
+      // CT_BOUNDS would otherwise land in neither bucket and vanish, making
+      // the returned order one stop short. The caller (useSortedDropoffs)
+      // treats any length mismatch as "TomTom failed" and discards the
+      // result — so this silently misreported a real, correct TomTom
+      // response as a failure whenever a bad (not merely missing) coordinate
+      // was in the mix.
+      const invalid = stopCoords.filter(c => !isValidCoord(c));
       return [...reordered, ...invalid];
     }
     const candidates = await Promise.all(valid.map(async (candidateEnd, i) => {
