@@ -5994,14 +5994,23 @@ async function fetchMyConversations(myUserId, users) {
   if (error) throw error;
   const byCounterpart = new Map();
   for (const m of data || []) {
-    const counterpartId = m.senderid === myUserId ? m.recipientid : m.senderid;
-    if (!counterpartId || byCounterpart.has(counterpartId)) continue;
+    // String(...) on both sides — Supabase/PostgREST numeric-vs-string id
+    // inconsistencies are a real, recurring bug class in this codebase
+    // (fixed several times elsewhere this session); this is the exact
+    // "is this message from ME" identity comparison those fixes exist
+    // for. A bare === here would misattribute a sent message as
+    // received-from-self the moment myUserId and m.senderid's types ever
+    // diverge, corrupting both which conversation it's grouped into and
+    // whose name gets shown.
+    const iSentIt = String(m.senderid) === String(myUserId);
+    const counterpartId = String(iSentIt ? m.recipientid : m.senderid);
+    if (!counterpartId || counterpartId === "null" || byCounterpart.has(counterpartId)) continue;
     // direct_messages only stores the SENDER's name, never the
     // recipient's — if the most recent message in this thread was one
     // I sent, m.sendername is MY name, not the counterpart's, so it has
     // to be looked up from the user list instead.
-    const counterpartName = m.senderid === myUserId
-      ? (users.find(u => String(u.id) === String(counterpartId))?.name || "Unknown")
+    const counterpartName = iSentIt
+      ? (users.find(u => String(u.id) === counterpartId)?.name || "Unknown")
       : m.sendername;
     byCounterpart.set(counterpartId, {
       counterpart_id: counterpartId, counterpart_name: counterpartName,
