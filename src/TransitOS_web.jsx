@@ -6863,6 +6863,33 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (action.capacity !== undefined) dsUpdate.capacity = action.capacity;
         const { error: dErr } = await supabase.from("driver_status").update(dsUpdate).eq("driverid", action.user_id);
         if (dErr) throw dErr;
+        // Re-run the compliance check immediately when capacity changes —
+        // otherwise an admin lowering a driver's capacity below what's
+        // already assigned wouldn't get flagged until some unrelated trip
+        // mutation happened to touch that driver next (this is the only
+        // capacity-editing path in the app; checkComplianceTriggers's other
+        // 5 real call sites are all trip-mutation actions, none of them
+        // this one).
+        if (action.capacity !== undefined) {
+          const { data: activeTripsForCap } = await supabase.from("trips")
+            .select("id, agentid, extraagentids, driverroutekm")
+            .eq("driverid", action.user_id)
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+          if (activeTripsForCap && activeTripsForCap.length > 0) {
+            const totalPassengersForCap = activeTripsForCap.reduce((n, t) => n + 1 + (t.extraagentids || []).length, 0);
+            // All of a driver's active trips share the same computed
+            // whole-day route distance (stamped identically by
+            // TRIP/ASSIGN_DRIVER) — max() is just a defensive read in case
+            // any one row is out of sync, not an aggregation.
+            const routeKmForCap = Math.max(0, ...activeTripsForCap.map(t => t.driverroutekm || 0));
+            const capComplianceIssues = checkComplianceTriggers(
+              { name: target.fullname }, { capacity: action.capacity }, routeKmForCap, totalPassengersForCap
+            );
+            for (const issue of capComplianceIssues) {
+              await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, ts: nowEpoch(), read: false });
+            }
+          }
+        }
       }
       if (action.name) {
         // Keep the denormalized agentname in sync on that agent's own trips
