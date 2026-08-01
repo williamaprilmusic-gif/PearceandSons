@@ -869,8 +869,14 @@ function sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, desti
   // Strategy: exact brute-force for n ≤ 8 (≤ 40,320 permutations, ~5ms),
   //           2-opt improvement for n > 8 (near-optimal, O(n² × passes)).
   if (!anchorCoord || coords.length <= 1) return coords;
-  const valid = coords.filter(c => c?.lat != null && c?.lng != null);
-  const invalid = coords.filter(c => c?.lat == null || c?.lng == null);
+  // isValidCoord (defined below, but a hoisted function declaration so this
+  // forward reference is safe) also rejects {0,0} geocoder-fallback
+  // sentinels and out-of-CT_BOUNDS coords, not just missing ones — a bad
+  // geocode here used to get haversine-distanced against real Cape Town
+  // points as if it were a real address, skewing the fallback ordering
+  // this function is only ever used for when TomTom is unavailable.
+  const valid = coords.filter(c => isValidCoord(c));
+  const invalid = coords.filter(c => !isValidCoord(c));
   if (valid.length <= 1) return [...valid, ...invalid];
 
   // The "destination" for route cost: use destinationCoord (e.g. office for INBOUND)
@@ -16407,17 +16413,32 @@ function computeLiveSequenceForDriver(driverTrips, state) {
       if (!coord) return;
       const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
       if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, passengers: [], done: false };
-      if (coord.agent_id) {
-        const u = state.users.find(x => String(x.id) === String(coord.agent_id));
-        if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(coord.agent_id) && p.trip_id === trip.trip_id)) {
-          dropoffGroups[key].passengers.push({ id: coord.agent_id, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
-        }
-      } else if (coordIdx === 0) {
-        (trip.agent_ids || [trip.agent_id]).filter(Boolean).forEach(aid => {
-          const u = state.users.find(x => String(x.id) === String(aid));
+      // dropoff_sequence_coords entries hydrated fresh from Supabase (the
+      // normal case for essentially every real trip — see the DB-row
+      // mapping that builds { lat, lng } with no agent_id) carry no
+      // agent_id at all. The old code here special-cased ONLY coordIdx 0,
+      // dumping every agent on the trip onto the first stop and leaving
+      // every other untagged stop with zero passengers — which then read
+      // as "done" via Array.every's vacuous truth on an empty array,
+      // hiding real in-progress dropoffs from the admin's live view.
+      // A single dropoff entry legitimately means "everyone drops here
+      // together" (e.g. INBOUND to one shared office address) — that case
+      // still assigns every agent. For a genuine multi-stop, untagged trip,
+      // fall back to the same by-position convention already used
+      // elsewhere in this codebase for this exact data shape (see e.g. the
+      // dropCoord lookup in the CSV/passenger-list builder: find by
+      // agent_id, else dropoff_sequence_coords[aidIdx], else [0]).
+      const resolvedAgentIds = coord.agent_id
+        ? [coord.agent_id]
+        : dropCoords.length === 1
+          ? (trip.agent_ids || [trip.agent_id]).filter(Boolean)
+          : [trip.agent_ids?.[coordIdx]].filter(Boolean);
+      resolvedAgentIds.forEach(aid => {
+        const u = state.users.find(x => String(x.id) === String(aid));
+        if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(aid) && p.trip_id === trip.trip_id)) {
           dropoffGroups[key].passengers.push({ id: aid, name: u?.name || trip.agent_name, trip_id: trip.trip_id });
-        });
-      }
+        }
+      });
     });
   });
   const anchorForDropSort = defaultCompanyAnchor(state);
