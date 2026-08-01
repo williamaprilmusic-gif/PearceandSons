@@ -7506,15 +7506,23 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // reused for drivers too rather than adding a second column.
       if (!action.category?.trim()) throw new Error("Please choose a category.");
       if (!action.message?.trim()) throw new Error("Please describe the issue.");
-      const role = action.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT;
+      // Filer identity verified server-side, not trusted from the client —
+      // action.user_id/action.role previously went straight into the
+      // insert, letting any authenticated user file a ticket "as" an
+      // arbitrary other user or role. Same spoofing class fixed elsewhere
+      // this session; the only call site always files for the logged-in
+      // user themselves, so this can't break any legitimate flow.
+      if (activeUserRef.current == null) throw new Error("Not logged in.");
+      const { data: filingUser, error: filingUserErr } = await supabase.from("users").select("id, fullname, role").eq("id", activeUserRef.current).maybeSingle();
+      if (filingUserErr || !filingUser) throw new Error("Could not verify who's filing this ticket.");
+      const role = filingUser.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT;
       const nowTs = nowEpoch();
       const { error } = await supabase.from("tickets").insert({
-        agentid: action.user_id, tripid: action.trip_id || null, role,
+        agentid: filingUser.id, tripid: action.trip_id || null, role,
         category: action.category.trim(), message: action.message.trim(),
         status: "OPEN", createdat: nowTs, updatedat: nowTs,
       });
       if (error) throw error;
-      const { data: filingUser } = await supabase.from("users").select("fullname").eq("id", action.user_id).maybeSingle();
       await insertNotification({
         type: "TICKET_OPENED", for_roles: [ROLE.ADMIN],
         message: `🎫 New ticket from ${filingUser?.fullname || (role === ROLE.DRIVER ? "a driver" : "an agent")}: ${action.category}${action.trip_id ? ` (Trip ${action.trip_id})` : ""}`,
@@ -7787,8 +7795,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!cancelRow) throw new Error("Trip not found");
       if (cancelRow.status !== TRIP_STATE.UNASSIGNED_BOOKING) throw new Error("Only unassigned bookings can be cancelled.");
       if (action.agent_id != null) {
+        // Checks the verified CALLER (activeUserRef), not the client-
+        // supplied action.agent_id — the old check only confirmed
+        // action.agent_id was SOME owner of the booking, so any agent
+        // could pass a different real owner's id and cancel THEIR
+        // unassigned booking. Same spoofing class fixed on
+        // TRIP/AGENT_CANCEL/TRIP/BOOK elsewhere this session.
         const ownerIds = [cancelRow.agentid, ...(cancelRow.extraagentids || [])].filter(Boolean);
-        if (!ownerIds.some(id => String(id) === String(action.agent_id))) throw new Error("You can only cancel your own bookings.");
+        if (!ownerIds.some(id => String(id) === String(activeUserRef.current))) throw new Error("You can only cancel your own bookings.");
       }
       // Clear ANY driver_status row referencing this trip_id before deleting —
       // not just the trip's own driverid. An orphaned currenttripid reference
