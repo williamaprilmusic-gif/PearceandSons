@@ -7072,6 +7072,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // admins can't create users at all (manageAgentsDrivers/manageAdmins
       // are both false for VIEWER), so there's no tier here that's actually
       // meant to be company-scoped.
+      // users.username has no DB-level uniqueness constraint (checked
+      // directly against the schema — only a primary key on id exists).
+      // AUTH/LOGIN looks users up via .eq("username", ...).maybeSingle(),
+      // which THROWS if more than one row matches — so two accounts
+      // sharing a username don't just look confusing, they break login
+      // entirely for that person on both accounts. Reachable via bulk CSV
+      // import (two rows for the same person) or via retrying after the
+      // orphaned-row failure this same handler used to leave behind.
+      const { data: existingUsername } = await supabase.from("users").select("id").eq("username", action.auth.login).maybeSingle();
+      if (existingUsername) throw new Error(`Username "${action.auth.login}" is already taken — choose a different one.`);
       // New accounts are salted-hashed from the start — only lazy-upgraded
       // legacy accounts ever hold plaintext, and only until first login.
       const newUserSalt = makeSalt();
@@ -7112,7 +7122,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           driverid: inserted.id, state: DRIVER_STATE.AVAILABLE, currenttripid: null,
           vehicle: action.vehicle || "—", capacity: DRIVER_CAPACITY,
         });
-        if (dErr) throw dErr;
+        if (dErr) {
+          // Not a real transaction — supabase-js has no client-side
+          // multi-statement transaction here. Without this compensating
+          // delete, a failed driver_status insert left an orphaned users
+          // row behind (a DRIVER-role account with no driver_status row,
+          // which every other driver-facing query assumes exists) while
+          // the caller only sees "this row failed" and may reasonably
+          // retry, creating a second orphaned/duplicate account for the
+          // same person. Best-effort cleanup so a genuine failure here
+          // doesn't leave a corrupt half-created account behind.
+          await supabase.from("users").delete().eq("id", inserted.id);
+          throw dErr;
+        }
       }
       await logAuditAction({
         actorId: actingAdminCreate.id, actorName: actingAdminCreate.name, actionType: "ADMIN/CREATE_USER",
@@ -7989,9 +8011,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // trip listing all their passengers, not several trip cards that
       // merely happen to be sequenced together.
       if (tripRow.status === TRIP_STATE.UNASSIGNED_BOOKING) {
+        // Direction match is required — without it, this had no filter
+        // beyond same driver/date/active-status, so a driver's 06:00
+        // INBOUND trip (an agent commuting in) and an unrelated 18:00
+        // OUTBOUND trip (a different agent going home) assigned later the
+        // same day would get folded into ONE trip record, each agent told
+        // "your trip has been combined... for shared transport" even
+        // though they never share a vehicle leg together. Unlike
+        // getDriverLoad's deliberate whole-day, direction-agnostic seat
+        // counting (justified there because it's just tallying total
+        // passengers across one vehicle's whole day), this is about
+        // literally merging two trips' pickup/dropoff sequences into one
+        // continuous route — buildPickupSequenceTomTom/buildDropoffSequence
+        // have no way to sensibly interleave a 06:00 stop with an 18:00
+        // one as "one route."
         const { data: existingActiveTrips } = await supabase.from("trips").select("*")
           .eq("driverid", action.driver_id)
           .eq("scheduleddate", tripRow.scheduleddate)
+          .eq("direction", tripRow.direction)
           .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
           .neq("id", action.trip_id)
           .order("id", { ascending: true })
