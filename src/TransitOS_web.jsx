@@ -7857,8 +7857,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           newExtraAgentIds.push(sec.extraagentids[i]);
           newExtraPickups.push(sec.extrapickups?.[i] || { lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.extraagentids[i] });
           // Extra agents from the secondary also get their own dropoff entry.
-          const extraDrop = sec.extradropoffs?.[i];
-          if (extraDrop) newExtraDropoffs.push(extraDrop);
+          // Needs the same fallback the pickup side has two lines up — an
+          // agent whose extradropoffs entry was never recorded on the
+          // secondary trip used to get NO dropoff entry pushed at all
+          // (while still being added to newExtraAgentIds unconditionally
+          // above), leaving agent_ids longer than dropoff_sequence_coords
+          // with no positional slot for this agent to fall back to. Every
+          // "find by agent_id, else by position, else [0]" fallback fixed
+          // elsewhere this session degrades straight to index 0 for this
+          // agent, silently showing/confirming them against agent_ids[0]'s
+          // dropoff address instead of their own.
+          newExtraDropoffs.push(sec.extradropoffs?.[i] || { lat: sec.dropofflat, lng: sec.dropofflng, label: sec.dropofflocation, agent_id: sec.extraagentids[i] });
         }
       }
       // Optimistic-concurrency write, same pattern as the auto-merge fix in
@@ -11109,7 +11118,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         const SPEED_THRESHOLD_KMH = 130;
 
         if (!geofenceTriggeredRef.current.speedAlerts) {
-          geofenceTriggeredRef.current.speedAlerts = { stationaryStart: null, stationaryFired: false, speedingFired: {} };
+          geofenceTriggeredRef.current.speedAlerts = { stationaryStart: {}, stationaryFired: {}, speedingFired: {} };
         }
         const sa = geofenceTriggeredRef.current.speedAlerts;
 
@@ -11123,12 +11132,20 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           }).catch(() => {});
         }
 
-        // Stationary tracking
+        // Stationary tracking — keyed by currentTripId, same as
+        // speedingFired above. Previously a single shared stationaryStart/
+        // stationaryFired pair: a driver who ends one trip still parked and
+        // immediately starts the next one while still stationary would
+        // either get an alert immediately (stale stationaryStart from the
+        // PREVIOUS trip already past the 8-minute mark) or never get one at
+        // all (stationaryFired already true from the previous trip, never
+        // reset since the driver never moved fast enough in between) —
+        // either way misattributed to/suppressed for the wrong trip.
         const isActiveTrip = activeTrips?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
         if (isActiveTrip && speedKmh < STATIONARY_THRESHOLD_KMH) {
-          if (!sa.stationaryStart) sa.stationaryStart = now;
-          if (!sa.stationaryFired && now - sa.stationaryStart >= STATIONARY_DURATION_MS) {
-            sa.stationaryFired = true;
+          if (!sa.stationaryStart[currentTripId]) sa.stationaryStart[currentTripId] = now;
+          if (!sa.stationaryFired[currentTripId] && now - sa.stationaryStart[currentTripId] >= STATIONARY_DURATION_MS) {
+            sa.stationaryFired[currentTripId] = true;
             insertNotification({
               type: "SPEED_ANOMALY", for_roles: [ROLE.ADMIN],
               message: `⚠ STATIONARY — ${user.name || user.id} has not moved for 8+ minutes on trip ${currentTripId}. Possible breakdown or incident.`,
@@ -11138,8 +11155,8 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         } else {
           // Moving again — reset stationary state (allow re-alert on next long stop)
           if (speedKmh >= STATIONARY_THRESHOLD_KMH) {
-            sa.stationaryStart = null;
-            sa.stationaryFired = false;
+            sa.stationaryStart[currentTripId] = null;
+            sa.stationaryFired[currentTripId] = false;
           }
         }
       }
@@ -11161,12 +11178,20 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           if (navTarget?.lat) {
             const devKm = haversineKm(latitude, longitude, navTarget.lat, navTarget.lng);
             const DEVIATION_THRESHOLD_KM = 0.6; // 600 m
-            if (!geofenceTriggeredRef.current.deviationCount) geofenceTriggeredRef.current.deviationCount = 0;
-            if (!geofenceTriggeredRef.current.deviationAlertFired) geofenceTriggeredRef.current.deviationAlertFired = false;
+            // Keyed by currentTripId — same fix/reasoning as the stationary
+            // tracking above. A shared, un-keyed deviationCount/
+            // deviationAlertFired meant a driver who finished one trip
+            // off-course and immediately started the next one could have a
+            // stale "already fired" flag silently suppress a genuine new
+            // deviation alert on the new trip.
+            if (!geofenceTriggeredRef.current.deviationCount) geofenceTriggeredRef.current.deviationCount = {};
+            if (!geofenceTriggeredRef.current.deviationAlertFired) geofenceTriggeredRef.current.deviationAlertFired = {};
+            const devCount = geofenceTriggeredRef.current.deviationCount;
+            const devFired = geofenceTriggeredRef.current.deviationAlertFired;
             if (devKm > DEVIATION_THRESHOLD_KM) {
-              geofenceTriggeredRef.current.deviationCount++;
-              if (geofenceTriggeredRef.current.deviationCount >= 2 && !geofenceTriggeredRef.current.deviationAlertFired) {
-                geofenceTriggeredRef.current.deviationAlertFired = true;
+              devCount[currentTripId] = (devCount[currentTripId] || 0) + 1;
+              if (devCount[currentTripId] >= 2 && !devFired[currentTripId]) {
+                devFired[currentTripId] = true;
                 if (supabase && user?.id) {
                   insertNotification({
                     type: "ROUTE_DEVIATION", for_roles: [ROLE.ADMIN],
@@ -11177,8 +11202,8 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
               }
             } else {
               // Back on course — reset counter and allow future alert if they deviate again
-              geofenceTriggeredRef.current.deviationCount = 0;
-              geofenceTriggeredRef.current.deviationAlertFired = false;
+              devCount[currentTripId] = 0;
+              devFired[currentTripId] = false;
             }
           }
         }
