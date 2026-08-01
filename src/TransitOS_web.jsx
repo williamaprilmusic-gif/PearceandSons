@@ -8011,29 +8011,35 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // trip listing all their passengers, not several trip cards that
       // merely happen to be sequenced together.
       if (tripRow.status === TRIP_STATE.UNASSIGNED_BOOKING) {
-        // Direction match is required — without it, this had no filter
-        // beyond same driver/date/active-status, so a driver's 06:00
-        // INBOUND trip (an agent commuting in) and an unrelated 18:00
-        // OUTBOUND trip (a different agent going home) assigned later the
-        // same day would get folded into ONE trip record, each agent told
-        // "your trip has been combined... for shared transport" even
-        // though they never share a vehicle leg together. Unlike
-        // getDriverLoad's deliberate whole-day, direction-agnostic seat
-        // counting (justified there because it's just tallying total
-        // passengers across one vehicle's whole day), this is about
-        // literally merging two trips' pickup/dropoff sequences into one
-        // continuous route — buildPickupSequenceTomTom/buildDropoffSequence
-        // have no way to sensibly interleave a 06:00 stop with an 18:00
-        // one as "one route."
+        // Direction AND same-clock-hour match are both required — per
+        // explicit decision, only trips going the same direction at the
+        // same hour (e.g. two 18:xx OUTBOUND trips) qualify to share a
+        // vehicle. Without this, the query had no filter beyond same
+        // driver/date/active-status, so a driver's 06:00 INBOUND trip and
+        // an unrelated 18:00 OUTBOUND trip assigned later the same day
+        // would get folded into ONE trip record, each agent told "your
+        // trip has been combined... for shared transport" even though
+        // they never share a vehicle leg together. Unlike getDriverLoad's
+        // deliberate whole-day, direction-agnostic seat counting
+        // (justified there because it's just tallying total passengers
+        // across one vehicle's whole day), this is about literally
+        // merging two trips' pickup/dropoff sequences into one continuous
+        // route — buildPickupSequenceTomTom/buildDropoffSequence have no
+        // way to sensibly interleave a 06:00 stop with an 18:00 one as
+        // "one route." Hour is compared on scheduledtimestr ("HH:MM")
+        // rather than in SQL since "same hour" is relative to EACH trip's
+        // own time, not a fixed reference PostgREST can filter on
+        // directly — fetch all same-day/direction/status candidates and
+        // match in JS instead of a single .limit(1) query.
         const { data: existingActiveTrips } = await supabase.from("trips").select("*")
           .eq("driverid", action.driver_id)
           .eq("scheduleddate", tripRow.scheduleddate)
           .eq("direction", tripRow.direction)
           .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
           .neq("id", action.trip_id)
-          .order("id", { ascending: true })
-          .limit(1);
-        const mergeTargetTrip = existingActiveTrips?.[0];
+          .order("id", { ascending: true });
+        const tripHour = (tripRow.scheduledtimestr || "").split(":")[0];
+        const mergeTargetTrip = (existingActiveTrips || []).find(t => (t.scheduledtimestr || "").split(":")[0] === tripHour);
         if (mergeTargetTrip) {
           // Reject if this trip's agent(s) are already on the merge
           // target — same duplicate check TRIP/DISPATCH_MULTI already has
