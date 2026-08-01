@@ -11131,7 +11131,11 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
               {isUnassignedBooking
                 ? "Cancel this booking? It hasn't been assigned to a driver yet, so it will just be removed."
                 : otherAgentsRemain
-                ? "Cancel your spot on this trip? Your driver and admin will be notified — the trip continues for the other passengers."
+                // Per explicit decision: never reveal to an agent that
+                // their trip is shared with other passengers, or who —
+                // this used to say "the trip continues for the other
+                // passengers," which directly gave that away.
+                ? "Cancel your spot on this trip? Your driver and admin will be notified."
                 : "Cancel this trip? Your driver will be notified and freed up, and admin will be notified."}
             </span>
             {wouldBeLate && (
