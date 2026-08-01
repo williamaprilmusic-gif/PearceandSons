@@ -9482,6 +9482,56 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (curAnyFired) await refetch();
       return;
     }
+    case "DRIVER/CHECK_DOCUMENT_EXPIRY": {
+      // Periodic check — same pattern/rationale as TRIP/CHECK_LATE_START
+      // above. Document data (PrDP/licence/roadworthy expiry dates) was
+      // already tracked and passively displayed on several admin screens,
+      // but nothing ever proactively alerted anyone — a real compliance
+      // gap for a transport company. docexpirynotified stores the DATE
+      // VALUE last notified per doc type, so this fires once per
+      // genuinely-still-expiring date (not every poll cycle), and
+      // re-fires if the admin renews the doc to a new date that's STILL
+      // expiring/expired, while staying silent once truly renewed (the
+      // notified value no longer matches, but the new status is "ok").
+      const { data: driverStatusRows } = await supabase.from("driver_status").select("driverid, documents, docexpirynotified");
+      if (!driverStatusRows || driverStatusRows.length === 0) return;
+      const docNowTs = nowEpoch();
+      let docAnyFired = false;
+      for (const ds of driverStatusRows) {
+        const docs = ds.documents || {};
+        const notified = ds.docexpirynotified || {};
+        const newNotified = { ...notified };
+        let rowChanged = false;
+        for (const docType of DOC_TYPES) {
+          const dateVal = docs[docType.key];
+          if (!dateVal) continue;
+          const { status } = docExpiryStatus(dateVal);
+          if (status !== "expiring" && status !== "expired") continue;
+          if (notified[docType.key] === dateVal) continue; // already notified for this exact date
+          newNotified[docType.key] = dateVal;
+          rowChanged = true;
+          docAnyFired = true;
+          const { data: driverUserRow } = await supabase.from("users").select("fullname").eq("id", ds.driverid).maybeSingle();
+          const driverName = driverUserRow?.fullname || ds.driverid;
+          const verb = status === "expired" ? "has EXPIRED" : "is expiring soon";
+          await insertNotification({
+            type: "DRIVER_DOCUMENT_EXPIRY", for_roles: [ROLE.ADMIN],
+            message: `⚠ ${driverName}'s ${docType.label} ${verb} (${dateVal}).`,
+            ts: docNowTs, read: false,
+          });
+          await insertNotification({
+            type: "DRIVER_DOCUMENT_EXPIRY", for_roles: [ROLE.DRIVER], for_user_ids: [ds.driverid],
+            message: `⚠ Your ${docType.label} ${verb} (${dateVal}) — please renew and update it as soon as possible.`,
+            ts: docNowTs, read: false,
+          });
+        }
+        if (rowChanged) {
+          await supabase.from("driver_status").update({ docexpirynotified: newNotified }).eq("driverid", ds.driverid);
+        }
+      }
+      if (docAnyFired) await refetch();
+      return;
+    }
     case "NOTIF/DELETE_SELECTED": {
       // Deletes notifications by ID. For agents/drivers: scoped to their own userid.
       // For admins: delete by ID only — no userid constraint. This handles:
@@ -11209,7 +11259,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -19479,7 +19529,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -19795,9 +19845,15 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+    // Document expiry is a fleet-wide compliance sweep (checks every
+    // driver, not just the current session's own trips), so it belongs
+    // here alongside the other admin-triggered periodic checks rather
+    // than in every driver's own polling effect.
+    dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+      dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
     }, 5 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
