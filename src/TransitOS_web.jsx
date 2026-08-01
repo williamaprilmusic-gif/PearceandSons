@@ -13994,11 +13994,23 @@ function DriverNavMap({ destination, driverPosition, onExit }) {
     }
   }, [destination?.lat, destination?.lng]);
 
-  // Initial route fetch, once a starting position is available.
+  // Initial route fetch, once a starting position is available. Can't be a
+  // mount-only ([]) effect — driverPosition is frequently still null at
+  // mount (no GPS fix yet when the driver taps Navigate), and the
+  // separate reroute-deviation effect below only acts once a route
+  // already exists, so with empty deps this would silently never fire
+  // again and the driver would be stuck on "Calculating route…" forever.
+  // Depend on the live position and gate on `!route` so it fires exactly
+  // once, whenever the first fix actually arrives; the ref guards against
+  // firing a second overlapping request while the first is still in
+  // flight (GPS can tick again before the response lands).
+  const initialFetchInFlightRef = useRef(false);
   useEffect(() => {
-    if (driverPosition?.lat) fetchRoute(driverPosition);
+    if (route || initialFetchInFlightRef.current || !driverPosition?.lat) return;
+    initialFetchInFlightRef.current = true;
+    fetchRoute(driverPosition).finally(() => { initialFetchInFlightRef.current = false; });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [driverPosition?.lat, driverPosition?.lng, route]);
 
   // Map init — once, on mount.
   useEffect(() => {
