@@ -2192,14 +2192,23 @@ function computeSurchargeInvoice(trips, users, monthPrefix) {
 function exportSurchargeInvoice(trips, users, monthPrefix) {
   const rows = computeSurchargeInvoice(trips, users, monthPrefix);
   if (rows.length === 0) { alert("No long-distance surcharge trips found for " + monthPrefix); return; }
+  // Matches csvCell elsewhere in this file — the old `"${r.agent}"` wrap
+  // only quoted the agent field and never escaped an embedded quote
+  // character inside it, which would silently terminate the cell early
+  // and corrupt every column after it for that row. Every field now goes
+  // through the same proper escaping, not just agent.
+  const csvCell = (v) => {
+    const s = v == null ? "" : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
   const headers = ["Trip ID","Date","Agent","Staff #","Road km","Billable km (over 40)","Base cost (ZAR)","Surcharge (ZAR)","Total (ZAR)"];
   const totalSurcharge = rows.reduce((n, r) => n + parseFloat(r.surchargeZar), 0);
   const csv = [
-    headers.join(","),
-    ...rows.map(r => [r.tripId, r.date, `"${r.agent}"`, r.staffNum, r.km, r.billableKm, r.baseCostZar, r.surchargeZar, r.totalZar].join(",")),
+    headers.map(csvCell).join(","),
+    ...rows.map(r => [r.tripId, r.date, r.agent, r.staffNum, r.km, r.billableKm, r.baseCostZar, r.surchargeZar, r.totalZar].map(csvCell).join(",")),
     "",
     `,,,,,,TOTAL SURCHARGE:,${totalSurcharge.toFixed(2)},`,
-  ].join("\n");
+  ].join("\r\n"); // CRLF for Excel compatibility, matching the other CSV exports
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -2722,7 +2731,7 @@ function DriverDocEditor({ ds, dispatch, onClose }) {
 // against every trip, with actor, timestamp, GPS where captured, and
 // exception flags. Suitable for transport regulator submissions and
 // insurance claims.
-async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDateStr) {
+async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDateStr, delaysByTrip = {}) {
   const headers = [
     "Trip ID","Date","Time","Direction","Driver","Agent(s)","Status",
     "Exception","Booked At","Driver Assigned At","Driver Accepted At",
@@ -2783,7 +2792,17 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
       `[${fmtEpoch(a.timestamp)}] ${a.username || a.actor_name || ""}: ${a.actionType || a.action_type || ""}${a.details ? " - " + a.details : ""}`
     ).join(" | ");
 
-    const delayCount = (t.delays || []).length;
+    // Trips never carry a `delays` field — real delay/detour reports live
+    // in the trip_delays table and must be fetched separately (see
+    // fetchDelaysForTrips, already used the same way by the main trip CSV
+    // export). This read `t.delays` directly, which is undefined on every
+    // trip object in this codebase, so the "Delay Reports" column always
+    // silently showed nothing — on a document whose own UI copy explicitly
+    // promises delay reports for regulatory submissions.
+    const tripDelays = delaysByTrip[t.trip_id] || [];
+    const delaySummary = tripDelays.map(d =>
+      `${d.reason}${d.note ? ` (${d.note})` : ""} @ ${fmtEpoch(d.reported_at)}`
+    ).join(" | ");
 
     return [
       t.trip_id,
@@ -2802,7 +2821,7 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
       t.rejection_reason || "",
       t.rejection_note || "",
       (t.no_shows || []).length,
-      delayCount,
+      delaySummary,
       t.driver_route_km ?? t.est_distance_km ?? "",
       auditSummary,
     ].map(csvCell);
@@ -2848,7 +2867,8 @@ function AuditExportPanel({ state }) {
       });
       const tripIds = inRange.map(t => t.trip_id).filter(Boolean);
       const auditLogs = tripIds.length > 0 ? await fetchAuditLogsForTrips(tripIds) : [];
-      await exportComplianceAudit(state.trips, state.users, auditLogs, from.replace(/-/g,"/"), to.replace(/-/g,"/"));
+      const delaysByTrip = tripIds.length > 0 ? await fetchDelaysForTrips(tripIds) : {};
+      await exportComplianceAudit(state.trips, state.users, auditLogs, from.replace(/-/g,"/"), to.replace(/-/g,"/"), delaysByTrip);
     } finally {
       setExporting(false);
     }
