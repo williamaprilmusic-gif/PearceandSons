@@ -4652,13 +4652,28 @@ function appReducer(state, action) {
           ? { ...t, state: TRIP_STATE.DRIVER_CONFIRMED, driverAccepted: true, acceptedAt: nowAccept, confirmed_at: nowAccept }
           : t
       );
+      // Two separate rows, not one for_roles:[AGENT,ADMIN] row with
+      // for_user_ids set to only the agents — every notification consumer
+      // (isNotificationForUser, MARK_ALL_READ, the admin notification list)
+      // treats a populated for_user_ids as "individually addressed to
+      // exactly these people," so an admin (never in trip.agent_ids) could
+      // never match that single row despite for_roles explicitly listing
+      // ADMIN. Matches the established TRIP_DELAY pattern: a targeted row
+      // for the agents plus a separate broadcast row (empty for_user_ids)
+      // for admins.
+      const acceptMsg = `✓ Driver ${driverUser?.name} accepted your trip — they are confirmed and on the way.`;
       const notif = {
-        id: mkId(), type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN],
+        id: mkId(), type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT],
         for_user_ids: [...trip.agent_ids],
-        message: `✓ Driver ${driverUser?.name} accepted your trip — they are confirmed and on the way.`,
+        message: acceptMsg,
         trip_id: action.trip_id, ts: nowAccept, read: false,
       };
-      return { ...state, trips: newTrips, notifications: [notif, ...state.notifications], _error: null };
+      const notifAdmin = {
+        id: mkId(), type: "TRIP_ACCEPTED", for_roles: [ROLE.ADMIN], for_user_ids: [],
+        message: acceptMsg,
+        trip_id: action.trip_id, ts: nowAccept, read: false,
+      };
+      return { ...state, trips: newTrips, notifications: [notif, notifAdmin, ...state.notifications], _error: null };
     }
 
 
@@ -4697,12 +4712,22 @@ function appReducer(state, action) {
         ? state.driver_status.map(d => String(d.driver_id) === String(removedDriverId) ? { ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null } : d)
         : state.driver_status;
       const removedDriverUser = state.users.find(u => String(u.id) === String(removedDriverId));
+      // Split into an agent-targeted row + an admin-broadcast row — see the
+      // identical fix/comment on TRIP/ACCEPT's notification above for why a
+      // single for_roles:[AGENT,ADMIN] row with for_user_ids set to only
+      // the agents silently never reaches any admin.
+      const removeDriverMsg = `Driver ${removedDriverUser?.name || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`;
       const notif = {
-        id: mkId(), type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: [...trip.agent_ids],
-        message: `Driver ${removedDriverUser?.name || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`,
+        id: mkId(), type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT], for_user_ids: [...trip.agent_ids],
+        message: removeDriverMsg,
         trip_id: action.trip_id, ts: now(), read: false,
       };
-      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, ...state.notifications], _error: null };
+      const notifAdmin = {
+        id: mkId(), type: "DRIVER_REMOVED", for_roles: [ROLE.ADMIN], for_user_ids: [],
+        message: removeDriverMsg,
+        trip_id: action.trip_id, ts: now(), read: false,
+      };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, notifAdmin, ...state.notifications], _error: null };
     }
 
     case "TRIP/REPORT_DELAY": {
@@ -8369,9 +8394,23 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
       }).eq("id", action.trip_id));
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      // Two separate insertNotification calls, not one row with
+      // for_roles:[AGENT,ADMIN] + for_user_ids:tripAgentIds — insertNotification
+      // fans for_user_ids out into one DB row PER id, each carrying userid
+      // set to that agent; there's never a userid:null broadcast row for an
+      // admin to match, so for_roles including ADMIN was pure dead weight —
+      // no admin, anywhere, was ever actually notified of a trip being
+      // accepted. Matches the TRIP_DELAY precedent elsewhere in this file:
+      // a targeted row for the agents + a separate broadcast row (empty
+      // for_user_ids -> userid: null) for admins.
+      const tripAcceptedMsg = `Driver ${driverUser?.fullname} accepted your trip.`;
       await insertNotification({
-        type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: tripAgentIds,
-        message: `Driver ${driverUser?.fullname} accepted your trip.`, trip_id: action.trip_id, ts: nowTs, read: false,
+        type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+        message: tripAcceptedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await insertNotification({
+        type: "TRIP_ACCEPTED", for_roles: [ROLE.ADMIN], for_user_ids: [],
+        message: tripAcceptedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
       });
       await refetch();
       return;
@@ -8410,10 +8449,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       const { data: removedDriverUser } = await supabase.from("users").select("fullname").eq("id", removedDriverId).maybeSingle();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      // Split into an agent-targeted row + an admin-broadcast row — see the
+      // identical fix/comment on TRIP/ACCEPT's insertNotification above.
+      const driverRemovedMsg = `Driver ${removedDriverUser?.fullname || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`;
       await insertNotification({
-        type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT, ROLE.ADMIN], for_user_ids: tripAgentIds,
-        message: `Driver ${removedDriverUser?.fullname || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`,
-        trip_id: action.trip_id, ts: nowTs, read: false,
+        type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
+        message: driverRemovedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await insertNotification({
+        type: "DRIVER_REMOVED", for_roles: [ROLE.ADMIN], for_user_ids: [],
+        message: driverRemovedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
       });
       await logAuditAction({
         actorId: actingAdminRemoveDriver.id, actorName: actingAdminRemoveDriver.name, actionType: "TRIP/REMOVE_DRIVER",
