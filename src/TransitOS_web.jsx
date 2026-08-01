@@ -11558,6 +11558,21 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
   // Geofence: track which stops we've already auto-triggered so we
   // don't fire CONFIRM_AGENT_PICKUP/DROPOFF twice for the same stop.
   const geofenceTriggeredRef = useRef(new Set());
+  // activeTrips/dispatch/highRiskZones are read via refs inside the GPS
+  // effect below instead of being closure-captured dependencies — see
+  // that effect's own comment for why. Synced on every render (a plain
+  // assignment during render, not inside an effect — the standard,
+  // side-effect-free pattern for keeping a ref current without
+  // triggering the effect it's read from).
+  const activeTripsRef = useRef(activeTrips);
+  activeTripsRef.current = activeTrips;
+  const dispatchRef = useRef(dispatch);
+  dispatchRef.current = dispatch;
+  const highRiskZonesRef = useRef(highRiskZones);
+  highRiskZonesRef.current = highRiskZones;
+  // Last time onPosition actually fired — read by the stale-watch
+  // watchdog below.
+  const lastPositionAtRef = useRef(Date.now());
 
   // Screen Wake Lock — the real, genuine improvement available for
   // keeping tracking alive longer while the app is open, per explicit
@@ -11624,6 +11639,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
 
     const onPosition = async (pos) => {
       const now = Date.now();
+      lastPositionAtRef.current = now;
       const { latitude, longitude, heading, speed, accuracy } = pos.coords;
       const speedKmh = speed != null ? speed * 3.6 : null;
 
@@ -11646,8 +11662,8 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // loose enough to handle GPS drift in dense urban areas. Uber uses ~50m
       // with their more accurate native-app GPS; 80m is appropriate for a PWA.
       const GEOFENCE_RADIUS_KM = 0.08; // 80 metres
-      if (dispatch && activeTrips?.length) {
-        for (const trip of activeTrips) {
+      if (dispatchRef.current && activeTripsRef.current?.length) {
+        for (const trip of activeTripsRef.current) {
           if (!["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(trip.state)) continue;
           const completedPickups = trip.completed_pickups || [];
           const completedDropoffs = trip.completed_dropoffs || [];
@@ -11677,7 +11693,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
               console.log(`[Geofence] Auto-confirming pickup for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
               const geoAction = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: trip.trip_id, agent_id: aid,
                 driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
-              dispatch(geoAction).catch((err) => {
+              dispatchRef.current(geoAction).catch((err) => {
                 // Unlike the manual confirm buttons (which enqueue for
                 // offline replay on a network-shaped failure), this used to
                 // just swallow the error — geofenceTriggeredRef permanently
@@ -11718,7 +11734,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
               console.log(`[Geofence] Auto-confirming dropoff for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
               const geoAction = { type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: trip.trip_id, agent_id: aid,
                 driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
-              dispatch(geoAction).catch((err) => {
+              dispatchRef.current(geoAction).catch((err) => {
                 // See the identical fix/reasoning on the pickup geofence
                 // loop above — a network-shaped failure must not
                 // permanently block this stop's auto-confirm.
@@ -11764,7 +11780,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         // all (stationaryFired already true from the previous trip, never
         // reset since the driver never moved fast enough in between) —
         // either way misattributed to/suppressed for the wrong trip.
-        const isActiveTrip = activeTrips?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
+        const isActiveTrip = activeTripsRef.current?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
         if (isActiveTrip && speedKmh < STATIONARY_THRESHOLD_KMH) {
           if (!sa.stationaryStart[currentTripId]) sa.stationaryStart[currentTripId] = now;
           if (!sa.stationaryFired[currentTripId] && now - sa.stationaryStart[currentTripId] >= STATIONARY_DURATION_MS) {
@@ -11789,8 +11805,8 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // 2+ consecutive GPS readings while IN_TRANSIT, fire an admin alert.
       // The deviationCountRef counts consecutive off-course readings and
       // resets when back on course — prevents a single GPS blip from firing.
-      if (currentTripId && activeTrips?.length) {
-        const activeTripForNav = activeTrips.find(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
+      if (currentTripId && activeTripsRef.current?.length) {
+        const activeTripForNav = activeTripsRef.current.find(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
         if (activeTripForNav) {
           // Current nav target: first un-done pickup, else first un-done dropoff
           const undonePkup = (activeTripForNav.pickup_sequence_coords || [])
@@ -11839,10 +11855,10 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // gated to IN_TRANSIT specifically (unlike the deviation check) —
       // real physical risk to the driver doesn't care about the app's
       // internal trip state machine, only whether they're actually there.
-      if (supabase && user?.id && currentTripId && highRiskZones?.length) {
+      if (supabase && user?.id && currentTripId && highRiskZonesRef.current?.length) {
         if (!geofenceTriggeredRef.current.highRiskFired) geofenceTriggeredRef.current.highRiskFired = {};
         const hrFired = geofenceTriggeredRef.current.highRiskFired;
-        for (const zone of highRiskZones) {
+        for (const zone of highRiskZonesRef.current) {
           if (!zone.active || zone.lat == null || zone.lng == null || !zone.radius_km) continue;
           const fireKey = `${currentTripId}:${zone.id}`;
           if (hrFired[fireKey]) continue;
@@ -11898,17 +11914,59 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       );
     };
 
-    watchIdRef.current = navigator.geolocation.watchPosition(onPosition, onError, {
-      enableHighAccuracy: true, maximumAge: 5000, timeout: 15000,
-    });
+    const startWatch = () => {
+      if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = navigator.geolocation.watchPosition(onPosition, onError, {
+        enableHighAccuracy: true, maximumAge: 5000, timeout: 15000,
+      });
+    };
+    startWatch();
     setTracking(true);
 
+    // Watchdog — Android's geolocation watch is documented to sometimes
+    // silently stop delivering updates after the tab is backgrounded or
+    // the screen locks for a while, WITHOUT ever firing onError, so
+    // there's nothing else to react to. If tracking should be live but
+    // no position has arrived in over a minute, force a fresh
+    // watchPosition registration rather than leaving the driver silently
+    // untracked until they happen to background/foreground the app again
+    // (or reload it). Can't fire while the tab is fully suspended (JS
+    // itself is paused then, same platform limit noted above) — this
+    // recovers once execution resumes, instead of staying stuck.
+    lastPositionAtRef.current = Date.now();
+    const WATCHDOG_STALE_MS = 60000;
+    const watchdogId = setInterval(() => {
+      if (Date.now() - lastPositionAtRef.current > WATCHDOG_STALE_MS) {
+        console.warn("[GPS] No position update in 60s — restarting watch.");
+        startWatch();
+      }
+    }, 30000);
+
     return () => {
+      clearInterval(watchdogId);
       if (watchIdRef.current != null) navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
     };
-  }, [isLoggedIn, user?.id, currentTripId, activeTrips, dispatch, highRiskZones]);
+    // Deliberately NOT depending on activeTrips/dispatch/highRiskZones —
+    // all three are read via refs above instead. activeTrips in
+    // particular is rebuilt with a fresh array reference on every render
+    // of DriverApp (a plain inline .filter(), never memoized), and
+    // DriverApp re-renders on every realtime trips update fleet-wide, not
+    // just this driver's own trips. With those in the dependency array,
+    // this effect was tearing down and recreating navigator.geolocation.
+    // watchPosition() — forcing a full GPS cold-reacquisition, which on
+    // Android with enableHighAccuracy can take many seconds — and the
+    // Supabase broadcast channel, potentially many times per hour during
+    // busy periods, with nothing to do with this specific driver. On a
+    // real Android device this manifested as GPS tracking appearing to
+    // silently stop/never settle, since the watch rarely stayed alive
+    // long enough to deliver a steady stream of fixes. Now the watch and
+    // channel only restart on an actual identity/login change or a
+    // genuinely new tracked trip (currentTripId), both real primitive
+    // values, not object references that change every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoggedIn, user?.id, currentTripId]);
 
   return { tracking, lastError };
 }
