@@ -168,25 +168,20 @@ function hasAdminPermission(user, permission) {
 
 // ── Company visibility rules ─────────────────────────────────────────────
 //
-// Per explicit product decision: FLEET_OPS and STANDARD are both full-access
-// operational tiers — see and manage every company's agents/drivers/trips,
-// with no company restriction. The ONLY difference between them is
-// manageAdmins (ADMIN_PERMISSIONS above): FLEET_OPS can create/edit/delete
-// other admin accounts, STANDARD cannot. VIEWER is the only tier that's
-// actually company-scoped (read-only, restricted to scoped_company_ids).
-//
 // isMasterAdmin(user, companies):
-//   Legacy naming from an earlier design — despite the name, this is NOT
-//   what gates company visibility (see getAdminCompanyIds below). Used
-//   elsewhere for FLEET_OPS-specific Pearce & Sons authority checks.
+//   Only FLEET_OPS admins whose scoped_company_ids includes a Pearce & Sons
+//   company ID (or who have no scoped company, for backward compat) are
+//   master admins. They see ALL companies. Everyone else is scoped.
 //
 // getAdminCompanyIds(user, companies):
 //   Returns the set of company IDs this admin may see. Empty = all.
-//   - FLEET_OPS / STANDARD: [] = unrestricted, always — by design, not a bug
-//   - VIEWER: their scoped_company_ids (or branch_id-derived)
+//   - Master admin (Pearce & Sons FLEET_OPS): [] = unrestricted
+//   - FLEET_OPS linked to another company: their company only
+//   - STANDARD: their scoped_company_ids (or branch_id-derived)
+//   - VIEWER: their scoped_company_ids
 //
 // isCompanyScoped(user, companies):
-//   True when the admin has a non-empty company restriction (VIEWER only).
+//   True when the admin has a non-empty company restriction.
 
 function isPearceCompany(company) {
   return /pearce/i.test(company?.name || "") || /pearce/i.test(company?.label || "");
@@ -263,18 +258,14 @@ function scopeTripsToCompany(trips, users, companyIds) {
 }
 
 // Tickets carry agent_id directly (filed by that agent, whether about
-// themselves or a trip) — but that same column also holds the filer's id
-// when a DRIVER files a ticket (see TICKET/CREATE), so this needs the same
-// trip cross-reference scopeUsersToCompany uses to resolve relevant drivers,
-// or a ticket filed by a driver silently vanishes for every scoped admin.
-function scopeTicketsToCompany(tickets, users, trips, companyIds) {
+// themselves or a trip), so this doesn't need the trip cross-reference
+// scopeTripsToCompany does — a simple membership check against the same
+// scoped-agent set.
+function scopeTicketsToCompany(tickets, users, companyIds) {
   if (!companyIds?.length) return tickets;
   const idSet = new Set(companyIds);
   const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
-  const relevantDriverIds = new Set(
-    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
-  );
-  return tickets.filter(t => scopedAgentIds.has(t.agent_id) || relevantDriverIds.has(t.agent_id));
+  return tickets.filter(t => scopedAgentIds.has(t.agent_id));
 }
 
 // Admin notifications are broadcast-style (no for_user_ids), so scoping
@@ -711,6 +702,12 @@ const CPT_ADDRESS_DB = [
   { label: "Lady Grey Street, Paarl", area: "Paarl", lat: -33.7320, lng: 18.9650 },
 ];
 
+function coordForArea(areaName) {
+  const entry = CPT_ADDRESS_DB.find(a => a.area === areaName);
+  if (entry) return { lat: entry.lat, lng: entry.lng };
+  return { lat: -33.9249, lng: 18.4241 };
+}
+
 // Reacts to the viewport crossing the phone/tablet breakpoint — via
 // matchMedia's change event, not a one-time window.innerWidth read at
 // mount, so rotating a tablet or resizing a browser window updates the
@@ -807,10 +804,14 @@ function dedupeCoordsByLocation(coords) {
 function _routeKm(stops, anchor, destination) {
   let km = 0, cur = anchor;
   for (const s of stops) {
-    km += haversineKm(cur.lat, cur.lng, s.lat, s.lng);
+    const d = haversineKm(cur.lat, cur.lng, s.lat, s.lng);
+    km += d === Infinity ? 99999 : d; // treat invalid coords as very far
     cur = s;
   }
-  if (destination) km += haversineKm(cur.lat, cur.lng, destination.lat, destination.lng);
+  if (destination) {
+    const d = haversineKm(cur.lat, cur.lng, destination.lat, destination.lng);
+    km += d === Infinity ? 99999 : d;
+  }
   return km;
 }
 
@@ -1534,11 +1535,7 @@ console.log(
 
 // ── Insurance & compliance triggers ──────────────────────────────────────
 const COMPLIANCE_ROUTE_MAX_KM = 80;  // notify when driver route > 80 km
-// A shift-duration compliance check (originally planned: notify when a
-// driver's been online > 10h) was never actually implemented below — there's
-// no shift-start timestamp anywhere in driver_status to check against
-// (only a plain isonline boolean), so it would need a real schema change,
-// not just wiring up existing pieces. Left out of scope for now.
+const COMPLIANCE_MAX_SHIFT_HOURS = 10; // notify when driver online > 10h
 
 // Called inside TRIP/ASSIGN_DRIVER and TRIP/ADD_AGENT after route is computed.
 // Returns array of compliance issues (empty = all clear).
@@ -1788,10 +1785,10 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
 
 function DisputeAdminPanel({ trip, dispatch, users }) {
   const dispute = trip.dispute;
-  const [resolution, setResolution] = React.useState("");
-  const [resolving, setResolving] = React.useState(false);
   if (!dispute) return null;
   const filer = users.find(u => u.id?.toString() === dispute.agent_id?.toString());
+  const [resolution, setResolution] = React.useState("");
+  const [resolving, setResolving] = React.useState(false);
 
   const resolve = async (outcome) => {
     if (!resolution.trim()) return;
@@ -1997,21 +1994,14 @@ function getOfflineQueue() {
 function setOfflineQueue(q) {
   try { localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch {}
 }
-// navigator.onLine only reflects whether a network interface is
-// associated — it stays true during a weak/spotty signal, which is
-// exactly the real-world case this queue exists for (a moving vehicle,
-// not a toggled airplane mode). A failed dispatch whose error looks
-// network-shaped (rather than a real server-side rejection) should be
-// queued too, not just surfaced as a one-shot error the driver must
-// notice and manually retry.
-function isNetworkError(e) {
-  return e instanceof TypeError || /fetch|network|failed to connect/i.test(e?.message || "");
-}
 function enqueueOfflineAction(action) {
   const q = getOfflineQueue();
   q.push({ ...action, _queuedAt: Date.now() });
   setOfflineQueue(q);
   console.log(`[Offline] Queued: ${action.type} (queue depth: ${q.length})`);
+}
+function clearOfflineQueue() {
+  setOfflineQueue([]);
 }
 
 // Hook that tracks online status and auto-replays the queue on reconnect
@@ -2033,11 +2023,6 @@ function useOfflineSync(dispatch) {
       if (q.length === 0) return;
       setSyncing(true);
       let replayed = 0, failed = 0;
-      // Keep failed actions queued instead of unconditionally clearing —
-      // a replay failure (flaky reconnect, one bad request) used to
-      // permanently delete a driver's pickup/dropoff confirmation with no
-      // retry, defeating the entire point of this queue.
-      const stillPending = [];
       for (const action of q) {
         try {
           await dispatch(action);
@@ -2045,10 +2030,9 @@ function useOfflineSync(dispatch) {
         } catch (e) {
           console.warn(`[Offline] Replay failed for ${action.type}:`, e.message);
           failed++;
-          stillPending.push(action);
         }
       }
-      setOfflineQueue(stillPending);
+      clearOfflineQueue();
       setSyncing(false);
       setSyncResult({ replayed, failed });
       setTimeout(() => setSyncResult(null), 5000);
@@ -2434,7 +2418,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   if (armed) return (
     <div style={{ display: "flex", gap: 8 }}>
       <button onClick={() => { setArmed(false); clearTimeout(armTimeout); }}
-        style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 5, padding: 10, cursor: "pointer", color: COLORS.chalk, fontSize: 11, fontWeight: 700 }}>
+        style={{ flex: 1, background: COLORS.surface, border: `1px solid \${COLORS.wire}`, borderRadius: 5, padding: 10, cursor: "pointer", color: COLORS.chalk, fontSize: 11, fontWeight: 700 }}>
         CANCEL
       </button>
       <button onClick={fire}
@@ -2446,7 +2430,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
 
   return (
     <button onClick={arm}
-      style={{ width: "100%", background: "rgba(220,53,69,0.08)", border: `2px solid ${COLORS.red}`, borderRadius: 6, padding: 10, cursor: "pointer", color: COLORS.red, fontSize: 11, fontWeight: 800, letterSpacing: 0.5 }}>
+      style={{ width: "100%", background: "rgba(220,53,69,0.08)", border: `2px solid \${COLORS.red}`, borderRadius: 6, padding: 10, cursor: "pointer", color: COLORS.red, fontSize: 11, fontWeight: 800, letterSpacing: 0.5 }}>
       🚨 SOS / EMERGENCY
     </button>
   );
@@ -3306,6 +3290,7 @@ function buildSupportingPointsParam(coords) {
 // avoidUnpavedRoads: never route via informal-settlement unmaintained tracks
 // avoidTollRoads: no toll roads in Cape Town but good practice for future
 // (N1 east, N2 toll plazas if Pearce & Sons ever expands to Paarl/Stellenbosch)
+const TOMTOM_AVOID = "avoidAreas=&avoid=unpavedRoads";
 // Note: TomTom uses comma-separated values in the `avoid` param:
 //   avoid=tollRoads,unpavedRoads,ferries
 // Using unpavedRoads only for now — add tollRoads if needed.
@@ -3460,72 +3445,6 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
   }
 }
 
-// Runs one computeBestOrder request for a fixed set of free (reorderable)
-// stops plus one pinned end waypoint. Returns { order, km } — order is
-// freeStops reordered by TomTom + pinnedEnd appended, km is the ACTUAL total
-// route distance TomTom computed for that specific order (not an estimate) —
-// or null if the request failed or the response shape didn't match.
-async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEpoch) {
-  const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
-  const locations = allWaypoints.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
-  const departAtParam = departAtEpoch
-    ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
-    : "";
-  // CRITICAL — confirmed against the live API: TomTom rejects supportingPoints
-  // outright when combined with computeBestOrder=true ("Invalid request:
-  // parameter [supportingPoints] not supported", HTTP 400) — the two are not
-  // supported together, full stop. Since almost every real Pearce & Sons
-  // route runs through the Cape Flats (which is exactly what
-  // buildSupportingPointsParam triggers on), this meant EVERY real
-  // route-optimization request was hitting a hard 400 and silently falling
-  // back to the haversine estimate — independent of, and in addition to, the
-  // fixed-last-waypoint bug fixed earlier. supportingPoints is still used
-  // for the actual distance calculation (tomtomRealRouteKm, which never sets
-  // computeBestOrder) — just not here.
-  const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
-    `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    let errBody = "";
-    try { errBody = JSON.stringify(await res.json(), null, 2); } catch { errBody = await res.text().catch(() => ""); }
-    console.error(`[TomTom] Routing API error ${res.status} — URL: ${url.replace(TOMTOM_API_KEY, "***")}`);
-    console.error(`[TomTom] Error body: ${errBody}`);
-    throw new Error(`TomTom routing returned ${res.status}: ${errBody.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  // IMPORTANT — confirmed in production against real API responses:
-  // optimizedWaypoints does NOT include either fixed anchor (start or end).
-  // providedIndex is 0-indexed relative ONLY to the "soft" reorderable
-  // waypoints we listed (`freeStops`), not the full allWaypoints array. A
-  // request with 2 free stops → optimizedWaypoints has exactly 2 entries,
-  // with providedIndex values 0 and 1.
-  const optimized = data.routes?.[0]?.optimizedWaypoints;
-  const totalMetres = data.routes?.[0]?.summary?.lengthInMeters;
-  if (!optimized || optimized.length !== freeStops.length || totalMetres == null) {
-    console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${freeStops.length}. Falling back to haversine.`);
-    return null;
-  }
-  // CRITICAL: optimizedWaypoints from the API is consistently ordered by
-  // providedIndex (0,1,2,...) — it is NOT already in visiting order. The
-  // actual optimal sequence is given by each entry's optimizedIndex field.
-  // Sorting by optimizedIndex BEFORE mapping to coordinates is what
-  // actually applies TomTom's computed reordering — without this sort,
-  // .map(w => freeStops[w.providedIndex]) just reconstructs the original
-  // input order (since the array itself is providedIndex-ordered),
-  // silently discarding every genuine reorder TomTom returns. Confirmed in
-  // production: a request with providedIndex/optimizedIndex pairs (0,0)
-  // (1,2) (2,1) — a real, valid reordering (visit index 0, then 2, then 1)
-  // — was being flattened straight back to [0,1,2] by this bug, always
-  // matching the un-optimized input order.
-  const reorderedFree = [...optimized]
-    .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
-    .filter(w => w.providedIndex >= 0 && w.providedIndex < freeStops.length)
-    .map(w => freeStops[w.providedIndex])
-    .filter(Boolean);
-  if (reorderedFree.length !== freeStops.length) return null;
-  return { order: [...reorderedFree, pinnedEnd], km: totalMetres / 1000 };
-}
-
 // Validates a single coordinate is non-null, non-zero, and within
 // a plausible geographic range. Coordinates that geocoded to [0,0]
 // (geocoder error) or are outside the bounding box of greater Cape Town
@@ -3541,15 +3460,33 @@ function isValidCoord(c) {
   return true;
 }
 
+// ── TomTom Optimal Stop Order (Pro Implementation) ──────────────────────────
+// Single API call returns BOTH the optimal stop sequence AND full route metrics
+// (total km, total minutes, per-leg distances, per-stop ETAs).
+// This replaces the old pattern of two separate calls — one for order and one
+// for distance — halving API usage and providing richer data to the driver UI.
+//
+// Returns a RouteResult object:
+// {
+//   coords:      Coord[]   — stops in optimal visit order
+//   totalKm:     number    — total road distance
+//   totalMin:    number    — total travel time in minutes
+//   legKm:       number[]  — road km for each leg (leg[0] = anchor→stop[0], etc.)
+//   legMin:      number[]  — travel minutes for each leg
+//   legEta:      string[]  — ISO arrival time string per stop
+// }
+// Returns null on failure (caller falls back to haversine TSP).
 async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = null, destinationCoord = null) {
   if (!TOMTOM_API_KEY || !anchorCoord || stopCoords.length <= 1) return null;
+  // Validate ALL coordinates before building the URL — a single invalid coord
+  // causes TomTom to return 400 and the whole route fails silently.
   if (!isValidCoord(anchorCoord)) {
     console.warn("[TomTom] anchorCoord is invalid or outside Cape Town bounds:", anchorCoord);
     return null;
   }
   if (destinationCoord != null && !isValidCoord(destinationCoord)) {
     console.warn("[TomTom] destinationCoord is invalid:", destinationCoord);
-    destinationCoord = null;
+    destinationCoord = null; // drop the invalid destination, still optimise stops
   }
   const valid = stopCoords.filter(c => {
     if (isValidCoord(c)) return true;
@@ -3579,55 +3516,130 @@ async function tomtomOptimalStopOrder(anchorCoord, stopCoords, departAtEpoch = n
     // Fix: fix ONLY the start point. Every dropoff is a free waypoint,
     // with NO forced return to the anchor — this is what "find the
     // shortest one-way route visiting these stops" genuinely means.
-    // Adding a fixed destination does NOT create a closed loop (as a fixed
-    // start+end would if start===end) — it means "shortest path from
-    // start, visiting all intermediate stops in the best order, ending at
-    // destination."
-    //
-    // CONFIRMED against the live API: computeBestOrder always treats the
-    // LAST waypoint in the request as a second fixed anchor too — not just
-    // the first. When we have a genuine destination (INBOUND, ending at
-    // the company office), that's exactly what we want: pin it as the end,
-    // every dropoff in between is free.
-    //
-    // When there's no genuine destination (OUTBOUND), there's nothing
-    // correct to pin as "last" — WHICH stop should be visited last is
-    // itself part of what "shortest route" means, and TomTom's API will
-    // never revisit that choice once one stop is pinned as the fixed end.
-    // An earlier version of this fix pinned whichever stop the haversine
-    // pre-sort happened to place last — but that's a straight-line guess,
-    // not a road-distance one, and it can easily disagree with the true
-    // shortest order (rivers, highways, one-way streets all change which
-    // stop is actually cheapest to visit last). The only way to actually
-    // find the true shortest one-way route is to try EACH stop as the
-    // candidate last stop, let TomTom optimize the rest for each, and keep
-    // whichever candidate's real total road distance comes out shortest.
-    // Stop counts here are always small (1-4 typical dropoffs per trip),
-    // so this is at most a handful of extra API calls, run concurrently.
-    const hasRealDestination = destinationCoord?.lat != null;
-    if (hasRealDestination) {
-      const result = await tomtomBestOrderOnce(anchorCoord, valid, destinationCoord, departAtEpoch);
-      if (!result) return null;
-      // The destination itself is never a real dropoff — exclude it from
-      // the returned order (it was only needed to anchor the computation).
-      const reordered = result.order.slice(0, -1);
-      const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
-      return [...reordered, ...invalid];
+    // Build waypoints: fixed start anchor + reorderable stops + optional fixed end.
+    // Adding a fixed destination does NOT create a closed loop (as a fixed start+end
+    // would if start===end) — it means "shortest path from start, visiting all
+    // intermediate stops in the best order, ending at destination."
+    const allWaypoints = destinationCoord?.lat != null
+      ? [anchorCoord, ...valid, destinationCoord]
+      : [anchorCoord, ...valid];
+    const locations = allWaypoints.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
+    const departAtParam = departAtEpoch
+      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+      : "";
+    const supportingPtsParam = buildSupportingPointsParam(valid);
+    const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
+      `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      // Log full TomTom error payload so routing failures are diagnosable.
+      // Common causes: invalid coordinate (geocode failed → null/0,0),
+      // waypoint outside TomTom's road network, API key quota exceeded.
+      let errBody = "";
+      try { errBody = JSON.stringify(await res.json(), null, 2); } catch { errBody = await res.text().catch(() => ""); }
+      console.error(`[TomTom] Routing API error ${res.status} — URL: ${url.replace(TOMTOM_API_KEY, "***")}`);
+      console.error(`[TomTom] Error body: ${errBody}`);
+      throw new Error(`TomTom routing returned ${res.status}: ${errBody.slice(0, 200)}`);
     }
-    const candidates = await Promise.all(valid.map(async (candidateEnd, i) => {
-      const freeStops = valid.filter((_, j) => j !== i);
-      try { return await tomtomBestOrderOnce(anchorCoord, freeStops, candidateEnd, departAtEpoch); }
-      catch (e) { console.warn(`[TomTom] candidate end #${i} failed:`, e.message); return null; }
-    }));
-    let best = null;
-    for (const c of candidates) {
-      if (c && (!best || c.km < best.km)) best = c;
+    const data = await res.json();
+    const route = data.routes?.[0];
+    if (!route) {
+      console.warn("[TomTom] No route returned in response. Falling back to haversine.");
+      return null;
     }
-    if (!best) return null;
+
+    // ── Stop order ────────────────────────────────────────────────────────
+    // optimizedWaypoints is indexed relative to the reorderable stops only
+    // (NOT including the fixed anchor/destination). A request with N stops
+    // returns exactly N entries. Each entry has:
+    //   providedIndex  — index in the `valid` array we sent
+    //   optimizedIndex — position in the optimal visit sequence
+    // Sort by optimizedIndex to get the visit order, then map back to coords.
+    const optimized = route.optimizedWaypoints;
+    let reordered;
+    if (!optimized || optimized.length === 0) {
+      // TomTom confirms input order is already optimal
+      reordered = [...valid];
+    } else if (optimized.length !== valid.length) {
+      console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized.length}, expected ${valid.length}.`);
+      return null;
+    } else {
+      reordered = [...optimized]
+        .sort((a, b) => a.optimizedIndex - b.optimizedIndex)
+        .map(w => valid[w.providedIndex])
+        .filter(Boolean);
+      if (reordered.length !== valid.length) return null;
+    }
+
+    // ── Route summary ─────────────────────────────────────────────────────
+    // Extract total km + minutes from the SAME response — no second API call needed.
+    // legs[0] = anchor → stop[0], legs[1] = stop[0] → stop[1], ... etc.
+    // If a fixed destination was appended, the last leg goes to destination.
+    const summary = route.summary || {};
+    const totalKm  = summary.lengthInMeters  != null ? summary.lengthInMeters  / 1000 : null;
+    const totalMin = summary.travelTimeInSeconds != null ? Math.round(summary.travelTimeInSeconds / 60) : null;
+
+    // Per-leg metrics — leg i connects waypoint i to waypoint i+1
+    // Leg 0 is always anchor→first_stop, so legs 1..N-1 are stop-to-stop legs.
+    const legs = route.legs || [];
+    const legKm  = legs.map(l => l.summary?.lengthInMeters  != null ? l.summary.lengthInMeters  / 1000 : null);
+    const legMin = legs.map(l => l.summary?.travelTimeInSeconds != null ? Math.round(l.summary.travelTimeInSeconds / 60) : null);
+    const legEta = legs.map(l => l.summary?.arrivalTime ?? null);
+
+    // Append any invalid (null-coord) entries at the end unchanged.
     const invalid = stopCoords.filter(c => c?.lat == null || c?.lng == null);
-    return [...best.order, ...invalid];
+    const coords = [...reordered, ...invalid];
+
+    console.log(`[TomTom] Optimised ${coords.length} stops: ${totalKm?.toFixed(1) ?? "?"}km, ${totalMin ?? "?"}min`);
+
+    return { coords, totalKm, totalMin, legKm, legMin, legEta };
+
   } catch (e) {
     console.warn("[TomTom] route optimization failed, falling back to haversine:", e.message);
+    return null;
+  }
+}
+
+// ── FEATURE 4: TomTom Matrix Routing API ──────────────────────────────────
+// Replaces N sequential calculateRoute calls with a single matrix request
+// when we need distances from one origin to multiple destinations (or
+// multiple origins to one destination). Used during dispatch to evaluate
+// how far each available driver is from the company anchor — previously
+// this was N separate API calls fired sequentially; now it's one HTTP
+// request that returns all N distances in parallel.
+//
+// TomTom Matrix API: POST /routing/1/matrix/json?key=...
+// origins and destinations are arrays of { point: { latitude, longitude } }
+// Returns a matrix of summary objects — we only need lengthInMeters here.
+//
+// Falls back to haversineKm × ROAD_FACTOR if TomTom is unavailable.
+async function tomtomMatrixDistances(origin, destinations, departAtEpoch = null) {
+  if (!TOMTOM_API_KEY || !origin || !destinations?.length) return null;
+  try {
+    const departAtParam = departAtEpoch
+      ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
+      : "";
+    const url = `https://api.tomtom.com/routing/1/matrix/json?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}`;
+    const body = {
+      origins: [{ point: { latitude: origin.lat, longitude: origin.lng } }],
+      destinations: destinations.map(d => ({ point: { latitude: d.lat, longitude: d.lng } })),
+    };
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`TomTom matrix returned ${res.status}`);
+    const data = await res.json();
+    // data.matrix is a 2D array [originIndex][destinationIndex]
+    // We have 1 origin so it's always data.matrix[0][destIndex]
+    return destinations.map((_, i) => {
+      const cell = data.matrix?.[0]?.[i];
+      const m = cell?.response?.routeSummary?.lengthInMeters;
+      return m != null ? m / 1000 : null; // → km, or null if unreachable
+    });
+  } catch (e) {
+    console.warn("[TomTom] matrix distances failed, falling back to haversine:", e.message);
     return null;
   }
 }
@@ -5780,7 +5792,7 @@ async function fetchAllFromSupabase() {
   return {
     users: usersRes.data.map(userRowToApp),
     driver_status: driversRes.data.map(driverStatusRowToApp),
-    trips: tripsRes.data.map(r => tripRowToApp(r, chatByTrip)),
+    trips: freshenTripCoords(tripsRes.data.map(r => tripRowToApp(r, chatByTrip)), usersRes.data.map(userRowToApp)),
     notifications: merged,
   };
 }
@@ -5940,11 +5952,7 @@ async function insertNotification(n) {
   const base = { title, type: n.type, forroles: n.for_roles || [], message: n.message, tripid: n.trip_id ?? null, timestamp: n.ts, isread: n.read ?? false };
   const userIds = n.for_user_ids && n.for_user_ids.length ? n.for_user_ids : [null];
   const rows = userIds.map(uid => ({ ...base, userid: uid }));
-  // must() throws on a failed insert — per must()'s own doc comment, a
-  // silently-ignored failure here means the calling action (ticket filed,
-  // DM sent, trip event) still reports success while the recipient's
-  // notification simply never exists, with nothing logged anywhere.
-  const result = must(await supabase.from("notifications").insert(rows));
+  const result = await supabase.from("notifications").insert(rows);
   // Real Web Push — reaches the user's phone even with the app fully
   // closed or the screen locked, per explicit requirement. A specific,
   // targeted user list (userIds, filtering out the null/broadcast-to-
@@ -5958,19 +5966,8 @@ async function insertNotification(n) {
   // which always succeeds/fails independently above.
   const pushTargets = userIds.filter(Boolean);
   if (pushTargets.length > 0 && SUPABASE_URL) {
-    // Authorization is best-effort here too — if no token is cached yet
-    // (e.g. an already-open session from before login started attaching
-    // one), the edge function will just reject with 401 and this push
-    // silently doesn't go out, same as any other push-delivery failure
-    // this function already tolerates (dead subscription, offline device,
-    // etc.) per the .catch() below. The in-app notification this backs
-    // (inserted separately, above) always still succeeds independently.
     fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
-      },
+      method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_ids: pushTargets, title, message: n.message, type: n.type, trip_id: n.trip_id ?? null }),
     }).catch(() => { /* best-effort — see rationale above */ });
   }
@@ -6130,7 +6127,7 @@ function ViewerPortal({ state, dispatch, user }) {
       companies: (state.companies || []).filter(c => companyIds.some(id => String(id) === String(c.id))),
       users: scopeUsersToCompany(state.users, state.trips, companyIds),
       trips: scopeTripsToCompany(state.trips, state.users, companyIds),
-      tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, companyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, companyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, companyIds),
     };
   }, [state, user.scoped_company_ids]);
@@ -6178,6 +6175,36 @@ function ViewerPortal({ state, dispatch, user }) {
   );
 }
 
+
+// ── freshenTripCoords ────────────────────────────────────────────────────────
+// After refetching trips, replace any extrapickup coordinates that still show
+// the company fallback address (e.g. Turas Hotel "3 Lagoon Beach Drive") with
+// the agent's actual current home_address from the users table.
+// This corrects trips created before agents had geocoded home addresses.
+function freshenTripCoords(trips, users) {
+  if (!trips?.length || !users?.length) return trips;
+  const userById = Object.fromEntries(users.map(u => [String(u.id), u]));
+  return trips.map(trip => {
+    if (!trip.pickup_sequence_coords?.length) return trip;
+    let changed = false;
+    const freshPickups = trip.pickup_sequence_coords.map(coord => {
+      if (!coord.agent_id) return coord;
+      const agent = userById[String(coord.agent_id)];
+      if (!agent?.home_address?.lat) return coord;
+      // Replace if coord matches the company address (stale fallback)
+      // or is outright invalid
+      const isStale = !isValidCoord(coord) ||
+        (Math.abs(coord.lat - (-33.891199)) < 0.0001 && Math.abs(coord.lng - 18.484883) < 0.0001);
+      if (isStale) {
+        changed = true;
+        return { ...coord, lat: agent.home_address.lat, lng: agent.home_address.lng, label: agent.home_address.label };
+      }
+      return coord;
+    });
+    return changed ? { ...trip, pickup_sequence_coords: freshPickups } : trip;
+  });
+}
+
 // ── WebAuthn biometric login helpers ──────────────────────────────────────
 const WEBAUTHN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/webauthn";
 
@@ -6215,13 +6242,9 @@ function arrayBufToB64(buf) {
 }
 
 // Register the current device's biometric as a credential
-async function webauthnRegister(userId, username, password) {
-  // 1. Get challenge + options from Edge Function. Requires the account's
-  // current password — the edge function re-verifies it server-side before
-  // issuing a challenge or storing a credential, since user_id alone proves
-  // nothing about who's actually asking (see the CRITICAL comment on
-  // verifyPassword in supabase/functions/webauthn/index.ts).
-  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username, password });
+async function webauthnRegister(userId, username) {
+  // 1. Get challenge + options from Edge Function
+  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username });
   // 2. Convert strings → ArrayBuffers for the browser API
   opts.challenge = b64ToArrayBuf(opts.challenge);
   opts.user.id = b64ToArrayBuf(opts.user.id);
@@ -6243,7 +6266,6 @@ async function webauthnRegister(userId, username, password) {
   await webauthnPost({
     action: "register",
     user_id: userId,
-    password,
     credential: {
       id: cred.id,
       rawId: arrayBufToB64(cred.rawId),
@@ -6300,69 +6322,6 @@ async function webauthnAuthenticate(username) {
   return result;
 }
 
-// ── Optimistic-concurrency guard for trip writes ────────────────────────────
-// Conditions a trips-table write on the row's updatedat still matching what
-// was read earlier in the same action, so a write based on stale data
-// becomes a no-op (the caller checks the returned row count) instead of
-// silently overwriting a change another admin made in between. Two admins
-// racing to edit the same trip (e.g. one assigning a driver while another
-// removes a passenger) previously always resulted in last-write-wins with
-// no error to either admin — this makes that detectable.
-//
-// updatedat is commonly NULL for a trip that's never been updated since
-// booking (trips.insert() doesn't set it) — Supabase/PostgREST's .eq(col,
-// null) does NOT match NULL rows (the same asymmetry .neq() explicitly
-// documents, excluding NULLs unless you use .is() instead) — so this
-// branches on whether the expected value is null and uses .is() vs .eq()
-// accordingly. Same pattern already used by TRIP/DISPATCH_MULTI and the
-// TRIP/ASSIGN_DRIVER auto-merge path.
-function withUpdatedAtGuard(query, expectedUpdatedAt) {
-  return expectedUpdatedAt == null ? query.is("updatedat", expectedUpdatedAt) : query.eq("updatedat", expectedUpdatedAt);
-}
-
-// ── Real session tokens (STAGE 1/2 of the auth/RLS migration) ─────────────
-// Mints a Postgres-verifiable session token by independently re-checking the
-// account's password server-side (supabase/functions/session-login), then
-// hands it to supabase-js so every subsequent request carries a real,
-// signature-verified Authorization header instead of just the shared anon
-// key. This is intentionally NON-BLOCKING and NON-FATAL — no RLS policy
-// reads this token yet (that's a deliberately separate, later cutover step
-// requiring its own sign-off), so a failure here must never stop a login
-// that otherwise succeeded under the existing (client-side-only) checks.
-const SESSION_LOGIN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/session-login";
-async function fetchSessionToken(username, password) {
-  const res = await fetch(SESSION_LOGIN_URL, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action: "login", username, password }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error);
-  return data;
-}
-// refresh_token has no real GoTrue-backed counterpart for a custom-signed
-// token — passing the access token itself is a harmless placeholder;
-// supabase-js's background auto-refresh will simply fail silently against
-// it near the 24h expiry (the old token just keeps working until then)
-// rather than throwing, since autoRefreshToken is on for this client.
-//
-// Cached separately from whatever supabase.auth.setSession() does
-// internally — that propagation path was never actually verified to work
-// end-to-end in a real browser (see the RLS-lockdown rollback), so any code
-// that needs to explicitly attach the current token to a fetch() (e.g.
-// send-push-notification, which isn't a supabase.from() call and doesn't
-// go through PostgREST's automatic header handling at all) reads this
-// plain variable instead of depending on that mechanism.
-let _cachedSessionToken = null;
-async function applySessionToken(token) {
-  if (!token) return;
-  _cachedSessionToken = token;
-  try {
-    await supabase.auth.setSession({ access_token: token, refresh_token: token });
-  } catch (e) {
-    console.warn("[Auth] applying session token failed (login still proceeds on the existing trust model):", e.message);
-  }
-}
-
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
     case "AUTH/LOGIN_BIOMETRIC": {
@@ -6376,10 +6335,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         .from("users").select("*").eq("id", action.user_id).maybeSingle();
       if (bioErr || !bioUser) throw new Error("User not found");
       if (bioUser.status !== "ACTIVE") throw new Error("Account is not active");
-      // See applySessionToken — additive/non-blocking, no RLS depends on
-      // this yet. The webauthn edge function already minted this token as
-      // part of verifying the biometric assertion.
-      await applySessionToken(action.session_token);
       activeUserRef.current = bioUser.id;
       persistActiveUserId(bioUser.id);
       await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
@@ -6403,33 +6358,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         valid = (await hashPassword(action.pass, data.passwordsalt)) === data.passwordhash;
       } else {
         valid = data.passwordhash === action.pass;
-      }
-      if (!valid) throw new Error("Invalid credentials");
-      // Biometric login has always enforced this (both client-side and in
-      // the webauthn edge function) — password login never did, so a
-      // suspended/offboarded account could still sign in normally with
-      // just a password even though the exact same account was correctly
-      // blocked via fingerprint. Closing that gap here.
-      if (data.status !== "ACTIVE") throw new Error("Account is not active");
-      // See applySessionToken — additive/non-blocking, no RLS depends on
-      // this yet. Applied BEFORE the lazy hash-upgrade write below: once
-      // RLS requires a valid app token to write to `users` (see the "admin
-      // or self can write users" policy), that write would otherwise run
-      // on the bare anon key (no token yet) and silently no-op — the
-      // account would never actually get upgraded off plaintext.
-      try { await applySessionToken((await fetchSessionToken(action.login, action.pass)).token); }
-      catch (e) { console.warn("[Auth] session token issuance failed (login still proceeds):", e.message); }
-      if (!data.passwordsalt) {
-        // Lazy upgrade — best-effort: a failed upgrade never blocks the
-        // login itself, the account just stays plaintext until next time.
-        try {
-          const upSalt = makeSalt();
-          const upHash = await hashPassword(action.pass, upSalt);
-          await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
-        } catch (e) {
-          console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
+        if (valid) {
+          // Lazy upgrade — best-effort: a failed upgrade never blocks the
+          // login itself, the account just stays plaintext until next time.
+          try {
+            const upSalt = makeSalt();
+            const upHash = await hashPassword(action.pass, upSalt);
+            await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
+          } catch (e) {
+            console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
+          }
         }
       }
+      if (!valid) throw new Error("Invalid credentials");
       activeUserRef.current = data.id;
       persistActiveUserId(data.id);
       // Per explicit decision: "online" means logged in right now — set
@@ -6698,21 +6639,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         ? [...(tripRow.extradropoffs || []), { lat: action.dropoff_coord.lat, lng: action.dropoff_coord.lng, label: action.dropoff_label, agent_id: action.agent_id }]
         : (tripRow.extradropoffs || []);
 
-      // Optimistic-concurrency write — see withUpdatedAtGuard. Without this,
-      // two admins adding DIFFERENT passengers to the same trip within
-      // moments of each other would both read the same starting passenger
-      // list; whichever write lands second overwrites the first, silently
-      // dropping the first passenger from the trip with no error to either
-      // admin.
-      const addAgentNowTs = nowEpoch();
-      const { data: addAgentWriteResult, error: upErr } = await withUpdatedAtGuard(
-        supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs, updatedat: addAgentNowTs }).eq("id", action.trip_id),
-        tripRow.updatedat
-      ).select("id");
+      const { error: upErr } = await supabase.from("trips").update({ extraagentids: newExtraAgentIds, extrapickups: newExtraPickups, extradropoffs: newExtraDropoffs }).eq("id", action.trip_id);
       if (upErr) throw upErr;
-      if (!addAgentWriteResult || addAgentWriteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
 
       // Re-sequence this driver's active trips the same way ASSIGN_DRIVER does,
       // since the new pickup point may now be geographically first for someone
@@ -6813,18 +6741,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (newPrimaryUser) update.agentname = newPrimaryUser.fullname;
       }
 
-      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
-      // the same class of race as TRIP/ADD_AGENT: two admins each removing a
-      // different passenger from the same trip at nearly the same time would
-      // otherwise silently undo one of the two removals.
-      update.updatedat = nowEpoch();
-      const { data: rmWriteResult, error: rmErr } = await withUpdatedAtGuard(
-        supabase.from("trips").update(update).eq("id", action.trip_id), tripRow.updatedat
-      ).select("id");
+      const { error: rmErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
       if (rmErr) throw rmErr;
-      if (!rmWriteResult || rmWriteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
 
       if (tripRow.driverid) {
         const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
@@ -6915,18 +6833,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         );
       }
 
-      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
-      // an admin relocating this passenger's pickup at the same moment
-      // another admin removes them (or relocates a different passenger,
-      // whose write would otherwise silently clobber this one).
-      update.updatedat = nowEpoch();
-      const { data: relWriteResult, error: relErr } = await withUpdatedAtGuard(
-        supabase.from("trips").update(update).eq("id", action.trip_id), tripRow.updatedat
-      ).select("id");
+      const { error: relErr } = await supabase.from("trips").update(update).eq("id", action.trip_id);
       if (relErr) throw relErr;
-      if (!relWriteResult || relWriteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
 
       if (tripRow.driverid) {
         const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
@@ -6979,13 +6887,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Creating an admin account (any level) is Fleet Ops only; creating
       // an agent or driver just needs manageAgentsDrivers.
       const actingAdminCreate = await assertAdminPermission(activeUserRef, action.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
-      // No company-scope restriction here by design — FLEET_OPS/STANDARD
-      // (the only tiers that can reach this action) are unrestricted across
-      // companies per the confirmed product decision (see the "Company
-      // visibility rules" comment above getAdminCompanyIds). VIEWER-tier
-      // admins can't create users at all (manageAgentsDrivers/manageAdmins
-      // are both false for VIEWER), so there's no tier here that's actually
-      // meant to be company-scoped.
+      // Company scope enforcement: a scoped admin can only create users for their own company
+      if (actingAdminCreate.scopedCompanyIds?.length && action.branch_id && !actingAdminCreate.scopedCompanyIds.includes(action.branch_id)) {
+        throw new Error("Not authorised — you can only create users for your assigned company");
+      }
       // New accounts are salted-hashed from the start — only lazy-upgraded
       // legacy accounts ever hold plaintext, and only until first login.
       const newUserSalt = makeSalt();
@@ -7545,17 +7450,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // earlier reassignment that didn't fully clean up) — the FK
       // constraint blocks the delete regardless of which driver row it is.
       await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
-      // Optimistic-concurrency delete — see withUpdatedAtGuard. Guards
-      // against cancelling a trip that another admin just changed (e.g.
-      // assigned a driver to) after this action's initial read — without
-      // this, the delete would proceed unconditionally and silently
-      // discard whatever the other admin just did.
-      const { data: cancelDeleteResult } = await withUpdatedAtGuard(
-        supabase.from("trips").delete().eq("id", action.trip_id), tripRow.updatedat
-      ).select("id");
-      if (!cancelDeleteResult || cancelDeleteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
+      must(await supabase.from("trips").delete().eq("id", action.trip_id));
       await refetch();
       return;
     }
@@ -7701,7 +7596,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const acCompanyAnchor = await fetchCompanyAnchor();
-        const departEpochAc = acTripRow.scheduledtime ?? null;
+        const departEpochAc = tripRow.scheduledtime ?? null;
         const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor, departEpochAc);
         const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
         const acSeqMap = {}, acDropMap = {};
@@ -8108,26 +8003,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nowTs = nowEpoch();
       // Set ASSIGNED — driver must explicitly accept before DRIVER_CONFIRMED.
       // driveraccepted stays false; acceptedat/confirmedat stay null until TRIP/ACCEPT.
-      // Optimistic-concurrency write — see withUpdatedAtGuard. Without this,
-      // two admins assigning DIFFERENT drivers to the same unassigned trip
-      // within moments of each other would both succeed with no error,
-      // silently leaving whichever write landed last as the "winner" (and
-      // the driver_status/notification side effects below would then run
-      // for BOTH admins' assignments, leaving driver_status pointing at a
-      // driver who isn't actually on the trip anymore).
-      const { data: assignWriteResult, error: upErr } = await withUpdatedAtGuard(
-        supabase.from("trips").update({
-          status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
-          pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
-          driveraccepted: false, updatedat: nowTs,
-          driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
-        }).eq("id", action.trip_id),
-        tripRow.updatedat
-      ).select("id");
+      const { error: upErr } = await supabase.from("trips").update({
+        status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
+        pickupordernum: seqMap[action.trip_id], dropsequencenum: dropMap[action.trip_id],
+        driveraccepted: false, updatedat: nowTs,
+        driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
+      }).eq("id", action.trip_id);
       if (upErr) throw upErr;
-      if (!assignWriteResult || assignWriteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
       for (const t of existingAssigned) {
         await supabase.from("trips").update({
           pickupordernum: seqMap[t.id] ?? t.pickupordernum,
@@ -8180,14 +8062,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/FILE_DISPUTE": {
-      // Ownership check — DisputeFilingModal always sends agent_id: user.id,
-      // but nothing server-side enforced that. Without this, any caller
-      // could file a dispute "as" an arbitrary agent on any trip.
-      const { data: fdTripRow } = await supabase.from("trips").select("agentid, extraagentids").eq("id", action.trip_id).single();
-      if (!fdTripRow) throw new Error("Trip not found");
-      if (String(action.agent_id) !== String(activeUserRef.current)) throw new Error("You can only file a dispute as yourself.");
-      const fdAgentIds = [fdTripRow.agentid, ...(fdTripRow.extraagentids || [])].filter(Boolean);
-      if (!fdAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
       must(await supabase.from("trips").update({
         dispute: {
           agent_id: action.agent_id, category: action.category,
@@ -8207,30 +8081,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
 
     case "TRIP/RESOLVE_DISPUTE": {
-      // Admin-facing — resolving a dispute is operational work, same tier
-      // as TICKET/UPDATE. Previously had no permission gate at all: any
-      // dispatch call with a trip_id could resolve (or dismiss) a dispute
-      // regardless of who sent it, and nothing was ever logged.
-      const actingAdminDispute = await assertAdminPermission(activeUserRef, "manageTrips");
       const { data: tripForDispute } = await supabase.from("trips").select("dispute").eq("id", action.trip_id).single();
       must(await supabase.from("trips").update({
         dispute: { ...(tripForDispute?.dispute || {}), state: action.outcome, resolution_note: action.resolution_note, resolved_at: nowEpoch() },
         updatedat: nowEpoch(),
       }).eq("id", action.trip_id));
-      await logAuditAction({
-        actorId: actingAdminDispute.id, actorName: actingAdminDispute.name, actionType: "TRIP/RESOLVE_DISPUTE",
-        tripId: action.trip_id, details: `Resolved dispute — outcome: ${action.outcome}${action.resolution_note ? ` — "${action.resolution_note}"` : ""}`,
-      });
       await refetch();
       return;
     }
 
     case "TRIP/SET_SHARE_TOKEN": {
-      // Admin-facing only (see copyShareLink's one call site, on the admin
-      // user-detail screen). Previously had no permission gate: any
-      // dispatch call could mint a live-tracking share link for an
-      // arbitrary trip_id it had no relationship to.
-      await assertAdminPermission(activeUserRef, "manageTrips");
       must(await supabase.from("trips").update({
         sharetoken: action.token, updatedat: nowEpoch()
       }).eq("id", action.trip_id));
@@ -8249,7 +8109,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await logAuditAction({
         actorId: action.sender_id, actorName: action.sender_name,
         actionType: "SYSTEM/SOS_ALERT", tripId: action.trip_id,
-        details: `SOS alert fired. GPS: ${action.gps}. Driver: ${action.driver_name || "N/A"}`,
+        details: `SOS alert fired. GPS: \${action.gps}. Driver: \${action.driver_name || "N/A"}`,
       });
       await refetch();
       return;
@@ -8285,11 +8145,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/DRIVER_CONFIRM": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — without this, any authenticated driver could
-      // confirm (and later complete/no-show) a trip assigned to a
-      // different driver, since nothing else in this handler verifies
-      // the caller actually owns it.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
@@ -8302,13 +8157,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/RATE": {
-      // Ownership check — without this, any caller could inject/overwrite
-      // any agent's rating on any trip by supplying an arbitrary agent_id.
-      const { data: tripRow } = await supabase.from("trips").select("agentid, extraagentids, agentratings").eq("id", action.trip_id).single();
-      if (!tripRow) throw new Error("Trip not found");
-      if (String(action.agent_id) !== String(activeUserRef.current)) throw new Error("You can only submit your own rating.");
-      const rateAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      if (!rateAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
+      const { data: tripRow } = await supabase.from("trips").select("agentratings").eq("id", action.trip_id).single();
       const newRatings = { ...(tripRow?.agentratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, rated_at: nowEpoch() } };
       must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id));
       await refetch();
@@ -8318,8 +8167,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/ACCEPT": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
       // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
@@ -8349,19 +8196,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot remove the driver from a completed or cancelled trip.");
       const removedDriverId = tripRow.driverid;
       const nowTs = nowEpoch();
-      // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
-      // an admin removing this driver at the same moment another admin
-      // action (e.g. assigning a different driver) already changed the row.
-      const { data: removeDriverWriteResult } = await withUpdatedAtGuard(
-        supabase.from("trips").update({
-          status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
-          driveraccepted: false, updatedat: nowTs,
-        }).eq("id", action.trip_id),
-        tripRow.updatedat
-      ).select("id");
-      if (!removeDriverWriteResult || removeDriverWriteResult.length === 0) {
-        throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      }
+      must(await supabase.from("trips").update({
+        status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
+        driveraccepted: false, updatedat: nowTs,
+      }).eq("id", action.trip_id));
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", removedDriverId)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       if (!remaining || remaining.length === 0) {
@@ -8391,22 +8229,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!validReasons.includes(action.reason)) throw new Error("Please choose a valid delay reason.");
       const { data: tripRow } = await supabase.from("trips").select("driverid, status, agentid, extraagentids").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — was comparing tripRow.driverid to the
-      // client-supplied action.driver_id (two values the caller effectively
-      // controls), never against the actual logged-in caller. Anyone who
-      // knew/guessed the real driver's id could spoof delay reports "as"
-      // them. Matches the activeUserRef pattern used everywhere else.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("You're not the driver on this trip.");
+      if (tripRow.driverid !== action.driver_id) throw new Error("You're not the driver on this trip.");
       if (![TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(tripRow.status)) {
         throw new Error("Delays can only be reported on an active trip.");
       }
       const nowTs = nowEpoch();
       const { error } = await supabase.from("trip_delays").insert({
-        tripid: action.trip_id, driverid: activeUserRef.current, reason: action.reason,
+        tripid: action.trip_id, driverid: action.driver_id, reason: action.reason,
         note: action.note?.trim() || null, reportedat: nowTs,
       });
       if (error) throw error;
-      const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", activeUserRef.current).maybeSingle();
+      const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "TRIP_DELAY", for_roles: [ROLE.ADMIN], for_user_ids: [],
@@ -8443,10 +8276,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/DECLINE": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM. Without this, any driver
-      // could decline (and get added to declinedby on) a trip assigned to
-      // someone else.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const nowTs = nowEpoch();
       must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
@@ -8484,16 +8313,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/CONFIRM_AGENT_PICKUP": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      // Membership + dedup check — action.agent_id must actually be on this
-      // trip, and a retried/duplicate confirmation (e.g. a flaky-connection
-      // double-tap) must not push a second entry into completedpickups.
-      if (!tripAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
-      const newCompleted = (tripRow.completedpickups || []).some(c => String(c) === String(action.agent_id))
-        ? (tripRow.completedpickups || [])
-        : [...(tripRow.completedpickups || []), action.agent_id];
+      const newCompleted = [...(tripRow.completedpickups || []), action.agent_id];
       const allPickedUp = tripAgentIds.every(id => newCompleted.some(c => String(c) === String(id)));
       const nowTs = nowEpoch();
       let newState = tripRow.status, inTransitAt = tripRow.intransitat;
@@ -8536,8 +8357,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // for this specific agent. When all agents are confirmed, completes the trip.
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       const nowTs = nowEpoch();
       // Reverse-geocode the driver's GPS to get a readable street address
@@ -8604,8 +8423,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // than a real pickuptimestamps entry, flagged as an exception).
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       const nsAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (!nsAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
       const nsCompletedPrior = tripRow.completedpickups || [];
@@ -8679,8 +8496,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/COMPLETE": {
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
-      // Ownership check — see TRIP/DRIVER_CONFIRM.
-      if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
       const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", tripRow.driverid).maybeSingle();
       if (!driverRow) throw new Error(`Driver status not found for ${action.trip_id}`);
@@ -8739,16 +8554,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // stale client. Checked against the EARLIEST scheduled trip in this
       // batch, matching the client-side check.
       const { trips: routeTrips, driver_coord } = action;
-      // Ownership check — every other action that writes to a trip row
-      // checks driverid against the caller; this one previously didn't, so
-      // any dispatch call naming someone else's trip_ids in `trips` could
-      // overwrite that driver's route sequence numbers and total km with
-      // attacker-controlled values.
-      const routeTripIds = routeTrips.map(t => t.trip_id);
-      const { data: routeOwnerRows } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
-      if ((routeOwnerRows || []).some(r => String(r.driverid) !== String(activeUserRef.current))) {
-        throw new Error("This trip isn't assigned to you.");
-      }
       const earliestScheduled = routeTrips
         .map(t => t.scheduled_time_epoch)
         .filter(Boolean)
@@ -8793,9 +8598,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       dropoffOrder.forEach((d, i) => {
         if (firstDropoffPosForTrip[d.trip_id] === undefined) firstDropoffPosForTrip[d.trip_id] = i + 1;
       });
+      // Prefer TomTom real road km from the driver's cached route (set when they
+      // viewed the Navigate tab) over the haversine estimate from computeOptimalRoute.
+      // The cache fingerprint matches any entry computed for this trip's stop set.
+      let realTotalKm = totalRoadKm;
+      for (const [fp, cached] of _tomtomSortCache.entries()) {
+        if (fp.includes(String(routeTrips[0]?.trip_id))) {
+          const cachedKm = cached?.totalKm;
+          if (cachedKm != null) { realTotalKm = cachedKm; break; }
+        }
+      }
       for (const t of routeTrips) {
         await supabase.from("trips").update({
-          routetotalkm: totalRoadKm,
+          routetotalkm: realTotalKm,
           pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
           dropsequencenum: firstDropoffPosForTrip[t.trip_id] ?? t.drop_sequence_num ?? null,
         }).eq("id", t.trip_id);
@@ -8909,48 +8724,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // to them, so deleting by ID alone is safe.
       if (!action.ids || action.ids.length === 0) return;
       if (action.admin) {
-        // Admin path: delete purely by ID — no userid filter. action.admin
-        // is client-supplied, so it must never be trusted on its own —
-        // verify the caller is actually an admin account first, or any
-        // logged-in agent/driver could pass admin:true and delete arbitrary
-        // notification rows (including other users' and system broadcasts).
-        const { data: actingUserDel } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
-        if (!actingUserDel || actingUserDel.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
+        // Admin path: delete purely by ID — no userid filter.
         must(await supabase.from("notifications").delete().in("id", action.ids));
       } else {
-        // Agent/driver path: scope to their own userid for safety. Uses
-        // activeUserRef.current (the actual authenticated caller), NOT
-        // action.user_id — that field is client-supplied and, like
-        // action.admin above, must never be trusted on its own, or any
-        // caller could pass someone else's user_id and delete that
-        // person's notifications instead of their own.
+        // Agent/driver path: scope to their own userid for safety.
         const scopedRes = await supabase.from("notifications").delete()
           .in("id", action.ids)
-          .eq("userid", activeUserRef.current);
-        // A real failure here must surface, not silently retry unscoped —
-        // that fallback would delete arbitrary rows for a non-admin caller,
-        // defeating the ownership check this branch exists to enforce.
-        if (scopedRes?.error) throw scopedRes.error;
+          .eq("userid", action.user_id);
+        if (scopedRes?.error) {
+          // RLS or other error — fall back to id-only
+          must(await supabase.from("notifications").delete().in("id", action.ids));
+        }
       }
       await refetch();
       return;
     }
-    case "NOTIF/MARK_READ": {
-      // Ownership check — a caller may only mark their own notification
-      // read, or (if they're an admin) one addressed to admins broadly.
-      const { data: notifRow } = await supabase.from("notifications").select("userid, forroles").eq("id", action.id).single();
-      if (!notifRow) return;
-      const isOwn = notifRow.userid != null && String(notifRow.userid) === String(activeUserRef.current);
-      const isAdminBroadcast = notifRow.userid == null && (notifRow.forroles || []).includes(ROLE.ADMIN);
-      if (!isOwn) {
-        if (!isAdminBroadcast) throw new Error("You can't modify this notification.");
-        const { data: actingUserRead } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
-        if (!actingUserRead || actingUserRead.role !== ROLE.ADMIN) throw new Error("You can't modify this notification.");
-      }
+    case "NOTIF/MARK_READ":
       must(await supabase.from("notifications").update({ isread: true }).eq("id", action.id));
       await refetch();
       return;
-    }
     case "NOTIF/MARK_ALL_READ": {
       // Scoped to the caller (see the in-memory reducer's case) — the old
       // .neq("id", -1) matched every row, so any user clearing their
@@ -8960,17 +8752,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // rows, silently marking the entire notifications table read for
       // every user if neither was provided. Replaced with a safe no-op.
       if (action.user_id != null) {
-        // action.user_id is client-supplied, same as action.admin below —
-        // scope to the actual authenticated caller, not whatever id the
-        // client sent, or any caller could mark another user's
-        // notifications read (suppressing alerts meant for them).
-        must(await supabase.from("notifications").update({ isread: true }).eq("userid", activeUserRef.current));
+        must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.user_id));
       } else if (action.admin) {
-        // action.admin is client-supplied — verify the caller is actually
-        // an admin (any tier) before honoring it, same rationale as
-        // NOTIF/DELETE_SELECTED above.
-        const { data: actingUserMarkAll } = await supabase.from("users").select("role").eq("id", activeUserRef.current).single();
-        if (!actingUserMarkAll || actingUserMarkAll.role !== ROLE.ADMIN) throw new Error("Only admin accounts can perform this action.");
         // Two separate updates: broadcasts (userid IS NULL) AND anything
         // specifically targeted at this admin's own actor_id. Previously
         // only the broadcast case was cleared here — a targeted admin
@@ -9569,45 +9352,7 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   );
 }
 
-function LocationSelector({ mode, setMode, companyId, setCompanyId, state, streetValue, streetCoord, onStreetChange, error, errMsg }) {
-  // BUGFIX (2026-07-31): this component used to take manualAddress/
-  // onManualAddressChange as props, but no caller anywhere in the app ever
-  // provided them — every real usage only wires up onStreetChange. That
-  // meant clicking "Type Address" and typing crashed immediately
-  // (calling onManualAddressChange, which was always undefined). Made
-  // manual-entry self-contained instead: manages its own text state here
-  // and reuses the SAME onStreetChange callback every caller already
-  // supplies, geocoding in the background via tomtomGeocodeAddress
-  // (previously written but never actually called anywhere) exactly as
-  // this mode's own help text always claimed it would.
-  const [manualAddress, setManualAddress] = useState(mode === "manual" ? (streetValue || "") : "");
-  const [manualGeocoding, setManualGeocoding] = useState(false);
-  React.useEffect(() => {
-    if (mode !== "manual") return;
-    const trimmed = manualAddress.trim();
-    if (trimmed.length < 8) {
-      onStreetChange({ street: trimmed, area: null, coord: null, confirmed: false });
-      return;
-    }
-    // Usable immediately once it looks like a real address — Waze can
-    // search the raw typed text even without a resolved coordinate (per
-    // the help text below), so typing shouldn't block the user from
-    // proceeding while geocoding is still in flight.
-    onStreetChange({ street: trimmed, area: null, coord: null, confirmed: true });
-    let cancelled = false;
-    setManualGeocoding(true);
-    const handle = setTimeout(() => {
-      tomtomGeocodeAddress(trimmed).then(result => {
-        if (cancelled || !result) return;
-        // Upgrade with a precise pin once found — same street text, now
-        // with real coordinates attached.
-        onStreetChange({ street: trimmed, area: result.area, coord: { lat: result.lat, lng: result.lng }, confirmed: true });
-      }).finally(() => { if (!cancelled) setManualGeocoding(false); });
-    }, 600); // debounce — avoid geocoding on every keystroke
-    return () => { cancelled = true; clearTimeout(handle); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [manualAddress, mode]);
-
+function LocationSelector({ mode, setMode, companyId, setCompanyId, state, streetValue, streetCoord, onStreetChange, manualAddress, onManualAddressChange, error, errMsg }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       <div style={{ display: "flex", gap: 6 }}>
@@ -9649,13 +9394,11 @@ function LocationSelector({ mode, setMode, companyId, setCompanyId, state, stree
         <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <TextField
             label="Full address (typed exactly as it should appear in Waze)"
-            value={manualAddress} onChange={e => setManualAddress(e.target.value)}
+            value={manualAddress} onChange={e => onManualAddressChange(e.target.value)}
             placeholder="e.g. 14 Bokmakierie Street, Rocklands, Cape Town, 7100"
           />
           <span style={{ fontSize: 9, color: COLORS.ghost }}>
-            {manualGeocoding
-              ? "Looking up a precise pin for this address…"
-              : "No dropdown search — type the exact address and it'll be looked up in the background to give your driver a precise pin in Waze. If it can't be found, Waze will fall back to searching this text directly when navigation opens. Include the suburb and postal code for the best match."}
+            No dropdown search — type the exact address and it'll be looked up in the background to give your driver a precise pin in Waze. If it can't be found, Waze will fall back to searching this text directly when navigation opens. Include the suburb and postal code for the best match.
           </span>
           {errMsg ? <span style={{ fontSize: 10, color: COLORS.red }}>{errMsg}</span> : null}
         </div>
@@ -9681,18 +9424,12 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
     webauthnSupported().then(ok => setShowBiometricBtn(ok)).catch(() => {});
   }, []);
 
-  // Check if this specific username has a registered credential. Uses the
-  // read-only "has-credential" action — NOT "authentication-options", which
-  // deletes and reissues the real login challenge on every call. Polling
-  // that one from this debounced, display-only effect could invalidate a
-  // challenge an in-flight fingerprint scan was about to submit (if this
-  // effect fired again while the OS biometric prompt was still open),
-  // causing the real login attempt to fail right after a successful scan.
+  // Check if this specific username has a registered credential
   const [hasCredential, setHasCredential] = useState(false);
   React.useEffect(() => {
     if (!login || !showBiometricBtn) { setHasCredential(false); return; }
     const t = setTimeout(() => {
-      webauthnPost({ action: "has-credential", username: login })
+      webauthnPost({ action: "authentication-options", username: login })
         .then(r => setHasCredential(!!r?.hasCredentials))
         .catch(() => setHasCredential(false));
     }, 500); // debounce
@@ -9720,7 +9457,7 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
       const result = await webauthnAuthenticate(login);
       if (!result) { setBiometricError("No biometric registered for this account."); return; }
       // Biometric verified — log in directly (bypass password)
-      await onBiometricLogin(result.userId, result.sessionToken);
+      await onBiometricLogin(result.userId);
     } catch (e) {
       setBiometricError(e.message || "Biometric login failed.");
     } finally {
@@ -11273,23 +11010,9 @@ function useWebRTCCall(currentUser) {
       // the ref, not the callState closure variable, since this effect no
       // longer re-runs on every state change (see comment above).
       if (callStateRef.current !== CALL_STATE.IDLE) {
-        // A re-ring of the call already ringing/active (the caller
-        // re-broadcasts its offer every 4s in case we were backgrounded
-        // — see the reRingInterval in startCall) is NOT a second incoming
-        // call — it's idempotent, just refresh the pending offer and
-        // ignore it. Without this check, our own first re-ring at ~4s
-        // was mistaken for a competing call and replied "busy" to
-        // ourselves, hanging up every unanswered (and some answered)
-        // calls right on schedule.
-        if (pcRef.current?.callChannelName === payload.callChannelName) {
-          if (pcRef.current) pcRef.current.pendingOffer = payload.offer;
-          return;
-        }
-        const busyChan = supabase.channel(payload.callChannelName);
-        busyChan.subscribe((status) => {
+        supabase.channel(payload.callChannelName).subscribe((status) => {
           if (status === "SUBSCRIBED") {
-            busyChan.send({ type: "broadcast", event: "busy", payload: {} });
-            setTimeout(() => supabase.removeChannel(busyChan), 500);
+            supabase.channel(payload.callChannelName).send({ type: "broadcast", event: "busy", payload: {} });
           }
         });
         return;
@@ -11386,15 +11109,6 @@ function useWebRTCCall(currentUser) {
       localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
 
       channel.on("broadcast", { event: "answer" }, async ({ payload }) => {
-        // Stop re-ringing now that it's been answered — otherwise a
-        // scheduled re-ring tick still fires later, the callee (now
-        // ACTIVE on this exact call) sees it as a stray offer and there
-        // was previously nothing distinguishing that from a real second
-        // call, so it could reply "busy" and hang up a live, connected call.
-        if (callChannelRef.current?._reRingInterval) {
-          clearInterval(callChannelRef.current._reRingInterval);
-          callChannelRef.current._reRingInterval = null;
-        }
         await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
         for (const c of pendingIceRef.current) await pc.addIceCandidate(new RTCIceCandidate(c));
         pendingIceRef.current = [];
@@ -11545,22 +11259,13 @@ function BiometricEnrollButton({ user }) {
   const [msg, setMsg] = useState("");
   const [hasCredential, setHasCredential] = useState(false);
   const [removing, setRemoving] = useState(false);
-  const [confirmingPassword, setConfirmingPassword] = useState(false);
-  const [password, setPassword] = useState("");
 
   React.useEffect(() => {
     webauthnSupported().then(ok => {
       setSupported(ok);
       if (ok && user?.name) {
-        // Read-only check — must be "has-credential", NOT
-        // "authentication-options". The latter deletes and reissues the
-        // real login challenge on every call (see the comment on
-        // LoginScreen's identical check) — calling it here just to decide
-        // whether to show "BIOMETRIC ACTIVE" could invalidate a challenge a
-        // concurrent, in-flight biometric login for this same account was
-        // about to submit, since this button is mounted in the persistent
-        // sidebar for any logged-in user.
-        webauthnPost({ action: "has-credential", username: user.name })
+        // Check if this user already has a credential registered
+        webauthnPost({ action: "authentication-options", username: user.name })
           .then(r => setHasCredential(!!r?.hasCredentials))
           .catch(() => {});
       }
@@ -11569,25 +11274,15 @@ function BiometricEnrollButton({ user }) {
 
   if (!supported) return null;
 
-  const handleEnrollClick = () => {
-    setStatus(null);
-    setMsg("");
-    setPassword("");
-    setConfirmingPassword(true);
-  };
-
-  const handleConfirmEnroll = async () => {
-    if (!password || enrolling) return;
+  const handleEnroll = async () => {
     setEnrolling(true);
     setStatus(null);
     setMsg("");
     try {
-      await webauthnRegister(user.id, user.name, password);
+      await webauthnRegister(user.id, user.name);
       setHasCredential(true);
       setStatus("success");
       setMsg("Biometric registered! You can now log in with your fingerprint or Face ID.");
-      setConfirmingPassword(false);
-      setPassword("");
     } catch (e) {
       setStatus("error");
       setMsg(e.message || "Registration failed — please try again.");
@@ -11598,41 +11293,20 @@ function BiometricEnrollButton({ user }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      {!confirmingPassword ? (
-        <button
-          onClick={handleEnrollClick}
-          disabled={enrolling}
-          style={{
-            background: "none", border: `1px solid ${hasCredential ? "rgba(29,185,84,.4)" : COLORS.wire}`,
-            borderRadius: 4, padding: "7px 10px", color: hasCredential ? COLORS.green : COLORS.ghost,
-            fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: enrolling ? "wait" : "pointer",
-            display: "flex", alignItems: "center", gap: 6, width: "100%",
-            opacity: enrolling ? 0.6 : 1,
-          }}
-        >
-          <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
-          {hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
-        </button>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8 }}>
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>Confirm your password to register this device:</div>
-          <input
-            type="password" value={password} autoFocus
-            onChange={e => setPassword(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && handleConfirmEnroll()}
-            style={{
-              background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3,
-              padding: "6px 8px", fontSize: 11, color: COLORS.chalk, width: "100%",
-            }}
-          />
-          <div style={{ display: "flex", gap: 6 }}>
-            <Button title={enrolling ? "SETTING UP…" : "CONFIRM"} variant="amber" size="sm"
-              onClick={handleConfirmEnroll} disabled={enrolling || !password} loading={enrolling} />
-            <Button title="CANCEL" variant="ghost" size="sm"
-              onClick={() => { setConfirmingPassword(false); setPassword(""); }} disabled={enrolling} />
-          </div>
-        </div>
-      )}
+      <button
+        onClick={handleEnroll}
+        disabled={enrolling}
+        style={{
+          background: "none", border: `1px solid ${hasCredential ? "rgba(29,185,84,.4)" : COLORS.wire}`,
+          borderRadius: 4, padding: "7px 10px", color: hasCredential ? COLORS.green : COLORS.ghost,
+          fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: enrolling ? "wait" : "pointer",
+          display: "flex", alignItems: "center", gap: 6, width: "100%",
+          opacity: enrolling ? 0.6 : 1,
+        }}
+      >
+        <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
+        {enrolling ? "SETTING UP…" : hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
+      </button>
       {status && (
         <div style={{ fontSize: 9, color: status === "success" ? COLORS.green : COLORS.red, lineHeight: 1.4, padding: "0 2px" }}>
           {msg}
@@ -11729,6 +11403,31 @@ function setAlertSoundMuted(muted) {
 }
 
 let sharedAudioCtx = null;
+// Every selectable sound for ringtone / message tone. "synth" options
+// Built-in options only — the app's own original, always-available
+// tones (zero setup, already proven copyright-clear per the app's own
+// compliance rules).
+const RINGTONE_OPTIONS = [
+  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
+];
+const MESSAGE_TONE_OPTIONS = [
+  { id: "synth_chime", label: "Default Chime (built-in)", kind: "synth" },
+];
+
+function getUserSoundPref(userId, kind) {
+  // kind is "ringtone" or "messageTone" — stored per-user, like every
+  // other per-user preference in this app (see usePersistedTab).
+  try {
+    return localStorage.getItem(`transitos_sound_${kind}_${userId}`) || "synth_chime";
+  } catch (e) {
+    return "synth_chime";
+  }
+}
+function setUserSoundPref(userId, kind, optionId) {
+  try {
+    localStorage.setItem(`transitos_sound_${kind}_${userId}`, optionId);
+  } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+}
 
 function playAlertSound() {
   if (isAlertSoundMuted()) return;
@@ -12244,7 +11943,7 @@ function AdminTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
   const finalCoords = sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
@@ -12282,7 +11981,7 @@ function DriverTripDropoffs({ trip, state }) {
     dropCoords = derived;
   }
   const anchor = defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null);
   const finalCoords = (sorted || dropCoords);
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
@@ -12582,18 +12281,10 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call }) {
             {/* Drop-off: per-agent for OUTBOUND — uses TomTom road-optimal ordering */}
             <DriverTripDropoffs trip={trip} state={state} />
             {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
-            {(trip.route_total_km ?? trip.driver_route_km) != null && (
+            {trip.driver_route_km != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
-                {/* Prefer route_total_km — recomputed from the driver's ACTUAL
-                    position when they tapped Start Trip, so it reflects the
-                    real route rather than the dispatch-time estimate (which
-                    can go stale, e.g. if it was computed before a routing fix
-                    shipped, or before the driver's day changed). Same
-                    fallback pattern used everywhere else this pair is shown —
-                    this was the one place that only ever read driver_route_km
-                    directly. */}
                 Driver's total route: <span style={{ color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, fontWeight: 700 }}>
-                  {(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
+                  {trip.driver_route_km.toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
                 </span>
               </div>
             )}
@@ -12841,7 +12532,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const lastPickupDone = [...pickupStops].reverse().find(s => s.done) || pickupStops[0];
   const lastPickupCoord = lastPickupDone ? { lat: lastPickupDone.lat, lng: lastPickupDone.lng } : null;
 
-  const navDirection = myActiveTrips[0]?.direction || "OUTBOUND";
   const dropoffGroups = {};
   myActiveTrips.forEach(trip => {
     // Iterate ALL per-agent dropoffs — OUTBOUND multi-agent trips have one
@@ -12928,17 +12618,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   // useSortedDropoffs is a hook — called unconditionally here (before any
   // early-return). Direction is taken from the first active trip; for mixed
   // runs the TSP is direction-agnostic anyway.
+  const navDirection = myActiveTrips[0]?.direction || "OUTBOUND";
   const navTripKey = myActiveTrips.map(t => t.trip_id).join("-");
   // For INBOUND: the destination is the company office — TomTom optimises the full
   // route: driver_start → pickup_home_A → pickup_home_B → ... → office (min km).
   // For OUTBOUND: no fixed destination — optimise drop sequence from office outward.
   const navDestination = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  // Earliest scheduled time across this batch of active trips — same
-  // "whichever pickup comes first" epoch used below to gate Start Trip —
-  // so TomTom optimises for the traffic conditions the driver will actually
-  // be in, not whatever traffic looks like right now.
-  const navDepartAtEpoch = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0] ?? null;
-  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination, navDepartAtEpoch);
+  const [tomtomSortedCoords,, , navRouteSummary] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination);
   // Re-order the groups to match TomTom's coord sequence. Match by lat/lng
   // rounded to 4dp (same precision as the group key used above).
   let dropStops;
@@ -13055,13 +12741,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
         await dispatch(action).catch(() => {});
         return;
       }
-      try {
-        await dispatch(action);
-      } catch (dispatchErr) {
-        if (!isNetworkError(dispatchErr)) throw dispatchErr;
-        enqueueOfflineAction(action);
-        return;
-      }
+      await dispatch(action);
     } catch (e) {
       setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
       return;
@@ -13095,12 +12775,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           enqueueOfflineAction(action);
           await dispatch(action).catch(() => {});
         } else {
-          try {
-            await dispatch(action);
-          } catch (dispatchErr) {
-            if (!isNetworkError(dispatchErr)) throw dispatchErr;
-            enqueueOfflineAction(action);
-          }
+          await dispatch(action);
         }
       }
     } catch (e) {
@@ -13164,7 +12839,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
       <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div>
       <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1.5, textTransform: "uppercase", marginTop: -8 }}>
         {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
-        {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
+        {(() => {
+            const dbKm = myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km;
+            const liveKm = navRouteSummary?.totalKm;
+            const liveMin = navRouteSummary?.totalMin;
+            const km = liveKm ?? dbKm;
+            if (km == null) return null;
+            return ` · ${km.toFixed(1)} km${liveMin != null ? ` · ${liveMin} min` : ''} TOTAL ROUTE`;
+          })()}
       </div>
       {/* Feature B: Waze nav panel — persistent stop-by-stop guide */}
       {myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} />}
@@ -14093,7 +13775,7 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
   const destination = trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination, trip.scheduled_time_epoch);
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination);
   const finalCoords = sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
@@ -14133,9 +13815,9 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // Bump this when anchor-affecting logic changes (e.g. defaultCompanyAnchor fix)
 // so any cached TomTom results computed against the OLD anchor are invalidated
 // and re-fetched against the corrected one, instead of silently persisting.
-const _TOMTOM_CACHE_VERSION = "v13-scheduled-departure-traffic";
+const _TOMTOM_CACHE_VERSION = "v12-one-way-not-round-trip";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
-function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null, departAtEpoch = null) {
+function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null) {
   // TomTom optimisation applies to any multi-stop run regardless of direction —
   // the goal is always shortest total km, not direction-specific heuristics.
   const isMultiStop = coords && coords.length > 1;
@@ -14145,21 +13827,29 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
   // cached result computed for someone else's home endpoint.
   const endKey = driverEndCoord?.lat != null ? `${driverEndCoord.lat.toFixed(4)},${driverEndCoord.lng.toFixed(4)}` : "none";
   const destKey = destinationCoord?.lat != null ? `dest:${destinationCoord.lat.toFixed(4)},${destinationCoord.lng.toFixed(4)}` : "nodest";
-  // Round to the nearest hour (same trick as routeCacheKey) so trips booked
-  // at 14:26 vs 14:58 for the same ~21:00 run share one cache entry, while a
-  // genuinely different scheduled hour gets its own traffic-aware result.
-  const hourBucket = departAtEpoch ? Math.floor(Number(departAtEpoch) / 3600000) : 0;
-  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + destKey + "|" + hourBucket + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
+  const fingerprint = _TOMTOM_CACHE_VERSION + "|" + tripId + "|" + endKey + "|" + destKey + "|" + (coords || []).map(c => `${c?.lat?.toFixed(4)},${c?.lng?.toFixed(4)}`).sort().join("|");
   const [sorted, setSorted] = React.useState(() => {
     if (!isMultiStop) return coords;
-    if (_tomtomSortCache.has(fingerprint)) return _tomtomSortCache.get(fingerprint);
+    if (_tomtomSortCache.has(fingerprint)) {
+      const c = _tomtomSortCache.get(fingerprint);
+      return c?.coords ?? c; // RouteResult or legacy array
+    }
     return sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord); // haversine until TomTom responds
   });
   const [loading, setLoading] = React.useState(false);
   const [tomtomError, setTomtomError] = React.useState(null);
+  const [routeSummary, setRouteSummary] = React.useState(null); // { totalKm, totalMin, legKm, legMin, legEta }
   React.useEffect(() => {
     if (!isMultiStop || !TOMTOM_API_KEY) return;
-    if (_tomtomSortCache.has(fingerprint)) { setSorted(_tomtomSortCache.get(fingerprint)); return; }
+    if (_tomtomSortCache.has(fingerprint)) {
+        const cached = _tomtomSortCache.get(fingerprint);
+        setSorted(cached.coords ?? cached); // support both old (array) and new (RouteResult) cache entries
+        if (cached.totalKm != null) setRouteSummary({ totalKm: cached.totalKm, totalMin: cached.totalMin, legKm: cached.legKm, legMin: cached.legMin, legEta: cached.legEta });
+        return;
+      }
+    // Pre-flight: warn about stops with missing/invalid coordinates.
+    // These cause TomTom to silently fail or route to the wrong location.
+    // Common cause: agent's home address geocoded to null or 0,0.
     const badStops = (coords || []).filter(c => !isValidCoord(c));
     if (badStops.length) console.warn("[TomTom] Stop(s) with invalid coordinates will be excluded from optimization:", badStops.map(c => c?.label ?? JSON.stringify(c)));
     if (anchorCoord && !isValidCoord(anchorCoord)) console.warn("[TomTom] anchorCoord is invalid — TomTom optimization may fail:", anchorCoord);
@@ -14188,7 +13878,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
     // For INBOUND: pass the company office as destination so TomTom optimises
     // the full chain: driver_start → home_A → home_B → ... → office (min total km)
     // For OUTBOUND: no destination — optimise dropoffs from the office outward.
-    tomtomOptimalStopOrder(anchorCoord, coords, departAtEpoch, destinationCoord).then(result => {
+    tomtomOptimalStopOrder(anchorCoord, coords, null, destinationCoord).then(result => {
       if (cancelled) return;
       if (result && result.length !== requestedCount) {
         // Response doesn't match what THIS call actually asked for — discard
@@ -14198,8 +13888,8 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
         setLoading(false);
         return;
       }
-      if (!result) setTomtomError("TomTom returned no result — using distance estimate instead");
-      const final = result || sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord);
+      if (!result) setTomtomError("TomTom route unavailable — using shortest-path calculation instead");
+      const final = result?.coords ?? result ?? sortDropoffCoordsByProximity(coords, anchorCoord, driverEndCoord, destinationCoord);
       _tomtomSortCache.set(fingerprint, final);
       setSorted(final);
     }).catch(e => {
@@ -14210,7 +13900,7 @@ function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoor
     return () => { cancelled = true; clearTimeout(debounceHandle); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fingerprint]);
-  return [sorted, loading, tomtomError];
+  return [sorted, loading, tomtomError, routeSummary];
 }
 
 // Actual real-time visiting order — ranks every agent on a trip by their
@@ -14991,7 +14681,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   );
 }
 
-function AdminProfileSearch({ state, user, dispatch }) {
+function AdminProfileSearch({ state, user }) {
   const [query, setQuery] = useState("");
   const [selectedUserId, setSelectedUserId] = useState(null);
   const [historyTrips, setHistoryTrips] = useState(null); // null = not loaded yet
@@ -15086,11 +14776,11 @@ function AdminProfileSearch({ state, user, dispatch }) {
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL BOOKINGS: </span><span style={{ fontWeight: 700 }}>{allTrips.length}</span></span>
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>COMPLETED: </span><span style={{ fontWeight: 700, color: COLORS.green }}>{completedCount}</span></span>
               {exceptionCount > 0 && <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>EXCEPTIONS: </span><span style={{ fontWeight: 700, color: COLORS.red }}>{exceptionCount}</span></span>}
-              {allTrips.length > 0 && <DisputeAdminPanel trip={allTrips[0]} dispatch={dispatch} users={state.users} />}
-              {allTrips.length > 0 && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(allTrips[0].state) && (
-                <button onClick={() => copyShareLink(allTrips[0], dispatch)}
+              <DisputeAdminPanel trip={groupTrips[0]} dispatch={dispatch} users={state.users} />
+              {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(groupTrips[0].state) && (
+                <button onClick={() => copyShareLink(groupTrips[0], dispatch)}
                   style={{ fontSize: 9, color: COLORS.teal, fontWeight: 700, border: `1px solid ${COLORS.teal}`, padding: "2px 6px", borderRadius: 2, background: "none", cursor: "pointer" }}>
-                  🔗 {allTrips[0].share_token ? "COPY SHARE LINK" : "GENERATE LIVE LINK"}
+                  🔗 {groupTrips[0].share_token ? "COPY SHARE LINK" : "GENERATE LIVE LINK"}
                 </button>
               )}
             </div>
@@ -16513,8 +16203,6 @@ function AdminDrivers({ state, user, dispatch }) {
   // home address, no live status, no active-route detail. Full tier
   // (Fleet Ops / Standard) still sees everything, same as before.
   const fullView = hasAdminPermission(user, "viewDriverProfiles");
-  const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
-  const [docEditorFor, setDocEditorFor] = React.useState(null);
 
   if (!fullView) {
     return (
@@ -16542,6 +16230,8 @@ function AdminDrivers({ state, user, dispatch }) {
     );
   }
 
+  const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
+  const [docEditorFor, setDocEditorFor] = React.useState(null);
   return (
     <div className="pad">
       <SectionHeader label={`Drivers (${state.driver_status.length})`} />
@@ -17281,7 +16971,7 @@ function CompanyManagerPanel({ state, dispatch, onClose }) {
                     <Button title="SAVE" variant="amber" size="sm" style={{ flex: 1 }} onClick={() => saveEdit(c.id)} />
                   </div>
                 </>
-              ) : confirmingDeleteId === c.id ? (
+              ) : String(confirmingDeleteId) === String(c.id) ? (
                 <>
                   <span style={{ fontSize: 10, color: COLORS.red }}>Delete "{c.name}"? Agents assigned to it must be reassigned first.</span>
                   <div style={{ display: "flex", gap: 8 }}>
@@ -17388,7 +17078,7 @@ function CampaignManagerPanel({ state, dispatch, onClose }) {
                   <Button title="SAVE" variant="amber" size="sm" onClick={() => saveEdit(c.id)} />
                   <Button title="✕" variant="ghost" size="sm" onClick={() => setEditingId(null)} />
                 </>
-              ) : confirmingDeleteId === c.id ? (
+              ) : String(confirmingDeleteId) === String(c.id) ? (
                 <>
                   <span style={{ flex: 1, fontSize: 10, color: COLORS.red }}>Delete "{c.name}"? Agents assigned to it must be reassigned first.</span>
                   <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(null)} />
@@ -18442,7 +18132,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       companies: (state.companies || []).filter(c => adminCompanyIds.some(id => String(id) === String(c.id))),
       users: scopeUsersToCompany(state.users, state.trips, adminCompanyIds),
       trips: scopeTripsToCompany(state.trips, state.users, adminCompanyIds),
-      tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, adminCompanyIds),
+      tickets: scopeTicketsToCompany(state.tickets, state.users, adminCompanyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, adminCompanyIds),
     };
   }, [state, user]);
@@ -18506,7 +18196,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
-      {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
@@ -18719,10 +18409,10 @@ function AppInner() {
   // At this point the user's identity is confirmed by their device biometric.
   // We dispatch AUTH/LOGIN_BIOMETRIC which skips the password check and just
   // sets the session for the given user ID.
-  const handleBiometricLogin = async (userId, sessionToken) => {
+  const handleBiometricLogin = async (userId) => {
     setLoginError(null);
     try {
-      await dispatch({ type: "AUTH/LOGIN_BIOMETRIC", user_id: userId, session_token: sessionToken });
+      await dispatch({ type: "AUTH/LOGIN_BIOMETRIC", user_id: userId });
     } catch (e) {
       setLoginError(e.message || "Biometric login failed — please use your password.");
     }
