@@ -1899,8 +1899,13 @@ function useSessionTimeout(user, onLogout) {
   // time toward the inactivity timer. Pause on hide, resume on show.
   const hiddenAtRef = React.useRef(null);
   const remainingAtHideRef = React.useRef(null);
+  // Synced copy of warningVisible for the activity listener below to read
+  // without needing it in that effect's dependency array (which would
+  // tear down/re-add the listeners on every warning toggle).
+  const warningVisibleRef = React.useRef(false);
 
   const resetTimer = React.useCallback(() => {
+    warningVisibleRef.current = false;
     setWarningVisible(false);
     setSecondsLeft(null);
     clearTimeout(timerRef.current);
@@ -1910,6 +1915,7 @@ function useSessionTimeout(user, onLogout) {
     remainingAtHideRef.current = null;
 
     warnTimerRef.current = setTimeout(() => {
+      warningVisibleRef.current = true;
       setWarningVisible(true);
       setSecondsLeft(SESSION_WARN_MS / 1000);
       countdownRef.current = setInterval(() => {
@@ -1955,6 +1961,15 @@ function useSessionTimeout(user, onLogout) {
         }
         return;
       }
+      // Once the warning is showing, ambient activity (pointermove, scroll,
+      // even a stray keydown/pointerdown while nobody's actually reading
+      // the modal) must NOT silently reset the timer — the whole point of
+      // this warning is requiring a deliberate confirmation before
+      // extending an unattended session. The modal is a full-screen
+      // overlay, so nothing legitimate is blocked by ignoring these here:
+      // the only real interaction available is its own "Stay Logged In"
+      // button, which calls resetTimer directly, bypassing this check.
+      if (warningVisibleRef.current) return;
       resetTimer();
     };
 
