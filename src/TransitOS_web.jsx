@@ -14918,9 +14918,19 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   };
 
   const selectedDropCompany = companyById(state, dropCompanyId) || { address: "", lat: null, lng: null };
+  // Requires streetCoord/dropStreetCoord too, not just confirmed —
+  // LocationSelector's manual-entry mode sets confirmed:true the instant
+  // 8+ characters are typed, BEFORE the debounced TomTom geocode even
+  // fires (intentional there: it lets the primary agent booking flow's
+  // Waze fallback work on raw text alone). But this panel writes
+  // pickup_coord/dropoff_coord straight into the trips table via
+  // TRIP/ADD_AGENT with no null check — saving inside that debounce
+  // window dispatched pickup_coord: null and crashed with a raw
+  // TypeError. confirmed alone was never a safe enough gate for a save
+  // path that actually persists coordinates.
   const canSave = agentId &&
-    (mode === "company" || (streetValue && confirmed)) &&
-    (!isOutbound || dropMode === "company" || (dropStreetValue && dropConfirmed));
+    (mode === "company" || (streetValue && confirmed && streetCoord)) &&
+    (!isOutbound || dropMode === "company" || (dropStreetValue && dropConfirmed && dropStreetCoord));
 
   const [saveError, setSaveError] = useState(null);
   const save = async () => {
@@ -15011,7 +15021,11 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
   const [saving, setSaving] = useState(false);
 
   const selectedCompany = companyById(state, companyId) || { address: "", lat: null, lng: null };
-  const canSave = mode === "company" || (streetValue && confirmed);
+  // See the identical fix/reasoning on AddAgentPanel's canSave — requires
+  // streetCoord too, not just confirmed, since manual-entry mode sets
+  // confirmed:true before the debounced geocode resolves, and this panel
+  // writes pickup_coord straight into the trips table with no null check.
+  const canSave = mode === "company" || (streetValue && confirmed && streetCoord);
 
   const [saveError, setSaveError] = useState(null);
   const save = async () => {

@@ -36,6 +36,22 @@ self.addEventListener('fetch', e => {
     return;
   }
 
+  // Network-only for third-party routing/geocoding APIs — TomTom and
+  // Nominatim URLs are near-always unique (embedded coordinates, query
+  // text), so letting them fall through to the cache-first branch below
+  // grew this cache UNBOUNDED: one entry per distinct route/search/geocode
+  // request ever made over the app's lifetime, with nothing here ever
+  // expiring an individual entry, and CACHE's name never changing between
+  // deploys (see the app-shell branch below for why that matters) means
+  // activate's cleanup never evicted any of it either. These responses are
+  // also just wrong to cache on their own terms — a routing/geocoding
+  // result is only valid for the specific query that produced it, not
+  // something meant to be replayed offline.
+  if (url.hostname.includes('api.tomtom.com') || url.hostname.includes('nominatim.openstreetmap.org')) {
+    e.respondWith(fetch(e.request));
+    return;
+  }
+
   // Network-first for the app shell (page navigations) and manifest.json
   // — these must always reflect the LATEST deploy for anyone online. The
   // blanket cache-first strategy below never re-checks the network once
