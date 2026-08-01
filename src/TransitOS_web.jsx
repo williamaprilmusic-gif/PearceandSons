@@ -3298,7 +3298,10 @@ function isCapeFlatsBoundingBox(coords) {
 
 function buildSupportingPointsParam(coords) {
   if (!isCapeFlatsBoundingBox(coords)) return "";
-  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
+  // TomTom calculateRoute path param is latitude,longitude (confirmed against
+  // official docs — do not swap this; a prior attempt to "fix" it to lng,lat
+  // silently sent every real Cape Town coordinate into the Atlantic Ocean).
+  const pts = CAPE_FLATS_CORRIDOR.map(c => `${c.lat},${c.lng}`).join(":");
   return `&supportingPoints=${encodeURIComponent(pts)}`;
 }
 
@@ -3430,7 +3433,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     // who are merely nearby but at genuinely different addresses.
     const dedupedCoords = dedupeCoordsByLocation(coords);
     if (dedupedCoords.length < 2) return null;
-    const locations = dedupedCoords.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
+    const locations = dedupedCoords.map(c => `${c.lat},${c.lng}`).join(":"); // TomTom calculateRoute: latitude,longitude
     // departAt: use the trip's scheduled time so TomTom applies historical
     // traffic patterns for that hour, not live conditions at booking time.
     const departAtParam = departAtEpoch
@@ -3467,7 +3470,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
 // or null if the request failed or the response shape didn't match.
 async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEpoch) {
   const allWaypoints = [anchorCoord, ...freeStops, pinnedEnd];
-  const locations = allWaypoints.map(c => `${c.lng},${c.lat}`).join(":"); // TomTom calculateRoute: longitude,latitude
+  const locations = allWaypoints.map(c => `${c.lat},${c.lng}`).join(":"); // TomTom calculateRoute: latitude,longitude
   const departAtParam = departAtEpoch
     ? `&departAt=${new Date(departAtEpoch).toISOString().slice(0, 19)}`
     : "";
