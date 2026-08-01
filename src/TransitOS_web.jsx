@@ -2044,7 +2044,9 @@ function useOfflineSync(dispatch) {
       // permanently delete a driver's pickup/dropoff confirmation with no
       // retry, defeating the entire point of this queue.
       const stillPending = [];
+      let notYetProcessed = q;
       for (const action of q) {
+        notYetProcessed = notYetProcessed.slice(1);
         try {
           await dispatch(action);
           replayed++;
@@ -2053,8 +2055,17 @@ function useOfflineSync(dispatch) {
           failed++;
           stillPending.push(action);
         }
+        // Persist after EVERY item, not just once after the whole loop —
+        // this hook runs in a moving vehicle with flaky signal; if the
+        // tab/PWA gets backgrounded or killed mid-replay, localStorage
+        // must already reflect what's actually still pending. Persisting
+        // only once at the end meant an interrupted replay left the
+        // ORIGINAL full queue in storage, including items that had
+        // already succeeded — the next reconnect would replay them a
+        // second time, silently overwriting a correct pickup/dropoff
+        // timestamp+GPS with a new, later, wrong pair.
+        setOfflineQueue([...stillPending, ...notYetProcessed]);
       }
-      setOfflineQueue(stillPending);
       setSyncing(false);
       setSyncResult({ replayed, failed });
       setTimeout(() => setSyncResult(null), 5000);
@@ -4847,7 +4858,11 @@ function appReducer(state, action) {
       // agent id. Supabase handler writes both; local reducer was only
       // writing pickup_locations, leaving pickup_timestamps blank in
       // demo mode (CSV column always empty). Fixed to match Supabase.
-      const newPickupTimestamps = { ...(trip.pickup_timestamps || {}), [action.agent_id]: Date.now() };
+      // Prefer action.confirmed_at (the real moment the driver tapped
+      // confirm, captured client-side) over Date.now() (whenever this
+      // dispatch actually executes) — matters once an offline-queued
+      // action can replay later than when it was originally confirmed.
+      const newPickupTimestamps = { ...(trip.pickup_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
       const newPickupLocations = action.driver_coord
         ? { ...(trip.pickup_locations || {}), [action.agent_id]: { lat: action.driver_coord.lat, lng: action.driver_coord.lng } }
         : (trip.pickup_locations || {});
@@ -4873,7 +4888,9 @@ function appReducer(state, action) {
       // When ALL agents are confirmed dropped off, TRIP/COMPLETE fires.
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
-      const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: Date.now() };
+      // Prefer action.confirmed_at over Date.now() — see the identical
+      // fix/reasoning on CONFIRM_AGENT_PICKUP above.
+      const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
       const newDropoffLocations = { ...(trip.dropoff_locations || {}) };
       if (action.driver_coord) {
         newDropoffLocations[action.agent_id] = {
@@ -6844,6 +6861,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           patch.driverroutekm = routeDistanceKmAdd; patch.driverroutecapkm = policyCapKmAdd; patch.driverrouteexceedspolicy = exceedsPolicyAdd;
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
+        // Feature 13: compliance checks — checkComplianceTriggers's own doc
+        // comment claims this runs "inside TRIP/ASSIGN_DRIVER and
+        // TRIP/ADD_AGENT after route is computed," but this call was
+        // missing entirely — only ASSIGN_DRIVER ever actually called it.
+        // Adding a passenger to an already-assigned trip can push the
+        // driver's route over the insurance-notification distance
+        // threshold or over vehicle capacity just as easily as an initial
+        // assignment can, and that silently produced no compliance alert.
+        const { data: driverUserForComplianceAdd } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+        const complianceIssuesAdd = checkComplianceTriggers(
+          { name: driverUserForComplianceAdd?.fullname }, { capacity: addAgentDriverCapacitySupa }, routeDistanceKmAdd, totalAgentCountAdd
+        );
+        for (const issue of complianceIssuesAdd) {
+          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: addAgentNowTs, read: false });
+        }
       }
 
       await insertNotification({
@@ -8669,8 +8701,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       // Real per-agent pickup time — this specific agent, this specific
       // moment, distinct from intransitat (which only marks when the
-      // LAST passenger on the trip was picked up).
-      const newPickupTimestamps = { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: nowTs };
+      // LAST passenger on the trip was picked up). Prefer
+      // action.confirmed_at (captured client-side at the moment the
+      // driver actually tapped confirm) over nowTs (whenever this
+      // dispatch actually executes) — an offline-queued confirmation can
+      // replay minutes later once signal returns, and nowTs would stamp
+      // that later replay time instead of the real moment of pickup,
+      // corrupting actualPickupOrderFor's derived "real visiting order."
+      const confirmTs = action.confirmed_at ?? nowTs;
+      const newPickupTimestamps = { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: confirmTs };
       // Driver's GPS at the moment of confirming THIS pickup — saved as
       // lat/lng AND reverse-geocoded to a readable address label so the
       // CSV shows a real street address, not just coordinates.
@@ -8709,7 +8748,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const dropoffLabel = action.driver_coord
         ? (action.dropoff_label || await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
         : null;
-      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: nowTs };
+      // Prefer action.confirmed_at over nowTs — see the identical
+      // fix/reasoning on CONFIRM_AGENT_PICKUP above.
+      const confirmTs = action.confirmed_at ?? nowTs;
+      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
       const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
       if (action.driver_coord) {
         newDropoffLocations[action.agent_id] = {
@@ -13281,7 +13323,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const confirmPickup = async (trip_id, agent_id) => {
     try {
       const driverCoord = await getFreshDriverCoord();
-      const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id, driver_coord: driverCoord };
+      // Captured now, at the moment the driver actually confirms — not
+      // when this eventually reaches the server. An offline-queued action
+      // can replay minutes later once signal returns; without this, the
+      // server stamped pickup_timestamps at REPLAY time, corrupting the
+      // "actual visiting order" derived from these timestamps elsewhere
+      // (actualPickupOrderFor/actualDropOrderFor) by however long the
+      // driver was out of signal.
+      const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id, agent_id, driver_coord: driverCoord, confirmed_at: Date.now() };
       if (!navigator.onLine) {
         enqueueOfflineAction(action);
         await dispatch(action).catch(() => {});
@@ -13320,9 +13369,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const confirmPickupAll = async () => {
     try {
       const driverCoord = await getFreshDriverCoord();
+      // Captured once for the whole batch, same reasoning as confirmPickup —
+      // real confirm time, not whenever an offline-queued replay executes.
+      const confirmedAt = Date.now();
       // Confirm each agent's pickup sequentially
       for (const stop of pickupStops.filter(s => !s.done)) {
-        const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: stop.trip_id, agent_id: stop.agent_id, driver_coord: driverCoord };
+        const action = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: stop.trip_id, agent_id: stop.agent_id, driver_coord: driverCoord, confirmed_at: confirmedAt };
         if (!navigator.onLine) {
           enqueueOfflineAction(action);
           await dispatch(action).catch(() => {});
@@ -13346,8 +13398,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
   const confirmDropoff = async (group) => {
     try {
       // Captured ONCE before the loop — the driver is at one physical stop
-      // so one GPS read covers all passengers being dropped here.
+      // so one GPS read covers all passengers being dropped here. Also the
+      // real confirm time (see confirmPickup) — recorded on the action so
+      // the server stamps dropoff_timestamps at this moment, not whenever
+      // an offline-queued replay actually executes.
       const driverCoord = await getFreshDriverCoord();
+      const confirmedAt = Date.now();
       // Dispatch per-agent dropoff confirmation for each passenger in this group.
       // This records each agent's individual GPS location + timestamp, and only
       // completes the trip when ALL agents across ALL dropoff stops are confirmed.
@@ -13365,18 +13421,29 @@ function DriverNavTab({ state, dispatch, user, call, myTrips }) {
           : (t.agent_ids || []).filter(id => !(t.completed_dropoffs || []).some(c => String(c) === String(id)));
         for (const aid of agentsToDrop) {
           if ((t.completed_dropoffs || []).some(c => String(c) === String(aid))) continue; // already done
+          // Unlike confirmPickup/confirmPickupAll, this never queued on a
+          // network failure — a dropoff confirmed in a signal-dead zone
+          // just failed outright with no auto-retry, unlike pickups. Same
+          // isNetworkError/enqueueOfflineAction protection now applied.
+          const dropAction = {
+            type: "TRIP/CONFIRM_AGENT_DROPOFF",
+            trip_id: tid,
+            agent_id: aid,
+            confirmed_at: confirmedAt,
+            driver_coord: driverCoord,
+            dropoff_label: group.label || null,
+          };
+          if (!navigator.onLine) {
+            enqueueOfflineAction(dropAction);
+            await dispatch(dropAction).catch(() => {});
+            continue;
+          }
           try {
-            await dispatch({
-              type: "TRIP/CONFIRM_AGENT_DROPOFF",
-              trip_id: tid,
-              agent_id: aid,
-              driver_coord: driverCoord,
-              dropoff_label: group.label || null,
-            });
+            await dispatch(dropAction);
           } catch (perAgentErr) {
-            if (!/ARCHIVED_COMPLETED.*ARCHIVED_COMPLETED/.test(perAgentErr.message || "")) {
-              throw perAgentErr;
-            }
+            if (/ARCHIVED_COMPLETED.*ARCHIVED_COMPLETED/.test(perAgentErr.message || "")) continue;
+            if (!isNetworkError(perAgentErr)) throw perAgentErr;
+            enqueueOfflineAction(dropAction);
           }
         }
       }
