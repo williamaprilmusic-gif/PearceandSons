@@ -19331,7 +19331,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -19837,7 +19837,31 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
 class AppErrorBoundary extends React.Component {
   constructor(props) { super(props); this.state = { error: null }; }
   static getDerivedStateFromError(error) { return { error }; }
-  componentDidCatch(error, info) { console.error("[Pearce & Sons] render error:", error, info); }
+  componentDidCatch(error, info) {
+    console.error("[Pearce & Sons] render error:", error, info);
+    // Previously this only went to console.error — if a driver's app
+    // crashed mid-trip, nobody found out unless they manually
+    // screenshotted the fallback screen and messaged someone (see that
+    // screen's own text below). Best-effort report it instead, so a real
+    // crash is visible to admins without depending on that. Deliberately
+    // NOT awaited/thrown from here — an error boundary's one job is to
+    // still render its fallback UI even when everything else is broken,
+    // and a failed report must never prevent that.
+    try {
+      if (supabase) {
+        supabase.from("client_errors").insert({
+          userid: readStoredActiveUserId(), message: error?.message || String(error),
+          stack: error?.stack || null, componentstack: info?.componentStack || null,
+          url: window.location.href, useragent: navigator.userAgent, createdat: nowEpoch(),
+        }).then(() => {}, () => {});
+        insertNotification({
+          type: "APP_CRASH", for_roles: [ROLE.ADMIN],
+          message: `⚠ App crash: ${error?.message || String(error)}`,
+          ts: nowEpoch(), read: false,
+        }).catch(() => {});
+      }
+    } catch (e) { /* best-effort — never let crash reporting itself throw */ }
+  }
   render() {
     if (!this.state.error) return this.props.children;
     const errMsg = this.state.error?.message || String(this.state.error);
@@ -19845,7 +19869,7 @@ class AppErrorBoundary extends React.Component {
       <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 24, background: "#0a0a0a", color: "#e5e5e5", fontFamily: "system-ui, sans-serif", textAlign: "center" }}>
         <div style={{ fontSize: 18, fontWeight: 800 }}>Something went wrong</div>
         <div style={{ fontSize: 12, color: "#f5a623", maxWidth: 480, wordBreak: "break-word", fontFamily: "monospace", background: "#111", padding: 12, borderRadius: 4, textAlign: "left" }}>{errMsg}</div>
-        <div style={{ fontSize: 11, color: "#888", maxWidth: 340 }}>Pearce &amp; Sons hit an unexpected error. Screenshot this and send it.</div>
+        <div style={{ fontSize: 11, color: "#888", maxWidth: 340 }}>Pearce &amp; Sons hit an unexpected error. This has been reported automatically — but a screenshot still helps if you can send one.</div>
         <button
           onClick={() => { try { localStorage.removeItem("transitos_active_user_id"); } catch (e) {} window.location.reload(); }}
           style={{ background: "#f5a623", color: "#000", border: "none", borderRadius: 4, padding: "10px 20px", fontWeight: 700, cursor: "pointer" }}
