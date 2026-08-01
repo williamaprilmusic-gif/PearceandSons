@@ -19,7 +19,16 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
 serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
-  const TO = "app@pearceandsons.co.za";
+  // TEMPORARY STOPGAP (2026-08-01): FROM is still onboarding@resend.dev,
+  // Resend's sandbox domain — confirmed live against the real API that it
+  // can ONLY deliver to the Resend account's own verified email, never to
+  // an arbitrary address. app@pearceandsons.co.za bounced with a 403
+  // ("You can only send testing emails to your own email address...").
+  // User's explicit choice: send to their own verified address for now
+  // rather than block on domain verification. TO DO once a real sending
+  // domain is verified at resend.com/domains: change FROM to an address
+  // on that domain and TO back to app@pearceandsons.co.za.
+  const TO = "williamaprilmusic@gmail.com";
   const FROM = "TransitOS <onboarding@resend.dev>";
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
