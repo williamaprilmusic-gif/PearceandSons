@@ -3294,6 +3294,38 @@ function scoreDriverForTrip(ds, u, distKm, state, tripAgentIds, trips) {
 const _routeCache = new Map(); // key → { km, ts }
 const ROUTE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
+// ── High-risk-zone routing avoidance ────────────────────────────────────
+// Module-level cache of TomTom avoidAreas rectangles, refreshed whenever
+// state.high_risk_zones changes (see fetchHighRiskZones) — read directly
+// by tomtomRealRouteKm/tomtomBestOrderOnce rather than threaded as an
+// explicit parameter through every call site (buildPickupSequenceTomTom,
+// useSortedDropoffs, tomtomOptimalStopOrder, etc.), matching the
+// _routeCache/_tomtomSortCache module-level-cache pattern already used in
+// this file. Keeps the change contained to the two functions that actually
+// hit the network, instead of touching every already-fixed call chain.
+let _highRiskAvoidRectangles = null;
+// TomTom's avoidAreas.rectangles accepts a maximum of 10 elements — active
+// zones beyond that are silently dropped (with a console warning) rather
+// than causing the whole request to fail.
+function setHighRiskAvoidZones(zones) {
+  const active = (zones || []).filter(z => z.active && z.lat != null && z.lng != null && z.radius_km > 0);
+  if (!active.length) { _highRiskAvoidRectangles = null; return; }
+  if (active.length > 10) console.warn(`[HighRiskZones] ${active.length} active zones, only the first 10 will be avoided (TomTom's avoidAreas limit).`);
+  _highRiskAvoidRectangles = active.slice(0, 10).map(z => {
+    // Simple lat/lng degree approximation (111km/degree latitude,
+    // adjusted for longitude by cos(latitude)) — plenty precise for a
+    // safety-margin bounding box around a radius-based zone; TomTom only
+    // accepts axis-aligned rectangles, not circles, so this is the
+    // necessary conversion, not a shortcut.
+    const latDelta = z.radius_km / 111;
+    const lngDelta = z.radius_km / (111 * Math.cos(z.lat * Math.PI / 180));
+    return {
+      southWestCorner: { latitude: z.lat - latDelta, longitude: z.lng - lngDelta },
+      northEastCorner: { latitude: z.lat + latDelta, longitude: z.lng + lngDelta },
+    };
+  });
+}
+
 function routeCacheKey(coords, departAtEpoch) {
   const waypts = coords.map(c => `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`).join("|");
   // Round to the nearest hour so trips booked at 14:26 and 14:58 for a
@@ -3486,7 +3518,18 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     // Feature 3: avoid unpaved roads.
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}${supportingPtsParam}`;
-    const res = await fetch(url);
+    // High-risk-zone avoidance requires a POST body — avoidAreas is not a
+    // GET query parameter (confirmed against TomTom's docs) — with every
+    // other parameter still on the query string as normal, since a
+    // parameter can't be supplied in both the query string and POST body
+    // at once.
+    const res = _highRiskAvoidRectangles
+      ? await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
+        })
+      : await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
     const metres = data.routes?.[0]?.summary?.lengthInMeters;
@@ -3524,7 +3567,15 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   // computeBestOrder) — just not here.
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
     `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
-  const res = await fetch(url);
+  // High-risk-zone avoidance requires a POST body — see the identical
+  // note/reasoning in tomtomRealRouteKm above.
+  const res = _highRiskAvoidRectangles
+    ? await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
+      })
+    : await fetch(url);
   if (!res.ok) {
     let errBody = "";
     try { errBody = JSON.stringify(await res.json(), null, 2); } catch { errBody = await res.text().catch(() => ""); }
@@ -7236,6 +7287,58 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else await refetch();
       return;
     }
+    case "ADMIN/CREATE_HIGH_RISK_ZONE": {
+      const actingAdminHrzC = await assertAdminPermission(activeUserRef, "manageDispatch");
+      if (!action.label?.trim()) throw new Error("A label/name is required.");
+      if (action.lat == null || action.lng == null) throw new Error("A location is required.");
+      const { data: hrzInserted, error } = await supabase.from("high_risk_zones").insert({
+        label: action.label.trim(), lat: action.lat, lng: action.lng,
+        radiuskm: action.radius_km || 1.0, active: action.active !== false,
+        source: action.source || null, notes: action.notes || null,
+        createdat: nowEpoch(), createdby: actingAdminHrzC.name,
+      }).select("id").single();
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminHrzC.id, actorName: actingAdminHrzC.name, actionType: "ADMIN/CREATE_HIGH_RISK_ZONE",
+        details: `Created high-risk zone: ${action.label.trim()} (id ${hrzInserted?.id})`,
+      });
+      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/UPDATE_HIGH_RISK_ZONE": {
+      const actingAdminHrzU = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const update = {};
+      if (action.label !== undefined) update.label = action.label.trim();
+      if (action.lat !== undefined) update.lat = action.lat;
+      if (action.lng !== undefined) update.lng = action.lng;
+      if (action.radius_km !== undefined) update.radiuskm = action.radius_km;
+      if (action.active !== undefined) update.active = action.active;
+      if (action.notes !== undefined) update.notes = action.notes;
+      const { error } = await supabase.from("high_risk_zones").update(update).eq("id", action.zone_id);
+      if (error) throw error;
+      await logAuditAction({
+        actorId: actingAdminHrzU.id, actorName: actingAdminHrzU.name, actionType: "ADMIN/UPDATE_HIGH_RISK_ZONE",
+        details: `Updated high-risk zone id ${action.zone_id}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
+      });
+      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/DELETE_HIGH_RISK_ZONE": {
+      const actingAdminHrzD = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const { data: hrzRow } = await supabase.from("high_risk_zones").select("id, label").eq("id", action.zone_id).maybeSingle();
+      if (!hrzRow) throw new Error("Zone not found");
+      await logAuditAction({
+        actorId: actingAdminHrzD.id, actorName: actingAdminHrzD.name, actionType: "ADMIN/DELETE_HIGH_RISK_ZONE",
+        details: `Deleted high-risk zone: ${hrzRow.label} (id ${action.zone_id})`,
+      });
+      const { error: delHrzErr } = await supabase.from("high_risk_zones").delete().eq("id", action.zone_id);
+      if (delHrzErr) throw delHrzErr;
+      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
+      else await refetch();
+      return;
+    }
     case "ADMIN/CREATE_CAMPAIGN": {
       const actingAdminCampC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
       if (!action.name?.trim()) throw new Error("Campaign name is required.");
@@ -9246,6 +9349,7 @@ function useAppStore() {
   const [campaigns, setCampaigns] = useState([]); // [{ id, name, active }]
   const [companies, setCompanies] = useState([]); // [{ id, name, active, address }]
   const [tickets, setTickets] = useState([]);
+  const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
 
   const refetch = useCallback(async () => {
     if (!supabase) return;
@@ -9327,6 +9431,22 @@ function useAppStore() {
       status: t.status, admin_id: t.adminid, admin_reply: t.adminreply, role: t.role || ROLE.AGENT,
       created_at: t.createdat, updated_at: t.updatedat, resolved_at: t.resolvedat,
     })));
+  }, []);
+
+  // High-risk zones — admin-editable driver-safety areas, same "own fetch
+  // cycle, not part of the main refetch" reasoning as campaigns/companies/
+  // tickets above. Used both to steer TomTom routing away from these areas
+  // and to alert a driver approaching one in real time.
+  const fetchHighRiskZones = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("high_risk_zones").select("*").order("label");
+    if (error) return;
+    const mapped = (data || []).map(z => ({
+      id: z.id, label: z.label, lat: z.lat, lng: z.lng, radius_km: z.radiuskm,
+      active: z.active, source: z.source, notes: z.notes,
+    }));
+    setHighRiskZones(mapped);
+    setHighRiskAvoidZones(mapped);
   }, []);
 
   useEffect(() => {
@@ -9415,6 +9535,16 @@ function useAppStore() {
     return () => { supabase.removeChannel(channel); };
   }, [fetchTickets]);
 
+  useEffect(() => {
+    if (!supabase) return;
+    fetchHighRiskZones();
+    const channel = supabase
+      .channel("transitos-high-risk-zones")
+      .on("postgres_changes", { event: "*", schema: "public", table: "high_risk_zones" }, fetchHighRiskZones)
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [fetchHighRiskZones]);
+
   const dispatch = useCallback(async (action) => {
     if (useFallback || !supabase) {
       // appReducer never throws — a failed action just comes back with
@@ -9468,7 +9598,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -9480,12 +9610,12 @@ function useAppStore() {
       setSupaError(e.message);
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -10743,7 +10873,7 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
   const myNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -11061,7 +11191,7 @@ function driverPositionChannelName(driverId) {
 const BROADCAST_INTERVAL_MS = 4000;
 const DB_PERSIST_INTERVAL_MS = 25000;
 
-function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null) {
+function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null, highRiskZones = []) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
   const watchIdRef = useRef(null);
@@ -11320,6 +11450,37 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           }
         }
       }
+      // Feature: High-risk-zone proximity alert ────────────────────────────
+      // Warns the driver the moment they come within a flagged high-risk
+      // area's radius, and notifies admins for visibility — fires once per
+      // zone per trip (not on every GPS tick), same trip-scoped "already
+      // fired" tracking as the stationary/deviation alerts above. Not
+      // gated to IN_TRANSIT specifically (unlike the deviation check) —
+      // real physical risk to the driver doesn't care about the app's
+      // internal trip state machine, only whether they're actually there.
+      if (supabase && user?.id && currentTripId && highRiskZones?.length) {
+        if (!geofenceTriggeredRef.current.highRiskFired) geofenceTriggeredRef.current.highRiskFired = {};
+        const hrFired = geofenceTriggeredRef.current.highRiskFired;
+        for (const zone of highRiskZones) {
+          if (!zone.active || zone.lat == null || zone.lng == null || !zone.radius_km) continue;
+          const fireKey = `${currentTripId}:${zone.id}`;
+          if (hrFired[fireKey]) continue;
+          const distKm = haversineKm(latitude, longitude, zone.lat, zone.lng);
+          if (distKm <= zone.radius_km) {
+            hrFired[fireKey] = true;
+            insertNotification({
+              type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
+              message: `⚠ You are entering a high-risk area (${zone.label}) — please stay alert and watch your surroundings.`,
+              trip_id: currentTripId, ts: Date.now(), read: false,
+            }).catch(() => {});
+            insertNotification({
+              type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
+              message: `⚠ Driver ${user.name || user.id} is entering a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
+              trip_id: currentTripId, ts: Date.now(), read: false,
+            }).catch(() => {});
+          }
+        }
+      }
       // Slow path: persist to the database roughly every 25s — far less
       // frequent than before, since the database write is the expensive
       // part (two REST calls) and live updates no longer depend on it.
@@ -11366,7 +11527,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       watchIdRef.current = null;
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
     };
-  }, [isLoggedIn, user?.id, currentTripId, activeTrips, dispatch]);
+  }, [isLoggedIn, user?.id, currentTripId, activeTrips, dispatch, highRiskZones]);
 
   return { tracking, lastError };
 }
@@ -14037,7 +14198,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // position logging context; falls back to the first active trip if
   // none are in transit yet (still assigned/confirmed but not started).
   const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
-  const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch);
+  const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch, state.high_risk_zones);
 
   return (
     <div className="screen">
@@ -17634,6 +17795,162 @@ function CompanyManagerPanel({ state, dispatch, onClose }) {
   );
 }
 
+// Driver-safety routing avoidance + proximity alerts. Center-point +
+// radius (not raw polygons) so this form stays a simple "search an
+// address, set a radius" — see setHighRiskAvoidZones for how this gets
+// converted to TomTom's rectangle-based avoidAreas format.
+function HighRiskZonesPanel({ state, dispatch, onClose }) {
+  const emptyForm = { label: "", street: "", area: "", coord: null, radiusKm: "1.0" };
+  const [newZone, setNewZone] = useState(emptyForm);
+  const [adding, setAdding] = useState(false);
+  const [editingId, setEditingId] = useState(null);
+  const [editZone, setEditZone] = useState(emptyForm);
+
+  const [zoneError, setZoneError] = useState(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
+  const [deletingId, setDeletingId] = useState(null);
+
+  const addZone = async () => {
+    if (!newZone.label.trim()) return;
+    if (!newZone.coord) {
+      setZoneError("Pick the location from the search results (not just typed) before adding a zone.");
+      return;
+    }
+    const radiusKm = parseFloat(newZone.radiusKm);
+    if (!(radiusKm > 0)) {
+      setZoneError("Radius must be a positive number of km.");
+      return;
+    }
+    setAdding(true);
+    setZoneError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/CREATE_HIGH_RISK_ZONE", label: newZone.label.trim(),
+        lat: newZone.coord.lat, lng: newZone.coord.lng, radius_km: radiusKm,
+        active: true, source: "Manually added via admin panel",
+      });
+      setNewZone(emptyForm);
+    } catch (e) {
+      setZoneError(e.message || "Couldn't add the zone — please try again.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const startEdit = (z) => {
+    setEditingId(z.id);
+    setEditZone({ label: z.label, street: z.label, area: "", coord: { lat: z.lat, lng: z.lng }, radiusKm: String(z.radius_km) });
+  };
+
+  const saveEdit = async (id) => {
+    if (!editZone.label.trim()) return;
+    const radiusKm = parseFloat(editZone.radiusKm);
+    if (!(radiusKm > 0)) { setZoneError("Radius must be a positive number of km."); return; }
+    setZoneError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/UPDATE_HIGH_RISK_ZONE", zone_id: id, label: editZone.label.trim(),
+        lat: editZone.coord?.lat, lng: editZone.coord?.lng, radius_km: radiusKm,
+      });
+      setEditingId(null);
+    } catch (e) {
+      setZoneError(e.message || "Couldn't update the zone — please try again.");
+    }
+  };
+
+  const toggleActive = async (z) => {
+    setZoneError(null);
+    try {
+      await dispatch({ type: "ADMIN/UPDATE_HIGH_RISK_ZONE", zone_id: z.id, active: !z.active });
+    } catch (e) {
+      setZoneError(e.message || "Couldn't update the zone — please try again.");
+    }
+  };
+
+  const deleteZone = async (z) => {
+    setDeletingId(z.id);
+    setZoneError(null);
+    try {
+      await dispatch({ type: "ADMIN/DELETE_HIGH_RISK_ZONE", zone_id: z.id });
+      setConfirmingDeleteId(null);
+    } catch (e) {
+      setZoneError(e.message || "Couldn't delete the zone — please try again.");
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  const LocationField = ({ value, onChange }) => (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>CENTER LOCATION</span>
+      <StreetInput value={value.street} placeholder="Search an address or area…"
+        preConfirmed={value.coord ? { label: value.street, area: value.area, lat: value.coord.lat, lng: value.coord.lng } : null}
+        onChange={({ street, area, coord, confirmed }) => onChange({ ...value, street, area, coord: confirmed ? coord : value.coord })} />
+      <span style={{ fontSize: 8, color: COLORS.dim }}>Pick from the search results so the coordinates are set, not just typed text.</span>
+    </div>
+  );
+
+  return (
+    <Card>
+      <SectionHeader label="High-Risk Zones" />
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Active zones are avoided when TomTom computes routes, and a driver gets an in-app alert ("watch your surroundings")
+        the moment their live GPS comes within the set radius. Inactive zones have no effect — use that to review a
+        candidate area before it actually changes driver routing/alerts.
+      </div>
+      <TextField label="Zone Name" value={newZone.label} onChange={e => setNewZone(f => ({ ...f, label: e.target.value }))} placeholder="e.g. Area name" />
+      <LocationField value={newZone} onChange={setNewZone} />
+      <TextField label="Radius (km)" value={newZone.radiusKm} onChange={e => setNewZone(f => ({ ...f, radiusKm: e.target.value }))} placeholder="1.0" />
+      <Button title={adding ? "ADDING…" : "+ ADD ZONE"} variant="amber" size="sm" onClick={addZone} disabled={adding || !newZone.label.trim()} />
+      {zoneError && <span style={{ fontSize: 10, color: COLORS.red }}>{zoneError}</span>}
+
+      {(state.high_risk_zones || []).length === 0 ? (
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>No high-risk zones yet — add one above.</span>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {state.high_risk_zones.map(z => (
+            <div key={z.id} style={{ display: "flex", flexDirection: "column", gap: 8, padding: 10, border: `1px solid ${COLORS.wire}`, borderRadius: 4, opacity: z.active ? 1 : .5 }}>
+              {editingId === z.id ? (
+                <>
+                  <input className="inp" value={editZone.label} onChange={e => setEditZone(f => ({ ...f, label: e.target.value }))} autoFocus />
+                  <LocationField value={editZone} onChange={setEditZone} />
+                  <TextField label="Radius (km)" value={editZone.radiusKm} onChange={e => setEditZone(f => ({ ...f, radiusKm: e.target.value }))} />
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setEditingId(null)} />
+                    <Button title="SAVE" variant="amber" size="sm" style={{ flex: 1 }} onClick={() => saveEdit(z.id)} />
+                  </div>
+                </>
+              ) : confirmingDeleteId === z.id ? (
+                <>
+                  <span style={{ fontSize: 10, color: COLORS.red }}>Delete "{z.label}"?</span>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDeleteId(null)} />
+                    <Button title={deletingId === z.id ? "…" : "CONFIRM"} variant="danger" size="sm" style={{ flex: 1 }} onClick={() => deleteZone(z)} disabled={deletingId === z.id} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ flex: 1, fontSize: 11, fontWeight: 700 }}>{z.label}</span>
+                    {!z.active && <span style={{ fontSize: 8, color: COLORS.ghost, border: `1px solid ${COLORS.wire}`, borderRadius: 2, padding: "2px 5px" }}>INACTIVE</span>}
+                    <Button title="✎" variant="ghost" size="sm" onClick={() => startEdit(z)} />
+                    <Button title={z.active ? "DEACTIVATE" : "ACTIVATE"} variant="ghost" size="sm" onClick={() => toggleActive(z)} />
+                    <Button title="🗑" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(z.id)} />
+                  </div>
+                  <div style={{ fontSize: 9, color: COLORS.teal }}>{z.radius_km.toFixed(1)} km radius · {z.lat.toFixed(4)}, {z.lng.toFixed(4)}</div>
+                  {z.source && <div style={{ fontSize: 8, color: COLORS.dim }}>Source: {z.source}</div>}
+                  {z.notes && <div style={{ fontSize: 8, color: COLORS.dim }}>{z.notes}</div>}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <Button title="CLOSE" variant="ghost" onClick={onClose} />
+    </Card>
+  );
+}
+
 function CampaignManagerPanel({ state, dispatch, onClose }) {
   const [newName, setNewName] = useState("");
   const [adding, setAdding] = useState(false);
@@ -17834,6 +18151,8 @@ function AdminUsers({ state, dispatch, user }) {
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [showCampaigns, setShowCampaigns] = useState(false);
   const [showCompanies, setShowCompanies] = useState(false);
+  const [showHighRiskZones, setShowHighRiskZones] = useState(false);
+  const closeAllPanels = () => { setShow(false); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setShowHighRiskZones(false); setEditingId(null); setEditModeId(null); };
 
   return (
     <div className="pad">
@@ -17841,14 +18160,15 @@ function AdminUsers({ state, dispatch, user }) {
         <SectionHeader label="User Registry" />
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           {hasAdminPermission(user, "exportCsv") && <Button title="⬇ EXPORT CSV" variant="ghost" size="sm" onClick={() => downloadCsv(usersToCsv(state.users, state.driver_status), `users_${new Date().toISOString().slice(0, 10)}.csv`)} />}
-          {canCreateAnything && <Button title="🏢 COMPANIES" variant="ghost" size="sm" onClick={() => { setShowCompanies(s => !s); setShow(false); setShowBulkImport(false); setShowCampaigns(false); setEditingId(null); setEditModeId(null); }} />}
-          {canCreateAnything && <Button title="🏷 CAMPAIGNS" variant="ghost" size="sm" onClick={() => { setShowCampaigns(s => !s); setShow(false); setShowBulkImport(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
-          {canCreateAnything && <Button title="⬆ BULK IMPORT" variant="ghost" size="sm" onClick={() => { setShowBulkImport(s => !s); setShow(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
-          {canCreateAnything && <Button title="+ CREATE USER" variant="amber" size="sm" onClick={() => { setShow(s => !s); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />}
+          {canCreateAnything && <Button title="🏢 COMPANIES" variant="ghost" size="sm" onClick={() => { const next = !showCompanies; closeAllPanels(); setShowCompanies(next); }} />}
+          {canCreateAnything && <Button title="🏷 CAMPAIGNS" variant="ghost" size="sm" onClick={() => { const next = !showCampaigns; closeAllPanels(); setShowCampaigns(next); }} />}
+          {canCreateAnything && <Button title="⚠ RISK ZONES" variant="ghost" size="sm" onClick={() => { const next = !showHighRiskZones; closeAllPanels(); setShowHighRiskZones(next); }} />}
+          {canCreateAnything && <Button title="⬆ BULK IMPORT" variant="ghost" size="sm" onClick={() => { const next = !showBulkImport; closeAllPanels(); setShowBulkImport(next); }} />}
+          {canCreateAnything && <Button title="+ CREATE USER" variant="amber" size="sm" onClick={() => { const next = !show; closeAllPanels(); setShow(next); }} />}
           {canCreateAnything && (
             selectMode
               ? <Button title="✕ CANCEL SELECT" variant="ghost" size="sm" onClick={exitSelectMode} />
-              : <Button title="☑ SELECT" variant="ghost" size="sm" onClick={() => { setSelectMode(true); setShow(false); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); }} />
+              : <Button title="☑ SELECT" variant="ghost" size="sm" onClick={() => { closeAllPanels(); setSelectMode(true); }} />
           )}
         </div>
       </div>
@@ -17857,6 +18177,9 @@ function AdminUsers({ state, dispatch, user }) {
       )}
       {showCampaigns && canCreateAnything && (
         <CampaignManagerPanel state={state} dispatch={dispatch} onClose={() => setShowCampaigns(false)} />
+      )}
+      {showHighRiskZones && canCreateAnything && (
+        <HighRiskZonesPanel state={state} dispatch={dispatch} onClose={() => setShowHighRiskZones(false)} />
       )}
       {showBulkImport && canCreateAnything && (
         <BulkUserImportPanel state={state} dispatch={dispatch} onClose={() => setShowBulkImport(false)} onDone={() => setShowBulkImport(false)} />
@@ -18401,7 +18724,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   const unread = adminNotifsAll.filter(n => !n.read).length;
   const unreadInView = adminNotifs.filter(n => !n.read).length;
   const allSelected = adminNotifs.length > 0 && adminNotifs.every(n => selectedNotifIds.has(n.id));
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", DISTANCE_SURCHARGE: "💰", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
