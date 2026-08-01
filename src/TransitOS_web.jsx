@@ -5832,7 +5832,7 @@ function userRowToApp(row) {
   return user;
 }
 function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
+  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_away: row.isaway || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
 }
 function tripRowToApp(row, chatByTrip) {
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
@@ -9795,9 +9795,17 @@ function GpsBlock({ coord }) {
   );
 }
 
-function DriverAvatar({ name, size = 42, isOnline }) {
+function DriverAvatar({ name, size = 42, isOnline, isAway = false }) {
   const init = (name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
   const dotSize = Math.max(8, Math.round(size * 0.28));
+  // Online only means "actively in the app" now — away (logged in, but
+  // the app is backgrounded/not the focused tab) is a distinct middle
+  // state, not lumped in with either fully online or fully offline.
+  // Deliberately has no bearing on whether this person's live position
+  // shows on the map elsewhere — that's independent, position-driven
+  // logic, not gated on this presence status at all.
+  const presenceLabel = !isOnline ? "Offline" : isAway ? "Away" : "Online";
+  const presenceColor = !isOnline ? COLORS.ghost : isAway ? COLORS.amber : COLORS.green;
   return (
     <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
       <div className="driver-av" style={{ width: size, height: size, fontSize: size * 0.38, borderRadius: size * 0.07 }}>
@@ -9805,10 +9813,10 @@ function DriverAvatar({ name, size = 42, isOnline }) {
       </div>
       {isOnline != null && (
         <span
-          title={isOnline ? "Online" : "Offline"}
+          title={presenceLabel}
           style={{
             position: "absolute", bottom: -1, right: -1, width: dotSize, height: dotSize, borderRadius: dotSize / 2,
-            background: isOnline ? COLORS.green : COLORS.ghost,
+            background: presenceColor,
             border: `2px solid ${COLORS.ink}`, boxSizing: "border-box",
           }}
         />
@@ -11340,6 +11348,41 @@ function driverPositionChannelName(driverId) {
 //     served live via broadcast anyway.
 const BROADCAST_INTERVAL_MS = 4000;
 const DB_PERSIST_INTERVAL_MS = 25000;
+
+// ── Away detection ──────────────────────────────────────────────────────
+// Tracks whether a logged-in driver's app is currently backgrounded/not
+// the focused tab — distinct from is_online (has an active login
+// session at all). Per explicit requirement: a driver only shows
+// "online" while actively in the app; if the app is open but not in the
+// foreground, they show "away" instead — but their live GPS position
+// must keep showing on the admin map regardless, so this is
+// DELIBERATELY independent of useDriverLocationTracking (not gated on
+// visibility at all, not touched here) rather than pausing/resuming
+// tracking based on presence.
+function useAwayDetection(userId, isLoggedIn) {
+  useEffect(() => {
+    if (!isLoggedIn || !userId || !supabase) return;
+    const setAway = (away) => {
+      supabase.from("driver_status").update({ isaway: away, updatedat: new Date().toISOString() })
+        .eq("driverid", userId).then(() => {}, () => {}); // best-effort — a failed presence update isn't worth surfacing to the driver
+    };
+    const onVisibilityChange = () => setAway(document.visibilityState !== "visible");
+    // Set the correct initial state immediately — a driver who logs in
+    // while already backgrounded (rare, but possible) shouldn't show as
+    // falsely "online" until the next visibility change.
+    setAway(document.visibilityState !== "visible");
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      // Clear away status on unmount (logout/navigating away from the
+      // driver app) — is_online itself already gets reset by
+      // AUTH/LOGOUT, so this is just defensive cleanup against a stale
+      // isaway:true row confusing the NEXT login, not the primary
+      // offline signal.
+      setAway(false);
+    };
+  }, [userId, isLoggedIn]);
+}
 
 function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null, highRiskZones = []) {
   const [tracking, setTracking] = useState(false);
@@ -14393,6 +14436,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // none are in transit yet (still assigned/confirmed but not started).
   const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
   const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch, state.high_risk_zones);
+  useAwayDetection(user?.id, !!user);
 
   return (
     <div className="screen">
@@ -16737,7 +16781,7 @@ function AdminLiveMap({ state, user }) {
     // catches a driver whose tab was closed or lost signal, not just normal
     // jitter between updates.
     const stale = pos ? (Date.now() - new Date(pos.updated_at).getTime()) > 30000 : true;
-    return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale, is_online: ds.is_online };
+    return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale, is_online: ds.is_online, is_away: ds.is_away };
   });
 
   const withPosition = driverPoints.filter(d => d.pos);
@@ -16981,7 +17025,14 @@ function AdminLiveMap({ state, user }) {
           <div style={{ flex: 1 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <span style={{ fontSize: 11, fontWeight: 700 }}>{d.name}</span>
-              {d.is_online && <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, letterSpacing: .5, border: `1px solid ${COLORS.green}`, borderRadius: 2, padding: "1px 4px" }}>ONLINE</span>}
+              {/* Position/state dot above is unaffected by online/away — a driver
+                  who's "away" (app backgrounded) still shows their real live
+                  position and state normally; only this presence pill changes. */}
+              {d.is_online && (
+                d.is_away
+                  ? <span style={{ fontSize: 8, color: COLORS.amber, fontWeight: 700, letterSpacing: .5, border: `1px solid ${COLORS.amber}`, borderRadius: 2, padding: "1px 4px" }}>AWAY</span>
+                  : <span style={{ fontSize: 8, color: COLORS.green, fontWeight: 700, letterSpacing: .5, border: `1px solid ${COLORS.green}`, borderRadius: 2, padding: "1px 4px" }}>ONLINE</span>
+              )}
             </div>
             <div style={{ fontSize: 9, color: COLORS.ghost }}>{d.pos ? timeSinceLabel(d.pos.updated_at) : "never reported"}</div>
           </div>
@@ -17203,10 +17254,13 @@ function AdminDrivers({ state, user, dispatch }) {
                 <div style={{ flex: 1 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{driverUser?.name}</span>
-                    <span style={{ width: 7, height: 7, borderRadius: 4, background: ds.is_online ? COLORS.green : COLORS.ghost, flexShrink: 0 }} title={ds.is_online ? "Online" : "Offline"} />
+                    <span style={{ width: 7, height: 7, borderRadius: 4, background: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, flexShrink: 0 }} title={!ds.is_online ? "Offline" : ds.is_away ? "Away" : "Online"} />
                   </div>
                   <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
-                  <div style={{ fontSize: 9, color: ds.is_online ? COLORS.green : COLORS.ghost, marginTop: 2, fontWeight: 700, letterSpacing: .5 }}>{ds.is_online ? "● ONLINE" : "○ OFFLINE"}</div>
+                  {/* Online now means "actively in the app," away means "logged in
+                      but app backgrounded" — live position elsewhere is unaffected
+                      by either, only this presence label. */}
+                  <div style={{ fontSize: 9, color: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, marginTop: 2, fontWeight: 700, letterSpacing: .5 }}>{!ds.is_online ? "○ OFFLINE" : ds.is_away ? "◐ AWAY" : "● ONLINE"}</div>
                 </div>
               </div>
             </Card>
@@ -17232,8 +17286,8 @@ function AdminDrivers({ state, user, dispatch }) {
               <div style={{ flex: 1 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                   <span style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>{driverUser?.name}</span>
-                  <span style={{ width: 7, height: 7, borderRadius: 4, background: ds.is_online ? COLORS.green : COLORS.ghost, flexShrink: 0 }} title={ds.is_online ? "Online" : "Offline"} />
-                  <span style={{ fontSize: 9, color: ds.is_online ? COLORS.green : COLORS.ghost, fontWeight: 700, letterSpacing: .5 }}>{ds.is_online ? "ONLINE" : "OFFLINE"}</span>
+                  <span style={{ width: 7, height: 7, borderRadius: 4, background: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, flexShrink: 0 }} title={!ds.is_online ? "Offline" : ds.is_away ? "Away" : "Online"} />
+                  <span style={{ fontSize: 9, color: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, fontWeight: 700, letterSpacing: .5 }}>{!ds.is_online ? "OFFLINE" : ds.is_away ? "AWAY" : "ONLINE"}</span>
                 </div>
                 <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
                 <div style={{ fontSize: 10, color: COLORS.ghost }}>{ds.phone}</div>
