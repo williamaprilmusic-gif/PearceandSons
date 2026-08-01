@@ -11341,7 +11341,7 @@ function useWebRTCCall(currentUser) {
               existing.forEach(n => n.close());
               registration.showNotification(`Incoming call — ${payload.fromName}`, {
                 body: "Tap to open Pearce & Sons and answer.",
-                icon: "/icons/icon-192.png",
+                icon: "/icon-192.png",
                 tag: payload.callChannelName,
                 requireInteraction: true,
                 data: { callChannelName: payload.callChannelName, notifType: "INCOMING_CALL" },
@@ -11444,7 +11444,19 @@ function useWebRTCCall(currentUser) {
       let ringAttempts = 0;
       const reRingInterval = setInterval(async () => {
         ringAttempts++;
-        if (ringAttempts >= 7) { clearInterval(reRingInterval); return; } // ~30s total
+        if (ringAttempts >= 7) {
+          // ~30s total with no answer — this used to just stop re-ringing
+          // silently, leaving the caller's UI stuck on "Calling…" forever
+          // (nothing else transitions callState away from RINGING_OUTGOING).
+          // Tear the call down for real, same as a manual hang-up, so the
+          // caller sees "No answer" instead of a call that looks alive but
+          // is actually abandoned.
+          clearInterval(reRingInterval);
+          hangUp(true);
+          setErrorMsg("No answer");
+          setCallState(CALL_STATE.FAILED);
+          return;
+        }
         try {
           const reInbox = supabase.channel(callChannelName(targetUser.id));
           await new Promise((resolve) => reInbox.subscribe((status) => { if (status === "SUBSCRIBED") resolve(); }));
