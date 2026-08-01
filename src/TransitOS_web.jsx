@@ -19993,15 +19993,15 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
-      {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={state} dispatch={dispatch} />}
+      {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
-      {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={state} dispatch={dispatch} user={user} />}
+      {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
-      {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={state} dispatch={dispatch} user={user} call={call} />}
+      {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={scopedState} dispatch={dispatch} user={user} call={call} />}
       {tab === "notifs" && <AdminNotifs state={scopedState} user={user} dispatch={dispatch} onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }} />}
     </div>
   );
