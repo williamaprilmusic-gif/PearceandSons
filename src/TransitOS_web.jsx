@@ -15305,18 +15305,26 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   }, []);
   // Progressive reveal for week-trip series: a trip that's part of a
   // week group (week_group_id set) and isn't day 1 stays hidden from the
-  // driver's dashboard until the PRIOR day in that same group has been
-  // completed. This is what makes "next day's trip pops up once today's
-  // is done" actually work — without this, all of a week booking's daily
-  // trips would be visible (and bookable for navigation) at once, which
-  // isn't how a driver should plan a multi-day series.
+  // driver's dashboard until the PRIOR day in that same group is DONE —
+  // completed OR cancelled. This is what makes "next day's trip pops up
+  // once today's is done" actually work — without this, all of a week
+  // booking's daily trips would be visible (and bookable for navigation)
+  // at once, which isn't how a driver should plan a multi-day series.
   const myTrips = allMyTrips.filter(t => {
     if (!t.week_group_id || !t.week_day_num || t.week_day_num <= 1) return true;
     const priorDay = allMyTrips.find(other => String(other.week_group_id) === String(t.week_group_id) && other.week_day_num === t.week_day_num - 1);
     // If the prior day's trip isn't even in this driver's list yet (e.g.
     // assigned to a different driver, or not yet assigned at all), don't
     // reveal this one either — the whole point is sequential visibility.
-    return priorDay ? priorDay.state === TRIP_STATE.ARCHIVED_COMPLETED : false;
+    // Cancellation counts as "done" here too, not just completion — each
+    // day of a week booking can be independently cancelled (confirmed:
+    // no cancel path ever touches sibling week_group_id rows), and that's
+    // a real, expected scenario (a sick day mid-week, say). Gating only
+    // on ARCHIVED_COMPLETED meant a single cancelled day permanently
+    // hid every later day of that week's series from the driver forever
+    // — a cancelled trip never transitions to ARCHIVED_COMPLETED, so the
+    // gate could never open.
+    return priorDay ? [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state) : false;
   });
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   // Seats used = sum of passengers across active trips, not trip-record
