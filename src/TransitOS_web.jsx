@@ -6346,7 +6346,18 @@ function ViewerPortal({ state, dispatch, user }) {
   // the same hasAdminPermission checks used everywhere else), it just
   // was never actually reachable from here before.
   const [viewerTab, setViewerTab] = React.useState("portal");
-  // Scope state to this viewer's companies (same logic as AdminApp scopedState)
+  // Scope state to this viewer's companies (same logic as AdminApp scopedState
+  // — this is a SEPARATE, duplicate implementation, not a shared one, so a
+  // fix to AdminApp's copy (e.g. driver_status scoping, added commit
+  // 760494e) does NOT automatically apply here too. That gap mattered more
+  // than it first looked: VIEWER admins are routed straight to THIS
+  // component and never reach AdminApp at all, so this copy — not
+  // AdminApp's — is the one actually live for every Viewer session. Kept in
+  // sync with AdminApp's scopedState for the same defense-in-depth reason;
+  // not currently exploitable (ClientPortalApp never reads driver_status,
+  // and AdminProfileSearch's driver-profile path is gated behind
+  // viewDriverProfiles, false for VIEWER) but there's no reason to leave
+  // one of the two copies behind.
   const scopedState = React.useMemo(() => {
     const companyIds = user.scoped_company_ids || [];
     if (!companyIds.length) return state; // no scope = see all (shouldn't happen for VIEWER)
@@ -6357,6 +6368,7 @@ function ViewerPortal({ state, dispatch, user }) {
       trips: scopeTripsToCompany(state.trips, state.users, companyIds),
       tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, companyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, companyIds),
+      driver_status: scopeDriverStatusToCompany(state.driver_status, state.trips, state.users, companyIds),
     };
   }, [state, user.scoped_company_ids]);
 
