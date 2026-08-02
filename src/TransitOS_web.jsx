@@ -323,6 +323,24 @@ function scopeNotificationsToCompany(notifications, trips, users, companyIds) {
   return notifications.filter(n => !n.trip_id || scopedTripIds.has(n.trip_id));
 }
 
+// driver_status has no company/branch field of its own — same
+// relevant-driver derivation scopeUsersToCompany uses (a driver is
+// "relevant" if they've served a scoped agent on some trip). Not
+// currently exploitable (only VIEWER gets a restricting companyIds list,
+// and VIEWER is routed to ViewerPortal, never AdminApp/AdminLiveMap) but
+// kept consistent with every other scoped collection so scopedState is a
+// complete, trustworthy scoping boundary rather than one with a
+// driver_status-shaped hole waiting for a future scoped tier to fall into.
+function scopeDriverStatusToCompany(driverStatus, trips, users, companyIds) {
+  if (!companyIds?.length) return driverStatus;
+  const idSet = new Set(companyIds);
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  const relevantDriverIds = new Set(
+    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+  );
+  return driverStatus.filter(ds => relevantDriverIds.has(ds.driver_id));
+}
+
 const TRIP_STATE = Object.freeze({
   UNASSIGNED_BOOKING: "UNASSIGNED_BOOKING",
   ASSIGNED:           "ASSIGNED",
@@ -20271,6 +20289,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       trips: scopeTripsToCompany(state.trips, state.users, adminCompanyIds),
       tickets: scopeTicketsToCompany(state.tickets, state.users, state.trips, adminCompanyIds),
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, adminCompanyIds),
+      driver_status: scopeDriverStatusToCompany(state.driver_status, state.trips, state.users, adminCompanyIds),
     };
   }, [state, user]);
 
