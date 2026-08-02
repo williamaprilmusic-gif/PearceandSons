@@ -11496,7 +11496,8 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   });
 
   const send = async () => {
-    if (!text.trim()) return;
+    if (!text.trim() || sending) return;
+    setSending(true);
     try {
       await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: chatUser.id, sender_name: chatUser.name, sender_role: chatUser.role, recipient_id: driverUser?.id ?? null, text: text.trim() });
       setText("");
@@ -11505,6 +11506,8 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
       // just hit send again — no error banner for a single dropped
       // message in a low-stakes, frequently-retried action like chat.
       console.warn("[Chat] send failed:", e.message);
+    } finally {
+      setSending(false);
     }
   };
 
@@ -11648,8 +11651,8 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
             })}
           </div>
           <div style={{ display: "flex", gap: 7 }}>
-            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" />
-            <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim()} />
+            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && !sending && send()} placeholder="Type a message…" disabled={sending} />
+            <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim() || sending} />
           </div>
         </Card>
       )}
@@ -13728,6 +13731,15 @@ function DmThreadModal({ currentUser, counterpart, dispatch, onClose, dmVersion 
 
 function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
   const [text, setText] = useState("");
+  // Real, verified production bug (live-queried 2026-08-02): 3 identical
+  // messages sent ~1s apart on trip 206 — this send() had no guard against
+  // being invoked again while a previous call was still in flight (a held
+  // Enter key auto-repeats, or an impatient double-tap on Send before the
+  // input visibly clears over a slow connection). The DM reply/send
+  // modals elsewhere in this file already have this exact `sending` guard
+  // — this one and AgentTripDetail's equivalent trip-chat send() were
+  // missing it.
+  const [sending, setSending] = useState(false);
   const allMsgs = trip.chat_messages || [];
   // A message belongs to THIS specific conversation only if it was
   // exchanged between exactly these two people — checked both ways
@@ -13750,12 +13762,15 @@ function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
   });
 
   const send = async () => {
-    if (!text.trim()) return;
+    if (!text.trim() || sending) return;
+    setSending(true);
     try {
       await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: currentUser.id, sender_name: currentUser.name, sender_role: currentUser.role, recipient_id: otherUser.id, text: text.trim() });
       setText("");
     } catch (e) {
       console.warn("[Chat] send failed:", e.message);
+    } finally {
+      setSending(false);
     }
   };
 
@@ -13782,8 +13797,8 @@ function TripChatModal({ trip, currentUser, otherUser, dispatch, onClose }) {
           })}
         </div>
         <div style={{ display: "flex", gap: 7, padding: 14, borderTop: `1px solid ${COLORS.wire}` }}>
-          <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" autoFocus />
-          <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim()} />
+          <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && !sending && send()} placeholder="Type a message…" autoFocus disabled={sending} />
+          <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={!text.trim() || sending} />
         </div>
       </div>
     </div>
@@ -17038,6 +17053,17 @@ function AdminProfileSearch({ state, user, dispatch }) {
 
   const exceptionCount = allTrips.filter(t => t.is_exception).length;
   const completedCount = allTrips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
+  // On-screen totals — per explicit request ("the finance admin side
+  // still doesn't capture the total of the trip per agent and also the
+  // total trip cost"). These figures already existed, correctly computed,
+  // inside the CSV's trailing TOTAL row (tripFeeAmount/tripDriverPayment,
+  // same as exportTripsToCsv) — but were never actually shown anywhere on
+  // screen, only reachable by downloading and opening the export. De-dupe
+  // by trip_id first (same convention the CSV total row already uses) so
+  // a multi-passenger trip's fee/pay isn't counted once per passenger row.
+  const uniqueTripsForTotal = Array.from(new Map(allTrips.map(t => [t.trip_id, t])).values());
+  const totalTripFee = state.fee_rates ? uniqueTripsForTotal.reduce((sum, t) => sum + (tripFeeAmount(t, state.fee_rates) || 0), 0) : null;
+  const totalDriverPay = state.fee_rates ? uniqueTripsForTotal.reduce((sum, t) => sum + (tripDriverPayment(t, state.fee_rates)?.total || 0), 0) : null;
 
   return (
     <div className="pad">
@@ -17087,6 +17113,12 @@ function AdminProfileSearch({ state, user, dispatch }) {
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL BOOKINGS: </span><span style={{ fontWeight: 700 }}>{allTrips.length}</span></span>
               <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>COMPLETED: </span><span style={{ fontWeight: 700, color: COLORS.green }}>{completedCount}</span></span>
               {exceptionCount > 0 && <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>EXCEPTIONS: </span><span style={{ fontWeight: 700, color: COLORS.red }}>{exceptionCount}</span></span>}
+              {hasAdminPermission(user, "viewTripFees") && totalTripFee != null && (
+                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL TRIP COST: </span><span style={{ fontWeight: 700, color: COLORS.amber }}>R{totalTripFee.toFixed(2)}</span></span>
+              )}
+              {hasAdminPermission(user, "viewTripFees") && totalDriverPay != null && (
+                <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>DRIVER PAY TOTAL: </span><span style={{ fontWeight: 700, color: COLORS.teal }}>R{totalDriverPay.toFixed(2)}</span></span>
+              )}
               {allTrips.length > 0 && <DisputeAdminPanel trip={allTrips[0]} dispatch={dispatch} users={state.users} />}
               {allTrips.length > 0 && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(allTrips[0].state) && (
                 <button onClick={() => copyShareLink(allTrips[0], dispatch)}
@@ -20113,7 +20145,7 @@ function AdminContacts({ state, dispatch, user, call }) {
   }, [state._dmVersion, selectedId, user.id]);
 
   const send = async () => {
-    if (!text.trim() || !selected) return;
+    if (!text.trim() || !selected || sending) return;
     setSending(true);
     try {
       await dispatch({ type: "DM/SEND", sender_id: user.id, sender_name: user.name, sender_role: ROLE.ADMIN, recipient_id: selected.id, message: text.trim() });
@@ -20223,7 +20255,7 @@ function AdminContacts({ state, dispatch, user, call }) {
             })}
           </div>
           <div style={{ display: "flex", gap: 7, marginTop: 8 }}>
-            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && send()} placeholder="Type a message…" />
+            <input className="inp" style={{ flex: 1 }} value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === "Enter" && !sending && send()} placeholder="Type a message…" disabled={sending} />
             <Button title="SEND" variant="amber" size="sm" onClick={send} disabled={sending || !text.trim()} />
           </div>
         </Card>
