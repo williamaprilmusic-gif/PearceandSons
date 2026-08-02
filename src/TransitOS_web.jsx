@@ -9914,6 +9914,14 @@ function useAppStore() {
   const [supaState, setSupaState] = useState(null);
   const [supaError, setSupaError] = useState(null);
   const [useFallback, setUseFallback] = useState(!supabase);
+  // refetch (below) is a useCallback with an EMPTY dep array — it closes
+  // over whatever supaState was on its first render (permanently null),
+  // so it can't read the CURRENT value directly. This ref is kept in
+  // sync every render so refetch's catch block can tell "never
+  // successfully loaded real data at all" apart from "already have real
+  // data, this one refetch attempt just failed."
+  const supaStateRef = useRef(null);
+  useEffect(() => { supaStateRef.current = supaState; }, [supaState]);
   const [dmVersion, setDmVersion] = useState(0); // incremented on every direct_messages change
   // Rehydrated from localStorage so a page refresh doesn't log everyone
   // out — the initial refetch below then loads data for this user. An id
@@ -9944,12 +9952,37 @@ function useAppStore() {
       setSupaState({ ...fresh, active_user_id: activeUserRef.current });
       setSupaError(null);
     } catch (e) {
-      // Supabase configured but unreachable (bad credentials, network, RLS
-      // misconfigured, schema not migrated yet) — fall back to the in-memory
-      // reducer so the app is still usable/demoable.
-      console.warn("[Supabase] falling back to in-memory store:", e.message);
-      setUseFallback(true);
       setSupaError(e.message);
+      // Only fall back to the in-memory/demo reducer if we've NEVER
+      // successfully loaded real data at all — that genuinely looks like
+      // Supabase is unreachable/misconfigured (bad credentials, RLS,
+      // schema not migrated yet), matching this fallback's original
+      // intent ("so the app is still usable/demoable").
+      //
+      // Critical distinction from a MID-SESSION refetch failure: this
+      // same refetch is wired as the direct realtime callback for EVERY
+      // change on trips/driver_status/messages/notifications/users (five
+      // of the highest-frequency tables in the app) — see the
+      // postgres_changes subscriptions below. A single dropped request
+      // during patchy signal (this app's own established normal
+      // operating condition for a driver in a moving vehicle, not a rare
+      // edge case) used to permanently and SILENTLY flip useFallback to
+      // true for the rest of the session, with no code anywhere ever
+      // resetting it back — every subsequent dispatch() call (bookings,
+      // dispatch, chat, SOS, everything) would then route to the local,
+      // unpersisted, not-synced-to-any-server reducer instead of the
+      // real backend, invisible to every other device/user, with no
+      // visible indication anything had changed. Once real data has
+      // already loaded once, a later failed refetch instead just leaves
+      // the last-known-good supaState on screen (momentarily stale until
+      // the next successful refetch or realtime event) — honest and
+      // safe, instead of silently and permanently faking success.
+      if (supaStateRef.current === null) {
+        console.warn("[Supabase] falling back to in-memory store:", e.message);
+        setUseFallback(true);
+      } else {
+        console.warn("[Supabase] refetch failed, keeping last-known-good state:", e.message);
+      }
     }
   }, []);
 
