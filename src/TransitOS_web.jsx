@@ -9710,9 +9710,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // (which counts by for_roles/ADMIN, not by the userid column) —
         // this is exactly why the badge count never fully cleared.
         must(await supabase.from("notifications").update({ isread: true }).is("userid", null));
-        if (action.actor_id != null) {
-          must(await supabase.from("notifications").update({ isread: true }).eq("userid", action.actor_id));
-        }
+        // Targeted-at-this-admin notifications — scoped to the actual
+        // caller (activeUserRef.current), NOT action.actor_id. The caller
+        // is confirmed to be *an* admin above, but that doesn't make
+        // action.actor_id trustworthy: without this, any admin could pass
+        // another admin's id and silently mark THEIR targeted
+        // notifications read, suppressing alerts meant for someone else.
+        // Same identity-spoofing class fixed elsewhere in this file this
+        // session (see NOTIF/MARK_READ two cases above, DM/REPLY, etc.) —
+        // this one call site was missed in that sweep.
+        must(await supabase.from("notifications").update({ isread: true }).eq("userid", activeUserRef.current));
       }
       // else: no scope provided — no-op rather than marking everything read
       await refetch();
