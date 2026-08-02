@@ -1322,17 +1322,22 @@ const now = () => new Date().toLocaleString("en-ZA", { day: "2-digit", month: "2
 const nowEpoch = () => Date.now();
 
 /* ---------- MONTHLY ARCHIVE WINDOWS ----------
-   Agents and drivers see completed trips in calendar-month buckets:
-   the CURRENT month live, plus exactly ONE month of archive (the
+   Agents and drivers see completed OR cancelled trips in calendar-month
+   buckets: the CURRENT month live, plus exactly ONE month of archive (the
    previous calendar month). On the 1st of each month the buckets roll
    over automatically — last month becomes the archive, and the month
    before that EXPIRES from the app's display. Expired trips are NEVER
    deleted: they stay in the backend and remain reachable through the
    admin Trip History range queries and the Help tab's full-history
    trip picker. scheduled_date is "YYYY/MM/DD" (en-ZA), so a 7-char
-   prefix compare is an exact calendar-month match. Non-completed
-   trips (booked/assigned/in-transit) never expire regardless of
-   date — an old stuck booking should stay visible, not vanish. */
+   prefix compare is an exact calendar-month match. Only genuinely-ACTIVE
+   trips (booked/assigned/in-transit) never expire regardless of date —
+   an old stuck booking should stay visible, not vanish. A cancelled trip
+   is just as "done" as a completed one and should age out the same way
+   (see tripArchiveBucket — this was a real bug once: it only checked
+   ARCHIVED_COMPLETED, so a cancelled trip from any point in an agent's
+   history stayed pinned under "CURRENT" forever, the exact same bug
+   shape fixed in the week-booking reveal gate this session). */
 const monthPrefixOf = (d) => `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}`;
 const currentMonthPrefix = () => monthPrefixOf(new Date());
 const previousMonthPrefix = () => {
@@ -1348,7 +1353,7 @@ const archiveMonthLabel = () => {
   return d.toLocaleString("en-ZA", { month: "long", year: "numeric" }).toUpperCase();
 };
 function tripArchiveBucket(trip) {
-  if (trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) return "CURRENT";
+  if (![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return "CURRENT";
   const mp = String(trip.scheduled_date || "").slice(0, 7);
   if (mp === currentMonthPrefix()) return "CURRENT";
   if (mp === previousMonthPrefix()) return "ARCHIVE";
