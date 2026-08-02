@@ -28,11 +28,25 @@ self.addEventListener('fetch', e => {
   // these anyway; let the browser's default handling take it.
   if (!url.protocol.startsWith('http')) return;
 
-  // Network-first for Supabase API calls
+  // Network-only for Supabase API calls — no cache fallback, because this
+  // branch never writes anything TO the cache in the first place (unlike
+  // the app-shell and static-asset branches below, which both call
+  // caches.open(CACHE).then(c => c.put(...)) on a successful fetch). The
+  // old `.catch(() => caches.match(e.request))` here was dead code: on any
+  // genuine network failure it fell through to a cache lookup that was
+  // GUARANTEED to find nothing, which — instead of a useful offline
+  // fallback — produced a confusing "FetchEvent ... resulted in a network
+  // error response" browser-level error on every transient network hiccup
+  // (this app's own established normal condition for a driver on the
+  // road), on top of the genuine failure that was already happening.
+  // Dynamic per-request REST data isn't something that should ever be
+  // served from a stale cache anyway — same reasoning already applied to
+  // the TomTom/Nominatim branch below. Letting the fetch failure propagate
+  // cleanly (no catch) hands it straight to the app's own already-robust
+  // offline handling (enqueueOfflineAction/isNetworkError, the useFallback
+  // fix, etc.) instead of routing it through a pointless dead end first.
   if (url.hostname.includes('supabase.co')) {
-    e.respondWith(
-      fetch(e.request).catch(() => caches.match(e.request))
-    );
+    e.respondWith(fetch(e.request));
     return;
   }
 
