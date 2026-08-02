@@ -4567,9 +4567,12 @@ function appReducer(state, action) {
         ...state,
         trips: state.trips.filter(t => !secondaryIdSet.has(String(t.trip_id))).map(t => t.trip_id === primaryId ? mergedTrip : t),
         notifications: [
+          // Mirrors the server-side handler's wording — per explicit
+          // privacy requirement, must never name the other agent or
+          // describe the trip as merged/combined.
           ...secondaries.flatMap(t => t.agent_ids.map(aid => ({
             id: mkId(), type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
-            message: `Your trip has been combined with ${primary.agent_name}'s trip (${primaryId}) for shared transport.`,
+            message: `Your trip (${primaryId}) has been dispatched to a driver.`,
             trip_id: primaryId, ts: now(), read: false,
           }))),
           ...state.notifications,
@@ -6788,6 +6791,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // ("violates foreign key constraint notifications_userid_fkey")
         // instead of either succeeding cleanly or giving a real reason.
         await supabase.from("notifications").delete().eq("userid", targetId);
+        // Same reasoning as notifications above, for a table that got
+        // missed: trip chat (`messages.senderid`) has a plain FK to users
+        // with NO cascade/set-null rule, and TRIP/REMOVE_AGENT and
+        // TRIP/REMOVE_DRIVER both sever a user's link to a trip
+        // (extraagentids/driverid) WITHOUT deleting that user's chat
+        // messages on it — so a user who chatted on a trip they were
+        // later removed from (not deleted, just removed) leaves an
+        // orphaned messages row referencing them with zero trip left to
+        // show it. The trip-history check above only counts trips still
+        // referencing this user via agentid/driverid/extraagentids, so it
+        // wouldn't catch this case — the delete would reach the DB and
+        // fail on messages_senderid_fkey with a raw, confusing Postgres
+        // error instead of either succeeding or giving a real reason.
+        await supabase.from("messages").delete().eq("senderid", targetId);
         // Logged BEFORE the delete, not after — audit_logs.targetuserid
         // is a foreign key to users, so writing the log entry once the
         // row is already gone always fails its own FK constraint. That
@@ -8405,10 +8422,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         await supabase.from("notifications").delete().in("tripid", secondaryIds);
       }
       const combinedAgentIds = (secondaryRows || []).flatMap(t => [t.agentid, ...(t.extraagentids || [])].filter(Boolean));
+      // Per explicit privacy requirement — an agent must never learn their
+      // trip was merged or with whom — this must NOT name the other
+      // agent or describe the trip as "combined"/"shared". Matches
+      // TRIP/ADD_AGENT's neutral convention (trip id + pickup detail,
+      // nothing about who else is on it).
       for (const aid of combinedAgentIds) {
         await insertNotification({
           type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
-          message: `Your trip has been combined with ${primaryRow.agentname}'s trip (${primaryId}) for shared transport.`,
+          message: `Your trip (${primaryId}) has been dispatched to a driver.`,
           trip_id: primaryId, ts: nowEpoch(), read: false,
         });
       }
@@ -8597,10 +8619,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           must(await supabase.from("trips").delete().eq("id", action.trip_id));
           await supabase.from("notifications").delete().eq("tripid", action.trip_id);
           const mergedInAgents = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+          // Same privacy requirement as TRIP/DISPATCH_MULTI above — never
+          // name the other agent or describe this as a merge/combine.
           for (const aid of mergedInAgents) {
             await insertNotification({
               type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
-              message: `Your trip has been combined with ${mergeTargetTrip.agentname}'s trip (${mergeTargetTrip.id}) for shared transport.`,
+              message: `Your trip (${mergeTargetTrip.id}) has been dispatched to a driver.`,
               trip_id: mergeTargetTrip.id, ts: nowEpoch(), read: false,
             });
           }
