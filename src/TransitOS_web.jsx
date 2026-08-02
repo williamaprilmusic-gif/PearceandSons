@@ -3664,7 +3664,22 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   // waypoints we listed (`freeStops`), not the full allWaypoints array. A
   // request with 2 free stops → optimizedWaypoints has exactly 2 entries,
   // with providedIndex values 0 and 1.
-  const optimized = data.routes?.[0]?.optimizedWaypoints;
+  //
+  // ROOT-CAUSE FIX — verified live against TomTom's actual API response
+  // shape: optimizedWaypoints lives at the TOP LEVEL of the response
+  // object (data.optimizedWaypoints), NOT nested under routes[0] like
+  // every other route-specific field (summary, legs, sections). Reading
+  // routes[0].optimizedWaypoints was ALWAYS undefined regardless of
+  // request shape — confirmed by direct calls to the live API with 1, 2,
+  // and 3 free stops, in both "already-optimal" and deliberately
+  // suboptimal/zigzag orderings, every one of which had real, correct
+  // data sitting at the top level the whole time. This was the actual
+  // cause of the "TomTom returned no result — using distance estimate
+  // instead" fallback firing on essentially every multi-stop route,
+  // silently degrading every driver's route to a straight-line haversine
+  // guess instead of TomTom's real road-distance optimization — not a
+  // genuine TomTom failure at all.
+  const optimized = data.optimizedWaypoints;
   const totalMetres = data.routes?.[0]?.summary?.lengthInMeters;
   if (!optimized || optimized.length !== freeStops.length || totalMetres == null) {
     console.warn(`[TomTom] optimizedWaypoints count mismatch: got ${optimized?.length ?? 0}, expected exactly ${freeStops.length}. Falling back to haversine.`);
