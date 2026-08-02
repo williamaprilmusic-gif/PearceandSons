@@ -2405,6 +2405,16 @@ function computeDriverStats(driverId, allTrips) {
 function SOSButton({ user, tripId, driverName, dispatch }) {
   const [armed, setArmed] = React.useState(false);
   const [sent, setSent] = React.useState(false);
+  // Was silently swallowed via `.catch(() => {})` with `sent` set BEFORE
+  // the dispatch even ran — meaning a network failure at the exact
+  // moment someone in a real emergency hit CONFIRM SOS showed them
+  // "🚨 SOS SENT — Operations has been alerted" regardless of whether
+  // anyone was actually alerted, with no way to know it hadn't gone
+  // through. `queued` (network-shaped failure, auto-retries via the
+  // existing offline queue) and `sendError` (a real rejection, needs a
+  // manual retry) are now both honestly distinguished from a confirmed send.
+  const [queued, setQueued] = React.useState(false);
+  const [sendError, setSendError] = React.useState(null);
   const [armTimeout, setArmTimeout] = React.useState(null);
 
   const arm = () => {
@@ -2416,7 +2426,7 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   const fire = async () => {
     if (armTimeout) clearTimeout(armTimeout);
     setArmed(false);
-    setSent(true);
+    setSendError(null);
     // Get GPS if available
     let gpsStr = "GPS unavailable";
     try {
@@ -2427,21 +2437,49 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
     } catch {}
     const mapsLink = gpsStr !== "GPS unavailable"
       ? " https://maps.google.com/?q=" + gpsStr : "";
-    await dispatch({
+    const sosAction = {
       type: "SYSTEM/SOS_ALERT",
       sender_id: user.id, sender_name: user.name,
       trip_id: tripId || null,
       driver_name: driverName || null,
       gps: gpsStr,
       message: "🚨 SOS — " + user.name + " (" + user.role + ") triggered emergency alert on trip " + (tripId || "unknown") + ". GPS: " + gpsStr + "." + mapsLink + " Immediate attention required.",
-    }).catch(() => {});
-    setTimeout(() => setSent(false), 10000);
+    };
+    try {
+      await dispatch(sosAction);
+      setSent(true);
+      setTimeout(() => setSent(false), 10000);
+    } catch (e) {
+      if (isNetworkError(e)) {
+        enqueueOfflineAction(sosAction);
+        setQueued(true);
+      } else {
+        setSendError(e.message || "Couldn't send the alert — please try again.");
+      }
+    }
   };
 
   if (sent) return (
     <div style={{ background: "rgba(220,53,69,0.12)", border: "1px solid rgba(220,53,69,0.5)", borderRadius: 6, padding: "10px 14px", textAlign: "center" }}>
       <div style={{ fontSize: 12, fontWeight: 800, color: COLORS.red }}>🚨 SOS SENT</div>
       <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>Operations has been alerted with your location.</div>
+    </div>
+  );
+
+  if (queued) return (
+    <div style={{ background: "rgba(245,166,35,0.12)", border: `1px solid ${COLORS.amber}`, borderRadius: 6, padding: "10px 14px", textAlign: "center" }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color: COLORS.amber }}>⚠ NO SIGNAL — SOS QUEUED</div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>Will send the instant you're back online. If this is a real emergency, please also call for help directly.</div>
+    </div>
+  );
+
+  if (sendError) return (
+    <div style={{ background: "rgba(220,53,69,0.12)", border: `1px solid ${COLORS.red}`, borderRadius: 6, padding: "10px 14px", textAlign: "center", display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ fontSize: 11, fontWeight: 800, color: COLORS.red }}>✗ SOS NOT SENT — {sendError}</div>
+      <button onClick={fire}
+        style={{ background: COLORS.red, border: "none", borderRadius: 5, padding: 10, cursor: "pointer", color: "#fff", fontSize: 12, fontWeight: 800 }}>
+        🚨 TRY AGAIN
+      </button>
     </div>
   );
 
@@ -18542,6 +18580,14 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
   const [saveError, setSaveError] = useState(null);
   const save = async () => {
     if (!form.name) return;
+    // See AdminUsers' create-form submit() for the full rationale — a
+    // Viewer admin with zero companies checked fails CLOSED (sees
+    // nothing), so editing an existing Viewer down to zero companies
+    // silently locks them out with no error anywhere explaining why.
+    if (user.role === ROLE.ADMIN && form.adminLevel === ADMIN_LEVEL.VIEWER && form.scopedCompanyIds.length === 0) {
+      setSaveError("Select at least one company for a Viewer admin — without one, they won't be able to see any data.");
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     try {
@@ -19424,6 +19470,17 @@ function AdminUsers({ state, dispatch, user }) {
   const [submitError, setSubmitError] = useState(null);
   const submit = async () => {
     if (!form.name || !form.staffNumber) return;
+    // A Viewer admin created with zero companies checked isn't a
+    // no-op — getAdminCompanyIds fails CLOSED for that case (sees
+    // NOTHING, not everything, per the fail-open bug fixed elsewhere
+    // this session), so this silently produces a Viewer account that
+    // can never see any data at all, with no error anywhere to explain
+    // why. Catch it here instead of leaving the admin to discover it
+    // only when the new Viewer logs in and reports an empty portal.
+    if (form.role === ROLE.ADMIN && form.adminLevel === ADMIN_LEVEL.VIEWER && form.scopedCompanyIds.length === 0) {
+      setSubmitError("Select at least one company for a Viewer admin — without one, they won't be able to see any data.");
+      return;
+    }
     setSubmitError(null);
     try {
       await dispatch({
