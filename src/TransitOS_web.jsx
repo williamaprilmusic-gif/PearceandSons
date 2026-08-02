@@ -17469,14 +17469,30 @@ function AdminHistory({ state, user, dispatch }) {
         // read from this same derived array, so they can never disagree
         // about what "filtered" means.
         const filteredResults = results.filter(t => (t.is_exception ? showException : showNormal));
+        // On-screen totals — per explicit request ("the finance admin
+        // side still doesn't capture... the total trip cost"). Same
+        // figures the CSV's trailing TOTAL row already computes
+        // (tripFeeAmount/tripDriverPayment), de-duped by trip_id first so
+        // a multi-passenger trip's fee/pay isn't counted once per
+        // passenger row — just never previously surfaced anywhere
+        // outside the downloaded export itself.
+        const uniqueFilteredTrips = Array.from(new Map(filteredResults.map(t => [t.trip_id, t])).values());
+        const totalTripFee = state.fee_rates ? uniqueFilteredTrips.reduce((sum, t) => sum + (tripFeeAmount(t, state.fee_rates) || 0), 0) : null;
+        const totalDriverPay = state.fee_rates ? uniqueFilteredTrips.reduce((sum, t) => sum + (tripDriverPayment(t, state.fee_rates)?.total || 0), 0) : null;
         return (
         <>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
             <div style={{ fontSize: 10, color: COLORS.ghost, flex: 1 }}>
               {filteredResults.length} trip{filteredResults.length !== 1 ? "s" : ""} found
               {filteredResults.length !== results.length ? ` (${results.length} total before filter)` : ""}
               {results.length === 500 ? " (capped at 500 — narrow the date range for a complete list)" : ""}
             </div>
+            {hasAdminPermission(user, "viewTripFees") && totalTripFee != null && (
+              <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>TOTAL TRIP COST: </span><span style={{ fontWeight: 700, color: COLORS.amber }}>R{totalTripFee.toFixed(2)}</span></span>
+            )}
+            {hasAdminPermission(user, "viewTripFees") && totalDriverPay != null && (
+              <span style={{ fontSize: 10 }}><span style={{ color: COLORS.ghost }}>DRIVER PAY TOTAL: </span><span style={{ fontWeight: 700, color: COLORS.teal }}>R{totalDriverPay.toFixed(2)}</span></span>
+            )}
             {filteredResults.length > 0 && hasAdminPermission(user, "viewTripFees") && (
               <Button size="sm" variant="amber" title={exporting ? "SAVING…" : "💾 SAVE TRIP SHEET (CSV)"} disabled={exporting} onClick={async () => {
                 setExporting(true);
