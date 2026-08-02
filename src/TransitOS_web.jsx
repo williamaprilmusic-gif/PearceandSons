@@ -14408,23 +14408,46 @@ function DriverNavMap({ destination, driverPosition, onExit }) {
     }
   }, [destination?.lat, destination?.lng]);
 
-  // Initial route fetch, once a starting position is available. Can't be a
-  // mount-only ([]) effect — driverPosition is frequently still null at
-  // mount (no GPS fix yet when the driver taps Navigate), and the
-  // separate reroute-deviation effect below only acts once a route
-  // already exists, so with empty deps this would silently never fire
-  // again and the driver would be stuck on "Calculating route…" forever.
-  // Depend on the live position and gate on `!route` so it fires exactly
-  // once, whenever the first fix actually arrives; the ref guards against
-  // firing a second overlapping request while the first is still in
-  // flight (GPS can tick again before the response lands).
+  // Route fetch — both the initial one (once a starting GPS fix is
+  // available) AND every subsequent one when `destination` itself changes.
+  //
+  // ROOT-CAUSE FIX — confirmed against a real production trip (multi-agent
+  // OUTBOUND dropoffs at 3 genuinely different addresses): DriverNavTab
+  // keeps ONE persistent <DriverNavMap> instance mounted across the whole
+  // drop-off sequence (no `key` prop, so React reuses it and just updates
+  // the `destination` prop each time confirmDropoff() advances navTarget
+  // to the next stop) — it does NOT remount per stop. The old version of
+  // this effect gated on `if (route) return`, i.e. "only ever fetch once,
+  // no matter what" — so once the FIRST leg's route loaded, `route` was
+  // permanently truthy and no later `destination` change ever triggered a
+  // new fetch. The map, turn-by-turn instructions, and route polyline all
+  // stayed frozen on the FIRST drop-off's route for the rest of the trip,
+  // while `navTarget`/`destination` itself correctly advanced underneath —
+  // a driver following the in-app nav would be silently kept on (or led
+  // back toward) the first stop for every remaining drop-off. This is what
+  // produced a real trip where all 3 agents' GPS-at-dropoff coordinates
+  // landed at the same physical spot despite having 3 distinct addresses.
+  //
+  // Fixed by keying the fetch on a `destKey` fingerprint instead of "have
+  // we ever fetched" — any change to destination now clears the stale
+  // route immediately (so the UI shows "Calculating route…" for the new
+  // leg rather than the previous leg's now-wrong route) and fetches fresh.
   const initialFetchInFlightRef = useRef(false);
+  const lastFetchedDestKeyRef = useRef(null);
   useEffect(() => {
-    if (route || initialFetchInFlightRef.current || !driverPosition?.lat) return;
+    if (!driverPosition?.lat || !destination?.lat) return;
+    const destKey = `${destination.lat},${destination.lng}`;
+    if (destKey === lastFetchedDestKeyRef.current || initialFetchInFlightRef.current) return;
+    const isDestinationChange = lastFetchedDestKeyRef.current != null;
+    lastFetchedDestKeyRef.current = destKey;
     initialFetchInFlightRef.current = true;
+    if (isDestinationChange) {
+      setRoute(null);
+      setCurrentInstructionIdx(0);
+    }
     fetchRoute(driverPosition).finally(() => { initialFetchInFlightRef.current = false; });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [driverPosition?.lat, driverPosition?.lng, route]);
+  }, [driverPosition?.lat, driverPosition?.lng, destination?.lat, destination?.lng, fetchRoute]);
 
   // Map init — once, on mount.
   useEffect(() => {
@@ -14454,10 +14477,19 @@ function DriverNavMap({ destination, driverPosition, onExit }) {
     if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
     const latlngs = route.points.map(p => [p.lat, p.lng]);
     routeLayerRef.current = L.polyline(latlngs, { color: "#2D8CF0", weight: 6, opacity: 0.85 }).addTo(map);
-    if (!destMarkerRef.current && destination?.lat) {
-      destMarkerRef.current = L.marker([destination.lat, destination.lng], {
-        icon: L.divIcon({ className: "", iconSize: [16, 16], html: `<div style="background:${COLORS.red};width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>` }),
-      }).addTo(map);
+    // Move the existing pin rather than only ever placing it once — same
+    // root cause as the route-fetch fix above: this instance persists
+    // across the whole multi-stop drop-off sequence, so a stop-to-stop
+    // destination change must actually relocate the marker, not leave it
+    // stuck at the first stop while everything else moves on.
+    if (destination?.lat) {
+      if (destMarkerRef.current) {
+        destMarkerRef.current.setLatLng([destination.lat, destination.lng]);
+      } else {
+        destMarkerRef.current = L.marker([destination.lat, destination.lng], {
+          icon: L.divIcon({ className: "", iconSize: [16, 16], html: `<div style="background:${COLORS.red};width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>` }),
+        }).addTo(map);
+      }
     }
     map.fitBounds(routeLayerRef.current.getBounds(), { padding: [40, 40] });
     // eslint-disable-next-line react-hooks/exhaustive-deps
