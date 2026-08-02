@@ -3451,7 +3451,17 @@ async function tomtomReverseGeocode(lat, lng) {
     const url = `https://api.tomtom.com/search/2/reverseGeocode/${lat},${lng}.json` +
       `?key=${TOMTOM_API_KEY}&returnSpeedLimit=false&returnRoadUse=false`;
     const res = await fetch(url);
-    if (!res.ok) return null;
+    // Previously silently returned null here with ZERO logging on a
+    // non-ok response — every other TomTom function in this file at
+    // least console.warns on failure. That silence is exactly what let
+    // this endpoint's live 403 ("account not provisioned for Reverse
+    // Geocoding") go unnoticed; logging it now so a future access-scope
+    // change is actually visible in the console instead of invisibly
+    // falling through to the Nominatim fallback below forever.
+    if (!res.ok) {
+      console.warn(`[TomTom] reverse geocode returned ${res.status} — falling back to Nominatim.`);
+      return null;
+    }
     const data = await res.json();
     const addr = data.addresses?.[0]?.address;
     if (!addr) return null;
@@ -3460,6 +3470,17 @@ async function tomtomReverseGeocode(lat, lng) {
     console.warn("[TomTom] reverse geocode failed:", e.message);
     return null;
   }
+}
+
+// Unified reverse geocode — TomTom first (kept as primary in case this
+// TomTom account's Reverse Geocoding access is ever restored), Nominatim
+// as a real, working fallback rather than the previous behavior of just
+// giving up and storing a null label. Mirrors unifiedAddressSearch's
+// TomTom-then-Nominatim pattern for forward search.
+async function reverseGeocode(lat, lng) {
+  const tomtom = await tomtomReverseGeocode(lat, lng);
+  if (tomtom) return tomtom;
+  return await nominatimReverseGeocode(lat, lng);
 }
 
 // Use TomTom Routing API to sort an array of dropoff coords into the optimal
@@ -3874,6 +3895,42 @@ async function nominatimSearch(query) {
   } catch (e) {
     console.warn("[Nominatim] search failed, falling back to offline DB:", e.message);
     return [];
+  }
+}
+
+// Reverse-geocode fallback for tomtomReverseGeocode — same label
+// construction as nominatimSearch above, kept in sync deliberately (both
+// read the same Nominatim address shape). Added 2026-08-02 after live
+// testing showed the TomTom reverse-geocode endpoint returns a 403
+// ("You are not allowed to access this endpoint" — this API key's TomTom
+// account isn't provisioned for the Reverse Geocoding product) on every
+// single call, which had been silently returning null with zero logging
+// for every pickup/dropoff confirmation this entire time — the "Actual
+// Pickup/Dropoff Address" CSV columns have always been blank in
+// production despite the real GPS lat/lng being correctly saved.
+async function nominatimReverseGeocode(lat, lng) {
+  if (lat == null || lng == null) return null;
+  try {
+    const params = new URLSearchParams({ lat, lon: lng, format: "jsonv2", addressdetails: "1" });
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?${params}`, {
+      headers: { "Accept-Language": "en" },
+    });
+    if (!res.ok) {
+      console.warn("[Nominatim] reverse geocode HTTP error:", res.status);
+      return null;
+    }
+    const r = await res.json();
+    const addr = r.address || {};
+    const houseNum = addr.house_number || "";
+    const road = addr.road || addr.pedestrian || addr.footway || "";
+    const suburb = addr.suburb || addr.neighbourhood || addr.city_district || addr.town || "";
+    const streetLine = road ? `${houseNum ? houseNum + " " : ""}${road}` : "";
+    return streetLine
+      ? `${streetLine}${suburb ? `, ${suburb}` : ""}, Cape Town`
+      : (r.display_name || null);
+  } catch (e) {
+    console.warn("[Nominatim] reverse geocode failed:", e.message);
+    return null;
   }
 }
 
@@ -9363,7 +9420,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // CSV shows a real street address, not just coordinates.
       let newPickupLocations = tripRow.pickuplocations || {};
       if (action.driver_coord) {
-        const pickupLabel = await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng);
+        const pickupLabel = await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng);
         newPickupLocations = {
           ...newPickupLocations,
           [action.agent_id]: {
@@ -9406,7 +9463,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const nowTs = nowEpoch();
       // Reverse-geocode the driver's GPS to get a readable street address
       const dropoffLabel = action.driver_coord
-        ? (action.dropoff_label || await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
+        ? (action.dropoff_label || await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
         : null;
       // Prefer action.confirmed_at over nowTs — see the identical
       // fix/reasoning on CONFIRM_AGENT_PICKUP above.
@@ -9578,7 +9635,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Reverse-geocode the driver's GPS position at drop-off time once,
       // then stamp it for every agent on the trip (they all exit at the same spot).
       const dropoffLabel = action.driver_coord
-        ? await tomtomReverseGeocode(action.driver_coord.lat, action.driver_coord.lng)
+        ? await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng)
         : null;
       tripAgentIdsForDrop.forEach(id => {
         newDropoffTimestamps[id] = nowTs;
