@@ -11504,7 +11504,12 @@ function HelpTab({ state, user, dispatch }) {
 
   const submit = async () => {
     if (!category) { setErr("Please choose a category."); return; }
-    if (!tripId) { setErr("Please select which trip this is about."); return; }
+    // trip_id is genuinely optional server-side (TICKET/CREATE) — not
+    // every ticket is about a specific trip (e.g. a brand-new driver
+    // with zero trips yet reporting a vehicle issue, or a general "Other"
+    // complaint). This used to be required here regardless, which meant
+    // anyone with no trip history at all (allMyTrips.length === 0, no
+    // dropdown even rendered) could NEVER file a ticket of any kind.
     if (!message.trim()) { setErr("Please describe the issue."); return; }
     setErr(null);
     setSubmitting(true);
@@ -11554,14 +11559,14 @@ function HelpTab({ state, user, dispatch }) {
             </div>
           )}
 
-          <SectionHeader label="Which trip is this about?" />
+          <SectionHeader label="Which trip is this about? (optional)" />
           {loadingHistory && allMyTrips.length === 0 ? (
             <span style={{ fontSize: 10, color: COLORS.ghost }}>Loading your trips…</span>
           ) : allMyTrips.length === 0 ? (
-            <span style={{ fontSize: 10, color: COLORS.ghost }}>You don't have any trips yet.</span>
+            <span style={{ fontSize: 10, color: COLORS.ghost }}>You don't have any trips yet — that's fine, you can still submit a ticket below.</span>
           ) : (
             <select className="inp" value={tripId} onChange={e => setTripId(e.target.value)} style={{ width: "100%" }}>
-              <option value="">— Select a trip —</option>
+              <option value="">— Not related to a specific trip —</option>
               {allMyTrips.map(t => (
                 <option key={t.trip_id} value={t.trip_id}>
                   {t.trip_id} · {t.scheduled_date} {t.scheduled_time} · {agentRouteLabel(t.direction)}
