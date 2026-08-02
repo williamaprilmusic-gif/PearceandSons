@@ -6490,6 +6490,55 @@ function ViewerPortal({ state, dispatch, user }) {
   );
 }
 
+// ── FinancialPortal ────────────────────────────────────────────────────────
+// Full-screen home for FINANCIAL admin accounts, per explicit request: same
+// shell as ViewerPortal (header, no admin sidebar) but with no tab bar at
+// all — Financial only ever needs profile search + trip history plus their
+// fee/driver-pay rate tools, not a tab switcher between two views the way
+// Viewer needs (Viewer's "Portal" tab is the external client-facing trip
+// view, which has no Financial equivalent). Unlike Viewer, Financial is
+// never company-scoped (getAdminCompanyIds is unrestricted for
+// FLEET_OPS/STANDARD/FINANCIAL by design), so there's no scopedState to
+// compute here — state passes straight through.
+//
+// AdminProfileSearch (search + full trip history, already gated correctly
+// per-field via viewDriverProfiles/viewTripFees) and AdminHistory (fee/
+// driver-pay rate setting + the date-range trip CSV with totals, gated via
+// manageFeeRates/viewTripFees) are both reused UNMODIFIED here rather than
+// rebuilt — Financial keeps every capability they had via the old full
+// AdminApp shell, this only drops the operational tabs (Dispatch, Live Map,
+// Drivers, Contacts, Alerts) they never had permission to use there anyway.
+function FinancialPortal({ state, dispatch, user }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100dvh", background: COLORS.bg }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 12,
+        padding: "10px 16px", paddingTop: "calc(10px + env(safe-area-inset-top, 0px))",
+        background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, flexShrink: 0,
+      }}>
+        <div style={{ width: 32, height: 32, borderRadius: 16, background: COLORS.amber, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: "#000", flexShrink: 0 }}>
+          {(user.name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase()}
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 800, color: COLORS.chalk }}>Financial Administrator</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 0.5 }}>{user.name}</div>
+        </div>
+        <button
+          onClick={() => dispatch({ type: "AUTH/LOGOUT" }).catch(() => {})}
+          style={{ background: "none", border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "5px 10px", color: COLORS.ghost, fontSize: 10, fontWeight: 700, letterSpacing: 0.5, cursor: "pointer", fontFamily: FONTS.head }}
+        >
+          LOG OUT
+        </button>
+      </div>
+      {/* Full-height, single scrollable view — no tab bar, no sidebar. */}
+      <div style={{ flex: 1, overflow: "auto" }}>
+        <AdminProfileSearch state={state} user={user} dispatch={dispatch} />
+        <AdminHistory state={state} user={user} dispatch={dispatch} />
+      </div>
+    </div>
+  );
+}
+
 // ── WebAuthn biometric login helpers ──────────────────────────────────────
 const WEBAUTHN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/webauthn";
 
@@ -20507,7 +20556,8 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // someone into a tab their permissions no longer allow would show a
   // broken/blank screen instead of falling back to the default.
   const visibleNav = ADMIN_NAV.filter(([id]) => {
-    // Note: VIEWER admins never reach AdminApp — they're routed to ViewerPortal.
+    // Note: VIEWER admins never reach AdminApp — they're routed to
+    // ViewerPortal. Same for FINANCIAL — routed to FinancialPortal.
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
@@ -20957,6 +21007,11 @@ function AppInner() {
         // They see only their company's portal view, same as a CLIENT role but
         // scoped by their scopedcompanyids.
         <ViewerPortal state={state} dispatch={dispatchWithToast} user={activeUser} />
+      ) : activeUser.role === ROLE.ADMIN && activeUser.admin_level === ADMIN_LEVEL.FINANCIAL ? (
+        // FINANCIAL admins get the same no-sidebar, single-screen shell as
+        // Viewer — just profile search + trip history + their fee/pay
+        // rate tools, no tab bar (they only ever need the one screen).
+        <FinancialPortal state={state} dispatch={dispatchWithToast} user={activeUser} />
       ) : activeUser.role === ROLE.ADMIN ? (
         <AdminApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.AGENT ? (
