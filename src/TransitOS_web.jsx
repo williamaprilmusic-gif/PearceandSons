@@ -6288,6 +6288,27 @@ function must(res) {
   return res;
 }
 
+// Server-side enforcement that a driver's REQUIRED documents (PrDP,
+// vehicle licence — see DOC_TYPES) aren't expired, per explicit request:
+// the driver's own app already displayed "You cannot legally operate with
+// expired documents" but nothing actually blocked dispatch/accept/start,
+// so it was purely cosmetic. Checked at every point a driver could newly
+// start carrying passengers: admin dispatching them (TRIP/ASSIGN_DRIVER,
+// which TRIP/DISPATCH_MULTI/BULK_ASSIGN_DRIVER both delegate to), the
+// driver accepting (TRIP/ACCEPT), and the driver actually starting
+// navigation (TRIP/RECORD_ROUTE — the real "trip starts now" moment, not
+// TRIP/DRIVER_CONFIRM, matching that handler's own existing 2-hour-window
+// comment). Roadworthy cert stays advisory-only (DOC_TYPES.required:
+// false), matching the driver-facing summary's own severity split.
+async function assertDriverDocsCurrent(driverId) {
+  const { data: docsRow } = await supabase.from("driver_status").select("documents").eq("driverid", driverId).maybeSingle();
+  const docs = docsRow?.documents || {};
+  const expired = DOC_TYPES.filter(d => d.required && docExpiryStatus(docs[d.key]).status === "expired");
+  if (expired.length) {
+    throw new Error(`This driver's ${expired.map(d => d.label).join(" and ")} ${expired.length > 1 ? "have" : "has"} expired — renew before this trip can be dispatched or started.`);
+  }
+}
+
 // Fetches the real "Pearce and Sons" company address from Supabase to use
 // as the driver-route starting anchor — used by every dispatch/sequencing
 // action below instead of a hardcoded placeholder coordinate. Matches
@@ -8429,6 +8450,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", action.driver_id).single();
       if (!tripRow || !driverRow) throw new Error("Trip or driver not found");
+      await assertDriverDocsCurrent(action.driver_id);
       // Auto-merge: if this driver already has an ACTIVE trip on the SAME
       // DAY (assigned via a previous single dispatch, not necessarily
       // through the multi-select DISPATCH_MULTI flow), fold this trip's
@@ -8921,6 +8943,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripRow) throw new Error("Trip not found");
       // Ownership check — see TRIP/DRIVER_CONFIRM.
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
+      await assertDriverDocsCurrent(activeUserRef.current);
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
       // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
@@ -9416,6 +9439,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if ((routeOwnerRows || []).some(r => String(r.driverid) !== String(activeUserRef.current))) {
         throw new Error("This trip isn't assigned to you.");
       }
+      await assertDriverDocsCurrent(activeUserRef.current);
       const earliestScheduled = routeTrips
         .map(t => t.scheduled_time_epoch)
         .filter(Boolean)
@@ -13649,6 +13673,11 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
   // driver deliberately collapsed themselves afterward.
   const autoExpandedRef = useRef(new Set());
   const [decliningTrip, setDecliningTrip] = useState(null); // trip being declined — shows modal
+  // Accept can legitimately fail server-side now (e.g. expired driver
+  // documents) — previously the catch below only console.warn'd, so a
+  // rejected accept silently did nothing visible and the driver had no
+  // idea why. { tripId, message } | null.
+  const [acceptError, setAcceptError] = useState(null);
   useEffect(() => {
     const needsAction = active.filter(t => t.state === TRIP_STATE.ASSIGNED && !t.driverAccepted);
     const toAdd = needsAction.filter(t => !autoExpandedRef.current.has(t.trip_id));
@@ -13804,14 +13833,19 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
                 })()}
                 <div style={{ display: "flex", gap: 8 }}>
                   <Button title="✓ ACCEPT TRIP" variant="green" style={{ flex: 1 }} onClick={async () => {
+                    setAcceptError(null);
                     try {
                       await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
                     } catch (e) {
                       console.warn("[DriverTripsTab] accept failed:", e.message);
+                      setAcceptError({ tripId: trip.trip_id, message: e.message || "Couldn't accept the trip — please try again." });
                     }
                   }} />
                   <Button title="✗ DECLINE" variant="danger" style={{ flex: 1 }} onClick={() => setDecliningTrip(trip)} />
                 </div>
+                {acceptError?.tripId === trip.trip_id && (
+                  <span style={{ fontSize: 11, color: COLORS.red }}>{acceptError.message}</span>
+                )}
               </div>
             )}
             {trip.driverAccepted && <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ ACCEPTED — {trip.acceptedAt}</span>}
