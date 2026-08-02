@@ -6346,21 +6346,26 @@ function ViewerPortal({ state, dispatch, user }) {
   // the same hasAdminPermission checks used everywhere else), it just
   // was never actually reachable from here before.
   const [viewerTab, setViewerTab] = React.useState("portal");
-  // Scope state to this viewer's companies (same logic as AdminApp scopedState
-  // — this is a SEPARATE, duplicate implementation, not a shared one, so a
-  // fix to AdminApp's copy (e.g. driver_status scoping, added commit
-  // 760494e) does NOT automatically apply here too. That gap mattered more
-  // than it first looked: VIEWER admins are routed straight to THIS
-  // component and never reach AdminApp at all, so this copy — not
-  // AdminApp's — is the one actually live for every Viewer session. Kept in
-  // sync with AdminApp's scopedState for the same defense-in-depth reason;
-  // not currently exploitable (ClientPortalApp never reads driver_status,
-  // and AdminProfileSearch's driver-profile path is gated behind
-  // viewDriverProfiles, false for VIEWER) but there's no reason to leave
-  // one of the two copies behind.
+  // Scope state to this viewer's companies via the SAME shared
+  // getAdminCompanyIds() AdminApp's scopedState uses — previously this was
+  // a separate, duplicate re-derivation (`user.scoped_company_ids || []`)
+  // that diverged from it in a real, exploitable way, not just a stale
+  // comment: getAdminCompanyIds deliberately fails CLOSED for a Viewer
+  // with no scoped_company_ids configured (returns the "__NONE__" sentinel
+  // — see all — nothing matches it), but this component's own copy failed
+  // OPEN in that exact case ("no scope = see all"). The admin-creation form
+  // has no required-selection validation on the company checklist, so
+  // creating (or editing) a Viewer admin with zero companies checked is a
+  // completely ordinary, unexotic path — and VIEWER admins are routed
+  // straight to THIS component, never to AdminApp, so that fail-open
+  // fallback was live and reachable: an under-configured Viewer account
+  // got full unrestricted fleet-wide agent/trip/ticket/driver-status
+  // access, the opposite of what the VIEWER tier means. Sharing the one
+  // real implementation instead of re-deriving it here closes this for
+  // good — no second copy left to drift out of sync again.
   const scopedState = React.useMemo(() => {
-    const companyIds = user.scoped_company_ids || [];
-    if (!companyIds.length) return state; // no scope = see all (shouldn't happen for VIEWER)
+    const companyIds = getAdminCompanyIds(user, state.companies);
+    if (!companyIds.length) return state; // FLEET_OPS/STANDARD/FINANCIAL only — VIEWER always gets a restricting (possibly "__NONE__") array
     return {
       ...state,
       companies: (state.companies || []).filter(c => companyIds.some(id => String(id) === String(c.id))),
@@ -6370,15 +6375,19 @@ function ViewerPortal({ state, dispatch, user }) {
       notifications: scopeNotificationsToCompany(state.notifications, state.trips, state.users, companyIds),
       driver_status: scopeDriverStatusToCompany(state.driver_status, state.trips, state.users, companyIds),
     };
-  }, [state, user.scoped_company_ids]);
+  }, [state, user]);
 
-  // Determine which company name to show in the header
+  // Determine which company name to show in the header — same
+  // getAdminCompanyIds fail-closed semantics as scopedState above, so an
+  // under-configured Viewer's header is now honest ("Client Portal", the
+  // existing neutral fallback) instead of claiming "All Companies" access
+  // it no longer actually has post-fix.
   const companyName = React.useMemo(() => {
-    const ids = user.scoped_company_ids || [];
+    const ids = getAdminCompanyIds(user, state.companies);
     if (!ids.length) return "All Companies";
     const co = state.companies.find(c => ids.some(id => String(id) === String(c.id)));
     return co?.name || "Client Portal";
-  }, [state.companies, user.scoped_company_ids]);
+  }, [state.companies, user]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100dvh", background: COLORS.bg }}>
