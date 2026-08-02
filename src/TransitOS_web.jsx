@@ -18113,6 +18113,32 @@ function AdminLiveMap({ state, user }) {
   const dragRef = useRef(null); // { startScreenX, startScreenY, startCenterLat, startCenterLng } while dragging
   const svgRef = useRef(null);
 
+  // Wheel-zoom needs a native, non-passive listener — React's JSX onWheel
+  // prop has been passive by default since React 17 (matching the
+  // browser's own default for scroll performance), so calling
+  // e.preventDefault() inside a JSX onWheel handler is silently ignored:
+  // it logs "Unable to preventDefault inside passive event listener
+  // invocation" and does NOT actually stop the page underneath from
+  // scrolling. Real, confirmed user-facing bug, not just console noise —
+  // scrolling the mouse wheel to zoom this map also scrolled the whole
+  // admin page at the same time, since the browser's default wheel-scroll
+  // behavior was never genuinely suppressed. Attaching the listener
+  // directly to the DOM node with { passive: false } is the only way to
+  // get a real, working preventDefault() for wheel events. setViewport is
+  // a React-guaranteed-stable setter and this uses the functional updater
+  // form, so an empty dependency array (attach once) is correct — no
+  // stale-closure risk, unlike the DriverNavMap bug class fixed earlier.
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const handleWheel = (e) => {
+      e.preventDefault();
+      setViewport(v => ({ ...v, zoom: Math.max(3, Math.min(18, v.zoom + (e.deltaY < 0 ? 0.5 : -0.5))) }));
+    };
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, []);
+
   // Live positions from the fast broadcast channel — keyed by driver id,
   // merged on top of the slower DB-backed state.driver_positions below.
   // The DB version remains the source of truth right after page load (or
@@ -18308,10 +18334,15 @@ function AdminLiveMap({ state, user }) {
               cursor: dragRef.current ? "grabbing" : "grab",
               touchAction: "none" /* prevent browser scroll-hijack during map pan */ }}
             onMouseDown={handlePointerDown} onMouseMove={handlePointerMove} onMouseUp={handlePointerUp} onMouseLeave={handlePointerUp}
-            onTouchStart={e => { e.preventDefault(); handlePointerDown(e); }}
-            onTouchMove={e => { e.preventDefault(); handlePointerMove(e); }}
-            onTouchEnd={e => { e.preventDefault(); handlePointerUp(e); }}
-            onWheel={(e) => { e.preventDefault(); setViewport(v => ({ ...v, zoom: Math.max(3, Math.min(18, v.zoom + (e.deltaY < 0 ? 0.5 : -0.5))) })); }}
+            // No e.preventDefault() here — same passive-listener limit as
+            // the wheel handler above (JSX onTouch* is passive since
+            // React 17, so the call could never succeed), but harmless to
+            // drop: touchAction: "none" below already suppresses the
+            // browser's default touch scroll/pan/zoom at the CSS/UA
+            // level, independent of JS preventDefault.
+            onTouchStart={handlePointerDown}
+            onTouchMove={handlePointerMove}
+            onTouchEnd={handlePointerUp}
           >
           {/* Map background — visible while tiles load */}
           <rect width={W} height={H} fill="#1a2333" />
