@@ -4397,6 +4397,16 @@ function appReducer(state, action) {
       if (existingForDate.length > 0) {
         return { ...state, _error: `You already have a ${action.direction} booking on ${action.scheduled_date} (Trip #${existingForDate[0].trip_id}). Cancel it first.` };
       }
+      // Mirrors the Supabase handler's same past-date rejection (see there
+      // for the full rationale) — kept in sync since this fallback path
+      // otherwise duplicates that handler's validation.
+      {
+        const todayForBooking = new Date();
+        const todayBookingStr = `${todayForBooking.getFullYear()}/${String(todayForBooking.getMonth() + 1).padStart(2, "0")}/${String(todayForBooking.getDate()).padStart(2, "0")}`;
+        if (action.scheduled_date < todayBookingStr) {
+          return { ...state, _error: `Can't book a trip for ${action.scheduled_date} — that date has already passed.` };
+        }
+      }
       const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
       const dropCoord = action.dropoff_coord || defaultCompanyAnchor(state);
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
@@ -7877,6 +7887,26 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (scheduledTimeEpoch == null) {
         throw new Error(`Couldn't understand the scheduled date/time ("${action.scheduled_date}" "${action.scheduled_time}"). Please use YYYY/MM/DD for the date and HH:MM for the time.`);
       }
+      // Computed here (moved up from just before isException below) so it
+      // can also gate the past-date check immediately following — the two
+      // used to duplicate this same "today, en-ZA format" derivation.
+      const nowDate = new Date(nowTs);
+      const bookingDateStr = `${nowDate.getFullYear()}/${String(nowDate.getMonth() + 1).padStart(2, "0")}/${String(nowDate.getDate()).padStart(2, "0")}`;
+      // Reject a scheduled date already in the past. The DAY-booking date
+      // field is a free-text input with no format constraint at all, and
+      // even the WEEK range's native date inputs only get a `min={today}`
+      // on the picker widget — neither is enforced here, so a stale form,
+      // a modified client, or the free-text field's lack of any picker
+      // could otherwise create a phantom past-dated UNASSIGNED_BOOKING
+      // trip that clutters dispatch screens forever (nothing else in the
+      // app expects scheduled_date to precede the day it was booked).
+      // Calendar-day comparison only, not time-of-day — a same-day booking
+      // stays allowed regardless of the current clock time; that's the
+      // existing isException/late-booking design just below, not this
+      // check's concern.
+      if (action.scheduled_date < bookingDateStr) {
+        throw new Error(`Can't book a trip for ${action.scheduled_date} — that date has already passed.`);
+      }
 
       // ── Duplicate booking check ──────────────────────────────────────────
       // An agent cannot have two active/pending bookings for the same
@@ -7904,8 +7934,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // "hours before departure" window. A trip booked today for tomorrow
       // at any time is never an exception under this rule, even if it's
       // booked at 11pm tonight; only same-day-after-3pm counts.
-      const nowDate = new Date(nowTs);
-      const bookingDateStr = `${nowDate.getFullYear()}/${String(nowDate.getMonth() + 1).padStart(2, "0")}/${String(nowDate.getDate()).padStart(2, "0")}`;
+      // (nowDate/bookingDateStr are now computed earlier above, reused here.)
       const isSameDay = action.scheduled_date === bookingDateStr;
       const isException = isSameDay && (nowDate.getHours() > 15 || (nowDate.getHours() === 15 && nowDate.getMinutes() > 0));
 
@@ -10888,7 +10917,11 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
   const [form, setForm] = useState({
     direction: "INBOUND", // INBOUND = home -> work, OUTBOUND = work -> home
     trip_type: "DAY",
-    date: new Date().toLocaleDateString("en-ZA"), // used for DAY bookings
+    // ISO YYYY-MM-DD (native <input type="date"> shape), same as
+    // weekStart/weekEnd below — converted to the app's actual storage
+    // format (en-ZA, YYYY/MM/DD) at the point of use in submit(), the
+    // same way weekDates already does via expandDateRange.
+    date: todayStr, // used for DAY bookings
     weekStart: todayStr, weekEnd: todayStr, // used for WEEK bookings (native date inputs, YYYY-MM-DD)
     // Pre-filled from the agent's own stored account phone number, per
     // the scan finding — previously this started genuinely empty and
@@ -10959,12 +10992,23 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
 
   const returnDirection = form.direction === "INBOUND" ? "OUTBOUND" : "INBOUND";
   const weekDates = form.trip_type === "WEEK" ? expandDateRange(form.weekStart, form.weekEnd) : [];
+  // form.date is ISO (native date-input shape) — converted here once to
+  // the app's actual scheduled_date storage format (en-ZA, YYYY/MM/DD),
+  // the same conversion expandDateRange already does per-day for WEEK.
+  const dayDateStr = form.trip_type === "DAY" && form.date
+    ? new Date(`${form.date}T00:00:00`).toLocaleDateString("en-ZA")
+    : null;
 
   const validate = () => {
     const e = {};
     if (!canBook) e.setup = "Missing home address or work location — contact your admin to have these set up before booking.";
     if (!form.phone) e.phone = "Contact number is required";
     if (form.trip_type === "WEEK" && weekDates.length === 0) e.week = "Please choose a valid date range (end date on or after start date, 14 days max).";
+    // Matches the native date input's own `min={todayStr}` — a user can't
+    // normally pick a past date via the picker widget, but nothing
+    // actually enforced it if they somehow did (or the server-side
+    // TRIP/BOOK guard is the real backstop; this is just fast feedback).
+    if (form.trip_type === "DAY" && (!form.date || form.date < todayStr)) e.date = "Please choose today or a future date.";
     setErrs(e);
     return Object.keys(e).length === 0;
   };
@@ -11030,10 +11074,10 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
           }
         }
       } else {
-        await bookLeg(buildLeg(form.direction, form.date, form.time));
+        await bookLeg(buildLeg(form.direction, dayDateStr, form.time));
         if (form.wantsReturn) {
           // Same overnight-return rollover as the week-booking path above.
-          const returnDate = form.returnTime < form.time ? addDaysToDateStr(form.date, 1) : form.date;
+          const returnDate = form.returnTime < form.time ? addDaysToDateStr(dayDateStr, 1) : dayDateStr;
           await bookLeg(buildLeg(returnDirection, returnDate, form.returnTime));
         }
       }
@@ -11135,7 +11179,11 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
             )}
           </>
         ) : (
-          <TextField label="Date" value={form.date} onChange={e => set("date", e.target.value)} />
+          <div>
+            <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>DATE</label>
+            <input type="date" className={`inp${errs.date ? " err" : ""}`} value={form.date} min={todayStr} onChange={e => set("date", e.target.value)} style={{ width: "100%" }} />
+            {errs.date && <span style={{ fontSize: 10, color: COLORS.red, marginTop: 2, display: "block" }}>{errs.date}</span>}
+          </div>
         )}
         <TextField label={form.trip_type === "WEEK" ? "Time (every day)" : "Time"} type="time" value={form.time} onChange={e => set("time", e.target.value)} />
 
