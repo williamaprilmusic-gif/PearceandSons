@@ -8886,15 +8886,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
 
     case "SYSTEM/SOS_ALERT": {
-      // SOS fires to ALL admins immediately — no permission check,
-      // no auth gate. Anyone can trigger an emergency.
+      // SOS fires to ALL admins immediately — no permission check, no auth
+      // gate on the ACTION itself (deliberate: zero friction for a genuine
+      // emergency). But the audit log's actorId/actorName previously came
+      // straight from client-supplied action.sender_id/sender_name — same
+      // spoofing shape fixed elsewhere this session. Real impact here:
+      // anyone able to call dispatch (devtools, a modified client) could
+      // fire a fake or real SOS credited to an arbitrary OTHER user in the
+      // audit trail — misdirecting incident response toward an innocent
+      // person, or letting whoever actually triggered it hide their own
+      // identity. Derived from activeUserRef + a server lookup instead,
+      // same as every other actor-identity fix this session. `message`
+      // stays client-authored free text (not an identity field the audit
+      // trail relies on) — same treatment as action.phone on TRIP/BOOK.
+      const { data: sosSender } = await supabase.from("users").select("id, fullname").eq("id", activeUserRef.current).maybeSingle();
       await insertNotification({
         type: "SOS_ALERT", for_roles: [ROLE.ADMIN],
         message: action.message,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       });
       await logAuditAction({
-        actorId: action.sender_id, actorName: action.sender_name,
+        actorId: sosSender?.id ?? activeUserRef.current, actorName: sosSender?.fullname || "Unknown",
         actionType: "SYSTEM/SOS_ALERT", tripId: action.trip_id,
         details: `SOS alert fired. GPS: ${action.gps}. Driver: ${action.driver_name || "N/A"}`,
       });
@@ -11167,12 +11179,31 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   // multi-passenger trip to the primary agent's identity instead of
   // their own. Use the actual logged-in user now.
   const chatUser = user;
-  const msgs = trip.chat_messages || [];
+  // Was unfiltered (every message ever exchanged on this trip) — on a
+  // merged multi-agent trip that meant this agent's "Trip Chat" showed
+  // the driver's messages to/from every OTHER passenger too, by name and
+  // content: a direct, live violation of the explicit "never let an agent
+  // learn their trip was merged, or with whom" requirement (worse than the
+  // notification-text leak fixed elsewhere for the same requirement — this
+  // one exposed full identity + message content, not just a phrase).
+  // TripChatModal (the driver-side equivalent) already solved this exact
+  // problem via recipient_id-scoped filtering; mirrored here with the
+  // driver as this agent's only fixed counterpart (an agent never
+  // messages another agent). Same legacy fallback for pre-recipient_id
+  // messages as TripChatModal, for the same reason.
+  const msgs = (trip.chat_messages || []).filter(m => {
+    if (!driverUser) return false;
+    if (m.recipient_id != null) {
+      return (String(m.sender_id) === String(chatUser.id) && String(m.recipient_id) === String(driverUser.id)) ||
+             (String(m.sender_id) === String(driverUser.id) && String(m.recipient_id) === String(chatUser.id));
+    }
+    return String(m.sender_id) === String(chatUser.id) || String(m.sender_id) === String(driverUser.id);
+  });
 
   const send = async () => {
     if (!text.trim()) return;
     try {
-      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: chatUser.id, sender_name: chatUser.name, sender_role: chatUser.role, text: text.trim() });
+      await dispatch({ type: "TRIP/SEND_CHAT", trip_id: trip.trip_id, sender_id: chatUser.id, sender_name: chatUser.name, sender_role: chatUser.role, recipient_id: driverUser?.id ?? null, text: text.trim() });
       setText("");
     } catch (e) {
       // Text deliberately stays in the input on failure so it's easy to
