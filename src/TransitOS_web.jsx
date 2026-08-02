@@ -10137,9 +10137,28 @@ function useAppStore() {
       .channel("transitos-driver-positions")
       .on("postgres_changes", { event: "*", schema: "public", table: "driver_positions" }, fetchDriverPositions)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    // Same visibility backstop as the 5 auxiliary fetch cycles below — in
+    // practice this table's own realtime traffic (any active driver
+    // broadcasts every ~8s) usually self-heals a failed initial load
+    // quickly, but an admin loading the Live Map while zero drivers are
+    // currently active would otherwise have no recovery path at all.
+    const onVisible = () => { if (document.visibilityState === "visible") fetchDriverPositions(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchDriverPositions]);
 
+  // Each of these 5 auxiliary fetch cycles (campaigns/companies/tickets/
+  // high_risk_zones/fee_rates) has ONLY its own realtime subscription —
+  // unlike the main refetch() cycle above, none of them has a polling
+  // backstop or a visibility-triggered refetch. That means a single
+  // transient failure on the INITIAL mount-time fetch (the exact same
+  // "patchy signal" condition that caused the useFallback bug fixed
+  // earlier this round) left that slice of state permanently empty/stale
+  // for the rest of the session, since nothing ever retries it short of
+  // someone else editing that exact table. Re-running on foreground
+  // return closes that gap cheaply (a single lightweight table read,
+  // only on an actual visibility change) — the same recovery path the
+  // main cycle already relies on for its own resilience.
   useEffect(() => {
     if (!supabase) return;
     fetchCampaigns();
@@ -10147,7 +10166,9 @@ function useAppStore() {
       .channel("transitos-campaigns")
       .on("postgres_changes", { event: "*", schema: "public", table: "campaigns" }, fetchCampaigns)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchCampaigns(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchCampaigns]);
 
   useEffect(() => {
@@ -10157,7 +10178,9 @@ function useAppStore() {
       .channel("transitos-companies")
       .on("postgres_changes", { event: "*", schema: "public", table: "companies" }, fetchCompanies)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchCompanies(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchCompanies]);
 
   useEffect(() => {
@@ -10167,7 +10190,9 @@ function useAppStore() {
       .channel("transitos-tickets")
       .on("postgres_changes", { event: "*", schema: "public", table: "tickets" }, fetchTickets)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchTickets(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchTickets]);
 
   useEffect(() => {
@@ -10177,7 +10202,9 @@ function useAppStore() {
       .channel("transitos-high-risk-zones")
       .on("postgres_changes", { event: "*", schema: "public", table: "high_risk_zones" }, fetchHighRiskZones)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchHighRiskZones(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchHighRiskZones]);
 
   useEffect(() => {
@@ -10187,7 +10214,9 @@ function useAppStore() {
       .channel("transitos-fee-rates")
       .on("postgres_changes", { event: "*", schema: "public", table: "trip_fee_rates" }, fetchFeeRates)
       .subscribe();
-    return () => { supabase.removeChannel(channel); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchFeeRates(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchFeeRates]);
 
   const dispatch = useCallback(async (action) => {
