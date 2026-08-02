@@ -16480,8 +16480,14 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     "Trip ID", "Week Group ID", "Week Day #", "Trip Type", "Direction", "Exception",
     // Scheduling
     "Scheduled Date", "Scheduled Time", "Late Booking",
-    // People
-    "Agent", "Agent Staff #", "Phone", "Driver", "Driver Vehicle",
+    // People — Agent Home Address is the agent's permanent profile
+    // address (state.users[].home_address), always shown regardless of
+    // trip direction. Distinct from "Pickup Address"/"Drop-off Address"
+    // below, which are per-TRIP and depend on direction (OUTBOUND drops
+    // at home, INBOUND picks up from home, so which of those two columns
+    // actually holds the home address flips depending on direction) —
+    // this column gives a single, direction-independent place to find it.
+    "Agent", "Agent Staff #", "Agent Phone", "Agent Home Address", "Driver", "Driver Vehicle",
     // Pickup (per agent)
     "Pickup Address", "Booked Pickup Coord (lat,lng)",
     // Dropoff (per agent)
@@ -16598,6 +16604,7 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         aid != null ? userName(aid) : (t.agent_name || ""),
         aid != null ? userStaffNum(aid) : "",
         agentUser?.phone || t.phone || "",
+        agentUser?.home_address?.label || "",
         userName(t.driver_id),
         driverVehicle(t.driver_id),
         // Pickup
