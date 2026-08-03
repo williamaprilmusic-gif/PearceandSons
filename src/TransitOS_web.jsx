@@ -12379,10 +12379,28 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       }
 
       // Feature 6: Route deviation alert ────────────────────────────────────
-      // If the driver is more than 600m from their current nav target for
-      // 2+ consecutive GPS readings while IN_TRANSIT, fire an admin alert.
-      // The deviationCountRef counts consecutive off-course readings and
-      // resets when back on course — prevents a single GPS blip from firing.
+      // ROOT-CAUSE FIX — confirmed on a real production alert: "Route
+      // deviation — Darin Pearce appears to be 10357m off-course on trip
+      // 211" fired the instant the driver finished pickups and was simply
+      // sitting AT the pickup point (speed 0, hadn't moved) — 10.357km is
+      // exactly the straight-line distance from the pickup point to their
+      // NEXT STOP, not any kind of deviation. The old logic compared raw
+      // "distance to nav target" against a 600m threshold — but every
+      // trip leg legitimately STARTS kilometres from the next stop (that's
+      // just the remaining drive, not deviation), so this fired as a false
+      // positive on essentially every leg of every trip, the moment
+      // IN_TRANSIT began or a stop was completed — a genuinely broken
+      // safety feature that trains admins to ignore it (alert fatigue),
+      // not a rare edge case.
+      //
+      // Fixed by tracking the CLOSEST the driver has gotten to the current
+      // target and only alerting on REGRESSION — moving meaningfully
+      // farther away after having already gotten closer — which is the
+      // actual signal of a missed turn or wrong direction, not "haven't
+      // arrived yet." No live route polyline is available in this hook
+      // (that only exists inside DriverNavMap, a separate component), so
+      // this is the correct proxy without threading route geometry all
+      // the way into location tracking.
       if (currentTripId && activeTripsRef.current?.length) {
         const activeTripForNav = activeTripsRef.current.find(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
         if (activeTripForNav) {
@@ -12403,22 +12421,33 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             // deviation alert on the new trip.
             if (!geofenceTriggeredRef.current.deviationCount) geofenceTriggeredRef.current.deviationCount = {};
             if (!geofenceTriggeredRef.current.deviationAlertFired) geofenceTriggeredRef.current.deviationAlertFired = {};
+            // Closest-approach tracker — keyed by trip AND the specific
+            // stop/agent being navigated to, so advancing to a new stop
+            // (or a totally different trip) starts a fresh baseline
+            // instead of inheriting a stale "closest" from a prior leg.
+            if (!geofenceTriggeredRef.current.deviationMinKm) geofenceTriggeredRef.current.deviationMinKm = {};
             const devCount = geofenceTriggeredRef.current.deviationCount;
             const devFired = geofenceTriggeredRef.current.deviationAlertFired;
-            if (devKm > DEVIATION_THRESHOLD_KM) {
+            const devMinKm = geofenceTriggeredRef.current.deviationMinKm;
+            const navTargetKey = navTarget.agent_id != null ? String(navTarget.agent_id) : `${navTarget.lat},${navTarget.lng}`;
+            const devMinKey = `${currentTripId}:${navTargetKey}`;
+            if (devMinKm[devMinKey] == null || devKm < devMinKm[devMinKey]) devMinKm[devMinKey] = devKm;
+            const regressedKm = devKm - devMinKm[devMinKey];
+            if (regressedKm > DEVIATION_THRESHOLD_KM) {
               devCount[currentTripId] = (devCount[currentTripId] || 0) + 1;
               if (devCount[currentTripId] >= 2 && !devFired[currentTripId]) {
                 devFired[currentTripId] = true;
                 if (supabase && user?.id) {
                   insertNotification({
                     type: "ROUTE_DEVIATION", for_roles: [ROLE.ADMIN],
-                    message: `⚠ Route deviation — ${user.name || user.id} appears to be ${(devKm * 1000).toFixed(0)}m off-course on trip ${currentTripId}. Check Live Map.`,
+                    message: `⚠ Route deviation — ${user.name || user.id} moved ${(regressedKm * 1000).toFixed(0)}m farther from their next stop after getting closer earlier on trip ${currentTripId}. Check Live Map.`,
                     trip_id: currentTripId, ts: Date.now(), read: false,
                   }).catch(() => {});
                 }
               }
             } else {
-              // Back on course — reset counter and allow future alert if they deviate again
+              // Back on course (at or closer than the best approach so far) —
+              // reset counter and allow future alert if they regress again
               devCount[currentTripId] = 0;
               devFired[currentTripId] = false;
             }
