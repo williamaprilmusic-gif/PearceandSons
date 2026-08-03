@@ -3738,6 +3738,13 @@ const CT_BOUNDS = { minLat: -35.0, maxLat: -33.0, minLng: 17.5, maxLng: 19.5 };
 // it's treated as stale — there's no upvote/confirm mechanism (unlike
 // Waze) to otherwise judge whether a report is still relevant.
 const HAZARD_REPORT_WINDOW_HOURS = 3;
+
+// Admin-posted route advisories (real-world knowledge relayed by an
+// admin — a protest, a known closure) stay relevant far longer than a
+// driver's in-the-moment hazard note, so they get their own, longer
+// window. An admin can also clear one manually before it expires via
+// ADMIN/CLEAR_ROUTE_ADVISORY.
+const ADMIN_ADVISORY_WINDOW_HOURS = 24;
 function isValidCoord(c) {
   if (c == null || c.lat == null || c.lng == null) return false;
   if (c.lat === 0 && c.lng === 0) return false; // geocoder fallback sentinel
@@ -9168,6 +9175,52 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "ADMIN/POST_ROUTE_ADVISORY": {
+      // Human-curated alternative to the (currently account-blocked)
+      // TomTom Traffic API — an admin relaying something they know about
+      // through any real-world channel (radio, a driver's phone call, a
+      // WhatsApp group, local knowledge) straight onto every active
+      // driver's nav map, immediately. Reuses hazard_reports (source
+      // column distinguishes it from a driver's own peer report) rather
+      // than a separate table, since the display/expiry/realtime
+      // machinery is identical — just a different reporter role and a
+      // longer relevance window (an admin-known closure/protest is far
+      // more likely to still matter hours later than a driver's
+      // in-the-moment "pothole here" note).
+      const actingAdvisory = await assertAdminPermission(activeUserRef, "manageDispatch");
+      if (!action.note?.trim()) throw new Error("Advisory message can't be empty.");
+      if (action.lat == null || action.lng == null || !isValidCoord({ lat: action.lat, lng: action.lng })) {
+        throw new Error("Invalid location for route advisory.");
+      }
+      must(await supabase.from("hazard_reports").insert({
+        driverid: actingAdvisory.id, drivername: actingAdvisory.name, source: "admin",
+        category: "advisory", lat: action.lat, lng: action.lng,
+        note: action.note.trim(), tripid: null, createdat: nowEpoch(),
+      }));
+      await logAuditAction({
+        actorId: actingAdvisory.id, actorName: actingAdvisory.name, actionType: "ADMIN/POST_ROUTE_ADVISORY",
+        details: `Posted route advisory: "${action.note.trim()}"`,
+      });
+      if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
+      else await refetch();
+      return;
+    }
+
+    case "ADMIN/CLEAR_ROUTE_ADVISORY": {
+      const actingClearAdvisory = await assertAdminPermission(activeUserRef, "manageDispatch");
+      // Only clears rows this admin flow actually created (source='admin')
+      // — never lets an admin action delete a driver's own peer hazard
+      // report, which has a different accountability owner entirely.
+      must(await supabase.from("hazard_reports").delete().eq("id", action.report_id).eq("source", "admin"));
+      await logAuditAction({
+        actorId: actingClearAdvisory.id, actorName: actingClearAdvisory.name, actionType: "ADMIN/CLEAR_ROUTE_ADVISORY",
+        details: `Cleared route advisory #${action.report_id}`,
+      });
+      if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
+      else await refetch();
+      return;
+    }
+
     case "DRIVER/SET_SHIFT_SCHEDULE": {
       const actingShift = await assertAdminPermission(activeUserRef, "manageDispatch");
       must(await supabase.from("driver_status").update({
@@ -10234,21 +10287,30 @@ function useAppStore() {
     });
   }, []);
 
-  // Driver-reported hazards ("⚠ Report Hazard" in DriverNavMap) — the
-  // in-house peer-to-peer alert system standing in for Waze's own
-  // crowd-sourced reports, which has no accessible API for a third-party
-  // app to pull from (see project memory for why). Only shows reports
-  // from the last HAZARD_REPORT_WINDOW_HOURS — an hours-old "hazard here"
-  // note isn't useful to a driver arriving later, and there's no
-  // upvote/confirm system to otherwise judge whether it's stale.
+  // Driver-reported hazards ("⚠ Report Hazard" in DriverNavMap) AND
+  // admin-posted route advisories ("📢 Post Route Advisory" in
+  // AdminLiveMap) — both stored in the same hazard_reports table
+  // (source: "driver" | "admin"), standing in for Waze's own
+  // crowd-sourced alerts, which has no accessible API for a third-party
+  // app to pull from (see project memory for why). Different relevance
+  // windows per source: a driver's in-the-moment "pothole here" note goes
+  // stale fast (HAZARD_REPORT_WINDOW_HOURS), but an admin-known closure/
+  // protest realistically stays relevant much longer
+  // (ADMIN_ADVISORY_WINDOW_HOURS) — fetched under the wider of the two
+  // cutoffs, then filtered per-row by its own actual source.
   const fetchHazardReports = useCallback(async () => {
     if (!supabase) return;
-    const cutoff = Date.now() - HAZARD_REPORT_WINDOW_HOURS * 60 * 60 * 1000;
-    const { data, error } = await supabase.from("hazard_reports").select("*").gte("createdat", cutoff).order("createdat", { ascending: false });
+    const widestCutoff = Date.now() - Math.max(HAZARD_REPORT_WINDOW_HOURS, ADMIN_ADVISORY_WINDOW_HOURS) * 60 * 60 * 1000;
+    const { data, error } = await supabase.from("hazard_reports").select("*").gte("createdat", widestCutoff).order("createdat", { ascending: false });
     if (error) return;
-    setHazardReports((data || []).map(r => ({
+    const now = Date.now();
+    const fresh = (data || []).filter(r => {
+      const windowHours = r.source === "admin" ? ADMIN_ADVISORY_WINDOW_HOURS : HAZARD_REPORT_WINDOW_HOURS;
+      return now - r.createdat <= windowHours * 60 * 60 * 1000;
+    });
+    setHazardReports(fresh.map(r => ({
       id: r.id, driver_id: r.driverid, driver_name: r.drivername, category: r.category,
-      lat: r.lat, lng: r.lng, note: r.note, trip_id: r.tripid, created_at: r.createdat,
+      source: r.source || "driver", lat: r.lat, lng: r.lng, note: r.note, trip_id: r.tripid, created_at: r.createdat,
     })));
   }, []);
 
@@ -14603,17 +14665,23 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
       if (h.lat == null || h.lng == null) return;
       const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
       const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
+      const isAdvisory = h.source === "admin";
       L.marker([h.lat, h.lng], {
         icon: L.divIcon({
           className: "", iconSize: [26, 26],
-          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">⚠️</div>`,
+          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${isAdvisory ? "📢" : "⚠️"}</div>`,
         }),
-      // Anonymous to other drivers, per explicit decision — matches
-      // Waze's own reports, which never name the reporter to other users.
-      // driver_id/driver_name still get stored server-side (see
-      // DRIVER/REPORT_HAZARD) for accountability if ever needed, just
-      // never surfaced in this popup.
-      }).bindPopup(`<b>Hazard reported</b><br>${ageLabel}`).addTo(group);
+      // Admin advisories show the actual message (an official company
+      // communication, not a peer report) — driver hazard reports stay
+      // anonymous per explicit decision, matching Waze's own reports,
+      // which never name the reporter to other users. driver_id/
+      // driver_name still get stored server-side either way (see
+      // DRIVER/REPORT_HAZARD / ADMIN/POST_ROUTE_ADVISORY) for
+      // accountability if ever needed, just not surfaced here.
+      }).bindPopup(isAdvisory
+        ? `<b>📢 Route Advisory</b><br>${h.note ? h.note.replace(/</g, "&lt;") : ""}<br><span style="opacity:.7">${ageLabel}</span>`
+        : `<b>Hazard reported</b><br>${ageLabel}`
+      ).addTo(group);
     });
     group.addTo(map);
     hazardLayerRef.current = group;
@@ -18352,8 +18420,87 @@ function timeSinceLabel(isoString) {
   return `${Math.round(diffSec / 3600)}h ago`;
 }
 
-function AdminLiveMap({ state, user }) {
+// Lets an admin relay real-world road knowledge (a protest, a known
+// closure, heavy traffic they heard about on the radio or from a driver's
+// call) straight onto every active driver's nav map — the human-curated
+// stand-in for the (currently account-blocked) TomTom Traffic API, per
+// explicit request. Modeled closely on HighRiskZonesPanel's proven
+// address-search-then-submit-then-list-with-delete shape.
+function RouteAdvisoryPanel({ state, dispatch, onClose }) {
+  const [note, setNote] = useState("");
+  const [street, setStreet] = useState("");
+  const [coord, setCoord] = useState(null);
+  const [posting, setPosting] = useState(false);
+  const [error, setError] = useState(null);
+  const [clearingId, setClearingId] = useState(null);
+
+  const activeAdvisories = (state.hazard_reports || []).filter(h => h.source === "admin");
+
+  const post = async () => {
+    if (!note.trim()) { setError("Enter a message describing the advisory."); return; }
+    if (!coord) { setError("Pick the location from the search results (not just typed) before posting."); return; }
+    setPosting(true);
+    setError(null);
+    try {
+      await dispatch({ type: "ADMIN/POST_ROUTE_ADVISORY", note: note.trim(), lat: coord.lat, lng: coord.lng });
+      setNote(""); setStreet(""); setCoord(null);
+    } catch (e) {
+      setError(e.message || "Couldn't post the advisory — please try again.");
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  const clearAdvisory = async (id) => {
+    setClearingId(id);
+    try {
+      await dispatch({ type: "ADMIN/CLEAR_ROUTE_ADVISORY", report_id: id });
+    } catch (e) {
+      setError(e.message || "Couldn't clear the advisory — please try again.");
+    } finally {
+      setClearingId(null);
+    }
+  };
+
+  return (
+    <Card>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <SectionHeader label="📢 Route Advisory" />
+        {onClose && <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 14, cursor: "pointer" }}>✕</button>}
+      </div>
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Posts a marker on every active driver's navigation map immediately — for anything you know about from any
+        source (radio, a driver's call, local knowledge) that TomTom/formal traffic data wouldn't catch. Stays live
+        for {ADMIN_ADVISORY_WINDOW_HOURS}h or until you clear it below.
+      </div>
+      <TextField label="Advisory Message" value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. N2 closed near Mitchells Plain — protest, use M5" />
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>LOCATION</span>
+        <StreetInput value={street} placeholder="Search an address or area…"
+          preConfirmed={coord ? { label: street, area: "", lat: coord.lat, lng: coord.lng } : null}
+          onChange={({ street: s, coord: c, confirmed }) => { setStreet(s); if (confirmed) setCoord(c); }} />
+      </div>
+      <Button title={posting ? "POSTING…" : "📢 POST ADVISORY"} variant="amber" size="sm" onClick={post} disabled={posting || !note.trim()} />
+      {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
+
+      {activeAdvisories.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 4 }}>
+          <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ACTIVE ADVISORIES ({activeAdvisories.length})</span>
+          {activeAdvisories.map(h => (
+            <div key={h.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: 10, border: `1px solid ${COLORS.wire}`, borderRadius: 4 }}>
+              <span style={{ fontSize: 11, flex: 1 }}>{h.note}</span>
+              <Button title={clearingId === h.id ? "…" : "🗑 CLEAR"} variant="ghost" size="sm" onClick={() => clearAdvisory(h.id)} disabled={clearingId === h.id} />
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function AdminLiveMap({ state, user, dispatch }) {
   const [selectedDriverId, setSelectedDriverId] = useState(null);
+  const [showAdvisoryPanel, setShowAdvisoryPanel] = useState(false);
   const W = 700, H = 560;
   // Viewport state: center lat/lng + zoom level (standard slippy-map
   // zoom, ~10-18 is a reasonable city-to-street range). Starts centered
@@ -18533,13 +18680,19 @@ function AdminLiveMap({ state, user }) {
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
         <SectionHeader label={`Live Driver Tracking (${withPosition.length}/${driverPoints.length} reporting)`} />
-        <div style={{ display: "flex", gap: 6 }}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {hasAdminPermission(user, "manageDispatch") && (
+            <Button title="📢 ADVISORY" variant={showAdvisoryPanel ? "amber" : "ghost"} size="sm" onClick={() => setShowAdvisoryPanel(v => !v)} />
+          )}
           <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
           <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
           <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
           <Button title={isMapExpanded ? "⤡ SHRINK" : "⤢ EXPAND"} variant="ghost" size="sm" onClick={() => setIsMapExpanded(v => !v)} />
         </div>
       </div>
+      {showAdvisoryPanel && hasAdminPermission(user, "manageDispatch") && (
+        <RouteAdvisoryPanel state={state} dispatch={dispatch} onClose={() => setShowAdvisoryPanel(false)} />
+      )}
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 4 }}>
         Positions update while a driver has the app open and an active trip. Grey pins haven't reported in over 30 seconds. Drag to pan, use +/− or scroll to zoom.
       </div>
@@ -21123,7 +21276,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
-      {tab === "map" && <AdminLiveMap state={scopedState} user={user} />}
+      {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
