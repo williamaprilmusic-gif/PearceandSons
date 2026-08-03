@@ -16443,6 +16443,14 @@ function exceptionLabel(t) {
 // consequential outcome — rather than double-counted or picking one
 // arbitrarily.
 function tripFeeCategory(t) {
+  // Fee category is only meaningful for a RESOLVED trip — per explicit
+  // decision, an active/unresolved trip (still UNASSIGNED_BOOKING,
+  // ASSIGNED, DRIVER_CONFIRMED, or IN_TRANSIT) must not count toward any
+  // total, since it could still change (e.g. turn into a no-show or late
+  // cancellation) before it's actually billable. Only the two terminal
+  // states are ever categorized as billable; everything else is "pending".
+  const isResolved = t.state === TRIP_STATE.ARCHIVED_COMPLETED || t.state === TRIP_STATE.ARCHIVED_CANCELLED;
+  if (!isResolved) return "pending";
   if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) return "late_cancellation";
   if (t.no_shows && t.no_shows.length > 0) return "no_show";
   if (t.late_booking_flag) return "late_booking";
@@ -16451,6 +16459,12 @@ function tripFeeCategory(t) {
 function tripFeeAmount(t, feeRates) {
   if (!feeRates) return null;
   const cat = tripFeeCategory(t);
+  // Pending (unresolved) trips contribute 0, not null — callers
+  // (exportTripsToCsv's row-push calls .toFixed() on this directly, and
+  // the on-screen totals sum it) both rely on a real number here, and 0
+  // correctly excludes a pending trip from every total without needing
+  // special-case handling at either call site.
+  if (cat === "pending") return 0;
   return cat === "late_cancellation" ? feeRates.late_cancellation_zar
     : cat === "no_show" ? feeRates.no_show_zar
     : cat === "late_booking" ? feeRates.late_booking_zar
@@ -16693,7 +16707,7 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         // The TOTAL row below sums per unique trip, not per row, so a
         // multi-passenger trip's fee is never double-counted in the total.
         ...(feeRates ? [
-          { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal" }[tripFeeCategory(t)],
+          { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal", pending: "Pending" }[tripFeeCategory(t)],
           tripFeeAmount(t, feeRates).toFixed(2),
           // Driver payment — same per-trip value repeats on every passenger
           // row (matches the Trip Fee convention above); the TOTAL row sums
