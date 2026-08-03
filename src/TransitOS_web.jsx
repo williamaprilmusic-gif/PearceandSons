@@ -3609,9 +3609,17 @@ async function tomtomNavRoute(fromCoord, toCoord) {
   if (!TOMTOM_API_KEY || !fromCoord?.lat || !toCoord?.lat) return null;
   try {
     const locations = `${fromCoord.lat},${fromCoord.lng}:${toCoord.lat},${toCoord.lng}`; // lat,lng — see the standing warning elsewhere in this file
+    // sectionType=speedLimit — live-verified against the real API (curl,
+    // real Cape Town route): this same, already-working Routing API
+    // endpoint (not the account-blocked Traffic product) returns the
+    // actual posted speed limit per road segment, no extra product/
+    // account access needed. Response shape confirmed:
+    // routes[0].sections[] = [{ maxSpeedLimitInKmh, startPointIndex,
+    // endPointIndex, sectionType: "SPEED_LIMIT" }, ...], indices into
+    // the SAME points array used for the route polyline/instructions.
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car` +
-      `&instructionsType=text&language=en-GB${TOMTOM_AVOID_PARAM}`;
+      `&instructionsType=text&language=en-GB&sectionType=speedLimit${TOMTOM_AVOID_PARAM}`;
     const res = _highRiskAvoidRectangles
       ? await fetch(url, {
           method: "POST",
@@ -3631,10 +3639,13 @@ async function tomtomNavRoute(fromCoord, toCoord) {
       maneuver: ins.maneuver || null, message: ins.message || ins.combinedMessage || "Continue",
       street: ins.street || null,
     })).filter(ins => ins.lat != null);
+    const speedLimitSections = (route.sections || [])
+      .filter(s => s.sectionType === "SPEED_LIMIT" && s.maxSpeedLimitInKmh != null)
+      .map(s => ({ maxSpeedKmh: s.maxSpeedLimitInKmh, startPointIndex: s.startPointIndex, endPointIndex: s.endPointIndex }));
     const metres = route.summary?.lengthInMeters;
     const seconds = route.summary?.travelTimeInSeconds;
     return {
-      points, instructions,
+      points, instructions, speedLimitSections,
       distanceKm: metres != null ? metres / 1000 : null,
       etaMin: seconds != null ? Math.max(1, Math.round(seconds / 60)) : null,
     };
@@ -14763,6 +14774,28 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     ? haversineKm(driverPosition.lat, driverPosition.lng, destination.lat, destination.lng) : null;
   const fmtDist = (km) => km == null ? "—" : km < 1 ? `${Math.round(km * 1000)}m` : `${km.toFixed(1)}km`;
 
+  // Current speed limit — live-verified against the real TomTom API
+  // (sectionType=speedLimit on the same already-working routing call, no
+  // extra account access needed — see tomtomNavRoute). Matches the
+  // driver's live position to the nearest point on the route polyline,
+  // then looks up which speed-limit section that point index falls
+  // within. Recomputed fresh every render (driverPosition changes on
+  // every GPS tick anyway) — a full scan of route.points is cheap at this
+  // scale (typically a few hundred points for a single from→to leg).
+  // Returns null (hides the badge) if the driver is genuinely off the
+  // route entirely, matching the same 400m threshold used for rerouting.
+  const currentSpeedLimitKmh = (() => {
+    if (!route?.speedLimitSections?.length || !route?.points?.length || !driverPosition?.lat) return null;
+    let nearestIdx = 0, nearestKm = Infinity;
+    for (let i = 0; i < route.points.length; i++) {
+      const d = haversineKm(driverPosition.lat, driverPosition.lng, route.points[i].lat, route.points[i].lng);
+      if (d < nearestKm) { nearestKm = d; nearestIdx = i; }
+    }
+    if (nearestKm > 0.4) return null;
+    const section = route.speedLimitSections.find(s => nearestIdx >= s.startPointIndex && nearestIdx <= s.endPointIndex);
+    return section ? section.maxSpeedKmh : null;
+  })();
+
   const MANEUVER_ICONS = {
     TURN_LEFT: "⬅", TURN_RIGHT: "➡", SHARP_LEFT: "↖", SHARP_RIGHT: "↗",
     BEAR_LEFT: "↖", BEAR_RIGHT: "↗", KEEP_LEFT: "↖", KEEP_RIGHT: "↗",
@@ -14781,6 +14814,20 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
             <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.chalk }}>{currentInstruction.message}</div>
             {distToNextKm != null && <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>in {fmtDist(distToNextKm)}</div>}
           </div>
+        </div>
+      )}
+      {/* Speed limit badge — standard real-road-sign styling (white disc,
+          red ring, bold black number), positioned above the bottom control
+          bar so it never overlaps either that or the top instruction
+          banner. Hidden entirely when unknown/off-route rather than
+          showing a stale or "—" placeholder. */}
+      {currentSpeedLimitKmh != null && (
+        <div style={{
+          position: "absolute", bottom: 78, left: 10, zIndex: 500,
+          width: 48, height: 48, borderRadius: "50%", background: "#fff", border: "5px solid #E23B3B",
+          display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 2px 6px rgba(0,0,0,.5)",
+        }}>
+          <span style={{ fontSize: 17, fontWeight: 800, color: "#111", lineHeight: 1 }}>{currentSpeedLimitKmh}</span>
         </div>
       )}
       <div style={{ position: "absolute", bottom: 10, left: 10, right: 10, display: "flex", gap: 8, zIndex: 500 }}>
@@ -18776,21 +18823,22 @@ function AdminLiveMap({ state, user, dispatch }) {
                     at typical zoom) so taps land on mobile even with imprecise fingers */}
                 <circle cx={p.x} cy={p.y} r={18} fill="transparent" />
                 {isSelected && <circle cx={p.x} cy={p.y} r={16} fill="none" stroke={color} strokeWidth={1.5} opacity={0.4} />}
-                {/* Direction heading line */}
-                {d.pos.heading != null && !d.stale && (
-                  <line
-                    x1={p.x} y1={p.y}
-                    x2={p.x + Math.sin((d.pos.heading * Math.PI) / 180) * 16}
-                    y2={p.y - Math.cos((d.pos.heading * Math.PI) / 180) * 16}
-                    stroke={color} strokeWidth={2.5} strokeLinecap="round"
-                  />
-                )}
-                {/* Pin body */}
-                <circle cx={p.x} cy={p.y} r={8} fill={color} stroke={COLORS.panel} strokeWidth={2} />
-                {/* Driver initial inside pin */}
-                <text x={p.x} y={p.y + 3} fontSize={8} fontWeight={800} fill={COLORS.panel}
-                  textAnchor="middle" style={{ pointerEvents: "none" }}>
-                  {d.name.charAt(0).toUpperCase()}
+                {/* Pin body — a car icon per explicit request, replacing the
+                    plain dot. Rotates to face the driver's actual heading,
+                    which also makes the old separate heading-line indicator
+                    redundant (one rotated icon reads more clearly than a
+                    dot + a separate direction line) — matches how Waze/
+                    Google Maps show a single rotated car glyph. The colored
+                    ring behind it preserves the busy/available/stale status
+                    signal a plain emoji can't otherwise carry (emoji glyphs
+                    aren't tintable via SVG fill). */}
+                <circle cx={p.x} cy={p.y} r={11} fill={COLORS.panel} stroke={color} strokeWidth={2.5} opacity={d.stale ? 0.6 : 1} />
+                <text
+                  x={p.x} y={p.y} fontSize={14} textAnchor="middle" dominantBaseline="central"
+                  transform={d.pos.heading != null ? `rotate(${d.pos.heading}, ${p.x}, ${p.y})` : undefined}
+                  style={{ pointerEvents: "none", opacity: d.stale ? 0.6 : 1 }}
+                >
+                  🚗
                 </text>
                 {/* Name label above pin */}
                 <text x={p.x} y={p.y - 14} fontSize={9} fontWeight={700} fill={COLORS.chalk}
