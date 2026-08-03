@@ -3733,6 +3733,11 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
 // will cause TomTom to return 400 or route to the wrong place entirely.
 // Bounding box covers Cape Town metro area with generous margins.
 const CT_BOUNDS = { minLat: -35.0, maxLat: -33.0, minLng: 17.5, maxLng: 19.5 };
+
+// How long a driver-reported hazard stays visible to other drivers before
+// it's treated as stale — there's no upvote/confirm mechanism (unlike
+// Waze) to otherwise judge whether a report is still relevant.
+const HAZARD_REPORT_WINDOW_HOURS = 3;
 function isValidCoord(c) {
   if (c == null || c.lat == null || c.lng == null) return false;
   if (c.lat === 0 && c.lng === 0) return false; // geocoder fallback sentinel
@@ -9140,6 +9145,29 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "DRIVER/REPORT_HAZARD": {
+      // In-house peer-to-peer hazard alert, standing in for Waze's own
+      // crowd-sourced reports (no accessible API to pull that from — see
+      // project memory). Any authenticated driver can report — no
+      // permission gate beyond being logged in, matching how a real-world
+      // "hazard ahead" call-out works. Identity is derived server-side
+      // from activeUserRef, never trusted from the client payload — same
+      // pattern as every other identity-shaped action this session.
+      const { data: reportingDriver } = await supabase.from("users").select("id, name").eq("id", activeUserRef.current).maybeSingle();
+      if (!reportingDriver) throw new Error("Driver not found.");
+      if (action.lat == null || action.lng == null || !isValidCoord({ lat: action.lat, lng: action.lng })) {
+        throw new Error("Invalid location for hazard report.");
+      }
+      must(await supabase.from("hazard_reports").insert({
+        driverid: reportingDriver.id, drivername: reportingDriver.name,
+        category: action.category || "hazard", lat: action.lat, lng: action.lng,
+        note: action.note || null, tripid: action.trip_id ?? null, createdat: nowEpoch(),
+      }));
+      if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
+      else await refetch();
+      return;
+    }
+
     case "DRIVER/SET_SHIFT_SCHEDULE": {
       const actingShift = await assertAdminPermission(activeUserRef, "manageDispatch");
       must(await supabase.from("driver_status").update({
@@ -10065,6 +10093,7 @@ function useAppStore() {
   const [tickets, setTickets] = useState([]);
   const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
   const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
+  const [hazardReports, setHazardReports] = useState([]); // [{ id, driver_id, driver_name, category, lat, lng, note, trip_id, created_at }]
 
   const refetch = useCallback(async () => {
     if (!supabase) return;
@@ -10205,6 +10234,24 @@ function useAppStore() {
     });
   }, []);
 
+  // Driver-reported hazards ("⚠ Report Hazard" in DriverNavMap) — the
+  // in-house peer-to-peer alert system standing in for Waze's own
+  // crowd-sourced reports, which has no accessible API for a third-party
+  // app to pull from (see project memory for why). Only shows reports
+  // from the last HAZARD_REPORT_WINDOW_HOURS — an hours-old "hazard here"
+  // note isn't useful to a driver arriving later, and there's no
+  // upvote/confirm system to otherwise judge whether it's stale.
+  const fetchHazardReports = useCallback(async () => {
+    if (!supabase) return;
+    const cutoff = Date.now() - HAZARD_REPORT_WINDOW_HOURS * 60 * 60 * 1000;
+    const { data, error } = await supabase.from("hazard_reports").select("*").gte("createdat", cutoff).order("createdat", { ascending: false });
+    if (error) return;
+    setHazardReports((data || []).map(r => ({
+      id: r.id, driver_id: r.driverid, driver_name: r.drivername, category: r.category,
+      lat: r.lat, lng: r.lng, note: r.note, trip_id: r.tripid, created_at: r.createdat,
+    })));
+  }, []);
+
   useEffect(() => {
     if (!supabase) return;
     refetch();
@@ -10340,6 +10387,18 @@ function useAppStore() {
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchFeeRates]);
 
+  useEffect(() => {
+    if (!supabase) return;
+    fetchHazardReports();
+    const channel = supabase
+      .channel("transitos-hazard-reports")
+      .on("postgres_changes", { event: "*", schema: "public", table: "hazard_reports" }, fetchHazardReports)
+      .subscribe();
+    const onVisible = () => { if (document.visibilityState === "visible") fetchHazardReports(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+  }, [fetchHazardReports]);
+
   const dispatch = useCallback(async (action) => {
     if (useFallback || !supabase) {
       // appReducer never throws — a failed action just comes back with
@@ -10393,7 +10452,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -10405,12 +10464,12 @@ function useAppStore() {
       setSupaError(e.message);
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -14432,17 +14491,19 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
 // simpler than caching state across mounts, avoids Leaflet's known
 // zero-height-container gotcha from mounting behind display:none, and gets
 // a genuinely fresh route/ETA each time rather than a stale cached one.
-function DriverNavMap({ destination, driverPosition, onExit }) {
+function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onReportHazard }) {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const routeLayerRef = useRef(null);
   const driverMarkerRef = useRef(null);
   const destMarkerRef = useRef(null);
+  const hazardLayerRef = useRef(null);
   const [route, setRoute] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [currentInstructionIdx, setCurrentInstructionIdx] = useState(0);
   const [followMode, setFollowMode] = useState(true);
+  const [hazardReported, setHazardReported] = useState(false);
   const lastRouteFetchAtRef = useRef(0);
 
   const fetchRoute = useCallback(async (fromCoord) => {
@@ -14523,6 +14584,35 @@ function DriverNavMap({ destination, driverPosition, onExit }) {
     return () => { map.remove(); mapRef.current = null; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Draw/redraw driver-reported hazard markers whenever the list changes —
+  // the in-house peer-to-peer alert system standing in for Waze's own
+  // crowd-sourced reports, which have no accessible API for a third-party
+  // app to pull from (Waze's only data-sharing program, the Connected
+  // Citizens Program, is restricted to government transportation agencies
+  // and isn't a real-time feed anyway — see project memory). Runs after
+  // the map-init effect above in source order, so on first mount
+  // mapRef.current is guaranteed to already be set by the time this runs,
+  // same reasoning as the route-drawing effect right below.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (hazardLayerRef.current) map.removeLayer(hazardLayerRef.current);
+    const group = L.layerGroup();
+    (hazardReports || []).forEach(h => {
+      if (h.lat == null || h.lng == null) return;
+      const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
+      const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
+      L.marker([h.lat, h.lng], {
+        icon: L.divIcon({
+          className: "", iconSize: [26, 26],
+          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">⚠️</div>`,
+        }),
+      }).bindPopup(`<b>Hazard reported</b><br>${h.driver_name || "A driver"} · ${ageLabel}`).addTo(group);
+    });
+    group.addTo(map);
+    hazardLayerRef.current = group;
+  }, [hazardReports]);
 
   // Draw/redraw the route line + destination pin whenever a route arrives.
   useEffect(() => {
@@ -14631,6 +14721,29 @@ function DriverNavMap({ destination, driverPosition, onExit }) {
         {!followMode && (
           <button onClick={() => setFollowMode(true)} style={{ background: COLORS.amber, border: "none", borderRadius: 8, padding: "0 16px", color: "#000", fontWeight: 800, fontSize: 11, cursor: "pointer" }}>
             ⊙ RECENTER
+          </button>
+        )}
+        {/* Single-tap hazard report — deliberately no category picker or
+            text entry (matches Waze's own one-handed-while-driving design
+            for quick reports): tapping this immediately submits the
+            driver's current position, nothing more, so it's safe to do
+            without looking away from the road for more than an instant. */}
+        {onReportHazard && (
+          <button
+            disabled={hazardReported || !driverPosition?.lat}
+            onClick={() => {
+              onReportHazard();
+              setHazardReported(true);
+              setTimeout(() => setHazardReported(false), 8000);
+            }}
+            style={{
+              background: hazardReported ? "rgba(29,185,84,.15)" : "rgba(10,10,10,.92)",
+              border: `1px solid ${hazardReported ? COLORS.green : COLORS.wire}`,
+              borderRadius: 8, padding: "0 14px", color: hazardReported ? COLORS.green : COLORS.chalk,
+              fontWeight: 800, fontSize: 11, cursor: hazardReported ? "default" : "pointer", whiteSpace: "nowrap",
+            }}
+          >
+            {hazardReported ? "✓ REPORTED" : "⚠ HAZARD"}
           </button>
         )}
       </div>
@@ -15076,7 +15189,15 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   if (navTarget) {
     return (
       <div style={{ height: "calc(100dvh - 130px)" }}>
-        <DriverNavMap destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)} />
+        <DriverNavMap
+          destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)}
+          hazardReports={state.hazard_reports}
+          onReportHazard={() => dispatch({
+            type: "DRIVER/REPORT_HAZARD", category: "hazard",
+            lat: driverPosition?.lat, lng: driverPosition?.lng,
+            trip_id: myActiveTrips[0]?.trip_id ?? null,
+          }).catch(() => {})}
+        />
       </div>
     );
   }
