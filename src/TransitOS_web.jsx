@@ -14608,7 +14608,12 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
           className: "", iconSize: [26, 26],
           html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">⚠️</div>`,
         }),
-      }).bindPopup(`<b>Hazard reported</b><br>${h.driver_name || "A driver"} · ${ageLabel}`).addTo(group);
+      // Anonymous to other drivers, per explicit decision — matches
+      // Waze's own reports, which never name the reporter to other users.
+      // driver_id/driver_name still get stored server-side (see
+      // DRIVER/REPORT_HAZARD) for accountability if ever needed, just
+      // never surfaced in this popup.
+      }).bindPopup(`<b>Hazard reported</b><br>${ageLabel}`).addTo(group);
     });
     group.addTo(map);
     hazardLayerRef.current = group;
