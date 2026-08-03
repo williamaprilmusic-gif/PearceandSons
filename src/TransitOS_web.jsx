@@ -14697,9 +14697,27 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     // Pre-sort coords with nearest-neighbour TSP so the group insertion
     // order approximates the shortest route. TomTom (useSortedDropoffs)
     // runs after the groups are built and overwrites this with the true
-    // road-distance optimum — this just ensures a reasonable initial order.
+    // road-distance optimum — this just ensures a reasonable initial order
+    // for the brief window before TomTom responds (or as the fallback if
+    // it ever fails for this exact request).
+    //
+    // ROOT-CAUSE FIX — confirmed against a real trip (id 211, OUTBOUND,
+    // 2 agents dropping ~25km apart at Blouberg and Philippi) and live
+    // TomTom calls: this anchor was `defaultCompanyAnchor(state)` — the
+    // COMPANY OFFICE — but a driver doing drop-offs has already left the
+    // office and is starting from the shared OUTBOUND pickup point
+    // instead. Using the office as the reference point picked the WRONG
+    // nearest-neighbour order (Philippi first, since it's closer to the
+    // office at 11.4km vs Blouberg's 31.4km) — the real drivable route
+    // from the actual starting point (the pickup location) is the
+    // opposite and meaningfully shorter (Blouberg first: 51.2km total vs
+    // 56.2km, confirmed live). `lastPickupCoord` (computed above, already
+    // correctly falls back to the first pickup stop before any pickup is
+    // actually confirmed) is the SAME anchor the real TomTom call just
+    // below already correctly uses — this pre-sort was the one place
+    // still using the wrong one.
     if (dropCoords.length > 1) {
-      const anchor = defaultCompanyAnchor(state);
+      const anchor = lastPickupCoord || defaultCompanyAnchor(state);
       const preSortDest = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
       dropCoords = sortDropoffCoordsByProximity(dropCoords, anchor, undefined, preSortDest);
     }
