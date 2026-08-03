@@ -1,5 +1,5 @@
 /**
- * Session-issuing Edge Function for Pearce & Sons TransitOS.
+ * Session-issuing Edge Function for Pearce & Sons.
  *
  * STAGE 1 of the auth/RLS migration (see project memory for full plan):
  * mints a real, Postgres-verifiable session token after independently

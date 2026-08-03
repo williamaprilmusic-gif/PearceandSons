@@ -23,7 +23,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
   const TO = "williamaprilmusic@gmail.com";
-  const FROM = "TransitOS <onboarding@resend.dev>";
+  const FROM = "Pearce & Sons <onboarding@resend.dev>";
 
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
@@ -206,7 +206,7 @@ serve(async (req) => {
   ${table(done)}` : ""}
 
   <div style="margin-top:28px;font-size:11px;color:#444;border-top:1px solid #1e1e1e;padding-top:12px">
-    Pearce &amp; Sons Fleet Operations · TransitOS Automated Report
+    Pearce &amp; Sons Fleet Operations · Automated Report
   </div>
 </div></body></html>`;
 

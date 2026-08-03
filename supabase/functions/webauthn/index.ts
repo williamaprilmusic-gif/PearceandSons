@@ -1,5 +1,5 @@
 /**
- * WebAuthn Edge Function for Pearce & Sons TransitOS
+ * WebAuthn Edge Function for Pearce & Sons
  * POST /webauthn { action: 'registration-options' | 'register' | 'authentication-options' | 'authenticate' | 'has-credential', ... }
  */
 import { createClient } from 'jsr:@supabase/supabase-js@2';
