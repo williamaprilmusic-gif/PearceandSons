@@ -18500,6 +18500,7 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
 
   const clearAdvisory = async (id) => {
     setClearingId(id);
+    setError(null);
     try {
       await dispatch({ type: "ADMIN/CLEAR_ROUTE_ADVISORY", report_id: id });
     } catch (e) {
@@ -18835,7 +18836,13 @@ function AdminLiveMap({ state, user, dispatch }) {
                 <circle cx={p.x} cy={p.y} r={11} fill={COLORS.panel} stroke={color} strokeWidth={2.5} opacity={d.stale ? 0.6 : 1} />
                 <text
                   x={p.x} y={p.y} fontSize={14} textAnchor="middle" dominantBaseline="central"
-                  transform={d.pos.heading != null ? `rotate(${d.pos.heading}, ${p.x}, ${p.y})` : undefined}
+                  // !d.stale check restored — a stale position's heading
+                  // could be significantly outdated (the driver may have
+                  // long since turned or stopped), so this matches the old
+                  // heading-line indicator's own deliberate exclusion
+                  // rather than rotating the icon to a potentially
+                  // misleading direction for data that's no longer fresh.
+                  transform={d.pos.heading != null && !d.stale ? `rotate(${d.pos.heading}, ${p.x}, ${p.y})` : undefined}
                   style={{ pointerEvents: "none", opacity: d.stale ? 0.6 : 1 }}
                 >
                   🚗
