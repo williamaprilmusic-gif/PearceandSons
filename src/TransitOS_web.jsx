@@ -6461,6 +6461,45 @@ async function fetchTripHistory({ fromMs, toMs, agentId, driverId } = {}) {
   return (data || []).map(r => tripRowToApp(r, {}));
 }
 
+// On-demand safety trend query for a single driver — state.trips/
+// state.notifications are a rolling ~30-62 day / 500-row fleet-wide cap,
+// too shallow/unreliable for a real 30/90-day trend view on a busy fleet.
+// SPEED_ANOMALY/ROUTE_DEVIATION notification rows carry trip_id but not
+// driver_id directly (confirmed by reading the actual insertNotification
+// call sites), so driver identity is resolved by matching against this
+// driver's own trip ids pulled via fetchTripHistory — a broadcast fired
+// for a different driver's trip is excluded automatically since its
+// trip_id won't be in that set.
+async function fetchDriverSafetyHistory({ driverId, fromMs, toMs }) {
+  const trips = await fetchTripHistory({ fromMs, toMs, driverId });
+  const { data: notifRows, error } = await supabase.from("notifications")
+    .select("id, type, message, tripid, timestamp")
+    .in("type", ["SPEED_ANOMALY", "ROUTE_DEVIATION"])
+    .gte("timestamp", fromMs)
+    .lte("timestamp", toMs);
+  if (error) throw error;
+  const myTripIds = new Set(trips.map(t => t.trip_id));
+  const notifications = (notifRows || []).filter(n => myTripIds.has(n.tripid));
+  return { trips, notifications };
+}
+
+// Pure aggregation over an already-fetched window — modeled on
+// computeDriverStats/driverAvgRating's style.
+function computeDriverSafetyScorecard(trips, notifications) {
+  const tripsInWindow = trips.length;
+  const noShows = trips.reduce((n, t) => n + (t.no_shows?.length || 0), 0);
+  const speedingAlerts = notifications.filter(n => n.type === "SPEED_ANOMALY").length;
+  const routeDeviations = notifications.filter(n => n.type === "ROUTE_DEVIATION").length;
+  let ratingSum = 0, ratingCount = 0;
+  for (const t of trips) {
+    for (const r of Object.values(t.agent_ratings || {})) {
+      if (r?.stars) { ratingSum += r.stars; ratingCount++; }
+    }
+  }
+  const avgRating = ratingCount > 0 ? ratingSum / ratingCount : null;
+  return { speedingAlerts, routeDeviations, noShows, avgRating, ratingCount, tripsInWindow };
+}
+
 // Re-checks the ACTING user's real, current admin_level directly from the
 // database before allowing a gated action — never trusts client-side state,
 // since that could be stale (permissions changed after login) or bypassed
@@ -19518,6 +19557,66 @@ function DriverStatsCard({ driverId, allTrips }) {
   );
 }
 
+// Bottom-sheet modal, same shape as DriverDocEditor — 30/90-day trend view
+// of speeding alerts, route deviations, no-shows, and avg rating, via the
+// dedicated fetchDriverSafetyHistory query (state.trips/notifications are
+// too shallow/capped for a real trend). Same "call the fetch fn directly,
+// try/catch degrades to empty in demo mode" convention as AdminProfileSearch
+// uses for fetchTripHistory.
+function DriverSafetyModal({ driverId, driverName, onClose }) {
+  const [windowDays, setWindowDays] = useState(30);
+  const [loading, setLoading] = useState(true);
+  const [scorecard, setScorecard] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    const toMs = Date.now();
+    const fromMs = toMs - windowDays * 24 * 60 * 60 * 1000;
+    fetchDriverSafetyHistory({ driverId, fromMs, toMs })
+      .then(({ trips, notifications }) => { if (!cancelled) setScorecard(computeDriverSafetyScorecard(trips, notifications)); })
+      .catch(() => { if (!cancelled) setScorecard(computeDriverSafetyScorecard([], [])); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [driverId, windowDays]);
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>🛡 SAFETY SCORECARD — {driverName}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Button title="30 DAYS" variant={windowDays === 30 ? "amber" : "ghost"} size="sm" onClick={() => setWindowDays(30)} />
+          <Button title="90 DAYS" variant={windowDays === 90 ? "amber" : "ghost"} size="sm" onClick={() => setWindowDays(90)} />
+        </div>
+        {loading ? (
+          <div style={{ fontSize: 10, color: COLORS.ghost }}>Loading…</div>
+        ) : scorecard.tripsInWindow === 0 ? (
+          <div style={{ fontSize: 10, color: COLORS.ghost }}>No completed trips in this window.</div>
+        ) : (
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {[
+              ["TRIPS", scorecard.tripsInWindow, COLORS.chalk],
+              ["SPEEDING ALERTS", scorecard.speedingAlerts, scorecard.speedingAlerts > 0 ? COLORS.red : COLORS.ghost],
+              ["ROUTE DEVIATIONS", scorecard.routeDeviations, scorecard.routeDeviations > 0 ? COLORS.amber : COLORS.ghost],
+              ["NO-SHOWS", scorecard.noShows, scorecard.noShows > 0 ? COLORS.amber : COLORS.ghost],
+              ["AVG RATING", scorecard.avgRating != null ? `${scorecard.avgRating.toFixed(1)}★ (${scorecard.ratingCount})` : "—", COLORS.ghost],
+            ].map(([label, val, color]) => (
+              <div key={label} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: "4px 10px", minWidth: 90 }}>
+                <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{label}</div>
+                <div style={{ fontSize: 14, fontWeight: 800, color, fontFamily: FONTS.head }}>{val}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // Bottom-sheet modal, same shape as DriverDocEditor — logs one service
 // entry and optionally advances the vehicle's next-service target in the
 // same submission (per the plan's "manually admin-set per log entry" scope
@@ -19769,6 +19868,7 @@ function AdminDrivers({ state, user, dispatch }) {
   const fullView = hasAdminPermission(user, "viewDriverProfiles");
   const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
   const [docEditorFor, setDocEditorFor] = React.useState(null);
+  const [safetyModalFor, setSafetyModalFor] = React.useState(null);
 
   if (!fullView) {
     return (
@@ -19830,12 +19930,17 @@ function AdminDrivers({ state, user, dispatch }) {
                     onClick={() => printWaybill(driverUser, ds, state.trips, state.users, todayStr)} />
                   <Button title="📄 DOCS" variant="ghost" size="sm"
                     onClick={() => setDocEditorFor(ds.driver_id)} />
+                  <Button title="🛡 SAFETY" variant="ghost" size="sm"
+                    onClick={() => setSafetyModalFor(ds.driver_id)} />
                 </div>
                 <DriverDocSummary ds={ds} />
                 <DriverHoursSummary driverId={ds.driver_id} trips={state.trips} />
                 <div style={{ fontSize: 7, color: COLORS.ghost, marginTop: 1, fontStyle: "italic" }}>estimated from trip activity, not clock-in/out</div>
                 {docEditorFor === ds.driver_id && (
                   <DriverDocEditor ds={ds} dispatch={dispatch} onClose={() => setDocEditorFor(null)} />
+                )}
+                {safetyModalFor === ds.driver_id && (
+                  <DriverSafetyModal driverId={ds.driver_id} driverName={driverUser?.name || "Driver"} onClose={() => setSafetyModalFor(null)} />
                 )}
                 <DriverStatsCard driverId={ds.driver_id} allTrips={state.trips} />
                 {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
