@@ -3283,6 +3283,44 @@ function computeWeeklySummary(trips, users, driverStatus) {
   };
 }
 
+// ── Fleet utilization reporting (v1 scope) ───────────────────────────────
+// Per-trip timestamp breakdown only — driving / loading-dispatch-lag /
+// gap-between-trips — NOT true online/away idle-time tracking (that needs
+// a new driver_status_history table that doesn't exist; explicitly
+// deferred, see project memory). "Gap" only counts time between two trips
+// on the SAME calendar day, since an overnight/multi-day gap is off-duty
+// time, not idle time, and there's no way to distinguish the two without
+// the deferred infrastructure — an explicit, honest limitation surfaced
+// in the UI, not hidden.
+function computeFleetUtilization(trips, users) {
+  const byDriver = {};
+  for (const t of trips) {
+    if (!t.driver_id) continue;
+    (byDriver[t.driver_id] = byDriver[t.driver_id] || []).push(t);
+  }
+  const rows = [];
+  for (const driverId of Object.keys(byDriver)) {
+    const sorted = [...byDriver[driverId]].sort((a, b) => (a.confirmed_at_epoch || a.booked_at_epoch || 0) - (b.confirmed_at_epoch || b.booked_at_epoch || 0));
+    let drivingMs = 0, loadingMs = 0, gapMs = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const t = sorted[i];
+      const { confirmed_at_epoch: confirmedAt, in_transit_at_epoch: inTransitAt, completed_at_epoch: completedAt } = t;
+      if (confirmedAt && inTransitAt && inTransitAt > confirmedAt) loadingMs += inTransitAt - confirmedAt;
+      if (inTransitAt && completedAt && completedAt > inTransitAt) drivingMs += completedAt - inTransitAt;
+      const next = sorted[i + 1];
+      if (next && completedAt) {
+        const nextStart = next.confirmed_at_epoch || next.booked_at_epoch;
+        if (nextStart && nextStart > completedAt && new Date(completedAt).toDateString() === new Date(nextStart).toDateString()) {
+          gapMs += nextStart - completedAt;
+        }
+      }
+    }
+    const u = users.find(uu => String(uu.id) === String(driverId));
+    rows.push({ driver_id: driverId, driver_name: u?.name || driverId, trips: sorted.length, driving_ms: drivingMs, loading_ms: loadingMs, gap_ms: gapMs });
+  }
+  return rows.sort((a, b) => b.driving_ms - a.driving_ms);
+}
+
 function formatWeeklySummaryText(s) {
   const lines = [
     `Pearce & Sons — Weekly Ops Summary (${s.period})`,
@@ -18266,6 +18304,118 @@ function AdminHistory({ state, user, dispatch }) {
   );
 }
 
+function fleetUtilizationToCsv(rows) {
+  const headers = ["Driver", "Trips", "Driving (hrs)", "Loading/Dispatch Lag (hrs)", "Gap Between Trips (hrs)"];
+  const escapeCsv = (val) => {
+    const s = val == null ? "" : String(val);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const toHrs = (ms) => (ms / (1000 * 60 * 60)).toFixed(2);
+  const dataRows = rows.map(r => [r.driver_name, r.trips, toHrs(r.driving_ms), toHrs(r.loading_ms), toHrs(r.gap_ms)]);
+  const csv = [headers, ...dataRows].map(r => r.map(escapeCsv).join(",")).join("\r\n");
+  return "﻿" + csv;
+}
+
+// Modeled on AdminHistory's date-range-picker + "run search" + results
+// shape, per-driver stacked-proportion bars (driving/loading/gap) reusing
+// CapacityBar's track/fill visual idiom, summary tiles in DriverStatsCard's
+// style. v1 scope — see computeFleetUtilization's own comment for what
+// "gap" does and doesn't capture.
+function AdminFleetUtilization({ state, user, dispatch }) {
+  const today = new Date();
+  const thirtyDaysAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const [fromDate, setFromDate] = useState(thirtyDaysAgo.toISOString().slice(0, 10));
+  const [toDate, setToDate] = useState(today.toISOString().slice(0, 10));
+  const [results, setResults] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const runSearch = async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const fromMs = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : undefined;
+      const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
+      const hits = await fetchTripHistory({ fromMs, toMs });
+      setResults(computeFleetUtilization(hits, state.users));
+    } catch (e) {
+      setErr(e.message || "Search failed");
+      setResults(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const exportCsv = () => {
+    if (!results || results.length === 0) return;
+    downloadCsv(fleetUtilizationToCsv(results), `fleet_utilization_${fromDate}_to_${toDate}.csv`);
+  };
+
+  return (
+    <div className="pad">
+      <SectionHeader label="Fleet Utilization" />
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Per-trip timestamp breakdown (driving / loading / gap between trips) for completed trips in the selected
+        range. "Gap" only counts time between two trips on the SAME day — it's the closest available proxy for idle
+        time today, not a true online/away log, so it can't distinguish genuine idle from off-duty.
+      </div>
+      <Card>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>FROM</span>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>TO</span>
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12 }} />
+          </div>
+          <Button title={loading ? "SEARCHING…" : "RUN SEARCH"} variant="amber" size="sm" onClick={runSearch} disabled={loading} />
+          {results && results.length > 0 && <Button title="⬇ EXPORT CSV" variant="ghost" size="sm" onClick={exportCsv} />}
+        </div>
+        {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+      </Card>
+
+      {results && (
+        results.length === 0 ? (
+          <Empty icon="📊" text="No completed trips in this range" />
+        ) : results.map(r => {
+          const totalMs = r.driving_ms + r.loading_ms + r.gap_ms;
+          const pct = (ms) => totalMs > 0 ? (ms / totalMs) * 100 : 0;
+          const toHrs = (ms) => (ms / (1000 * 60 * 60)).toFixed(1);
+          return (
+            <Card key={r.driver_id}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{r.driver_name}</span>
+                <span style={{ fontSize: 10, color: COLORS.ghost }}>{r.trips} trip{r.trips !== 1 ? "s" : ""}</span>
+              </div>
+              <div className="cap-wrap" style={{ marginTop: 8 }}>
+                <div className="cap-track" style={{ display: "flex", overflow: "hidden" }}>
+                  <div style={{ width: `${pct(r.driving_ms)}%`, background: COLORS.green }} />
+                  <div style={{ width: `${pct(r.loading_ms)}%`, background: COLORS.amber }} />
+                  <div style={{ width: `${pct(r.gap_ms)}%`, background: COLORS.wire }} />
+                </div>
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+                {[
+                  ["DRIVING", `${toHrs(r.driving_ms)}h`, COLORS.green],
+                  ["LOADING/LAG", `${toHrs(r.loading_ms)}h`, COLORS.amber],
+                  ["GAP", `${toHrs(r.gap_ms)}h`, COLORS.ghost],
+                ].map(([label, val, color]) => (
+                  <div key={label} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: "4px 10px", minWidth: 80 }}>
+                    <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{label}</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color, fontFamily: FONTS.head }}>{val}</div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          );
+        })
+      )}
+    </div>
+  );
+}
 
 function AdminDispatch({ state, dispatch }) {
   // Multiple unassigned trips can be selected together — for when several
@@ -21922,7 +22072,7 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -21944,6 +22094,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
     if (id === "vehicles") return hasAdminPermission(user, "manageAgentsDrivers");
+    if (id === "utilization") return hasAdminPermission(user, "manageDispatch");
     return true;
   });
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
@@ -22093,6 +22244,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "utilization" && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={scopedState} dispatch={dispatch} user={user} call={call} />}
