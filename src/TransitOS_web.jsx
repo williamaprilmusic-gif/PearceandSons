@@ -1508,7 +1508,20 @@ function isNotificationForUser(n, user) {
   if (!user) return false;
   if (n.for_user_ids?.length) return n.for_user_ids.some(id => String(id) === String(user.id));
   if (user.role === ROLE.ADMIN) return !n.for_roles?.length || n.for_roles.includes(ROLE.ADMIN);
-  return false;
+  // Broadcast row explicitly targeting this non-admin role — e.g. a
+  // company-wide announcement (for_roles:[AGENT,DRIVER], for_user_ids:[]).
+  // This was previously ADMIN-only, a real, confirmed-anticipated gap:
+  // "if a future feature ever tries to broadcast to all agents/drivers
+  // via for_roles with empty for_user_ids, it would silently reach
+  // nobody" (noted during an earlier audit this session, which also
+  // confirmed no existing call site ever actually exercised this path —
+  // every broadcast row in the codebase targets ROLE.ADMIN only, so this
+  // fix is purely additive). Unlike the admin branch above, a MISSING
+  // for_roles is deliberately NOT treated as "matches everyone" here —
+  // that fail-open behavior was only ever safe/exercised for admin
+  // broadcasts; a non-admin should only ever match a broadcast that
+  // explicitly names their role, never an unlabeled one.
+  return !!n.for_roles?.includes(user.role);
 }
 
 /* ---------- ADDRESS SEARCH (offline DB + OpenStreetMap Nominatim) ---------- */
@@ -5447,7 +5460,8 @@ function appReducer(state, action) {
       // admin notifications stuck unread forever even after CLEAR ALL,
       // since nothing else ever marked them read either.
       const matches = (n) => action.user_id != null
-        ? n.for_user_ids?.some(id => String(id) === String(action.user_id))
+        ? n.for_user_ids?.some(id => String(id) === String(action.user_id)) ||
+          (!n.for_user_ids?.length && !!action.role && !!n.for_roles?.includes(action.role))
         : (action.admin
             ? (n.for_roles?.includes(ROLE.ADMIN) || !n.for_roles?.length) &&
               (!n.for_user_ids?.length || n.for_user_ids.some(id => String(id) === String(action.actor_id)))
@@ -9217,6 +9231,29 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "ADMIN/POST_ANNOUNCEMENT": {
+      // Company-wide memo, distinct from the location-based Route Advisory
+      // above — a broadcast notification, not a map pin. No new table: an
+      // announcement is exactly as durable as any other notification,
+      // visible in AlertsTab until the recipient clears it.
+      const actingAnnouncer = await assertAdminPermission(activeUserRef, "manageDispatch");
+      if (!action.message?.trim()) throw new Error("Announcement can't be empty.");
+      await insertNotification({
+        type: "COMPANY_ANNOUNCEMENT",
+        for_roles: [ROLE.AGENT, ROLE.DRIVER],
+        for_user_ids: [],
+        message: action.message.trim(),
+        ts: nowEpoch(),
+        read: false,
+      });
+      await logAuditAction({
+        actorId: actingAnnouncer.id, actorName: actingAnnouncer.name, actionType: "ADMIN/POST_ANNOUNCEMENT",
+        details: `Posted company announcement: "${action.message.trim()}"`,
+      });
+      await refetch();
+      return;
+    }
+
     case "ADMIN/CLEAR_ROUTE_ADVISORY": {
       const actingClearAdvisory = await assertAdminPermission(activeUserRef, "manageDispatch");
       // Only clears rows this admin flow actually created (source='admin')
@@ -10059,7 +10096,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // scope to the actual authenticated caller, not whatever id the
         // client sent, or any caller could mark another user's
         // notifications read (suppressing alerts meant for them).
-        must(await supabase.from("notifications").update({ isread: true }).eq("userid", activeUserRef.current));
+        const { data: markAllCaller } = await supabase.from("users").select("id, role").eq("id", activeUserRef.current).maybeSingle();
+        if (!markAllCaller) throw new Error("User not found.");
+        must(await supabase.from("notifications").update({ isread: true }).eq("userid", markAllCaller.id));
+        // Broadcast rows (userid IS NULL) can never match the .eq above —
+        // a role-targeted broadcast (e.g. a company announcement) needs its
+        // own update scoped by forroles so a driver/agent's own CLEAR
+        // button can actually clear it, not just the admin branch below.
+        must(await supabase.from("notifications").update({ isread: true }).is("userid", null).contains("forroles", [markAllCaller.role]));
       } else if (action.admin) {
         // action.admin is client-supplied — verify the caller is actually
         // an admin (any tier) before honoring it, same rationale as
@@ -11875,8 +11919,13 @@ function AgentTripsTab({ myTrips, state, dispatch, user, call, jumpTripId, onJum
 // use the same component (a driver's ticket replies and trip-cancellation
 // alerts are targeted by user id, so they land here too).
 function AlertsTab({ state, user, dispatch }) {
-  const myNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄" };
+  // Was for_user_ids-only, which silently excluded every broadcast
+  // (empty for_user_ids, e.g. a role-wide COMPANY_ANNOUNCEMENT) from ever
+  // showing in this list — the toast effect elsewhere already used
+  // isNotificationForUser and fired once, but the notification then had
+  // nowhere to persist/be re-read, since this is the actual list render.
+  const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -11911,7 +11960,7 @@ function AlertsTab({ state, user, dispatch }) {
           {myNotifs.length > 0 && (
             <Button title={selectMode ? "CANCEL" : "SELECT"} variant="ghost" size="sm" onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))} />
           )}
-          {!selectMode && <Button title="CLEAR" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", user_id: user.id }).catch(() => {})} />}
+          {!selectMode && <Button title="CLEAR" variant="ghost" size="sm" onClick={() => dispatch({ type: "NOTIF/MARK_ALL_READ", user_id: user.id, role: user.role }).catch(() => {})} />}
         </div>
       </div>
       {selectMode && selectedIds.size > 0 && (
@@ -13674,7 +13723,7 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
     return () => clearInterval(intervalId);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  const myNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)) && !n.read);
+  const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user) && !n.read);
   // Home-screen cards say "Tap to view details" — so land on THAT trip's
   // detail view, not just the trips list (which is what happened before:
   // goToTrip ignored its argument entirely). The id is consumed by
@@ -15866,7 +15915,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notifClickHandlerRef]);
   const myStatus = state.driver_status.find(d => String(d.driver_id) === String(user.id));
-  const myUnreadNotifs = state.notifications.filter(n => n.for_user_ids?.some(id => String(id) === String(user.id)) && !n.read).length;
+  const myUnreadNotifs = state.notifications.filter(n => isNotificationForUser(n, user) && !n.read).length;
   const allMyTrips = state.trips.filter(t => String(t.driver_id) === String(user.id));
 
   // Client-side half of the late-start warning — see AdminApp's
@@ -15966,7 +16015,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
 /* ============================================================
    ADMIN APP
    ============================================================ */
-function AdminDashboard({ state, user }) {
+function AdminDashboard({ state, user, dispatch }) {
   // Viewer Administrator only sees TODAY's trips on the dashboard — Fleet
   // Ops and Standard keep the existing full live-window view (current +
   // previous month of activity, matching what "All Trips" shows). This does NOT
@@ -16060,6 +16109,7 @@ function AdminDashboard({ state, user }) {
           </Card>
         );
       })}
+      {hasAdminPermission(user, "manageDispatch") && (() => { try { return <AnnouncementPanel dispatch={dispatch} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>Announcement error: {e.message}</div>; } })()}
       {(() => { try { return <WeeklyOpsSummaryPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>WeeklyOps error: {e.message}</div>; } })()}
       <SectionHeader label="7-Day Demand Forecast" />
       {(() => { try { return <CapacityForecastPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>CapacityForecast error: {e.message}</div>; } })()}
@@ -18473,6 +18523,47 @@ function timeSinceLabel(isoString) {
 // stand-in for the (currently account-blocked) TomTom Traffic API, per
 // explicit request. Modeled closely on HighRiskZonesPanel's proven
 // address-search-then-submit-then-list-with-delete shape.
+// Company-wide memo broadcast to every agent and driver — distinct from
+// RouteAdvisoryPanel below, which posts a location pin on the nav map, not
+// a general notification. Modeled on RouteAdvisoryPanel's own form shape,
+// minus the location half.
+function AnnouncementPanel({ dispatch }) {
+  const [message, setMessage] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [error, setError] = useState(null);
+  const [sent, setSent] = useState(false);
+
+  const post = async () => {
+    if (!message.trim()) { setError("Enter an announcement message."); return; }
+    setPosting(true);
+    setError(null);
+    setSent(false);
+    try {
+      await dispatch({ type: "ADMIN/POST_ANNOUNCEMENT", message: message.trim() });
+      setMessage("");
+      setSent(true);
+    } catch (e) {
+      setError(e.message || "Couldn't post the announcement — please try again.");
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  return (
+    <Card>
+      <SectionHeader label="📢 Company Announcement" />
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Sends a notification to every agent and driver — for company-wide memos, not route/location alerts (use Route
+        Advisory on the Live Map for those).
+      </div>
+      <TextField label="Message" value={message} onChange={e => setMessage(e.target.value)} placeholder="e.g. Office closed Friday for public holiday — no dispatch changes." />
+      <Button title={posting ? "SENDING…" : "📢 BROADCAST"} variant="amber" size="sm" onClick={post} disabled={posting || !message.trim()} />
+      {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
+      {sent && !error && <span style={{ fontSize: 10, color: COLORS.green }}>Announcement sent.</span>}
+    </Card>
+  );
+}
+
 function RouteAdvisoryPanel({ state, dispatch, onClose }) {
   const [note, setNote] = useState("");
   const [street, setStreet] = useState("");
@@ -20888,7 +20979,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -21327,7 +21418,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
 
   const mainContent = (
     <div style={{ flex: 1, overflowY: "auto", minWidth: 0 }}>
-      {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} />}
+      {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
