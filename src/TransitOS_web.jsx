@@ -2719,6 +2719,26 @@ function docExpiryStatus(dateStr) {
   return { status: "ok", daysLeft };
 }
 
+function DriverHoursSummary({ driverId, trips }) {
+  const hoursToday = computeDriverHoursToday(driverId, trips);
+  const hoursWeek = computeDriverHoursThisWeek(driverId, trips);
+  const overDay = hoursToday >= MAX_DRIVER_HOURS_PER_DAY;
+  const overWeek = hoursWeek >= MAX_DRIVER_HOURS_PER_WEEK;
+  const nearDay = !overDay && hoursToday >= MAX_DRIVER_HOURS_PER_DAY * 0.8;
+  const nearWeek = !overWeek && hoursWeek >= MAX_DRIVER_HOURS_PER_WEEK * 0.8;
+  const color = (over, near) => over ? COLORS.red : near ? COLORS.amber : COLORS.ghost;
+  return (
+    <div style={{ fontSize: 8, marginTop: 2, display: "flex", gap: 10 }}>
+      <span style={{ color: color(overDay, nearDay), fontWeight: overDay ? 700 : 400 }}>
+        {overDay ? "⚠ " : ""}Hours today: {hoursToday.toFixed(1)}h / {MAX_DRIVER_HOURS_PER_DAY}h
+      </span>
+      <span style={{ color: color(overWeek, nearWeek), fontWeight: overWeek ? 700 : 400 }}>
+        {overWeek ? "⚠ " : ""}This week: {hoursWeek.toFixed(1)}h / {MAX_DRIVER_HOURS_PER_WEEK}h
+      </span>
+    </div>
+  );
+}
+
 function DriverDocSummary({ ds }) {
   const docs = ds.documents || {};
   const issues = DOC_TYPES.map(d => ({ ...d, ...docExpiryStatus(docs[d.key]), date: docs[d.key] }))
@@ -3126,6 +3146,55 @@ function SmartSchedulingPanel({ state }) {
 // Computes a plain-language ops summary for the last 7 days.
 // Designed to be: (a) shown in the dashboard, (b) copied and emailed,
 // (c) callable from a Supabase Edge Function for automated Monday emails.
+// ── Driver hours / rest compliance ───────────────────────────────────────
+// Advisory-only (SA driving-hours guidance), never a hard dispatch block —
+// confirmed with the user rather than guessed. Named constants so the
+// threshold is easy to revisit later.
+const MAX_DRIVER_HOURS_PER_DAY = 12;
+const MAX_DRIVER_HOURS_PER_WEEK = 60;
+
+// Derives "hours worked" from actual trip activity timestamps, not
+// driver_status.availability_schedule (that's planned availability, not
+// actual worked time — would badly overstate hours). Only trips that
+// actually started (accepted/confirmed/booked) AND either completed or
+// are still in transit contribute — a cancelled trip has no real worked
+// time. Intervals are merged before summing so two overlapping trip
+// windows for the same driver (e.g. a merged multi-passenger trip
+// reflected as more than one row) can't double-count the same minutes.
+function driverTripIntervalsMs(driverId, trips, fromMs, toMs) {
+  const intervals = [];
+  for (const t of trips) {
+    if (String(t.driver_id) !== String(driverId)) continue;
+    const start = t.accepted_at_epoch || t.confirmed_at_epoch || t.booked_at_epoch;
+    if (!start) continue;
+    const end = t.completed_at_epoch || (t.state === TRIP_STATE.IN_TRANSIT ? Date.now() : null);
+    if (!end || end <= start) continue;
+    if (end < fromMs || start > toMs) continue;
+    intervals.push([Math.max(start, fromMs), Math.min(end, toMs)]);
+  }
+  intervals.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const [s, e] of intervals) {
+    const last = merged[merged.length - 1];
+    if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+    else merged.push([s, e]);
+  }
+  return merged.reduce((sum, [s, e]) => sum + (e - s), 0);
+}
+
+function computeDriverHoursToday(driverId, trips) {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return driverTripIntervalsMs(driverId, trips, startOfDay, Date.now()) / (1000 * 60 * 60);
+}
+
+function computeDriverHoursThisWeek(driverId, trips) {
+  const now = new Date();
+  const diffToMonday = now.getDay() === 0 ? 6 : now.getDay() - 1;
+  const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday).getTime();
+  return driverTripIntervalsMs(driverId, trips, startOfWeek, Date.now()) / (1000 * 60 * 60);
+}
+
 function computeWeeklySummary(trips, users, driverStatus) {
   const now = Date.now();
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
@@ -10030,6 +10099,60 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (docAnyFired) await refetch();
       return;
     }
+    case "DRIVER/CHECK_HOURS_COMPLIANCE": {
+      // Advisory-only (never blocks dispatch) — see MAX_DRIVER_HOURS_PER_DAY/
+      // WEEK and computeDriverHoursToday/ThisWeek's own comments for why
+      // "hours worked" is derived from actual trip timestamps, not planned
+      // availability. hourscompliancenotifiedfor stores {date, notifiedAt},
+      // so this fires at most once per calendar day per driver, and
+      // naturally resets/can re-fire the next day if still over — same
+      // de-dup shape as DRIVER_DOCUMENT_EXPIRY above, just keyed by date
+      // instead of a doc's expiry value.
+      const { data: driverStatusHoursRows } = await supabase.from("driver_status").select("driverid, hourscompliancenotifiedfor");
+      if (!driverStatusHoursRows || driverStatusHoursRows.length === 0) return;
+      // Booking always precedes every other timestamp on a trip, so
+      // filtering on bookedat safely captures everything relevant to
+      // today/this-week's window without pulling the whole trips table.
+      const eightDaysAgoHours = nowEpoch() - 8 * 24 * 60 * 60 * 1000;
+      const { data: recentTripRowsHours } = await supabase.from("trips").select("driverid, status, bookedat, confirmedat, acceptedat, completedat").gte("bookedat", eightDaysAgoHours);
+      if (!recentTripRowsHours) return;
+      const tripsForHours = recentTripRowsHours.map(r => ({
+        driver_id: r.driverid, state: r.status,
+        booked_at_epoch: r.bookedat, confirmed_at_epoch: r.confirmedat,
+        accepted_at_epoch: r.acceptedat, completed_at_epoch: r.completedat,
+      }));
+      const hoursNowTs = nowEpoch();
+      const todayDateStr = new Date().toISOString().slice(0, 10);
+      let hoursAnyFired = false;
+      for (const dsHours of driverStatusHoursRows) {
+        const notifiedHours = dsHours.hourscompliancenotifiedfor || {};
+        if (notifiedHours.date === todayDateStr) continue;
+        const hoursToday = computeDriverHoursToday(dsHours.driverid, tripsForHours);
+        const hoursWeek = computeDriverHoursThisWeek(dsHours.driverid, tripsForHours);
+        const overDay = hoursToday >= MAX_DRIVER_HOURS_PER_DAY;
+        const overWeek = hoursWeek >= MAX_DRIVER_HOURS_PER_WEEK;
+        if (!overDay && !overWeek) continue;
+        hoursAnyFired = true;
+        const { data: driverUserRowHours } = await supabase.from("users").select("fullname").eq("id", dsHours.driverid).maybeSingle();
+        const driverNameHours = driverUserRowHours?.fullname || dsHours.driverid;
+        const reasonHours = overDay && overWeek
+          ? `${hoursToday.toFixed(1)}h today and ${hoursWeek.toFixed(1)}h this week`
+          : overDay ? `${hoursToday.toFixed(1)}h today` : `${hoursWeek.toFixed(1)}h this week`;
+        await insertNotification({
+          type: "DRIVER_HOURS_WARNING", for_roles: [ROLE.ADMIN],
+          message: `⚠ ${driverNameHours} has logged ${reasonHours} — approaching/over the advisory limit (${MAX_DRIVER_HOURS_PER_DAY}h/day, ${MAX_DRIVER_HOURS_PER_WEEK}h/week).`,
+          ts: hoursNowTs, read: false,
+        });
+        await insertNotification({
+          type: "DRIVER_HOURS_WARNING", for_roles: [ROLE.DRIVER], for_user_ids: [dsHours.driverid],
+          message: `⚠ You've logged ${reasonHours} — please plan for adequate rest.`,
+          ts: hoursNowTs, read: false,
+        });
+        await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: hoursNowTs } }).eq("driverid", dsHours.driverid);
+      }
+      if (hoursAnyFired) await refetch();
+      return;
+    }
     case "NOTIF/DELETE_SELECTED": {
       // Deletes notifications by ID. For agents/drivers: scoped to their own userid.
       // For admins: delete by ID only — no userid constraint. This handles:
@@ -11925,7 +12048,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -19279,6 +19402,8 @@ function AdminDrivers({ state, user, dispatch }) {
                     onClick={() => setDocEditorFor(ds.driver_id)} />
                 </div>
                 <DriverDocSummary ds={ds} />
+                <DriverHoursSummary driverId={ds.driver_id} trips={state.trips} />
+                <div style={{ fontSize: 7, color: COLORS.ghost, marginTop: 1, fontStyle: "italic" }}>estimated from trip activity, not clock-in/out</div>
                 {docEditorFor === ds.driver_id && (
                   <DriverDocEditor ds={ds} dispatch={dispatch} onClose={() => setDocEditorFor(null)} />
                 )}
@@ -20979,7 +21104,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -21310,10 +21435,12 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // here alongside the other admin-triggered periodic checks rather
     // than in every driver's own polling effect.
     dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
+    dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
+      dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
     }, 5 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
