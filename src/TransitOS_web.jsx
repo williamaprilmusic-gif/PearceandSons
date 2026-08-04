@@ -2739,6 +2739,27 @@ function DriverHoursSummary({ driverId, trips }) {
   );
 }
 
+// ── Vehicle service due tracking ─────────────────────────────────────────
+// Reuses docExpiryStatus's exact amber/red date logic for next_service_date,
+// plus an equivalent km-based check for next_service_km (both manually
+// admin-set per DriverDocEditor-style entry, not auto-computed intervals —
+// see project memory for why). Whichever dimension is more urgent wins.
+const MAINTENANCE_WARN_KM = 500;
+
+function vehicleServiceStatus(v) {
+  const hasDate = !!v.next_service_date;
+  const hasKm = v.next_service_km != null && v.odometer_km != null;
+  if (!hasDate && !hasKm) return { status: "missing", daysLeft: null, kmLeft: null };
+  const dateStatus = hasDate ? docExpiryStatus(v.next_service_date) : null;
+  const kmLeft = hasKm ? v.next_service_km - v.odometer_km : null;
+  const kmStatusVal = hasKm ? (kmLeft < 0 ? "expired" : kmLeft <= MAINTENANCE_WARN_KM ? "expiring" : "ok") : null;
+  const rank = { expired: 2, expiring: 1, ok: 0 };
+  let worst = "ok";
+  if (dateStatus && rank[dateStatus.status] > rank[worst]) worst = dateStatus.status;
+  if (kmStatusVal && rank[kmStatusVal] > rank[worst]) worst = kmStatusVal;
+  return { status: worst, daysLeft: dateStatus?.daysLeft ?? null, kmLeft };
+}
+
 function DriverDocSummary({ ds }) {
   const docs = ds.documents || {};
   const issues = DOC_TYPES.map(d => ({ ...d, ...docExpiryStatus(docs[d.key]), date: docs[d.key] }))
@@ -7830,6 +7851,142 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else await refetch();
       return;
     }
+    case "ADMIN/CREATE_VEHICLE": {
+      const actingAdminVehC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      if (!action.registration?.trim()) throw new Error("A registration number is required.");
+      const { data: vehInserted, error: vehCErr } = await supabase.from("vehicles").insert({
+        registration: action.registration.trim(), make: action.make || null, model: action.model || null,
+        year: action.year || null, odometerkm: action.odometer_km || 0,
+        nextservicedate: action.next_service_date || null, nextservicekm: action.next_service_km || null,
+        assigneddriverid: action.assigned_driver_id || null, active: true, createdat: nowEpoch(),
+      }).select("id").single();
+      if (vehCErr) throw vehCErr;
+      await logAuditAction({
+        actorId: actingAdminVehC.id, actorName: actingAdminVehC.name, actionType: "ADMIN/CREATE_VEHICLE",
+        details: `Added vehicle: ${action.registration.trim()} (id ${vehInserted?.id})`,
+      });
+      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/UPDATE_VEHICLE": {
+      const actingAdminVehU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const vehUpdate = { updatedat: nowEpoch() };
+      if (action.registration !== undefined) vehUpdate.registration = action.registration.trim();
+      if (action.make !== undefined) vehUpdate.make = action.make;
+      if (action.model !== undefined) vehUpdate.model = action.model;
+      if (action.year !== undefined) vehUpdate.year = action.year;
+      if (action.odometer_km !== undefined) vehUpdate.odometerkm = action.odometer_km;
+      if (action.next_service_date !== undefined) vehUpdate.nextservicedate = action.next_service_date;
+      if (action.next_service_km !== undefined) vehUpdate.nextservicekm = action.next_service_km;
+      const { error: vehUErr } = await supabase.from("vehicles").update(vehUpdate).eq("id", action.vehicle_id);
+      if (vehUErr) throw vehUErr;
+      await logAuditAction({
+        actorId: actingAdminVehU.id, actorName: actingAdminVehU.name, actionType: "ADMIN/UPDATE_VEHICLE",
+        details: `Updated vehicle id ${action.vehicle_id}`,
+      });
+      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/ARCHIVE_VEHICLE": {
+      const actingAdminVehA = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const { data: vehRow } = await supabase.from("vehicles").select("id, registration").eq("id", action.vehicle_id).maybeSingle();
+      if (!vehRow) throw new Error("Vehicle not found");
+      const { error: vehAErr } = await supabase.from("vehicles").update({ active: false, updatedat: nowEpoch() }).eq("id", action.vehicle_id);
+      if (vehAErr) throw vehAErr;
+      await logAuditAction({
+        actorId: actingAdminVehA.id, actorName: actingAdminVehA.name, actionType: "ADMIN/ARCHIVE_VEHICLE",
+        details: `Archived vehicle: ${vehRow.registration} (id ${action.vehicle_id})`,
+      });
+      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/ASSIGN_VEHICLE_TO_DRIVER": {
+      const actingAdminVehAs = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const { error: vehAsErr } = await supabase.from("vehicles").update({ assigneddriverid: action.driver_id || null, updatedat: nowEpoch() }).eq("id", action.vehicle_id);
+      if (vehAsErr) throw vehAsErr;
+      await logAuditAction({
+        actorId: actingAdminVehAs.id, actorName: actingAdminVehAs.name, actionType: "ADMIN/ASSIGN_VEHICLE_TO_DRIVER",
+        details: `Assigned vehicle id ${action.vehicle_id} to driver id ${action.driver_id || "(unassigned)"}`,
+      });
+      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
+      else await refetch();
+      return;
+    }
+    case "ADMIN/LOG_VEHICLE_MAINTENANCE": {
+      // loggedbyid/loggedbyname always server-derived from the actual
+      // caller, same as every other action in this file — never trust
+      // action.logged_by_* even though the client wouldn't currently send it.
+      const actingAdminVehLog = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      if (!action.vehicle_id) throw new Error("A vehicle is required.");
+      const { error: vehLogErr } = await supabase.from("vehicle_maintenance_log").insert({
+        vehicleid: action.vehicle_id, servicedate: action.service_date || null,
+        odometerkm: action.odometer_km || null, servicetype: action.service_type || null,
+        note: action.note || null, cost_zar: action.cost_zar != null ? action.cost_zar : null,
+        loggedbyid: actingAdminVehLog.id, loggedbyname: actingAdminVehLog.name, createdat: nowEpoch(),
+      });
+      if (vehLogErr) throw vehLogErr;
+      // A logged service reading only ever advances the vehicle's own
+      // record forward — a lower/older odometer or service target here
+      // would silently corrupt the vehicle's live state.
+      const vehUpdateFields = { updatedat: nowEpoch() };
+      const { data: vehForLog } = await supabase.from("vehicles").select("odometerkm").eq("id", action.vehicle_id).maybeSingle();
+      if (action.odometer_km != null && (vehForLog?.odometerkm == null || action.odometer_km > vehForLog.odometerkm)) {
+        vehUpdateFields.odometerkm = action.odometer_km;
+      }
+      if (action.next_service_date !== undefined) vehUpdateFields.nextservicedate = action.next_service_date;
+      if (action.next_service_km !== undefined) vehUpdateFields.nextservicekm = action.next_service_km;
+      // Advancing the service target clears any stale "due" notification
+      // flag so the next-check sweep can re-fire once the NEW target
+      // actually approaches, instead of staying silent because the old
+      // target's date/km is still recorded as "already notified."
+      if (action.next_service_date !== undefined || action.next_service_km !== undefined) {
+        vehUpdateFields.maintenancenotifiedfor = null;
+      }
+      await supabase.from("vehicles").update(vehUpdateFields).eq("id", action.vehicle_id);
+      await logAuditAction({
+        actorId: actingAdminVehLog.id, actorName: actingAdminVehLog.name, actionType: "ADMIN/LOG_VEHICLE_MAINTENANCE",
+        details: `Logged service for vehicle id ${action.vehicle_id}: ${action.service_type || "service"}`,
+      });
+      if (extraRefetchers.fetchVehicleMaintenanceLog) await extraRefetchers.fetchVehicleMaintenanceLog();
+      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
+      if (!extraRefetchers.fetchVehicleMaintenanceLog && !extraRefetchers.fetchVehicles) await refetch();
+      return;
+    }
+    case "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE": {
+      // Fleet-ops compliance sweep, same shape as DRIVER/CHECK_DOCUMENT_EXPIRY
+      // above (no assertAdminPermission — it's an internal system check
+      // triggered from AdminApp's own poll effect, not client-supplied
+      // data, same convention as every other periodic sweep in this file).
+      // maintenancenotifiedfor stores {key, notifiedAt} where key is the
+      // exact (date, km) target last notified for, so this re-fires once
+      // per genuinely-still-due target and goes silent once the admin logs
+      // a new service (which clears this field — see ADMIN/LOG_VEHICLE_
+      // MAINTENANCE above) or advances the target past due.
+      const { data: vehicleRows } = await supabase.from("vehicles").select("id, registration, odometerkm, nextservicedate, nextservicekm, maintenancenotifiedfor").eq("active", true);
+      if (!vehicleRows || vehicleRows.length === 0) return;
+      const vehNowTs = nowEpoch();
+      let vehAnyFired = false;
+      for (const v of vehicleRows) {
+        const { status } = vehicleServiceStatus({ next_service_date: v.nextservicedate, next_service_km: v.nextservicekm, odometer_km: v.odometerkm });
+        if (status !== "expiring" && status !== "expired") continue;
+        const notifiedKey = `${v.nextservicedate || ""}|${v.nextservicekm || ""}`;
+        const notified = v.maintenancenotifiedfor || {};
+        if (notified.key === notifiedKey) continue;
+        vehAnyFired = true;
+        const verb = status === "expired" ? "is OVERDUE for service" : "is due for service soon";
+        await insertNotification({
+          type: "VEHICLE_MAINTENANCE_DUE", for_roles: [ROLE.ADMIN],
+          message: `🔧 Vehicle ${v.registration} ${verb}${v.nextservicedate ? ` (${v.nextservicedate})` : ""}${v.nextservicekm ? `, target ${v.nextservicekm}km` : ""}.`,
+          ts: vehNowTs, read: false,
+        });
+        await supabase.from("vehicles").update({ maintenancenotifiedfor: { key: notifiedKey, notifiedAt: vehNowTs } }).eq("id", v.id);
+      }
+      if (vehAnyFired) await refetch();
+      return;
+    }
     case "ADMIN/UPDATE_FEE_RATES": {
       // Fleet Ops + Financial, per explicit decision — setting these rates
       // is Financial's actual job function, not an operational action.
@@ -10325,6 +10482,8 @@ function useAppStore() {
   const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
   const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
   const [hazardReports, setHazardReports] = useState([]); // [{ id, driver_id, driver_name, category, lat, lng, note, trip_id, created_at }]
+  const [vehicles, setVehicles] = useState([]); // [{ id, registration, make, model, year, odometer_km, next_service_date, next_service_km, assigned_driver_id, active }]
+  const [vehicleMaintenanceLog, setVehicleMaintenanceLog] = useState([]); // [{ id, vehicle_id, service_date, odometer_km, service_type, note, cost_zar, logged_by_id, logged_by_name, created_at }]
 
   const refetch = useCallback(async () => {
     if (!supabase) return;
@@ -10447,6 +10606,30 @@ function useAppStore() {
     }));
     setHighRiskZones(mapped);
     setHighRiskAvoidZones(mapped);
+  }, []);
+
+  // Vehicles + their service log — own fetch cycle, same "not part of the
+  // main refetch" reasoning as high_risk_zones/campaigns/companies above.
+  const fetchVehicles = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("vehicles").select("*").order("registration");
+    if (error) return;
+    setVehicles((data || []).map(v => ({
+      id: v.id, registration: v.registration, make: v.make, model: v.model, year: v.year,
+      odometer_km: v.odometerkm, next_service_date: v.nextservicedate, next_service_km: v.nextservicekm,
+      assigned_driver_id: v.assigneddriverid, active: v.active,
+    })));
+  }, []);
+
+  const fetchVehicleMaintenanceLog = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("vehicle_maintenance_log").select("*").order("createdat", { ascending: false });
+    if (error) return;
+    setVehicleMaintenanceLog((data || []).map(l => ({
+      id: l.id, vehicle_id: l.vehicleid, service_date: l.servicedate, odometer_km: l.odometerkm,
+      service_type: l.servicetype, note: l.note, cost_zar: l.cost_zar,
+      logged_by_id: l.loggedbyid, logged_by_name: l.loggedbyname, created_at: l.createdat,
+    })));
   }, []);
 
   // Trip fee rates — admin-configurable (Fleet Ops only) per-category
@@ -10617,6 +10800,30 @@ function useAppStore() {
 
   useEffect(() => {
     if (!supabase) return;
+    fetchVehicles();
+    const channel = supabase
+      .channel("transitos-vehicles")
+      .on("postgres_changes", { event: "*", schema: "public", table: "vehicles" }, fetchVehicles)
+      .subscribe();
+    const onVisible = () => { if (document.visibilityState === "visible") fetchVehicles(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+  }, [fetchVehicles]);
+
+  useEffect(() => {
+    if (!supabase) return;
+    fetchVehicleMaintenanceLog();
+    const channel = supabase
+      .channel("transitos-vehicle-maintenance-log")
+      .on("postgres_changes", { event: "*", schema: "public", table: "vehicle_maintenance_log" }, fetchVehicleMaintenanceLog)
+      .subscribe();
+    const onVisible = () => { if (document.visibilityState === "visible") fetchVehicleMaintenanceLog(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+  }, [fetchVehicleMaintenanceLog]);
+
+  useEffect(() => {
+    if (!supabase) return;
     fetchFeeRates();
     const channel = supabase
       .channel("transitos-fee-rates")
@@ -10692,7 +10899,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports, fetchVehicles, fetchVehicleMaintenanceLog });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -10704,12 +10911,12 @@ function useAppStore() {
       setSupaError(e.message);
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports, fetchVehicles, fetchVehicleMaintenanceLog]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], vehicles: localState.vehicles || [], vehicle_maintenance_log: localState.vehicle_maintenance_log || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, vehicles, vehicle_maintenance_log: vehicleMaintenanceLog, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -12048,7 +12255,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", VEHICLE_MAINTENANCE_DUE: "🔧" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -19311,6 +19518,229 @@ function DriverStatsCard({ driverId, allTrips }) {
   );
 }
 
+// Bottom-sheet modal, same shape as DriverDocEditor — logs one service
+// entry and optionally advances the vehicle's next-service target in the
+// same submission (per the plan's "manually admin-set per log entry" scope
+// decision, not an auto-computed interval).
+function VehicleServiceModal({ vehicle, dispatch, onClose }) {
+  const [serviceDate, setServiceDate] = useState("");
+  const [odometerKm, setOdometerKm] = useState(vehicle.odometer_km != null ? String(vehicle.odometer_km) : "");
+  const [serviceType, setServiceType] = useState("");
+  const [note, setNote] = useState("");
+  const [costZar, setCostZar] = useState("");
+  const [nextServiceDate, setNextServiceDate] = useState(vehicle.next_service_date || "");
+  const [nextServiceKm, setNextServiceKm] = useState(vehicle.next_service_km != null ? String(vehicle.next_service_km) : "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+
+  const save = async () => {
+    if (!serviceType.trim()) { setError("Enter a service type."); return; }
+    setSaving(true);
+    setError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/LOG_VEHICLE_MAINTENANCE", vehicle_id: vehicle.id,
+        service_date: serviceDate || null, odometer_km: odometerKm ? Number(odometerKm) : null,
+        service_type: serviceType.trim(), note: note.trim() || null,
+        cost_zar: costZar ? Number(costZar) : null,
+        next_service_date: nextServiceDate || null, next_service_km: nextServiceKm ? Number(nextServiceKm) : null,
+      });
+      onClose();
+    } catch (e) {
+      setError(e.message || "Couldn't log service — please try again.");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>🔧 LOG SERVICE — {vehicle.registration}</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        <TextField label="Service Type" value={serviceType} onChange={e => setServiceType(e.target.value)} placeholder="e.g. Oil change, brake pads" />
+        <div>
+          <label style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, display: "block", marginBottom: 4 }}>SERVICE DATE</label>
+          <input type="date" value={serviceDate} onChange={e => setServiceDate(e.target.value)}
+            style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box" }} />
+        </div>
+        <TextField label="Odometer at Service (km)" value={odometerKm} onChange={e => setOdometerKm(e.target.value)} placeholder="e.g. 85000" />
+        <TextField label="Cost (ZAR, optional)" value={costZar} onChange={e => setCostZar(e.target.value)} placeholder="e.g. 1500" />
+        <TextField label="Note (optional)" value={note} onChange={e => setNote(e.target.value)} placeholder="Any extra detail" />
+        <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5, marginTop: 4 }}>NEXT SERVICE DUE (optional — advances the reminder)</div>
+        <div>
+          <label style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, display: "block", marginBottom: 4 }}>NEXT SERVICE DATE</label>
+          <input type="date" value={nextServiceDate} onChange={e => setNextServiceDate(e.target.value)}
+            style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box" }} />
+        </div>
+        <TextField label="Next Service KM" value={nextServiceKm} onChange={e => setNextServiceKm(e.target.value)} placeholder="e.g. 90000" />
+        {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
+        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={saving} />
+          <Button title={saving ? "SAVING…" : "✓ LOG SERVICE"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={saving || !serviceType.trim()} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// List+form+delete panel, same shape as HighRiskZonesPanel — vehicle cards
+// with registration/assigned driver/odometer/next-service (due-soon badge
+// reusing vehicleServiceStatus's docExpiryStatus-derived amber/red logic),
+// a LOG SERVICE modal, and a per-vehicle expandable service-history list.
+function AdminVehicles({ state, user, dispatch }) {
+  const emptyForm = { registration: "", make: "", model: "", year: "", odometer_km: "" };
+  const [addingOpen, setAddingOpen] = useState(false);
+  const [newVeh, setNewVeh] = useState(emptyForm);
+  const [adding, setAdding] = useState(false);
+  const [error, setError] = useState(null);
+  const [serviceModalFor, setServiceModalFor] = useState(null);
+  const [expandedHistoryFor, setExpandedHistoryFor] = useState(null);
+  const [archivingId, setArchivingId] = useState(null);
+  const [confirmingArchiveId, setConfirmingArchiveId] = useState(null);
+
+  const activeVehicles = (state.vehicles || []).filter(v => v.active);
+
+  const addVehicle = async () => {
+    if (!newVeh.registration.trim()) { setError("Enter a registration number."); return; }
+    setAdding(true);
+    setError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/CREATE_VEHICLE", registration: newVeh.registration.trim(),
+        make: newVeh.make.trim() || null, model: newVeh.model.trim() || null,
+        year: newVeh.year ? Number(newVeh.year) : null,
+        odometer_km: newVeh.odometer_km ? Number(newVeh.odometer_km) : 0,
+      });
+      setNewVeh(emptyForm);
+      setAddingOpen(false);
+    } catch (e) {
+      setError(e.message || "Couldn't add the vehicle — please try again.");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const archiveVehicle = async (id) => {
+    setArchivingId(id);
+    try {
+      await dispatch({ type: "ADMIN/ARCHIVE_VEHICLE", vehicle_id: id });
+      setConfirmingArchiveId(null);
+    } catch (e) {
+      setError(e.message || "Couldn't archive the vehicle — please try again.");
+    } finally {
+      setArchivingId(null);
+    }
+  };
+
+  const assignDriver = async (vehicleId, driverId) => {
+    setError(null);
+    try {
+      await dispatch({ type: "ADMIN/ASSIGN_VEHICLE_TO_DRIVER", vehicle_id: vehicleId, driver_id: driverId || null });
+    } catch (e) {
+      setError(e.message || "Couldn't assign the driver — please try again.");
+    }
+  };
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <SectionHeader label={`Vehicles (${activeVehicles.length})`} />
+        <Button title={addingOpen ? "CANCEL" : "+ ADD VEHICLE"} variant={addingOpen ? "ghost" : "amber"} size="sm" onClick={() => setAddingOpen(v => !v)} />
+      </div>
+      {addingOpen && (
+        <Card>
+          <TextField label="Registration" value={newVeh.registration} onChange={e => setNewVeh(f => ({ ...f, registration: e.target.value }))} placeholder="e.g. CA 123-456" />
+          <TextField label="Make (optional)" value={newVeh.make} onChange={e => setNewVeh(f => ({ ...f, make: e.target.value }))} placeholder="e.g. Toyota" />
+          <TextField label="Model (optional)" value={newVeh.model} onChange={e => setNewVeh(f => ({ ...f, model: e.target.value }))} placeholder="e.g. Quantum" />
+          <TextField label="Year (optional)" value={newVeh.year} onChange={e => setNewVeh(f => ({ ...f, year: e.target.value }))} placeholder="e.g. 2022" />
+          <TextField label="Current Odometer (km)" value={newVeh.odometer_km} onChange={e => setNewVeh(f => ({ ...f, odometer_km: e.target.value }))} placeholder="e.g. 80000" />
+          <Button title={adding ? "ADDING…" : "+ ADD VEHICLE"} variant="amber" size="sm" onClick={addVehicle} disabled={adding || !newVeh.registration.trim()} />
+        </Card>
+      )}
+      {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
+      {activeVehicles.length === 0 ? <Empty icon="🚐" text="No vehicles registered" /> : activeVehicles.map(v => {
+        const driverUser = state.users.find(u => String(u.id) === String(v.assigned_driver_id));
+        const { status, kmLeft } = vehicleServiceStatus(v);
+        const history = (state.vehicle_maintenance_log || []).filter(l => String(l.vehicle_id) === String(v.id));
+        return (
+          <Card key={v.id}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+              <div>
+                <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 800 }}>{v.registration}</div>
+                <div style={{ fontSize: 10, color: COLORS.mist }}>{[v.make, v.model, v.year].filter(Boolean).join(" ") || "—"}</div>
+                <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{v.odometer_km != null ? `${Number(v.odometer_km).toLocaleString()} km` : "Odometer not set"}</div>
+              </div>
+              {confirmingArchiveId === v.id ? (
+                <div style={{ display: "flex", gap: 4 }}>
+                  <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(null)} />
+                  <Button title={archivingId === v.id ? "…" : "CONFIRM"} variant="ghost" size="sm" onClick={() => archiveVehicle(v.id)} disabled={archivingId === v.id} />
+                </div>
+              ) : (
+                <Button title="🗑 ARCHIVE" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(v.id)} />
+              )}
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ASSIGNED DRIVER</span>
+              <select value={v.assigned_driver_id || ""} onChange={e => assignDriver(v.id, e.target.value || null)}
+                style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "6px 8px", fontSize: 11, marginTop: 4 }}>
+                <option value="">— Unassigned —</option>
+                {state.users.filter(u => u.role === ROLE.DRIVER).map(u => (
+                  <option key={u.id} value={u.id}>{u.name}</option>
+                ))}
+              </select>
+              {driverUser && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 2 }}>Currently: {driverUser.name}</div>}
+            </div>
+
+            <div style={{ marginTop: 8 }}>
+              {status === "missing" ? (
+                <span style={{ fontSize: 9, color: COLORS.ghost }}>No service schedule set</span>
+              ) : status === "ok" ? (
+                <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ SERVICE UP TO DATE</span>
+              ) : (
+                <span style={{ fontSize: 9, fontWeight: 700, color: status === "expired" ? COLORS.red : COLORS.amber }}>
+                  {status === "expired" ? "✗ OVERDUE" : "⚠ DUE SOON"}
+                  {v.next_service_date ? ` — ${v.next_service_date}` : ""}
+                  {v.next_service_km ? ` (target ${Number(v.next_service_km).toLocaleString()}km${kmLeft != null ? `, ${kmLeft}km left` : ""})` : ""}
+                </span>
+              )}
+            </div>
+
+            <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
+              <Button title="🔧 LOG SERVICE" variant="ghost" size="sm" onClick={() => setServiceModalFor(v.id)} />
+              {history.length > 0 && (
+                <Button title={expandedHistoryFor === v.id ? "HIDE HISTORY" : `HISTORY (${history.length})`} variant="ghost" size="sm"
+                  onClick={() => setExpandedHistoryFor(expandedHistoryFor === v.id ? null : v.id)} />
+              )}
+            </div>
+
+            {expandedHistoryFor === v.id && (
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+                {history.map(l => (
+                  <div key={l.id} style={{ padding: 8, border: `1px solid ${COLORS.wire}`, borderRadius: 4, fontSize: 10 }}>
+                    <div style={{ fontWeight: 700 }}>{l.service_type || "Service"}{l.service_date ? ` — ${l.service_date}` : ""}</div>
+                    {l.odometer_km != null && <div style={{ color: COLORS.ghost }}>Odometer: {Number(l.odometer_km).toLocaleString()} km</div>}
+                    {l.cost_zar != null && <div style={{ color: COLORS.ghost }}>Cost: R{Number(l.cost_zar).toLocaleString()}</div>}
+                    {l.note && <div style={{ color: COLORS.ghost }}>{l.note}</div>}
+                    <div style={{ color: COLORS.dim, fontSize: 9, marginTop: 2 }}>Logged by {l.logged_by_name}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {serviceModalFor === v.id && (
+              <VehicleServiceModal vehicle={v} dispatch={dispatch} onClose={() => setServiceModalFor(null)} />
+            )}
+          </Card>
+        );
+      })}
+    </div>
+  );
+}
+
 function AdminDrivers({ state, user, dispatch }) {
   // Which trip cards are expanded, per driver. Collapsed by default —
   // a driver with several active trips otherwise dumps a wall of detail
@@ -21104,7 +21534,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", VEHICLE_MAINTENANCE_DUE: "🔧" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -21387,7 +21817,7 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -21408,6 +21838,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
+    if (id === "vehicles") return hasAdminPermission(user, "manageAgentsDrivers");
     return true;
   });
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
@@ -21436,11 +21867,13 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // than in every driver's own polling effect.
     dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
     dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
+    dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
+      dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
     }, 5 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -21551,6 +21984,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "vehicles" && <AdminVehicles state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
