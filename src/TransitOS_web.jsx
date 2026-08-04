@@ -10344,11 +10344,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // instead of a doc's expiry value.
       const { data: driverStatusHoursRows } = await supabase.from("driver_status").select("driverid, hourscompliancenotifiedfor");
       if (!driverStatusHoursRows || driverStatusHoursRows.length === 0) return;
-      // Booking always precedes every other timestamp on a trip, so
-      // filtering on bookedat safely captures everything relevant to
-      // today/this-week's window without pulling the whole trips table.
+      // Filtered on scheduledtime, NOT bookedat — a WEEK-type trip (booked
+      // up to 14 days in advance, all days sharing nearly the same
+      // bookedat from the single booking submission) can have its actual
+      // driving day fall well outside an 8-day bookedat window even
+      // though scheduledtime always stays close to when the trip is
+      // actually driven, regardless of how far ahead it was booked.
+      // Filtering on bookedat here would silently drop those trips from
+      // the hours computation on their driving day (confirmed via code
+      // path — no week-group trips exist in production yet to have hit
+      // this live, but the 14-day advance-booking feature is real).
       const eightDaysAgoHours = nowEpoch() - 8 * 24 * 60 * 60 * 1000;
-      const { data: recentTripRowsHours } = await supabase.from("trips").select("driverid, status, bookedat, confirmedat, acceptedat, completedat").gte("bookedat", eightDaysAgoHours);
+      const { data: recentTripRowsHours } = await supabase.from("trips").select("driverid, status, bookedat, confirmedat, acceptedat, completedat").gte("scheduledtime", eightDaysAgoHours);
       if (!recentTripRowsHours) return;
       const tripsForHours = recentTripRowsHours.map(r => ({
         driver_id: r.driverid, state: r.status,
@@ -19849,6 +19856,36 @@ function AdminVehicles({ state, user, dispatch }) {
   const [expandedHistoryFor, setExpandedHistoryFor] = useState(null);
   const [archivingId, setArchivingId] = useState(null);
   const [confirmingArchiveId, setConfirmingArchiveId] = useState(null);
+  // ADMIN/UPDATE_VEHICLE was defined server-side (correcting a typo'd
+  // registration/make/model/year) but had no way to actually reach it from
+  // the UI — LOG SERVICE only ever advances odometer/next-service fields,
+  // never the vehicle's own identity details. Closes that gap.
+  const [editingId, setEditingId] = useState(null);
+  const [editVeh, setEditVeh] = useState(emptyForm);
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const startEdit = (v) => {
+    setEditingId(v.id);
+    setEditVeh({ registration: v.registration || "", make: v.make || "", model: v.model || "", year: v.year != null ? String(v.year) : "", odometer_km: "" });
+  };
+
+  const saveEdit = async (id) => {
+    if (!editVeh.registration.trim()) { setError("Enter a registration number."); return; }
+    setSavingEdit(true);
+    setError(null);
+    try {
+      await dispatch({
+        type: "ADMIN/UPDATE_VEHICLE", vehicle_id: id, registration: editVeh.registration.trim(),
+        make: editVeh.make.trim() || null, model: editVeh.model.trim() || null,
+        year: editVeh.year ? Number(editVeh.year) : null,
+      });
+      setEditingId(null);
+    } catch (e) {
+      setError(e.message || "Couldn't update the vehicle — please try again.");
+    } finally {
+      setSavingEdit(false);
+    }
+  };
 
   const activeVehicles = (state.vehicles || []).filter(v => v.active);
 
@@ -19916,21 +19953,39 @@ function AdminVehicles({ state, user, dispatch }) {
         const history = (state.vehicle_maintenance_log || []).filter(l => String(l.vehicle_id) === String(v.id));
         return (
           <Card key={v.id}>
+            {editingId === v.id ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                <TextField label="Registration" value={editVeh.registration} onChange={e => setEditVeh(f => ({ ...f, registration: e.target.value }))} />
+                <TextField label="Make" value={editVeh.make} onChange={e => setEditVeh(f => ({ ...f, make: e.target.value }))} />
+                <TextField label="Model" value={editVeh.model} onChange={e => setEditVeh(f => ({ ...f, model: e.target.value }))} />
+                <TextField label="Year" value={editVeh.year} onChange={e => setEditVeh(f => ({ ...f, year: e.target.value }))} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setEditingId(null)} disabled={savingEdit} />
+                  <Button title={savingEdit ? "SAVING…" : "✓ SAVE"} variant="amber" size="sm" onClick={() => saveEdit(v.id)} disabled={savingEdit || !editVeh.registration.trim()} />
+                </div>
+              </div>
+            ) : (
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
               <div>
                 <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 800 }}>{v.registration}</div>
                 <div style={{ fontSize: 10, color: COLORS.mist }}>{[v.make, v.model, v.year].filter(Boolean).join(" ") || "—"}</div>
                 <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{v.odometer_km != null ? `${Number(v.odometer_km).toLocaleString()} km` : "Odometer not set"}</div>
               </div>
-              {confirmingArchiveId === v.id ? (
-                <div style={{ display: "flex", gap: 4 }}>
-                  <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(null)} />
-                  <Button title={archivingId === v.id ? "…" : "CONFIRM"} variant="ghost" size="sm" onClick={() => archiveVehicle(v.id)} disabled={archivingId === v.id} />
-                </div>
-              ) : (
-                <Button title="🗑 ARCHIVE" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(v.id)} />
-              )}
+              <div style={{ display: "flex", gap: 4 }}>
+                {confirmingArchiveId === v.id ? (
+                  <>
+                    <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(null)} />
+                    <Button title={archivingId === v.id ? "…" : "CONFIRM"} variant="ghost" size="sm" onClick={() => archiveVehicle(v.id)} disabled={archivingId === v.id} />
+                  </>
+                ) : (
+                  <>
+                    <Button title="✎ EDIT" variant="ghost" size="sm" onClick={() => startEdit(v)} />
+                    <Button title="🗑 ARCHIVE" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(v.id)} />
+                  </>
+                )}
+              </div>
             </div>
+            )}
 
             <div style={{ marginTop: 8 }}>
               <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ASSIGNED DRIVER</span>
