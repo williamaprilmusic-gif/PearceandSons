@@ -12368,6 +12368,46 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
   );
 }
 
+// Resolves which driver an agent should be tracking for a given trip, and
+// which coordinate their ETA should be computed against (their own pickup
+// point until they've been collected, then their own drop-off). Shared by
+// AgentTripDetail's on-screen summary and AgentEtaNotifier's app-wide
+// notification firing so both agree on the exact same resolution instead
+// of the two drifting out of sync with each other over time. See the
+// myPickupCoord/myDropoffCoord comments this was extracted from for why
+// per-agent (not just [0]/primary-agent) resolution matters here.
+function agentTrackingRefPoint(trip, userId, users) {
+  if (!trip) return { driverId: null, referencePoint: null };
+  const myAgentIdx = trip.agent_ids ? trip.agent_ids.findIndex(a => String(a) === String(userId)) : -1;
+  const myPickupCoord = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(userId))
+    ?? (myAgentIdx >= 0 ? trip.pickup_sequence_coords?.[myAgentIdx] : null) ?? null;
+  const myUser = users.find(u => String(u.id) === String(userId));
+  const myDropoffCoord = trip.dropoff_sequence_coords?.find(c => String(c.agent_id) === String(userId))
+    ?? (myAgentIdx >= 0 ? trip.dropoff_sequence_coords?.[myAgentIdx] : null)
+    ?? (trip.direction === "OUTBOUND" && myUser?.home_address ? myUser.home_address : null);
+  const referencePoint = (trip.completed_pickups?.some(c => String(c) === String(userId)) ? myDropoffCoord : myPickupCoord) ?? null;
+  const isActiveTripForTracking = [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state);
+  return { driverId: isActiveTripForTracking ? trip.driver_id : null, referencePoint };
+}
+
+// Mounted once at AgentApp level (see its render) so ETA-threshold
+// notifications fire for the agent's active trips regardless of which tab
+// they currently have open — previously this only ran inside
+// AgentTripDetail, so an agent who wasn't specifically staring at that
+// trip's detail screen at the exact moment their driver crossed the 5-min/
+// arriving threshold simply never got the notification at all. Renders
+// nothing; each tracked trip gets its own child instance purely so each
+// can call the useAgentShuttleStatus hook unconditionally per the Rules of
+// Hooks (a dynamic list of trips can't share one hook call).
+function AgentEtaNotifier({ trips, state, user }) {
+  return <>{trips.map(t => <AgentEtaNotifierForTrip key={t.trip_id} trip={t} state={state} user={user} />)}</>;
+}
+function AgentEtaNotifierForTrip({ trip, state, user }) {
+  const { driverId, referencePoint } = agentTrackingRefPoint(trip, user.id, state.users);
+  useAgentShuttleStatus(driverId, referencePoint, user?.id, true);
+  return null;
+}
+
 function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const [text, setText] = useState("");
   // Agent-facing cancel — works for BOTH a still-unassigned booking
@@ -12398,42 +12438,15 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
     }
   };
   const isActiveTripForTracking = trip && [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state);
-  // Reference point for the distance/ETA calculation is wherever the
-  // driver is currently headed — the pickup if they haven't collected
-  // this agent yet, otherwise the drop-off. Called unconditionally
-  // (before the early return below) per React's Rules of Hooks; the hook
-  // itself no-ops when driverId/referencePoint aren't available yet.
-  // On a multi-passenger trip, "the pickup" must be THIS agent's own
-  // pickup point — [0] is the PRIMARY agent's, so a secondary passenger
-  // was being shown distance/ETA to someone else's address. Falls back
-  // to [0] for the primary agent / legacy coords without agent_id.
-  // pickup_sequence_coords/dropoff_sequence_coords hydrated from Supabase
-  // carry no agent_id — falling straight back to index 0 (as myPickupCoord
-  // used to do, unconditionally) resolves every non-primary agent's "my
-  // pickup" against the PRIMARY agent's address instead of their own,
-  // exactly the bug this comment block already warned about. Resolve by
-  // this agent's actual position in agent_ids instead of always [0].
-  const myAgentIdx = trip?.agent_ids ? trip.agent_ids.findIndex(a => String(a) === String(user.id)) : -1;
-  const myPickupCoord = trip
-    ? (trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(user.id))
-        ?? (myAgentIdx >= 0 ? trip.pickup_sequence_coords?.[myAgentIdx] : null)) ?? null
-    : null;
-  // Per-agent dropoff: find this agent's specific dropoff (their home for OUTBOUND).
-  // Falls back to this agent's position in agent_ids on legacy/untagged
-  // coords, then to the user's home_address for OUTBOUND trips where
-  // extradropoffs wasn't stored yet (trips dispatched before the per-agent
-  // dropoff feature was added).
-  const myDropoffCoord = trip
-    ? (trip.dropoff_sequence_coords?.find(c => String(c.agent_id) === String(user.id))
-        ?? (myAgentIdx >= 0 ? trip.dropoff_sequence_coords?.[myAgentIdx] : null)
-        ?? (trip.direction === "OUTBOUND" && state.users.find(u => String(u.id) === String(user.id))?.home_address
-            ? state.users.find(u => String(u.id) === String(user.id)).home_address
-            : null))
-    : null;
-  const trackingReferencePoint = trip
-    ? (trip.completed_pickups?.some(c => String(c) === String(user.id)) ? myDropoffCoord : myPickupCoord) ?? null
-    : null;
-  const shuttleStatus = useAgentShuttleStatus(isActiveTripForTracking ? trip?.driver_id : null, trackingReferencePoint, user?.id);
+  // Reference point / driver resolution shared with AgentEtaNotifier — see
+  // agentTrackingRefPoint for why this must be per-agent, not just [0].
+  // Called unconditionally (before the early return below) per React's
+  // Rules of Hooks; the hook itself no-ops when driverId/referencePoint
+  // aren't available yet. fireEtaPush is false here — AgentEtaNotifier
+  // (mounted app-wide in AgentApp) owns firing the actual notification, so
+  // this call only drives the on-screen "your shuttle is X mins away" text.
+  const { driverId: trackingDriverId, referencePoint: trackingReferencePoint } = agentTrackingRefPoint(trip, user.id, state.users);
+  const shuttleStatus = useAgentShuttleStatus(trackingDriverId, trackingReferencePoint, user?.id, false);
   if (!trip) return <div className="pad"><span style={{ color: COLORS.ghost }}>Trip not found.</span></div>;
 
   const driverUser = state.users.find(u => String(u.id) === String(trip.driver_id));
@@ -13632,7 +13645,15 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
 // could accidentally end up rendered as a map later. Map rendering stays
 // exclusively on the admin/driver side, per the requirement that agents
 // only ever see "your shuttle is 3 mins away," never a position.
-function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null) {
+//
+// fireEtaPush: whether THIS hook instance is the one allowed to fire the
+// 5-min/arriving notifications below. AgentEtaNotifier (mounted for the
+// agent's whole session, regardless of which tab is open) owns firing;
+// AgentTripDetail's own call passes false so it only drives the on-screen
+// summary text — otherwise having both mounted at once (agent viewing the
+// detail screen while the app-wide tracker is also running) would fire the
+// same threshold notification twice.
+function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fireEtaPush = true) {
   const [summary, setSummary] = useState(null); // { distanceKm, etaMin, updatedAt } — never lat/lng
   const [stale, setStale] = useState(false);
   // ETA push tracking — fire once per threshold crossing, not on every update.
@@ -13655,7 +13676,7 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null) {
         // 2-min ETA thresholds. One notification per threshold per trip
         // — guarded by etaPushFiredRef so a GPS jitter that briefly
         // dips under then back over the threshold doesn't re-fire.
-        if (agentUserId && supabase) {
+        if (fireEtaPush && agentUserId && supabase) {
           if (!etaPushFiredRef.current.fiveMin && etaMin <= 5) {
             etaPushFiredRef.current.fiveMin = true;
             insertNotification({
@@ -14516,6 +14537,10 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notifClickHandlerRef]);
   const myTrips = state.trips.filter(t => t.agent_ids.some(id => String(id) === String(user.id)));
+  // Trips this agent should currently receive driver-ETA notifications
+  // for — mirrors the same DRIVER_CONFIRMED/IN_TRANSIT gate agentTrackingRefPoint
+  // applies per-trip, computed here just to build the tracked list.
+  const activeTrackedTrips = myTrips.filter(t => [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
   // Periodic check for enabled-but-not-yet-fired reminders — see
   // TRIP/CHECK_UPCOMING_REMINDERS. Previously only DriverApp and AdminApp
   // ran this poll, meaning an agent's own reminder (which they themselves
@@ -14545,6 +14570,7 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
 
   return (
     <div className="screen">
+      <AgentEtaNotifier trips={activeTrackedTrips} state={state} user={user} />
       <OfflineBanner isOnline={isOnline} syncing={syncing} syncResult={syncResult} />
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
         <img src={LOGO_DATA_URI} alt="Pearce & Sons" style={{ height: 32, width: 32, objectFit: "contain" }} />
@@ -15576,14 +15602,26 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     if (!showTraffic || !route?.points?.length) { setTrafficIncidents([]); return; }
     let cancelled = false;
     const fetchIncidents = async () => {
-      const lats = route.points.map(p => p.lat), lngs = route.points.map(p => p.lng);
-      const pad = 0.01; // ~1km buffer around the route
-      const bounds = {
-        minLat: Math.min(...lats) - pad, maxLat: Math.max(...lats) + pad,
-        minLng: Math.min(...lngs) - pad, maxLng: Math.max(...lngs) + pad,
-      };
-      const incidents = await tomtomTrafficIncidents(bounds);
-      if (!cancelled) setTrafficIncidents(incidents);
+      try {
+        // Manual min/max loop rather than Math.min(...lats) — spreading a
+        // dense polyline (a long route can carry tens of thousands of
+        // TomTom points) as call arguments risks "Maximum call stack size
+        // exceeded" in V8, which would silently stop traffic updates for
+        // that leg since this runs inside a fire-and-forget interval.
+        let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+        for (const p of route.points) {
+          if (p.lat < minLat) minLat = p.lat;
+          if (p.lat > maxLat) maxLat = p.lat;
+          if (p.lng < minLng) minLng = p.lng;
+          if (p.lng > maxLng) maxLng = p.lng;
+        }
+        const pad = 0.01; // ~1km buffer around the route
+        const bounds = { minLat: minLat - pad, maxLat: maxLat + pad, minLng: minLng - pad, maxLng: maxLng + pad };
+        const incidents = await tomtomTrafficIncidents(bounds);
+        if (!cancelled) setTrafficIncidents(incidents);
+      } catch (e) {
+        console.warn("[DriverNavMap] traffic incident fetch failed:", e.message);
+      }
     };
     fetchIncidents();
     const interval = setInterval(fetchIncidents, 3 * 60 * 1000);
