@@ -37,6 +37,45 @@
 //     Pearce & Sons notification to any device, unauthenticated. Now
 //     requires a valid app session token (the same kind session-login/
 //     webauthn issue), verified the same way those functions do.
+//
+// FIXED (2026-08-01) — a third bug, more subtle than #2 above:
+//  3. verifySessionToken() proves WHO the caller is, but the code never
+//     checked WHAT they were allowed to send. Any logged-in user of ANY
+//     role — the lowest-privilege driver or agent account, just by
+//     logging in normally — could POST directly to this function's URL
+//     with an arbitrary user_ids array, title, message, type, and
+//     trip_id, and it would send a real, official-looking "Pearce &
+//     Sons" OS-level push to any device in the system with fully
+//     fabricated content (including e.g. a fake SOS_ALERT). This
+//     completely bypassed every in-app authorization check in
+//     handleSupabaseAction — that logic only governs the in-app
+//     notification path (the `notifications` table insert), never this
+//     direct edge-function call. Fixed by requiring a matching row to
+//     already exist in `notifications` (same userid, same message,
+//     inserted within a few seconds of the client-supplied `ts`) before
+//     sending anything — insertNotification() in the main app always
+//     writes that row FIRST, then calls this function with the exact
+//     same message/ts, so this ties every push to content the app's own
+//     already-authorized insertNotification() path actually produced,
+//     rather than trusting the POST body on its own. Any user_ids with
+//     no matching row are silently dropped from the send list instead of
+//     being pushed to.
+//
+// LOCAL/DEPLOYED DRIFT FOUND AND CLOSED (2026-08-06) — a dedicated
+// security audit found this exact file on disk in the repo was MISSING
+// fix #3 above entirely (no notifications-row-matching check at all,
+// just the session-token check from fix #2) — a real, serious-looking
+// regression on paper. Pulled the ACTUALLY DEPLOYED function via the
+// Supabase MCP `get_edge_function` tool before touching anything (per
+// this project's own established practice, given its documented history
+// of exactly this kind of drift) and found production was already
+// running the correct, fully-fixed v29 (deployed 2026-08-01, this exact
+// code) — so there was no live vulnerability window, only a stale local
+// source file that never got updated to match what was actually shipped.
+// Restored local to match deployed exactly rather than deploying a
+// freshly-written (and, on comparison, slightly worse — it required
+// `ts` to be present at all, breaking silently for an old cached client
+// bundle that predates this field) version over an already-correct one.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import webpush from "https://esm.sh/web-push@3.6.7";
@@ -104,16 +143,46 @@ Deno.serve(async (req) => {
     }
     webpush.setVapidDetails(`mailto:${VAPID_CONTACT_EMAIL}`, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
-    const { user_ids, title, message, type, trip_id } = await req.json();
+    const { user_ids, title, message, type, trip_id, ts } = await req.json();
     if (!user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
       return json({ ok: true, sent: 0, note: "No target users provided" });
     }
+    if (!message) {
+      return json({ ok: true, sent: 0, note: "No message provided" });
+    }
 
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
+
+    // Authorization check #2 (see fix #3 above) — verifySessionToken only
+    // proves the caller is SOMEONE logged in, not that THIS push content
+    // was ever legitimately produced. Require a real notifications row —
+    // written by the app's own already-authorized insertNotification()
+    // path — matching each target user + this exact message, inserted
+    // within a few seconds of the client-supplied ts (falls back to "in
+    // the last 15s" if ts is missing, e.g. an older cached client bundle).
+    // Any user_id without a matching row is dropped from the send list —
+    // never pushed to based on the POST body alone.
+    const tsNum = Number(ts);
+    const windowStart = Number.isFinite(tsNum) ? tsNum - 5000 : Date.now() - 15000;
+    const windowEnd = Number.isFinite(tsNum) ? tsNum + 5000 : Date.now() + 1000;
+    const { data: matchedNotifs, error: matchError } = await supabase
+      .from("notifications")
+      .select("userid")
+      .in("userid", user_ids)
+      .eq("message", message)
+      .gte("timestamp", windowStart)
+      .lte("timestamp", windowEnd);
+    if (matchError) throw matchError;
+    const authorizedIds = new Set((matchedNotifs || []).map((r: { userid: unknown }) => String(r.userid)));
+    const targetIds = user_ids.filter((id: unknown) => authorizedIds.has(String(id)));
+    if (targetIds.length === 0) {
+      return json({ ok: true, sent: 0, note: "No matching notification found for any target user — nothing sent" });
+    }
+
     const { data: subs, error: subsError } = await supabase
       .from("push_subscriptions")
       .select("*")
-      .in("userid", user_ids);
+      .in("userid", targetIds);
     if (subsError) throw subsError;
 
     const payload = JSON.stringify({
