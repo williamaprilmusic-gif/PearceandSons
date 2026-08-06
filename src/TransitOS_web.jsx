@@ -2146,9 +2146,25 @@ function useOfflineSync(dispatch) {
           await dispatch(action);
           replayed++;
         } catch (e) {
-          console.warn(`[Offline] Replay failed for ${action.type}:`, e.message);
           failed++;
-          stillPending.push(action);
+          // Found via a dedicated audit: this used to unconditionally
+          // re-queue EVERY replay failure, with no way to tell a
+          // genuinely transient network blip from a real, permanent
+          // server-side rejection (the trip got cancelled by an admin
+          // while offline, the agent was removed, the trip already
+          // completed via another path). isNetworkError() is already
+          // used at ENQUEUE time (only network-shaped failures get
+          // queued in the first place) — this was the one place that
+          // same discrimination was missing, meaning a permanent
+          // rejection retried forever on every future reconnect,
+          // identically failing each time, with nothing visible to the
+          // driver beyond a console.warn.
+          if (isNetworkError(e)) {
+            console.warn(`[Offline] Replay failed for ${action.type} (network — will retry):`, e.message);
+            stillPending.push(action);
+          } else {
+            console.warn(`[Offline] Replay permanently failed for ${action.type} (not a network error, giving up):`, e.message);
+          }
         }
         // Persist after EVERY item, not just once after the whole loop —
         // this hook runs in a moving vehicle with flaky signal; if the
@@ -5395,6 +5411,16 @@ function appReducer(state, action) {
       // When ALL agents are confirmed dropped off, TRIP/COMPLETE fires.
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
+      // Must be picked up before being dropped off — matches
+      // handleSupabaseAction's identical guard. Found missing here via
+      // a dedicated audit: without it, a dropoff could be recorded for
+      // an agent never marked picked up, a real data inconsistency (and
+      // specifically, per the real backend's own comment, a genuine risk
+      // if a pickup confirmation is still queued offline when a later
+      // dropoff confirmation for the same agent replays first).
+      if (!(trip.completed_pickups || []).some(c => String(c) === String(action.agent_id))) {
+        return { ...state, _error: "This agent hasn't been confirmed picked up yet." };
+      }
       // Prefer action.confirmed_at over Date.now() — see the identical
       // fix/reasoning on CONFIRM_AGENT_PICKUP above.
       const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
@@ -6256,7 +6282,28 @@ function appReducer(state, action) {
       return { ...state, _error: null };
 
     default:
-      return state;
+      // Previously silently returned state unchanged for ANY action type
+      // not implemented in this fallback reducer — found via a dedicated
+      // audit to be a real, if low-blast-radius, gap: 16 real action
+      // types (vehicle CRUD, high-risk zones, fee rates, route
+      // advisories, announcements, hazard reports, the periodic
+      // document/hours compliance sweeps) have zero implementation here,
+      // so dispatching any of them while genuinely running in this
+      // fallback path (Supabase unreachable at the very first load of a
+      // session — see useAppStore's useFallback) resolved as a normal
+      // success, since the dispatch wrapper only throws when _error is
+      // set. An admin would tap e.g. "Add Vehicle," see no error, and
+      // have nothing actually happen — a textbook false positive.
+      // Surfacing an honest error here is a much smaller, safer fix than
+      // reimplementing 16 features' worth of business logic in a path
+      // with no way to test it live — this at minimum stops it from
+      // lying about success. Applies uniformly, including
+      // DRIVER/REPORT_HAZARD (previously a DELIBERATE silent no-op per
+      // this file's own comment, since hazard reporting is meaningless
+      // without real-time multi-driver sync that demo mode doesn't have
+      // — the original decision was about not implementing that sync,
+      // not about pretending the tap succeeded when it didn't).
+      return { ...state, _error: `"${action.type}" isn't available while running in offline/demo mode — reconnect and try again.` };
   }
 }
 
@@ -8198,6 +8245,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
     case "ADMIN/ASSIGN_VEHICLE_TO_DRIVER": {
       const actingAdminVehAs = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      // Guard against double-assignment — found missing via a dedicated
+      // audit: this write had no check at all for whether the target
+      // driver already has a DIFFERENT vehicle assigned. Doesn't fully
+      // close the gap (driver_status.vehicle, a separate free-text field
+      // set independently via EditUserPanel with nothing keeping it in
+      // sync with this relational field, is a distinct design question)
+      // but closes the specific case of two vehicles both pointing at
+      // one driver via THIS action. .maybeSingle() deliberately avoided
+      // here — if a past instance of this exact bug already left more
+      // than one vehicle assigned to this driver, maybeSingle() would
+      // throw on 2+ rows instead of surfacing the real problem.
+      if (action.driver_id) {
+        const { data: existingForDriver } = await supabase.from("vehicles").select("id, registration")
+          .eq("assigneddriverid", action.driver_id).neq("id", action.vehicle_id);
+        if (existingForDriver && existingForDriver.length > 0) {
+          throw new Error(`This driver already has ${existingForDriver.map(v => v.registration).join(", ")} assigned — unassign it first.`);
+        }
+      }
       const { error: vehAsErr } = await supabase.from("vehicles").update({ assigneddriverid: action.driver_id || null, updatedat: nowEpoch() }).eq("id", action.vehicle_id);
       if (vehAsErr) throw vehAsErr;
       await logAuditAction({
