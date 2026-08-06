@@ -11292,9 +11292,15 @@ function RoleBadge({ role }) {
   return <span className="role-badge" style={{ background: cfg.bg, borderColor: cfg.border, color: cfg.fg }}>{role}</span>;
 }
 
-function SectionHeader({ label }) {
+// collapsed/onToggle are both optional — every existing call site (there
+// are many) omits them and renders exactly as before, a plain
+// non-interactive label. Only passing onToggle turns this into a
+// clickable collapse header with a chevron, per explicit request to
+// sweep the app for space-consuming sections that should be collapsible.
+function SectionHeader({ label, collapsed, onToggle }) {
   return (
-    <div className="sec-hdr">
+    <div className="sec-hdr" onClick={onToggle} style={onToggle ? { cursor: "pointer" } : undefined}>
+      {onToggle && <span style={{ fontSize: 10, color: COLORS.ghost, flexShrink: 0 }}>{collapsed ? "▸" : "▾"}</span>}
       <span className="sec-hdr-txt">{label}</span>
       <div className="sec-hdr-line" />
     </div>
@@ -16916,6 +16922,24 @@ function AdminDashboard({ state, user, dispatch }) {
     }
   };
 
+  // Per-section collapse for the dashboard's stacked widgets — per
+  // explicit request to sweep the app for space-consuming sections.
+  // This is the FIRST screen every admin sees, and previously stacked
+  // Driver Fleet (a full driver-card list duplicating much of
+  // AdminDrivers), Announcement, Weekly Ops Summary, 7-Day Demand
+  // Forecast, and Staffing Gaps all fully expanded with no way to hide
+  // ones an admin doesn't need right now. Starts with nothing collapsed,
+  // matching existing behavior exactly. "Recent Activity" deliberately
+  // left alone — already capped to 8 rows, not a real space cost.
+  const [collapsedSections, setCollapsedSections] = React.useState(new Set());
+  const toggleSection = (key) => {
+    setCollapsedSections(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
   return (
     <div className="pad">
       {/* Emergency backup panel — always visible at the top of the dashboard */}
@@ -16947,8 +16971,8 @@ function AdminDashboard({ state, user, dispatch }) {
           </div>
         ))}
       </div>
-      <SectionHeader label="Driver Fleet" />
-      {state.driver_status.map(ds => {
+      <SectionHeader label="Driver Fleet" collapsed={collapsedSections.has("fleet")} onToggle={() => toggleSection("fleet")} />
+      {!collapsedSections.has("fleet") && state.driver_status.map(ds => {
         const u = state.users.find(x => String(x.id) === String(ds.driver_id));
         const load = getDriverLoad(state, ds.driver_id, todayStr);
         const driverCapacityDash = ds.capacity || DRIVER_CAPACITY;
@@ -16965,12 +16989,18 @@ function AdminDashboard({ state, user, dispatch }) {
           </Card>
         );
       })}
-      {hasAdminPermission(user, "manageDispatch") && (() => { try { return <AnnouncementPanel dispatch={dispatch} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>Announcement error: {e.message}</div>; } })()}
-      {(() => { try { return <WeeklyOpsSummaryPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>WeeklyOps error: {e.message}</div>; } })()}
-      <SectionHeader label="7-Day Demand Forecast" />
-      {(() => { try { return <CapacityForecastPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>CapacityForecast error: {e.message}</div>; } })()}
-      <SectionHeader label="Staffing Gaps (Next 7 Days)" />
-      {(() => { try { return <SmartSchedulingPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>SmartScheduling error: {e.message}</div>; } })()}
+      {hasAdminPermission(user, "manageDispatch") && (
+        <>
+          <SectionHeader label="Announcement" collapsed={collapsedSections.has("announce")} onToggle={() => toggleSection("announce")} />
+          {!collapsedSections.has("announce") && (() => { try { return <AnnouncementPanel dispatch={dispatch} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>Announcement error: {e.message}</div>; } })()}
+        </>
+      )}
+      <SectionHeader label="Weekly Ops Summary" collapsed={collapsedSections.has("weeklyOps")} onToggle={() => toggleSection("weeklyOps")} />
+      {!collapsedSections.has("weeklyOps") && (() => { try { return <WeeklyOpsSummaryPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>WeeklyOps error: {e.message}</div>; } })()}
+      <SectionHeader label="7-Day Demand Forecast" collapsed={collapsedSections.has("forecast")} onToggle={() => toggleSection("forecast")} />
+      {!collapsedSections.has("forecast") && (() => { try { return <CapacityForecastPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>CapacityForecast error: {e.message}</div>; } })()}
+      <SectionHeader label="Staffing Gaps (Next 7 Days)" collapsed={collapsedSections.has("gaps")} onToggle={() => toggleSection("gaps")} />
+      {!collapsedSections.has("gaps") && (() => { try { return <SmartSchedulingPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>SmartScheduling error: {e.message}</div>; } })()}
       <SectionHeader label="Recent Activity" />
       <Card body={false}>
         {trips.slice(0, 8).length === 0 ? <Empty icon="⊟" text="No bookings or trips yet" /> : trips.slice(0, 8).map(t => (
