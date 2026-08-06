@@ -14510,7 +14510,10 @@ function AdminTripDropoffs({ trip, state }) {
   // shared pickup coordinate (all OUTBOUND agents board at one location).
   const anchor = trip.pickup_sequence_coords?.[0] || defaultCompanyAnchor(state);
   const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
-  const finalCoords = sorted || dropCoords;
+  // Ground truth over prediction for a completed trip — see
+  // actualDropoffCoordOrder's comment for why this can genuinely differ
+  // from (or reverse) the freshly re-predicted `sorted` order above.
+  const finalCoords = actualDropoffCoordOrder(dropCoords, trip) || sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
   );
@@ -14550,7 +14553,10 @@ function DriverTripDropoffs({ trip, state }) {
   // component's comment for the full explanation.
   const anchor = trip.pickup_sequence_coords?.[0] || defaultCompanyAnchor(state);
   const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
-  const finalCoords = (sorted || dropCoords);
+  // Ground truth over prediction for a completed trip — see
+  // actualDropoffCoordOrder's comment for why this can genuinely differ
+  // from (or reverse) the freshly re-predicted `sorted` order above.
+  const finalCoords = actualDropoffCoordOrder(dropCoords, trip) || sorted || dropCoords;
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
       <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({finalCoords.length})</span>
@@ -16893,13 +16899,17 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
   const destination = trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
   const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination, trip.scheduled_time_epoch);
-  const finalCoords = sorted || coords || [];
+  // Ground truth over prediction for a completed trip — see
+  // actualDropoffCoordOrder's comment for why this can genuinely differ
+  // from (or reverse) the freshly re-predicted `sorted` order below.
+  const actualOrder = actualDropoffCoordOrder(coords, trip);
+  const finalCoords = actualOrder || sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
         <span style={{ color: COLORS.ghost, fontSize: 10 }}>DROP-OFF{finalCoords.length > 1 ? "S" : ""}: </span>
-        {loading && finalCoords.length > 1 && (
+        {loading && !actualOrder && finalCoords.length > 1 && (
           <span style={{ fontSize: 8, color: COLORS.amber, fontStyle: "italic" }}>⟳ optimizing route order…</span>
         )}
         {finalCoords.map((c, i) => {
@@ -16916,7 +16926,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
         })}
         {finalCoords.some(c => c._derived) && <span style={{ fontSize: 8, color: COLORS.ghost }}>* from profile</span>}
       </div>
-      {tomtomError && finalCoords.length > 1 && (
+      {tomtomError && !actualOrder && finalCoords.length > 1 && (
         <span style={{ fontSize: 8, color: COLORS.red }}>⚠ Route optimization: {tomtomError} (showing straight-line estimate)</span>
       )}
     </div>
@@ -17030,6 +17040,28 @@ function actualDropOrderFor(trip, agentId) {
   const ranked = Object.entries(trip.dropoff_timestamps).sort((a, b) => a[1] - b[1]);
   const idx = ranked.findIndex(([id]) => String(id) === String(agentId));
   return idx >= 0 ? idx + 1 : null;
+}
+
+// Same "ground truth over prediction" reasoning as actualPickupOrderFor/
+// actualDropOrderFor above, applied to a whole coords array instead of one
+// agent's rank — for a COMPLETED trip, returns the dropoff coords resorted
+// into the order they were actually confirmed in, or null if the trip
+// isn't complete yet (or is missing a timestamp for one of the coords, in
+// which case callers should fall back to the predictive TomTom/haversine
+// sort as before). This exists because AdminTripDropoffs/DriverTripDropoffs/
+// the TripDetailRow "DROP-OFFS" summary all independently re-asked TomTom
+// "what's the best order?" on every render, for trips that had ALREADY
+// happened — and since TomTom's traffic=true reflects LIVE conditions at
+// REQUEST time, a recompute done long after a trip ended can genuinely
+// disagree with (or fully reverse) what the driver's own in-app nav
+// computed while actually driving it, purely because real-world traffic
+// changed in between. Confirmed live against a real trip (233): recomputing
+// well after completion returned the exact reverse of the driver's real,
+// recorded dropoff_timestamps order. Ground truth removes the ambiguity.
+function actualDropoffCoordOrder(coords, trip) {
+  if (trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) return null;
+  if (!coords?.length || !coords.every(c => c.agent_id != null && trip.dropoff_timestamps?.[c.agent_id] != null)) return null;
+  return [...coords].sort((a, b) => trip.dropoff_timestamps[a.agent_id] - trip.dropoff_timestamps[b.agent_id]);
 }
 
 function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
@@ -19174,6 +19206,43 @@ function LiveMapTiles({ width, height, viewport }) {
   return <>{tiles}</>;
 }
 
+// Same tile-grid math as LiveMapTiles above, pointed at TomTom's colored
+// traffic-flow raster tiles instead of the basic street layer — rendered
+// as a second, semi-transparent <image> grid layered on top. Mirrors the
+// flow-tile overlay already shipped on DriverNavMap (see tomtomNavRoute's
+// neighbors), now confirmed live on this account (see project memory).
+function LiveMapTrafficTiles({ width, height, viewport }) {
+  if (!TOMTOM_API_KEY) return null;
+  const zoom = Math.round(viewport.zoom);
+  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
+  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
+  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
+  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+  const tiles = [];
+  for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
+    for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
+      const nw = tileToLonLat(tx, ty, zoom);
+      const se = tileToLonLat(tx + 1, ty + 1, zoom);
+      const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
+      const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+      tiles.push(
+        <image
+          key={`flow-${zoom}-${tx}-${ty}`}
+          href={`https://api.tomtom.com/traffic/map/4/tile/flow/relative0/${zoom}/${tx}/${ty}.png?key=${TOMTOM_API_KEY}`}
+          x={p1.x} y={p1.y}
+          width={Math.max(1, p2.x - p1.x)}
+          height={Math.max(1, p2.y - p1.y)}
+          preserveAspectRatio="none"
+          opacity={0.7}
+          style={{ pointerEvents: "none" }}
+          onError={(e) => { e.target.style.display = "none"; }}
+        />
+      );
+    }
+  }
+  return <>{tiles}</>;
+}
+
 function timeSinceLabel(isoString) {
   if (!isoString) return "no data";
   const diffSec = Math.max(0, Math.round((Date.now() - new Date(isoString).getTime()) / 1000));
@@ -19305,6 +19374,10 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
 function AdminLiveMap({ state, user, dispatch }) {
   const [selectedDriverId, setSelectedDriverId] = useState(null);
   const [showAdvisoryPanel, setShowAdvisoryPanel] = useState(false);
+  // "Show traffic" — same toggle concept as DriverNavMap's, extended to
+  // the admin live map per explicit request. Defaults on.
+  const [showTraffic, setShowTraffic] = useState(true);
+  const [trafficIncidents, setTrafficIncidents] = useState([]);
   const W = 700, H = 560;
   // Viewport state: center lat/lng + zoom level (standard slippy-map
   // zoom, ~10-18 is a reasonable city-to-street range). Starts centered
@@ -19341,6 +19414,34 @@ function AdminLiveMap({ state, user, dispatch }) {
     el.addEventListener("wheel", handleWheel, { passive: false });
     return () => el.removeEventListener("wheel", handleWheel);
   }, []);
+
+  // Live traffic incidents within the current viewport. Reads viewport via
+  // a ref rather than depending on it directly — `viewport` changes on
+  // every pointer-move frame while dragging, and re-fetching per-frame
+  // would flood TomTom with requests; instead this fetches on mount, on
+  // toggle-on, and every 3 minutes, always against whatever the viewport
+  // happens to be at that moment.
+  const viewportRef = useRef(viewport);
+  viewportRef.current = viewport;
+  useEffect(() => {
+    if (!showTraffic) { setTrafficIncidents([]); return; }
+    let cancelled = false;
+    const fetchIncidents = async () => {
+      const vp = viewportRef.current;
+      const zoom = Math.round(vp.zoom);
+      const topLeft = unprojectFromSvg(0, 0, W, H, { ...vp, zoom });
+      const bottomRight = unprojectFromSvg(W, H, W, H, { ...vp, zoom });
+      const bounds = {
+        minLat: Math.min(topLeft.lat, bottomRight.lat), maxLat: Math.max(topLeft.lat, bottomRight.lat),
+        minLng: Math.min(topLeft.lon, bottomRight.lon), maxLng: Math.max(topLeft.lon, bottomRight.lon),
+      };
+      const incidents = await tomtomTrafficIncidents(bounds);
+      if (!cancelled) setTrafficIncidents(incidents);
+    };
+    fetchIncidents();
+    const interval = setInterval(fetchIncidents, 3 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [showTraffic]);
 
   // Live positions from the fast broadcast channel — keyed by driver id,
   // merged on top of the slower DB-backed state.driver_positions below.
@@ -19488,6 +19589,7 @@ function AdminLiveMap({ state, user, dispatch }) {
           {hasAdminPermission(user, "manageDispatch") && (
             <Button title="📢 ADVISORY" variant={showAdvisoryPanel ? "amber" : "ghost"} size="sm" onClick={() => setShowAdvisoryPanel(v => !v)} />
           )}
+          <Button title="🚦 TRAFFIC" variant={showTraffic ? "amber" : "ghost"} size="sm" onClick={() => setShowTraffic(v => !v)} />
           <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
           <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
           <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
@@ -19557,6 +19659,24 @@ function AdminLiveMap({ state, user, dispatch }) {
           <rect width={W} height={H} fill="#1a2333" />
           {/* Tile layer — SVG <image> elements mapped to the same viewBox coords as pins */}
           <LiveMapTiles width={W} height={H} viewport={viewport} />
+          {showTraffic && <LiveMapTrafficTiles width={W} height={H} viewport={viewport} />}
+          {/* Live traffic incidents (accidents/closures/jams/roadworks) —
+              same TomTom Incidents v5 data as DriverNavMap's toggle, see
+              tomtomTrafficIncidents. Native <title> gives a hover tooltip
+              without needing a Leaflet-style popup component in this
+              hand-rolled SVG map. */}
+          {showTraffic && trafficIncidents.map(inc => {
+            const p = projectToSvg(inc.lat, inc.lng, W, H, viewport);
+            return (
+              <g key={inc.id}>
+                <title>{`${inc.description}${inc.from ? ` — ${inc.from}${inc.to ? " → " + inc.to : ""}` : ""}${inc.delaySec ? ` (+${Math.round(inc.delaySec / 60)} min)` : ""}`}</title>
+                <circle cx={p.x} cy={p.y} r={9} fill={COLORS.panel} stroke={COLORS.blue} strokeWidth={1.5} opacity={0.9} />
+                <text x={p.x} y={p.y} fontSize={11} textAnchor="middle" dominantBaseline="central" style={{ pointerEvents: "none" }}>
+                  {TRAFFIC_INCIDENT_ICON[inc.iconCategory] || "❗"}
+                </text>
+              </g>
+            );
+          })}
           {/* Company location reference points */}
           {(state.companies || []).filter(co => co.address?.lat != null).map(co => {
             const p = projectToSvg(co.address.lat, co.address.lng, W, H, viewport);
