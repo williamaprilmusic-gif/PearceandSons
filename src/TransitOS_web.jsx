@@ -19454,7 +19454,20 @@ function tomtomTileUrl(x, y, zoom) {
 // so a bad key logs its diagnostic exactly once, not once per tile.
 let tomtomTileErrorLoggedOnce = { current: false };
 
-function LiveMapTiles({ width, height, viewport }) {
+// Wrapped in React.memo — per explicit request to fully optimize the app.
+// AdminLiveMap (the sole caller) re-renders very frequently for reasons
+// that have nothing to do with tiles (a position broadcast lands roughly
+// every ~8s PER ACTIVE DRIVER, plus traffic-incident/hazard refreshes),
+// but this component's only real inputs are width/height (fixed
+// constants) and viewport (state that only changes on an actual pan/
+// zoom, via setViewport). Without memoization, every one of those
+// unrelated re-renders re-ran the full tile-grid nested loop (building
+// potentially dozens of <image> elements) for identical output. Shallow
+// prop comparison is safe here — no function/array/object props that
+// change identity without changing value, unlike AdminActiveTrips'
+// heavier per-driver computation (deliberately left unmemoized elsewhere
+// this session — see project notes for that reasoning).
+const LiveMapTiles = React.memo(function LiveMapTiles({ width, height, viewport }) {
   if (!TOMTOM_API_KEY) {
     // No TomTom key — render OSM tiles as fallback using the same SVG approach
     const zoom = Math.round(viewport.zoom);
@@ -19528,14 +19541,15 @@ function LiveMapTiles({ width, height, viewport }) {
   // SVG viewBox exactly (0-700, 0-560), so tiles align with pins correctly
   // at any screen size. No separate positioning div needed.
   return <>{tiles}</>;
-}
+});
 
 // Same tile-grid math as LiveMapTiles above, pointed at TomTom's colored
 // traffic-flow raster tiles instead of the basic street layer — rendered
 // as a second, semi-transparent <image> grid layered on top. Mirrors the
 // flow-tile overlay already shipped on DriverNavMap (see tomtomNavRoute's
 // neighbors), now confirmed live on this account (see project memory).
-function LiveMapTrafficTiles({ width, height, viewport }) {
+// Wrapped in React.memo for the same reason as LiveMapTiles above.
+const LiveMapTrafficTiles = React.memo(function LiveMapTrafficTiles({ width, height, viewport }) {
   if (!TOMTOM_API_KEY) return null;
   const zoom = Math.round(viewport.zoom);
   const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
@@ -19565,7 +19579,7 @@ function LiveMapTrafficTiles({ width, height, viewport }) {
     }
   }
   return <>{tiles}</>;
-}
+});
 
 function timeSinceLabel(isoString) {
   if (!isoString) return "no data";
