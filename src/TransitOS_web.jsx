@@ -7050,6 +7050,23 @@ async function applySessionToken(token) {
   _cachedSessionToken = token;
 }
 
+// `refetch` (reloads users + driver_status + trips + messages +
+// notifications, replacing app state wholesale) is called FIRE-AND-FORGET
+// at the end of nearly every case below — deliberately NOT awaited.
+// Found via a dedicated performance audit as the direct cause of reported
+// UI lag when clicking buttons: every write action's own dispatch() call
+// only resolves once handleSupabaseAction itself returns, and with
+// `await refetch()`, that meant every button's own "SAVING…" spinner
+// state stayed stuck for a full 5-table reload — not just the single row
+// that action actually wrote — on all ~70 call sites. The real DB write
+// (and its audit-log entry) has already completed by the time refetch()
+// is called, so the write itself was never blocked on this; only the
+// CALLER's perceived responsiveness was. Correctness doesn't depend on
+// refetch() completing before this function returns — the calling
+// component's own realtime subscription (see useAppStore, itself already
+// debounced) will pick up the same DB change moments later regardless of
+// whether this specific refetch() call is awaited or not; this call is
+// just a same-tab freshness nudge, not the only path to a synced UI.
 async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
     case "AUTH/LOGIN_BIOMETRIC": {
@@ -7073,6 +7090,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (bioUser.role === ROLE.DRIVER) {
         await supabase.from("driver_status").update({ isonline: true }).eq("driverid", bioUser.id).then(() => {}, () => {});
       }
+      // NOT fire-and-forget, unlike the rest of this function — see the
+      // header comment for why fire-and-forget is safe everywhere else.
+      // state.active_user_id (which every screen's "who's logged in, show
+      // the right app" check reads) is only ever set INSIDE refetch()
+      // itself (it merges activeUserRef.current into the freshly-fetched
+      // state) — so if this resolved before refetch() actually landed,
+      // the login button would look done while the screen was still
+      // showing the login form for a beat. Login/logout are one-time
+      // transitions, not the repeated-click case the fire-and-forget
+      // change was fixing — worth keeping exactly synchronous here.
       await refetch();
       return;
     }
@@ -7130,6 +7157,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (data.role === ROLE.DRIVER) {
         await supabase.from("driver_status").update({ isonline: true }).eq("driverid", data.id).then(() => {}, () => {});
       }
+      // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above.
       await refetch();
       return;
     }
@@ -7162,6 +7190,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       activeUserRef.current = null;
       persistActiveUserId(null);
+      // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above
+      // (same active_user_id timing reasoning applies symmetrically to
+      // logout clearing it).
       await refetch();
       return;
     }
@@ -7182,7 +7213,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         unavailablenote: action.unavailable ? (action.note || null) : null,
         updatedat: new Date().toISOString(),
       }).eq("driverid", action.driver_id));
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/DELETE_USERS": {
@@ -7273,7 +7304,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (delError) { results.push({ id: targetId, ok: false, name: target.fullname, reason: delError.message }); continue; }
         results.push({ id: targetId, ok: true, name: target.fullname });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return results;
     }
     case "ADMIN/UPDATE_USER": {
@@ -7423,7 +7454,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdmin.id, actorName: actingAdmin.name, actionType: "ADMIN/UPDATE_USER",
         targetUserId: action.user_id, details: `Updated ${target.role.toLowerCase()} account: ${target.fullname}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/ADD_AGENT": {
@@ -7538,7 +7569,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminAdd.id, actorName: actingAdminAdd.name, actionType: "TRIP/ADD_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Added passenger (pickup: ${action.pickup_label})`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -7677,7 +7708,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminRemove.id, actorName: actingAdminRemove.name, actionType: "TRIP/REMOVE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: "Removed passenger from trip",
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -7770,7 +7801,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminReloc.id, actorName: actingAdminReloc.name, actionType: "TRIP/RELOCATE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Relocated pickup to ${action.pickup_label}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CREATE_USER": {
@@ -7860,7 +7891,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminCreate.id, actorName: actingAdminCreate.name, actionType: "ADMIN/CREATE_USER",
         targetUserId: inserted.id, details: `Created ${action.role.toLowerCase()} account: ${action.name}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CREATE_COMPANY": {
@@ -7882,7 +7913,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Same reasoning as campaigns — companies lives in its own fetch
       // cycle, refetch() alone never reloads it.
       if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/UPDATE_COMPANY": {
@@ -7905,7 +7936,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Updated company id ${action.company_id}${action.name !== undefined ? ` — renamed to "${action.name.trim()}"` : ""}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
       });
       if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/DELETE_COMPANY": {
@@ -7925,7 +7956,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { error: delCoErr } = await supabase.from("companies").delete().eq("id", action.company_id);
       if (delCoErr) throw delCoErr;
       if (extraRefetchers.fetchCompanies) await extraRefetchers.fetchCompanies();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CREATE_HIGH_RISK_ZONE": {
@@ -7944,7 +7975,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Created high-risk zone: ${action.label.trim()} (id ${hrzInserted?.id})`,
       });
       if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/UPDATE_HIGH_RISK_ZONE": {
@@ -7963,7 +7994,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Updated high-risk zone id ${action.zone_id}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
       });
       if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/DELETE_HIGH_RISK_ZONE": {
@@ -7977,7 +8008,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { error: delHrzErr } = await supabase.from("high_risk_zones").delete().eq("id", action.zone_id);
       if (delHrzErr) throw delHrzErr;
       if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CREATE_VEHICLE": {
@@ -7995,7 +8026,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Added vehicle: ${action.registration.trim()} (id ${vehInserted?.id})`,
       });
       if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/UPDATE_VEHICLE": {
@@ -8015,7 +8046,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Updated vehicle id ${action.vehicle_id}`,
       });
       if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/ARCHIVE_VEHICLE": {
@@ -8029,7 +8060,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Archived vehicle: ${vehRow.registration} (id ${action.vehicle_id})`,
       });
       if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/ASSIGN_VEHICLE_TO_DRIVER": {
@@ -8041,7 +8072,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Assigned vehicle id ${action.vehicle_id} to driver id ${action.driver_id || "(unassigned)"}`,
       });
       if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/LOG_VEHICLE_MAINTENANCE": {
@@ -8081,7 +8112,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       });
       if (extraRefetchers.fetchVehicleMaintenanceLog) await extraRefetchers.fetchVehicleMaintenanceLog();
       if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      if (!extraRefetchers.fetchVehicleMaintenanceLog && !extraRefetchers.fetchVehicles) await refetch();
+      if (!extraRefetchers.fetchVehicleMaintenanceLog && !extraRefetchers.fetchVehicles) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE": {
@@ -8113,7 +8144,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
         await supabase.from("vehicles").update({ maintenancenotifiedfor: { key: notifiedKey, notifiedAt: vehNowTs } }).eq("id", v.id);
       }
-      if (vehAnyFired) await refetch();
+      if (vehAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/UPDATE_FEE_RATES": {
@@ -8145,7 +8176,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Updated trip fee rates — Normal: R${action.normal_zar}, Late Booking: R${action.late_booking_zar}, Late Cancellation: R${action.late_cancellation_zar}, No Show: R${action.no_show_zar}, Driver Pay/Agent: R${action.driver_pay_per_agent_zar}, Driver Pay/Extra KM: R${action.driver_pay_per_extra_km_zar}`,
       });
       if (extraRefetchers.fetchFeeRates) await extraRefetchers.fetchFeeRates();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/CREATE_CAMPAIGN": {
@@ -8163,7 +8194,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // admin's own screen kept showing the old list until the realtime
       // subscription happened to fire (or never, in some configurations).
       if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/UPDATE_CAMPAIGN": {
@@ -8181,7 +8212,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Updated campaign id ${action.campaign_id}${action.name !== undefined ? ` — renamed to "${action.name.trim()}"` : ""}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
       });
       if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "ADMIN/DELETE_CAMPAIGN": {
@@ -8209,7 +8240,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { error: delCampErr } = await supabase.from("campaigns").delete().eq("id", action.campaign_id);
       if (delCampErr) throw delCampErr;
       if (extraRefetchers.fetchCampaigns) await extraRefetchers.fetchCampaigns();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TICKET/CREATE": {
@@ -8247,7 +8278,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // an agent's filed ticket wouldn't appear on the admin's Tickets
       // screen until the realtime subscription happened to fire.
       if (extraRefetchers.fetchTickets) await extraRefetchers.fetchTickets();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TICKET/UPDATE": {
@@ -8298,7 +8329,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
       if (extraRefetchers.fetchTickets) await extraRefetchers.fetchTickets();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "DM/REPLY": {
@@ -8328,7 +8359,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: dmReplySender.id, actorName: dmReplySender.fullname, actionType: "DM/REPLY",
         targetUserId: action.recipient_id, details: `Sent direct message: "${action.message.trim().slice(0, 100)}"`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "DM/SEND": {
@@ -8358,7 +8389,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminDm.id, actorName: actingAdminDm.name, actionType: "DM/SEND",
         targetUserId: action.recipient_id, details: `Sent direct message: "${action.message.trim().slice(0, 100)}"`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/BOOK": {
@@ -8517,7 +8548,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       } catch (e) { /* malformed date/time — skip late-booking check */ }
 
       for (const row of notifRows) await insertNotification(row);
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       // Hand the new id back to the caller — the booking form uses this to
       // cancel already-created legs if a later leg of a multi-leg (week /
       // with-return) booking fails, making the whole booking atomic.
@@ -8550,7 +8581,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
       must(await supabase.from("trips").delete().eq("id", action.trip_id));
       await supabase.from("notifications").delete().eq("tripid", action.trip_id);
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/ADMIN_BULK_DELETE_UNASSIGNED": {
@@ -8578,7 +8609,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
         results.push({ trip_id: tripId, ok: true });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return results;
     }
 
@@ -8611,7 +8642,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
         resultsCompleted.push({ trip_id: tripId, ok: true });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return resultsCompleted;
     }
     case "TRIP/ADMIN_CANCEL": {
@@ -8729,7 +8760,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!cancelDeleteResult || cancelDeleteResult.length === 0) {
         throw new Error("This trip was just changed by someone else — please refresh and try again.");
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/AGENT_CANCEL": {
@@ -8832,7 +8863,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             updatedat: new Date(acNowTs).toISOString(),
           }).eq("driverid", acTripRow.driverid);
         }
-        await refetch();
+        refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
       }
 
@@ -8901,7 +8932,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/DISPATCH_MULTI": {
@@ -9070,7 +9101,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           results.push({ trip_id: tripId, ok: false, reason: e.message || "Assignment failed" });
         }
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return results;
     }
     case "TRIP/ASSIGN_DRIVER": {
@@ -9274,7 +9305,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
               driverrouteexceedspolicy: mergeRouteKm > mergePolicyCap,
             }).eq("id", r.id);
           }
-          await refetch();
+          refetch(); // fire-and-forget — see handleSupabaseAction's header comment
           return;
         }
       }
@@ -9395,7 +9426,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
         tripId: action.trip_id, targetUserId: action.driver_id, details: `Assigned driver ${driverUser?.fullname || action.driver_id}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/FILE_DISPUTE": {
@@ -9430,7 +9461,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `⚠ DISPUTE filed on trip ${action.trip_id}: "${action.category}"`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9474,7 +9505,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminDispute.id, actorName: actingAdminDispute.name, actionType: "TRIP/RESOLVE_DISPUTE",
         tripId: action.trip_id, details: `Resolved dispute — outcome: ${action.outcome}${action.resolution_note ? ` — "${action.resolution_note}"` : ""}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9487,7 +9518,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       must(await supabase.from("trips").update({
         sharetoken: action.token, updatedat: nowEpoch()
       }).eq("id", action.trip_id));
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9516,7 +9547,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actionType: "SYSTEM/SOS_ALERT", tripId: action.trip_id,
         details: `SOS alert fired. GPS: ${action.gps}. Driver: ${action.driver_name || "N/A"}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9528,7 +9559,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       await logAuditAction({ actorId: actingDocs.id, actorName: actingDocs.name,
         actionType: "DRIVER/SET_DOCUMENTS", targetUserId: action.driver_id,
         details: "Updated document expiry dates" });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9551,7 +9582,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         note: action.note || null, tripid: action.trip_id ?? null, createdat: nowEpoch(),
       }));
       if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9582,7 +9613,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Posted route advisory: "${action.note.trim()}"`,
       });
       if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9605,7 +9636,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAnnouncer.id, actorName: actingAnnouncer.name, actionType: "ADMIN/POST_ANNOUNCEMENT",
         details: `Posted company announcement: "${action.message.trim()}"`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9620,7 +9651,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         details: `Cleared route advisory #${action.report_id}`,
       });
       if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
-      else await refetch();
+      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9635,7 +9666,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actionType: "DRIVER/SET_SHIFT_SCHEDULE", targetUserId: action.driver_id,
         details: `Set ${action.schedule.length} shift block${action.schedule.length !== 1 ? "s" : ""}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9655,7 +9686,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
         message: "Your driver has confirmed the trip. They are on the way.", trip_id: action.trip_id, ts: nowTs, read: false,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/RATE": {
@@ -9668,7 +9699,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!rateAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
       const newRatings = { ...(tripRow?.agentratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, rated_at: nowEpoch() } };
       must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id));
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
 
@@ -9704,7 +9735,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         type: "TRIP_ACCEPTED", for_roles: [ROLE.ADMIN], for_user_ids: [],
         message: tripAcceptedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/REMOVE_DRIVER": {
@@ -9756,7 +9787,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         actorId: actingAdminRemoveDriver.id, actorName: actingAdminRemoveDriver.name, actionType: "TRIP/REMOVE_DRIVER",
         tripId: action.trip_id, targetUserId: removedDriverId, details: `Removed driver ${removedDriverUser?.fullname || removedDriverId} from trip`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/REPORT_DELAY": {
@@ -9815,7 +9846,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nowTs, read: false,
         });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/DECLINE": {
@@ -9864,7 +9895,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         tripId: action.trip_id,
         details: `Driver rejected trip. Reason: ${action.reason || "(none)"}${action.note ? ` — "${action.note}"` : ""}`,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/CONFIRM_AGENT_PICKUP": {
@@ -9921,7 +9952,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`, trip_id: action.trip_id, ts: nowTs, read: false,
         });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/CONFIRM_AGENT_DROPOFF": {
@@ -9976,7 +10007,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // the first time. Treat a replay against an already-completed trip
         // as a no-op success instead. Matches CONFIRM_AGENT_PICKUP's
         // equivalent status guard just above.
-        await refetch();
+        refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
       }
       if (allDroppedOff) {
@@ -10018,7 +10049,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           updatedat: nowTs,
         }).eq("id", action.trip_id));
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/MARK_NO_SHOW": {
@@ -10097,7 +10128,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nsNowTs, read: false,
         });
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/COMPLETE": {
@@ -10149,7 +10180,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       for (const row of agentNotifs) await insertNotification(row);
       const { data: completedDriverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
       await insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN], message: `Trip ${action.trip_id} archived. Driver ${completedDriverUser?.fullname || tripRow.driverid} has ${stillBusy.length} trips remaining.`, ts: nowTs, read: false });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/RECORD_ROUTE": {
@@ -10225,7 +10256,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           dropsequencenum: firstDropoffPosForTrip[t.trip_id] ?? t.drop_sequence_num ?? null,
         }).eq("id", t.trip_id);
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/SEND_CHAT":
@@ -10256,7 +10287,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         senderrole: chatSender.role, recipientid: action.recipient_id ?? null,
         content: action.text, timestamp: nowEpoch(),
       }));
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/CHECK_LATE_START": {
@@ -10296,7 +10327,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           });
         }
       }
-      if (anyFired) await refetch();
+      if (anyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/CHECK_UPCOMING_REMINDERS": {
@@ -10332,7 +10363,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: t.id, ts: nowMs, read: false,
         });
       }
-      if (curAnyFired) await refetch();
+      if (curAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "DRIVER/CHECK_DOCUMENT_EXPIRY": {
@@ -10382,7 +10413,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           await supabase.from("driver_status").update({ docexpirynotified: newNotified }).eq("driverid", ds.driverid);
         }
       }
-      if (docAnyFired) await refetch();
+      if (docAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "DRIVER/CHECK_HOURS_COMPLIANCE": {
@@ -10443,7 +10474,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
         await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: hoursNowTs } }).eq("driverid", dsHours.driverid);
       }
-      if (hoursAnyFired) await refetch();
+      if (hoursAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "NOTIF/DELETE_SELECTED": {
@@ -10480,7 +10511,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // defeating the ownership check this branch exists to enforce.
         if (scopedRes?.error) throw scopedRes.error;
       }
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "NOTIF/MARK_READ": {
@@ -10496,7 +10527,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (!actingUserRead || actingUserRead.role !== ROLE.ADMIN) throw new Error("You can't modify this notification.");
       }
       must(await supabase.from("notifications").update({ isread: true }).eq("id", action.id));
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "NOTIF/MARK_ALL_READ": {
@@ -10548,7 +10579,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         must(await supabase.from("notifications").update({ isread: true }).eq("userid", activeUserRef.current));
       }
       // else: no scope provided — no-op rather than marking everything read
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/SEND_REMINDER": {
@@ -10575,7 +10606,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `Reminder: your trip from ${tripRow.pickuplocation} departs at ${tripRow.scheduledtimestr || tripRow.scheduledtime}.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       });
-      await refetch();
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     default:
