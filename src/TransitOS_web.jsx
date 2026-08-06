@@ -2629,7 +2629,7 @@ function WazeNavPanel({ trip, user, state, setNavTarget }) {
             {current.coord.label || "Address not available"}
           </div>
           <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-            <button onClick={() => setNavTarget({ lat: current.coord.lat, lng: current.coord.lng, label: current.coord.label, isManual: false })}
+            <button onClick={() => setNavTarget({ lat: current.coord.lat, lng: current.coord.lng, label: current.coord.label, isManual: false, tripId: trip.trip_id })}
               style={{ flex: 1, background: "#00CCFF", border: "none", borderRadius: 5, padding: "10px 0",
                 fontWeight: 800, fontSize: 12, cursor: "pointer", color: "#000", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
               <span style={{ fontSize: 16 }}>🗺</span> NAVIGATE
@@ -10666,7 +10666,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         accepted_at_epoch: r.acceptedat, completed_at_epoch: r.completedat,
       }));
       const hoursNowTs = nowEpoch();
-      const todayDateStr = new Date().toISOString().slice(0, 10);
+      // Local calendar date, not new Date().toISOString().slice(0,10) — that
+      // reads the UTC date, which for Cape Town (SAST, UTC+2) stays on
+      // yesterday's date until 02:00 local. computeDriverHoursToday/ThisWeek
+      // below already reset at local midnight, so between 00:00-02:00 SAST
+      // the UTC-keyed dedup would still match yesterday's notifiedFor.date
+      // and wrongly skip notifying a driver who's genuinely over-limit on
+      // the new local day — same bug class as docExpiryStatus, fixed the
+      // same way (build from local y/m/d, not a UTC-based string).
+      const nowHoursLocal = new Date();
+      const todayDateStr = `${nowHoursLocal.getFullYear()}-${String(nowHoursLocal.getMonth() + 1).padStart(2, "0")}-${String(nowHoursLocal.getDate()).padStart(2, "0")}`;
       let hoursAnyFired = false;
       for (const dsHours of driverStatusHoursRows) {
         const notifiedHours = dsHours.hourscompliancenotifiedfor || {};
@@ -15298,7 +15307,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
             )}
             {trip.driverAccepted && <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ ACCEPTED — {trip.acceptedAt}</span>}
             <div style={{ display: "flex", gap: 8 }}>
-              {pickupCoord && <Button title="NAVIGATE ↗" variant="waze" style={{ flex: 1 }} onClick={() => { setNavTarget({ lat: pickupCoord.lat, lng: pickupCoord.lng, label: trip.custom_pickup, isManual: trip.pickup_is_manual }); setTab("navigate"); }} />}
+              {pickupCoord && <Button title="NAVIGATE ↗" variant="waze" style={{ flex: 1 }} onClick={() => { setNavTarget({ lat: pickupCoord.lat, lng: pickupCoord.lng, label: trip.custom_pickup, isManual: trip.pickup_is_manual, tripId: trip.trip_id }); setTab("navigate"); }} />}
               {[TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state) && <Button title="NAV →" variant="amber" onClick={() => setTab("navigate")} />}
             </div>
               </>
@@ -16188,7 +16197,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       // way to tell what had gone wrong.
       setTripStarted(true);
       const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
-      if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual });
+      if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual, tripId: firstPickup.trip_id ?? null });
     } catch (e) {
       setStartTripError(e.message || "Couldn't start the trip — please try again.");
     }
@@ -16256,11 +16265,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     const remaining = pickupStops.filter(s => String(s.trip_id) !== String(trip_id) || String(s.agent_id) !== String(agent_id)).filter(s => !s.done);
     const next = remaining[0];
     if (next?.lat && next?.lng) {
-      setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual });
+      setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual, tripId: next.trip_id ?? null });
       return;
     }
     const firstDrop = dropStops.find(s => !s.done);
-    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
+    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual, tripId: firstDrop.trip_ids?.[0] ?? null });
   };
 
   // OUTBOUND trips: all agents board at ONE location (company/work site).
@@ -16299,7 +16308,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     }
     // Navigate to first home dropoff
     const firstDrop = dropStops.find(s => !s.done);
-    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
+    if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual, tripId: firstDrop.trip_ids?.[0] ?? null });
   };
   const confirmDropoff = async (group) => {
     try {
@@ -16359,7 +16368,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     }
     const remaining = dropStops.filter(s => s !== group).filter(s => !s.done);
     const next = remaining[0];
-    if (next?.lat && next?.lng) setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual });
+    if (next?.lat && next?.lng) setNavTarget({ lat: next.lat, lng: next.lng, label: next.label, isManual: next.isManual, tripId: next.trip_ids?.[0] ?? null });
   };
 
   // In-app navigation view takes over the whole tab whenever a target is
@@ -16374,7 +16383,14 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
           onReportHazard={(category) => dispatch({
             type: "DRIVER/REPORT_HAZARD", category: category || "hazard",
             lat: driverPosition?.lat, lng: driverPosition?.lng,
-            trip_id: myActiveTrips[0]?.trip_id ?? null,
+            // Attribute to whichever trip's stop is actually being
+            // navigated to (navTarget.tripId, threaded through from every
+            // setNavTarget call site) — a driver juggling 2+ concurrent
+            // active trips reporting a hazard while on leg 2 previously
+            // always got it recorded under trip 1's ID (myActiveTrips[0]),
+            // which is still kept as a last-resort fallback for any legacy
+            // navTarget shape that doesn't carry tripId.
+            trip_id: navTarget?.tripId ?? myActiveTrips[0]?.trip_id ?? null,
           }).catch(() => {})}
         />
       </div>
@@ -16462,11 +16478,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
             const remainingPickups = pickupStops.filter(s => !(s.trip_id === noShowFor.trip_id && String(s.agent_id) === String(noShowFor.agent_id))).filter(s => !s.done);
             const nextPickup = remainingPickups[0];
             if (nextPickup?.lat && nextPickup?.lng) {
-              setNavTarget({ lat: nextPickup.lat, lng: nextPickup.lng, label: nextPickup.label, isManual: nextPickup.isManual });
+              setNavTarget({ lat: nextPickup.lat, lng: nextPickup.lng, label: nextPickup.label, isManual: nextPickup.isManual, tripId: nextPickup.trip_id ?? null });
               return;
             }
             const firstDrop = dropStops.find(s => !s.done);
-            if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual });
+            if (firstDrop?.lat && firstDrop?.lng) setNavTarget({ lat: firstDrop.lat, lng: firstDrop.lng, label: firstDrop.label, isManual: firstDrop.isManual, tripId: firstDrop.trip_ids?.[0] ?? null });
           }}
         />
       )}
@@ -18619,11 +18635,11 @@ function AdminProfileSearch({ state, user, dispatch }) {
   );
 }
 
-// Fleet-Ops-only settings panel for the 4 per-category trip fee rates used
-// to compute the trips CSV's Trip Fee column/total (visible to Fleet Ops
-// and Financial admins only, via viewTripFees). Financial admins can see
-// the resulting totals in their CSV but never edit the rates themselves —
-// this panel isn't shown to them at all, only to manageFeeRates holders.
+// Settings panel for the 4 per-category trip fee rates used to compute the
+// trips CSV's Trip Fee column/total. Gated by manageFeeRates, which — per
+// the explicit carve-out documented on ADMIN_PERMISSIONS above — both
+// Fleet Ops AND Financial hold; setting these rates is Financial's actual
+// job function, not an operational action reserved for Fleet Ops.
 function FeeRatesPanel({ state, user, dispatch }) {
   const rates = state.fee_rates;
   const [normal, setNormal] = useState("");
@@ -23180,11 +23196,11 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
-      {tab === "vehicles" && <AdminVehicles state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "vehicles" && hasAdminPermission(user, "manageAgentsDrivers") && <AdminVehicles state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
-      {tab === "utilization" && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={scopedState} dispatch={dispatch} user={user} call={call} />}
