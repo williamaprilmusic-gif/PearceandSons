@@ -2711,7 +2711,22 @@ const DOC_WARN_DAYS = 30;
 
 function docExpiryStatus(dateStr) {
   if (!dateStr) return { status: "missing", daysLeft: null };
-  const expiry = new Date(dateStr);
+  // `new Date(dateStr)` on a date-only string ("YYYY-MM-DD") parses as
+  // UTC MIDNIGHT per the ECMAScript spec, not local midnight — for Cape
+  // Town (SAST, UTC+2) that marked a document "expired" starting ~02:00
+  // SAST on its own actual expiry date, up to ~22 hours before the
+  // reasonable "valid through the end of its stated day" interpretation.
+  // Found via a dedicated audit, confirmed by hand: at 10:00 SAST on a
+  // document's own expiry date, the old logic already reported it
+  // expired. Same bug affected the "expiring" (DOC_WARN_DAYS) threshold
+  // boundary by the same margin, and — since vehicleServiceStatus calls
+  // this same function for next_service_date — vehicle maintenance
+  // due-soon alerts too. Fixed by building the expiry moment from the
+  // date's own y/m/d components (parsed in the DEVICE'S LOCAL time zone,
+  // not UTC) and treating it as valid through 23:59:59.999 of that day.
+  const [y, m, d] = dateStr.split("-").map(Number);
+  if (!y || !m || !d) return { status: "missing", daysLeft: null };
+  const expiry = new Date(y, m - 1, d, 23, 59, 59, 999);
   const now = new Date();
   const daysLeft = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
   if (daysLeft < 0) return { status: "expired", daysLeft };
@@ -4675,6 +4690,19 @@ function appReducer(state, action) {
     }
 
     case "TRIP/BOOK": {
+      // Booking agent identity verified against action._caller_id, not
+      // the client-supplied action.agent_id/agent_name — matches
+      // handleSupabaseAction's identical guard. Found missing here via a
+      // dedicated audit: without this, any caller in this fallback path
+      // could book a trip "as" an arbitrary agent, consuming that
+      // victim's duplicate-booking slot and showing up on their record.
+      // The only real call site (AgentBookTab) always books for the
+      // logged-in user themselves, so re-pointing can't break any
+      // legitimate use.
+      if (action._caller_id == null) return { ...state, _error: "Not logged in." };
+      const bookingAgentUser = state.users.find(u => String(u.id) === String(action._caller_id));
+      if (!bookingAgentUser) return { ...state, _error: "Could not verify booking agent." };
+      action = { ...action, agent_id: bookingAgentUser.id, agent_name: bookingAgentUser.name };
       // ── Duplicate booking check (client-side) ───────────────────────────
       const existingForDate = state.trips.filter(t =>
         (t.agent_ids || []).map(String).includes(String(action.agent_id)) &&
@@ -5079,6 +5107,14 @@ function appReducer(state, action) {
     case "TRIP/RATE": {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
+      // Ownership check — matches handleSupabaseAction's identical guard.
+      // Without this, any caller in this fallback path could inject/
+      // overwrite any agent's rating on any trip by supplying an
+      // arbitrary agent_id — found missing here via a dedicated audit
+      // (this fallback reducer predates that fix and never got it
+      // backported).
+      if (String(action.agent_id) !== String(action._caller_id)) return { ...state, _error: "You can only submit your own rating." };
+      if (!(trip.agent_ids || []).some(id => String(id) === String(action.agent_id))) return { ...state, _error: "You're not on this trip." };
       const newRatings = { ...(trip.agent_ratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, ratedAt: now() } };
       const newTrips = state.trips.map(t => String(t.trip_id) === String(action.trip_id) ? { ...t, agent_ratings: newRatings } : t);
       return { ...state, trips: newTrips, _error: null };
@@ -5215,6 +5251,16 @@ function appReducer(state, action) {
     case "TRIP/DECLINE": {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
+      // Ownership check — matches handleSupabaseAction's identical guard.
+      // Found missing here via a dedicated audit: without it, any caller
+      // in this fallback path could decline a trip assigned to someone
+      // else, and have an unrelated driver_id (not even necessarily the
+      // caller's own) flagged in declinedBy/rejectionDriverId and have
+      // THAT driver's status reset to AVAILABLE below. Re-point to the
+      // verified trip.driver_id, same as the real backend does, rather
+      // than trusting action.driver_id for the rest of this case.
+      if (String(trip.driver_id) !== String(action._caller_id)) return { ...state, _error: "This trip isn't assigned to you." };
+      const declineDriverId = trip.driver_id;
       const newTrips = state.trips.map(t =>
         String(t.trip_id) === String(action.trip_id)
           ? {
@@ -5224,22 +5270,22 @@ function appReducer(state, action) {
               pickup_order_num: null,
               drop_sequence_num: null,
               driverAccepted: false,
-              declinedBy: [...(t.declinedBy || []), action.driver_id],
+              declinedBy: [...(t.declinedBy || []), declineDriverId],
               rejection_reason: action.reason || null,
               rejection_note: action.note || null,
               rejected_at: now(),
-              rejection_driver_id: action.driver_id,
+              rejection_driver_id: declineDriverId,
               is_exception: true,
             }
           : t
       );
       const remaining = newTrips.filter(t =>
-        String(t.driver_id) === String(action.driver_id) &&
+        String(t.driver_id) === String(declineDriverId) &&
         [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
       );
       const newDriverStatus = remaining.length === 0
         ? state.driver_status.map(d =>
-            String(d.driver_id) === String(action.driver_id)
+            String(d.driver_id) === String(declineDriverId)
               ? { ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null } : d)
         : state.driver_status;
       const driverUser = state.users.find(u => String(u.id) === String(action.driver_id));
@@ -5358,6 +5404,12 @@ function appReducer(state, action) {
       // sheet CSV per explicit requirement.
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
+      // Ownership check — matches handleSupabaseAction's identical guard
+      // (see TRIP/DRIVER_CONFIRM there). Found missing here via a
+      // dedicated audit — without it, any caller in this fallback path
+      // could mark any agent as a no-show on a trip that isn't even
+      // assigned to them.
+      if (String(trip.driver_id) !== String(action._caller_id)) return { ...state, _error: "This trip isn't assigned to you." };
       if (!trip.agent_ids.some(id => String(id) === String(action.agent_id))) return { ...state, _error: "Agent is not on this trip" };
       const newCompleted = trip.completed_pickups.some(c => String(c) === String(action.agent_id)) ? trip.completed_pickups : [...trip.completed_pickups, action.agent_id];
       const allHandled = trip.agent_ids.every(id => newCompleted.some(c => String(c) === String(id)));
@@ -5512,9 +5564,22 @@ function appReducer(state, action) {
       // actually belonged to. Requires the `messages` table to have a
       // `recipientid` column (bigint, nullable) — see migration note on
       // the Supabase handler's identical case.
+      //
+      // Ownership + sender identity — matches handleSupabaseAction's
+      // identical guard. Found missing here via a dedicated audit: this
+      // previously trusted action.sender_id/sender_name/sender_role
+      // entirely from the client, letting any caller in this fallback
+      // path post into ANY trip's chat as anyone (same class of bug
+      // already fixed on the real backend).
+      const chatTrip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
+      if (!chatTrip) return state;
+      const chatParticipantIds = [chatTrip.driver_id, ...(chatTrip.agent_ids || [])].filter(Boolean).map(String);
+      if (!chatParticipantIds.includes(String(action._caller_id))) return { ...state, _error: "You're not on this trip." };
+      const chatSenderUser = state.users.find(u => String(u.id) === String(action._caller_id));
+      if (!chatSenderUser) return { ...state, _error: "Could not verify sender." };
       const msg = {
-        id: mkId(), sender_id: action.sender_id, sender_name: action.sender_name,
-        sender_role: action.sender_role, recipient_id: action.recipient_id ?? null,
+        id: mkId(), sender_id: chatSenderUser.id, sender_name: chatSenderUser.name,
+        sender_role: chatSenderUser.role, recipient_id: action.recipient_id ?? null,
         text: action.text, ts: now(),
       };
       const newTrips = state.trips.map(t =>
@@ -5726,7 +5791,13 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return { ...state, _error: "Trip not found" };
       if (trip.state !== TRIP_STATE.UNASSIGNED_BOOKING) return { ...state, _error: "Only unassigned bookings can be cancelled." };
-      if (action.agent_id != null && !trip.agent_ids.some(id => String(id) === String(action.agent_id))) return { ...state, _error: "You can only cancel your own bookings." };
+      // Checks the verified caller (action._caller_id), not the client-
+      // supplied action.agent_id — matches handleSupabaseAction's
+      // identical guard. Found missing here via a dedicated audit: the
+      // old check only confirmed action.agent_id was SOME owner of the
+      // booking, so any agent could pass a different real owner's id and
+      // cancel THEIR unassigned booking.
+      if (action.agent_id != null && !trip.agent_ids.some(id => String(id) === String(action._caller_id))) return { ...state, _error: "You can only cancel your own bookings." };
       return {
         ...state,
         trips: state.trips.filter(t => String(t.trip_id) !== String(action.trip_id)),
@@ -5746,7 +5817,14 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return { ...state, _error: "Trip not found" };
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "This trip has already been completed or cancelled." };
-      if (!trip.agent_ids.some(id => String(id) === String(action.agent_id))) return { ...state, _error: "You're not on this trip." };
+      if (!trip.agent_ids.some(id => String(id) === String(action._caller_id))) return { ...state, _error: "You're not on this trip." };
+      // Identity verified against action._caller_id, not the client-
+      // supplied action.agent_id — matches handleSupabaseAction's
+      // identical guard. Found missing here via a dedicated audit: the
+      // old check here only confirmed action.agent_id was SOME agent on
+      // the trip, not that it was the caller, so any agent sharing a
+      // merged trip could cancel a DIFFERENT agent's spot.
+      action = { ...action, agent_id: action._caller_id };
 
       const cancellingAgent = state.users.find(u => String(u.id) === String(action.agent_id));
       const cancelNowTs = now();
@@ -5869,18 +5947,25 @@ function appReducer(state, action) {
       // the Help form's submit "succeeded" while nothing ever appeared.
       if (!action.category?.trim()) return { ...state, _error: "Please choose a category." };
       if (!action.message?.trim()) return { ...state, _error: "Please describe the issue." };
+      // Filer identity verified against action._caller_id, not the
+      // client-supplied action.user_id/action.role — matches
+      // handleSupabaseAction's identical guard. Found missing here via a
+      // dedicated audit: this previously let any caller in this fallback
+      // path file a ticket "as" an arbitrary other user or role.
+      if (action._caller_id == null) return { ...state, _error: "Not logged in." };
+      const filingUserForTicket = state.users.find(u => String(u.id) === String(action._caller_id));
+      if (!filingUserForTicket) return { ...state, _error: "Could not verify who's filing this ticket." };
       const ticketNowTs = nowEpoch();
       const ticket = {
-        id: "TKT_" + mkId(), agent_id: action.user_id, trip_id: action.trip_id || null,
-        role: action.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT,
+        id: "TKT_" + mkId(), agent_id: filingUserForTicket.id, trip_id: action.trip_id || null,
+        role: filingUserForTicket.role === ROLE.DRIVER ? ROLE.DRIVER : ROLE.AGENT,
         category: action.category.trim(), message: action.message.trim(),
         status: "OPEN", admin_id: null, admin_reply: null,
         created_at: ticketNowTs, updated_at: ticketNowTs, resolved_at: null,
       };
-      const filingUser = state.users.find(u => String(u.id) === String(action.user_id));
       const ticketNotif = {
         id: mkId(), type: "TICKET_OPENED", for_roles: [ROLE.ADMIN],
-        message: `🎫 New ticket from ${filingUser?.name || (ticket.role === ROLE.DRIVER ? "a driver" : "an agent")}: ${ticket.category}${ticket.trip_id ? ` (Trip ${ticket.trip_id})` : ""}`,
+        message: `🎫 New ticket from ${filingUserForTicket?.name || (ticket.role === ROLE.DRIVER ? "a driver" : "an agent")}: ${ticket.category}${ticket.trip_id ? ` (Trip ${ticket.trip_id})` : ""}`,
         trip_id: ticket.trip_id, ts: now(), read: false,
       };
       return { ...state, tickets: [ticket, ...(state.tickets || [])], notifications: [ticketNotif, ...state.notifications], _error: null };
@@ -11057,14 +11142,22 @@ function useAppStore() {
       // generated random id would differ between the two runs — the id
       // returned to the booking form would then not exist in React's
       // authoritative state, breaking rollback (TRIP/CANCEL).
-      const effectiveAction = action.type === "TRIP/BOOK" && !action._client_trip_id
+      const bookIdAction = action.type === "TRIP/BOOK" && !action._client_trip_id
         ? { ...action, _client_trip_id: "TRP_" + mkId() }
-        : action.type === "ADMIN/DELETE_USERS"
-        // The reducer's self-deletion guard needs to know who's acting —
-        // a pure reducer has no access to activeUserRef itself, so it's
-        // injected here the same way _client_trip_id is for TRIP/BOOK.
-        ? { ...action, acting_admin_id: activeUserRef.current }
         : action;
+      // Every demo-mode action now carries the verified caller id — a
+      // pure reducer has no access to activeUserRef itself, so it's
+      // injected here uniformly rather than ad-hoc per action type
+      // (previously only done for ADMIN/DELETE_USERS's acting_admin_id).
+      // Lets any case that needs an identity/ownership check use
+      // action._caller_id instead of trusting a client-supplied
+      // agent_id/user_id field on its face — matching the real backend's
+      // activeUserRef.current pattern, closing a real gap found via audit:
+      // several demo-reducer cases (TRIP/RATE, TRIP/MARK_NO_SHOW, at
+      // least) were missing the same identity-spoofing protections their
+      // handleSupabaseAction counterparts already had, since this fallback
+      // path predates most of those fixes and never got them backported.
+      const effectiveAction = { ...bookIdAction, _caller_id: activeUserRef.current, acting_admin_id: activeUserRef.current };
       const result = appReducer({ ...localStateRef.current, _error: null }, effectiveAction);
       localStateRef.current = result;
       localDispatch(effectiveAction);
