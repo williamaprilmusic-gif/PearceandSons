@@ -15972,8 +15972,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
               </div>
             );
           })()}
-          <Button title="▶ START TRIP — OPEN WAZE" variant="amber" full onClick={handleStartTrip} style={{ padding: 18, fontSize: 15, letterSpacing: 2 }} />
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>🧭 Opens Waze immediately, navigating to your first pickup</div>
+          <Button title="▶ START TRIP — NAVIGATE" variant="amber" full onClick={handleStartTrip} style={{ padding: 18, fontSize: 15, letterSpacing: 2 }} />
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>🧭 Opens in-app navigation immediately, to your first pickup</div>
         </Card>
       )}
 
@@ -21874,7 +21874,7 @@ function AdminTickets({ state, dispatch, user }) {
         const trip = t.trip_id ? state.trips.find(x => String(x.trip_id) === String(t.trip_id)) : null;
         return (
           <Card key={t.id}>
-            <div onClick={() => setExpandedId(isExpanded ? null : t.id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div onClick={() => { setExpandedId(isExpanded ? null : t.id); setReplyText(""); }} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ flex: 1 }}>
                 <div style={{ fontSize: 12, fontWeight: 700 }}>{t.category}</div>
                 <div style={{ fontSize: 10, color: COLORS.ghost, display: "flex", alignItems: "center", gap: 6 }}>
