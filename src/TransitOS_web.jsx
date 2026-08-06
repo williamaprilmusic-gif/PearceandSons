@@ -3825,6 +3825,20 @@ const TRAFFIC_INCIDENT_LABEL = {
   10: "Strong wind", 11: "Flooding", 14: "Broken down vehicle",
 };
 
+// Driver peer-to-peer hazard report categories — the one-tap icon picker
+// matching Waze's own report flow (tap the report button, then tap a
+// category icon), per explicit request. Kept to Waze's canonical
+// categories, adapted since real Waze incident data itself has no
+// accessible API (see project memory) — this is the in-house stand-in.
+const HAZARD_CATEGORIES = [
+  { key: "police", icon: "👮", label: "Police" },
+  { key: "accident", icon: "💥", label: "Accident" },
+  { key: "traffic_jam", icon: "🐢", label: "Traffic Jam" },
+  { key: "hazard", icon: "⚠️", label: "Hazard" },
+  { key: "road_closed", icon: "⛔", label: "Closure" },
+];
+const HAZARD_CATEGORY_ICON = Object.fromEntries(HAZARD_CATEGORIES.map(c => [c.key, c.icon]));
+
 // Live traffic incidents (accidents/closures/jams/roadworks) within a
 // bounding box — the TomTom Traffic Incidents API v5, LIVE-VERIFIED
 // 2026-08-06 as now returning real 200 data (accidents, stationary/queuing
@@ -15270,6 +15284,7 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
   const [currentInstructionIdx, setCurrentInstructionIdx] = useState(0);
   const [followMode, setFollowMode] = useState(true);
   const [hazardReported, setHazardReported] = useState(false);
+  const [showHazardPicker, setShowHazardPicker] = useState(false);
   // "Show traffic" toggle — defaults ON to match Waze's own always-on
   // traffic display, now that the TomTom Traffic product is confirmed
   // live on this account (see tomtomTrafficIncidents). Drives both the
@@ -15443,10 +15458,12 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
       const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
       const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
       const isAdvisory = h.source === "admin";
+      const catMeta = HAZARD_CATEGORIES.find(c => c.key === h.category);
+      const markerIcon = isAdvisory ? "📢" : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
       L.marker([h.lat, h.lng], {
         icon: L.divIcon({
           className: "", iconSize: [26, 26],
-          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${isAdvisory ? "📢" : "⚠️"}</div>`,
+          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${markerIcon}</div>`,
         }),
       // Admin advisories show the actual message (an official company
       // communication, not a peer report) — driver hazard reports stay
@@ -15457,7 +15474,7 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
       // accountability if ever needed, just not surfaced here.
       }).bindPopup(isAdvisory
         ? `<b>📢 Route Advisory</b><br>${h.note ? h.note.replace(/</g, "&lt;") : ""}<br><span style="opacity:.7">${ageLabel}</span>`
-        : `<b>Hazard reported</b><br>${ageLabel}`
+        : `<b>${markerIcon} ${catMeta?.label || "Hazard"} reported</b><br>${ageLabel}`
       ).addTo(group);
     });
     group.addTo(map);
@@ -15609,28 +15626,48 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
             ⊙ RECENTER
           </button>
         )}
-        {/* Single-tap hazard report — deliberately no category picker or
-            text entry (matches Waze's own one-handed-while-driving design
-            for quick reports): tapping this immediately submits the
-            driver's current position, nothing more, so it's safe to do
-            without looking away from the road for more than an instant. */}
+        {/* Two-tap hazard report, matching Waze's own report flow — tap
+            the button to open a category icon picker, tap a category to
+            submit immediately (no text entry, still safe to do without
+            looking away from the road for more than an instant). */}
         {onReportHazard && (
-          <button
-            disabled={hazardReported || !driverPosition?.lat}
-            onClick={() => {
-              onReportHazard();
-              setHazardReported(true);
-              setTimeout(() => setHazardReported(false), 8000);
-            }}
-            style={{
-              background: hazardReported ? "rgba(29,185,84,.15)" : "rgba(10,10,10,.92)",
-              border: `1px solid ${hazardReported ? COLORS.green : COLORS.wire}`,
-              borderRadius: 8, padding: "0 14px", color: hazardReported ? COLORS.green : COLORS.chalk,
-              fontWeight: 800, fontSize: 11, cursor: hazardReported ? "default" : "pointer", whiteSpace: "nowrap",
-            }}
-          >
-            {hazardReported ? "✓ REPORTED" : "⚠ HAZARD"}
-          </button>
+          <div style={{ position: "relative" }}>
+            {showHazardPicker && (
+              <div style={{
+                position: "absolute", bottom: "calc(100% + 8px)", right: 0,
+                background: "rgba(10,10,10,.96)", border: `1px solid ${COLORS.wire}`, borderRadius: 10,
+                padding: 8, display: "flex", gap: 4, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 700,
+              }}>
+                {HAZARD_CATEGORIES.map(c => (
+                  <button
+                    key={c.key}
+                    onClick={() => {
+                      onReportHazard(c.key);
+                      setShowHazardPicker(false);
+                      setHazardReported(true);
+                      setTimeout(() => setHazardReported(false), 8000);
+                    }}
+                    style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, background: "none", border: "none", cursor: "pointer", padding: "5px 7px", borderRadius: 6 }}
+                  >
+                    <span style={{ fontSize: 22, lineHeight: 1 }}>{c.icon}</span>
+                    <span style={{ fontSize: 8, color: COLORS.ghost, fontWeight: 700, whiteSpace: "nowrap" }}>{c.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            <button
+              disabled={hazardReported || !driverPosition?.lat}
+              onClick={() => setShowHazardPicker(v => !v)}
+              style={{
+                background: hazardReported ? "rgba(29,185,84,.15)" : showHazardPicker ? "rgba(245,166,35,.15)" : "rgba(10,10,10,.92)",
+                border: `1px solid ${hazardReported ? COLORS.green : showHazardPicker ? COLORS.amber : COLORS.wire}`,
+                borderRadius: 8, padding: "0 14px", color: hazardReported ? COLORS.green : COLORS.chalk,
+                fontWeight: 800, fontSize: 11, cursor: hazardReported ? "default" : "pointer", whiteSpace: "nowrap",
+              }}
+            >
+              {hazardReported ? "✓ REPORTED" : "⚠ REPORT"}
+            </button>
+          </div>
         )}
       </div>
       {loading && !route && (
@@ -16090,8 +16127,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         <DriverNavMap
           destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)}
           hazardReports={state.hazard_reports}
-          onReportHazard={() => dispatch({
-            type: "DRIVER/REPORT_HAZARD", category: "hazard",
+          onReportHazard={(category) => dispatch({
+            type: "DRIVER/REPORT_HAZARD", category: category || "hazard",
             lat: driverPosition?.lat, lng: driverPosition?.lng,
             trip_id: myActiveTrips[0]?.trip_id ?? null,
           }).catch(() => {})}
