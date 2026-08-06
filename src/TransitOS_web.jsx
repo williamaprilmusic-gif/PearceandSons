@@ -20644,6 +20644,20 @@ function AdminDrivers({ state, user, dispatch }) {
   const [shiftEditorFor, setShiftEditorFor] = React.useState(null);
   const [docEditorFor, setDocEditorFor] = React.useState(null);
   const [safetyModalFor, setSafetyModalFor] = React.useState(null);
+  // Per-driver card collapse — each card's detail (docs/hours/stats
+  // summaries, action buttons, full active-route list) previously always
+  // rendered in full for every driver at once, a real wall of content on
+  // a fleet with more than a few drivers. Starts expanded to match
+  // existing behavior exactly, toggled by tapping the driver's own
+  // header row — same pattern already used in AdminTrips/DriverTripsTab.
+  const [collapsedDrivers, setCollapsedDrivers] = React.useState(new Set());
+  const toggleDriverCollapsed = (driverId) => {
+    setCollapsedDrivers(prev => {
+      const next = new Set(prev);
+      if (next.has(driverId)) next.delete(driverId); else next.add(driverId);
+      return next;
+    });
+  };
 
   if (!fullView) {
     return (
@@ -20683,22 +20697,29 @@ function AdminDrivers({ state, user, dispatch }) {
         const driverCapacityList = ds.capacity || DRIVER_CAPACITY;
         const full = load >= driverCapacityList;
         const activeTrips = state.trips.filter(t => String(t.driver_id) === String(ds.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+        const isDriverCollapsed = collapsedDrivers.has(ds.driver_id);
         return (
           <Card key={ds.driver_id}>
-            <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
+            <div
+              onClick={() => toggleDriverCollapsed(ds.driver_id)}
+              style={{ display: "flex", gap: 12, alignItems: "flex-start", cursor: "pointer" }}
+            >
               <DriverAvatar name={driverUser?.name} size={46} />
               <div style={{ flex: 1 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 10, color: COLORS.ghost, flexShrink: 0 }}>{isDriverCollapsed ? "▸" : "▾"}</span>
                   <span style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>{driverUser?.name}</span>
                   <span style={{ width: 7, height: 7, borderRadius: 4, background: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, flexShrink: 0 }} title={!ds.is_online ? "Offline" : ds.is_away ? "Away" : "Online"} />
                   <span style={{ fontSize: 9, color: !ds.is_online ? COLORS.ghost : ds.is_away ? COLORS.amber : COLORS.green, fontWeight: 700, letterSpacing: .5 }}>{!ds.is_online ? "OFFLINE" : ds.is_away ? "AWAY" : "ONLINE"}</span>
                 </div>
                 <div style={{ fontSize: 10, color: COLORS.mist, marginTop: 2 }}>{ds.vehicle}</div>
+                {!isDriverCollapsed && (
+                  <>
                 <div style={{ fontSize: 10, color: COLORS.ghost }}>{ds.phone}</div>
                 {driverUser?.home_address && (
                   <div style={{ fontSize: 10, color: COLORS.teal, marginTop: 2 }}>🏠 Lives in {driverUser.home_address.area || driverUser.home_address.label}</div>
                 )}
-                <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <div onClick={e => e.stopPropagation()} style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                   <Button title={ds.availability_schedule?.length > 0 ? `⏱ SHIFTS (${ds.availability_schedule.length} blocks)` : "⏱ SET SHIFTS"} variant="ghost" size="sm"
                     onClick={() => setShiftEditorFor(ds.driver_id)} />
                   <Button title="🖨 WAYBILL" variant="ghost" size="sm"
@@ -20712,10 +20733,10 @@ function AdminDrivers({ state, user, dispatch }) {
                 <DriverHoursSummary driverId={ds.driver_id} trips={state.trips} />
                 <div style={{ fontSize: 7, color: COLORS.ghost, marginTop: 1, fontStyle: "italic" }}>estimated from trip activity, not clock-in/out</div>
                 {docEditorFor === ds.driver_id && (
-                  <DriverDocEditor ds={ds} dispatch={dispatch} onClose={() => setDocEditorFor(null)} />
+                  <div onClick={e => e.stopPropagation()}><DriverDocEditor ds={ds} dispatch={dispatch} onClose={() => setDocEditorFor(null)} /></div>
                 )}
                 {safetyModalFor === ds.driver_id && (
-                  <DriverSafetyModal driverId={ds.driver_id} driverName={driverUser?.name || "Driver"} onClose={() => setSafetyModalFor(null)} />
+                  <div onClick={e => e.stopPropagation()}><DriverSafetyModal driverId={ds.driver_id} driverName={driverUser?.name || "Driver"} onClose={() => setSafetyModalFor(null)} /></div>
                 )}
                 <DriverStatsCard driverId={ds.driver_id} allTrips={state.trips} />
                 {(() => { const r = driverAvgRating(ds.driver_id, state.trips); return r ? (
@@ -20724,7 +20745,9 @@ function AdminDrivers({ state, user, dispatch }) {
                   </div>
                 ) : null; })()}
                 {shiftEditorFor === ds.driver_id && (
-                  <DriverShiftEditor ds={ds} dispatch={dispatch} onClose={() => setShiftEditorFor(null)} />
+                  <div onClick={e => e.stopPropagation()}><DriverShiftEditor ds={ds} dispatch={dispatch} onClose={() => setShiftEditorFor(null)} /></div>
+                )}
+                  </>
                 )}
               </div>
               <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
@@ -20735,7 +20758,7 @@ function AdminDrivers({ state, user, dispatch }) {
               </div>
             </div>
             <CapacityBar load={load} capacity={driverCapacityList} />
-            {activeTrips.length > 0 ? (
+            {!isDriverCollapsed && (activeTrips.length > 0 ? (
               <>
                 <SectionHeader label="Active Route" />
                 {activeTrips.map(trip => {
@@ -20770,7 +20793,7 @@ function AdminDrivers({ state, user, dispatch }) {
                   );
                 })}
               </>
-            ) : <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 8 }}>No active trips — driver available</span>}
+            ) : <span style={{ fontSize: 10, color: COLORS.ghost, textAlign: "center", padding: 8 }}>No active trips — driver available</span>)}
           </Card>
         );
       })}
