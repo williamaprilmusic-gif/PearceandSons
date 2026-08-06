@@ -17708,6 +17708,18 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // was) — per explicit decision, this move is a relocation of the UI,
   // not an expansion of what can be bulk-deleted.
   const [dateFilter, setDateFilter] = useState("");
+  // Per-driver-group collapse — each group's trip list starts expanded
+  // (matches the existing behavior before this was added), toggled by
+  // tapping that group's own header. Keyed by the same string group key
+  // used for `groups`/`orderedKeys` below ("UNASSIGNED" or a driver id).
+  const [collapsedGroups, setCollapsedGroups] = useState(new Set());
+  const toggleGroupCollapsed = (key) => {
+    setCollapsedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
   const [selectedTripIds, setSelectedTripIds] = useState(new Set());
   const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
@@ -17893,9 +17905,14 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         const isUnassigned = key === "UNASSIGNED";
         const driverUser = isUnassigned ? null : findUserByKey(key);
         const groupTrips = groups[key];
+        const isCollapsed = collapsedGroups.has(key);
         return (
           <div key={key}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px 4px" }}>
+            <div
+              onClick={() => toggleGroupCollapsed(key)}
+              style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 4px 4px", cursor: "pointer" }}
+            >
+              <span style={{ fontSize: 10, color: COLORS.ghost, width: 12, textAlign: "center" }}>{isCollapsed ? "▸" : "▾"}</span>
               {!isUnassigned && <DriverAvatar name={driverUser?.name} isOnline={driverUser?.is_online} size={26} />}
               <span style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 800, color: isUnassigned ? COLORS.ghost : COLORS.chalk }}>
                 {isUnassigned ? "UNASSIGNED" : (driverUser?.name || `Driver ${key}`)}
@@ -17905,6 +17922,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                 <span style={{ fontSize: 10, color: COLORS.teal, marginLeft: "auto" }}>{(groupTrips[0].route_total_km ?? groupTrips[0].driver_route_km).toFixed(1)} km route</span>
               )}
             </div>
+            {!isCollapsed && (
             <Card body={false}>
               {groupTrips.map(t => {
                 const isSelectable = canEditTrips && (t.state === TRIP_STATE.UNASSIGNED_BOOKING || t.state === TRIP_STATE.ARCHIVED_COMPLETED);
@@ -17924,6 +17942,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                 );
               })}
             </Card>
+            )}
           </div>
         );
       })}
