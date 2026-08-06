@@ -124,6 +124,37 @@ input, select, textarea { font-family: inherit; }
 
 .loading-screen { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: ${COLORS.ink}; }
 .spinner { width: 32px; height: 32px; border: 3px solid ${COLORS.wire}; border-top-color: ${COLORS.amber}; border-radius: 50%; animation: spin .8s linear infinite; }
+
+/* Map/nav motion — per explicit request that the maps/navigation felt
+   flat. Leaflet moves markers by setting an inline CSS transform on the
+   marker's own wrapper element on every setLatLng()/setIcon() call, with
+   no transition by default — that's the actual mechanism behind the
+   "GPS pins snap instead of glide" feeling. Adding a transition to that
+   same element (via its divIcon className) makes Leaflet's own,
+   already-correct position updates animate instead of jump, with zero
+   change to the underlying tracking logic — purely a rendering polish.
+   AdminLiveMap is a separate hand-rolled SVG map (not Leaflet), given
+   its own .svg-driver-marker rule below. */
+.glide-marker { transition: transform .5s linear; }
+.svg-driver-marker { transition: transform .6s linear; }
+
+@keyframes markerPop { from { transform: scale(.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.marker-pop { animation: markerPop .25s ease-out; transform-origin: center; }
+
+@keyframes navBannerIn { from { transform: translateY(-10px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+.nav-banner-in { animation: navBannerIn .25s ease-out; }
+
+@keyframes badgePopIn { from { transform: scale(.5); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.badge-pop-in { animation: badgePopIn .3s cubic-bezier(.34,1.56,.64,1); }
+
+/* The route polyline is REMOVED and fully recreated (not updated) on
+   every redraw — a new leg after a stop confirms, a reroute — so a CSS
+   transition can't animate it (nothing to transition FROM on a
+   freshly-inserted element). An animation plays on insertion
+   regardless, which is what actually fades a fresh route line in
+   instead of it appearing as an instant hard cut. */
+@keyframes routeFadeIn { from { opacity: 0; } to { opacity: .85; } }
+.route-fade-in { animation: routeFadeIn .4s ease; }
 `;
 
 /* ---------- DATA LAYER (enums, state machine, address DB, geo helpers) ---------- */
@@ -15461,7 +15492,7 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
       L.marker([inc.lat, inc.lng], {
         icon: L.divIcon({
           className: "", iconSize: [22, 22],
-          html: `<div style="font-size:17px;line-height:22px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${TRAFFIC_INCIDENT_ICON[inc.iconCategory] || "❗"}</div>`,
+          html: `<div class="marker-pop" style="font-size:17px;line-height:22px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${TRAFFIC_INCIDENT_ICON[inc.iconCategory] || "❗"}</div>`,
         }),
       }).bindPopup(
         `<b>${(inc.description || "").replace(/</g, "&lt;")}</b>` +
@@ -15497,7 +15528,7 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
       L.marker([h.lat, h.lng], {
         icon: L.divIcon({
           className: "", iconSize: [26, 26],
-          html: `<div style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${markerIcon}</div>`,
+          html: `<div class="marker-pop" style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${markerIcon}</div>`,
         }),
       // Admin advisories show the actual message (an official company
       // communication, not a peer report) — driver hazard reports stay
@@ -15521,7 +15552,10 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     if (!map || !route?.points?.length) return;
     if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
     const latlngs = route.points.map(p => [p.lat, p.lng]);
-    routeLayerRef.current = L.polyline(latlngs, { color: "#2D8CF0", weight: 6, opacity: 0.85 }).addTo(map);
+    // opacity 0.85 here must match routeFadeIn's "to" keyframe value (see
+    // global CSS) — the animation hands off to this static SVG attribute
+    // once it finishes, so a mismatch would show as a visible opacity jump.
+    routeLayerRef.current = L.polyline(latlngs, { color: "#2D8CF0", weight: 6, opacity: 0.85, className: "route-fade-in" }).addTo(map);
     // Move the existing pin rather than only ever placing it once — same
     // root cause as the route-fetch fix above: this instance persists
     // across the whole multi-stop drop-off sequence, so a stop-to-stop
@@ -15532,7 +15566,11 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
         destMarkerRef.current.setLatLng([destination.lat, destination.lng]);
       } else {
         destMarkerRef.current = L.marker([destination.lat, destination.lng], {
-          icon: L.divIcon({ className: "", iconSize: [16, 16], html: `<div style="background:${COLORS.red};width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>` }),
+          // glide-marker here too — this marker only ever calls
+          // setLatLng() after creation (never setIcon()), so it doesn't
+          // have the icon-recreation problem the driver marker had; the
+          // CSS transition applies cleanly as-is.
+          icon: L.divIcon({ className: "glide-marker", iconSize: [16, 16], html: `<div style="background:${COLORS.red};width:16px;height:16px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>` }),
         }).addTo(map);
       }
     }
@@ -15541,16 +15579,31 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
   }, [route]);
 
   // Move (or create) the driver's own marker, and recenter while following.
+  // Smooth glide between GPS ticks (per explicit request that the map
+  // felt flat) — the marker is created ONCE, then subsequent ticks only
+  // call setLatLng (Leaflet moves markers via an inline CSS transform on
+  // the wrapper element, which .glide-marker's CSS transition now
+  // animates) and rotate the EXISTING inner element directly, rather than
+  // calling setIcon() every tick — setIcon() tears down and recreates the
+  // marker's DOM node from scratch on every call, which would give the
+  // browser a brand-new element with no "previous" position/rotation to
+  // animate from, silently defeating the transition on every single tick.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !driverPosition?.lat) return;
     const latlng = [driverPosition.lat, driverPosition.lng];
-    const icon = L.divIcon({
-      className: "", iconSize: [22, 22],
-      html: `<div style="width:22px;height:22px;border-radius:50%;background:${COLORS.amber};border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.6);transform:rotate(${driverPosition.heading || 0}deg)"></div>`,
-    });
-    if (!driverMarkerRef.current) driverMarkerRef.current = L.marker(latlng, { icon }).addTo(map);
-    else { driverMarkerRef.current.setLatLng(latlng); driverMarkerRef.current.setIcon(icon); }
+    const heading = driverPosition.heading || 0;
+    if (!driverMarkerRef.current) {
+      const icon = L.divIcon({
+        className: "glide-marker", iconSize: [22, 22],
+        html: `<div style="width:22px;height:22px;border-radius:50%;background:${COLORS.amber};border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.6);transform:rotate(${heading}deg);transition:transform .4s ease"></div>`,
+      });
+      driverMarkerRef.current = L.marker(latlng, { icon }).addTo(map);
+    } else {
+      driverMarkerRef.current.setLatLng(latlng);
+      const inner = driverMarkerRef.current.getElement()?.firstElementChild;
+      if (inner) inner.style.transform = `rotate(${heading}deg)`;
+    }
     if (followMode) map.panTo(latlng, { animate: true });
   }, [driverPosition?.lat, driverPosition?.lng, driverPosition?.heading, followMode]);
 
@@ -15625,7 +15678,13 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     <div style={{ position: "relative", height: "100%", minHeight: 320, display: "flex", flexDirection: "column" }}>
       <div ref={mapContainerRef} style={{ flex: 1, minHeight: 240, background: "#111" }} />
       {currentInstruction && (
-        <div style={{ position: "absolute", top: 10, left: 10, right: 54, background: "rgba(10,10,10,.92)", border: `1px solid ${COLORS.wire}`, borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, zIndex: 500 }}>
+        // key'd on the maneuver's identity so the slide-in animation
+        // replays each time the CURRENT instruction actually changes
+        // (a new turn), not just on this banner's first mount — without
+        // a key React reuses the same DOM node across instruction
+        // updates, and a CSS `animation` only ever plays once on an
+        // element's initial insertion.
+        <div key={`${currentInstructionIdx}-${currentInstruction.maneuver}`} className="nav-banner-in" style={{ position: "absolute", top: 10, left: 10, right: 54, background: "rgba(10,10,10,.92)", border: `1px solid ${COLORS.wire}`, borderRadius: 8, padding: "10px 14px", display: "flex", alignItems: "center", gap: 12, zIndex: 500 }}>
           <span style={{ fontSize: 26, flexShrink: 0 }}>{MANEUVER_ICONS[currentInstruction.maneuver] || "⬆"}</span>
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 800, color: COLORS.chalk }}>{currentInstruction.message}</div>
@@ -15637,9 +15696,11 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
           red ring, bold black number), positioned above the bottom control
           bar so it never overlaps either that or the top instruction
           banner. Hidden entirely when unknown/off-route rather than
-          showing a stale or "—" placeholder. */}
+          showing a stale or "—" placeholder. Key'd on the speed value so
+          it pops in fresh each time the limit actually changes (a new
+          road segment), not just on first appearance. */}
       {currentSpeedLimitKmh != null && (
-        <div style={{
+        <div key={currentSpeedLimitKmh} className="badge-pop-in" style={{
           position: "absolute", bottom: 78, left: 10, zIndex: 500,
           width: 48, height: 48, borderRadius: "50%", background: "#fff", border: "5px solid #E23B3B",
           display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 2px 6px rgba(0,0,0,.5)",
@@ -19931,7 +19992,7 @@ function AdminLiveMap({ state, user, dispatch }) {
           {showTraffic && trafficIncidents.map(inc => {
             const p = projectToSvg(inc.lat, inc.lng, W, H, viewport);
             return (
-              <g key={inc.id}>
+              <g key={inc.id} className="marker-pop" style={{ transformOrigin: `${p.x}px ${p.y}px` }}>
                 <title>{`${inc.description}${inc.from ? ` — ${inc.from}${inc.to ? " → " + inc.to : ""}` : ""}${inc.delaySec ? ` (+${Math.round(inc.delaySec / 60)} min)` : ""}`}</title>
                 <circle cx={p.x} cy={p.y} r={9} fill={COLORS.panel} stroke={COLORS.blue} strokeWidth={1.5} opacity={0.9} />
                 <text x={p.x} y={p.y} fontSize={11} textAnchor="middle" dominantBaseline="central" style={{ pointerEvents: "none" }}>
@@ -19956,13 +20017,24 @@ function AdminLiveMap({ state, user, dispatch }) {
             const color = d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green;
             const isSelected = selectedDriverId === d.driverId;
             return (
+              // Position moved onto a single outer transform (was separate
+              // absolute cx/cy/x/y on every child before) specifically so
+              // svg-driver-marker's CSS transition can animate the WHOLE
+              // marker gliding between GPS ticks instead of snapping — per
+              // explicit request that the live map felt flat. Rotation
+              // lives on its own nested <g> (car glyph only — the status
+              // ring and name label must stay upright, not spin with
+              // heading), animated independently so a heading change
+              // doesn't also restart the position glide.
               <g key={d.driverId}
+                className="svg-driver-marker"
+                transform={`translate(${p.x},${p.y})`}
                 onClick={() => setSelectedDriverId(isSelected ? null : d.driverId)}
                 style={{ cursor: "pointer" }}>
                 {/* Invisible hit target — 44px equivalent in SVG coords (~22 units radius
                     at typical zoom) so taps land on mobile even with imprecise fingers */}
-                <circle cx={p.x} cy={p.y} r={18} fill="transparent" />
-                {isSelected && <circle cx={p.x} cy={p.y} r={16} fill="none" stroke={color} strokeWidth={1.5} opacity={0.4} />}
+                <circle cx={0} cy={0} r={18} fill="transparent" />
+                {isSelected && <circle cx={0} cy={0} r={16} fill="none" stroke={color} strokeWidth={1.5} opacity={0.4} />}
                 {/* Pin body — a car icon per explicit request, replacing the
                     plain dot. Rotates to face the driver's actual heading,
                     which also makes the old separate heading-line indicator
@@ -19972,22 +20044,24 @@ function AdminLiveMap({ state, user, dispatch }) {
                     ring behind it preserves the busy/available/stale status
                     signal a plain emoji can't otherwise carry (emoji glyphs
                     aren't tintable via SVG fill). */}
-                <circle cx={p.x} cy={p.y} r={11} fill={COLORS.panel} stroke={color} strokeWidth={2.5} opacity={d.stale ? 0.6 : 1} />
-                <text
-                  x={p.x} y={p.y} fontSize={14} textAnchor="middle" dominantBaseline="central"
+                <circle cx={0} cy={0} r={11} fill={COLORS.panel} stroke={color} strokeWidth={2.5} opacity={d.stale ? 0.6 : 1} />
+                <g
                   // !d.stale check restored — a stale position's heading
                   // could be significantly outdated (the driver may have
                   // long since turned or stopped), so this matches the old
                   // heading-line indicator's own deliberate exclusion
                   // rather than rotating the icon to a potentially
                   // misleading direction for data that's no longer fresh.
-                  transform={d.pos.heading != null && !d.stale ? `rotate(${d.pos.heading}, ${p.x}, ${p.y})` : undefined}
-                  style={{ pointerEvents: "none", opacity: d.stale ? 0.6 : 1 }}
+                  transform={d.pos.heading != null && !d.stale ? `rotate(${d.pos.heading})` : undefined}
+                  style={{ transition: "transform .4s ease" }}
                 >
-                  🚗
-                </text>
+                  <text x={0} y={0} fontSize={14} textAnchor="middle" dominantBaseline="central"
+                    style={{ pointerEvents: "none", opacity: d.stale ? 0.6 : 1 }}>
+                    🚗
+                  </text>
+                </g>
                 {/* Name label above pin */}
-                <text x={p.x} y={p.y - 14} fontSize={9} fontWeight={700} fill={COLORS.chalk}
+                <text x={0} y={-14} fontSize={9} fontWeight={700} fill={COLORS.chalk}
                   textAnchor="middle" style={{ pointerEvents: "none" }}>
                   {d.name.split(" ")[0]}
                 </text>
