@@ -19963,18 +19963,104 @@ function computeLiveSequenceForDriver(driverTrips, state) {
       });
     });
   });
-  // Same fix as above — this is the final cross-trip drop-off ordering
-  // step, and matches sortDropoffsByProximity's correct usage in
-  // DriverNavTab (anchored on lastPickupCoord, never the office).
-  const anchorForDropSort = lastPickupCoord || defaultCompanyAnchor(state);
-  const dropStops = sortDropoffsByProximity(Object.values(dropoffGroups), anchorForDropSort);
-  dropStops.forEach(group => {
+  const dropGroupList = Object.values(dropoffGroups);
+  dropGroupList.forEach(group => {
     group.done = group.passengers.every(p => {
       const t = driverTrips.find(x => String(x.trip_id) === String(p.trip_id));
       return t && (t.completed_dropoffs || []).some(c => String(c) === String(p.id));
     });
   });
-  return { pickupStops, dropStops };
+  // Deliberately returns dropGroupList UNSORTED — sequencing now happens in
+  // ActiveDriverCard via the same useSortedDropoffs/TomTom path DriverNavTab
+  // uses, not a synchronous haversine-only sort here (see that component's
+  // comment for why: this function previously called sortDropoffsByProximity
+  // directly, which is a pure greedy-nearest-neighbour heuristic with NO
+  // real road-routing awareness — confirmed via trip 227, a real reported
+  // case, to produce a genuinely bad tour: greedily chasing the single
+  // nearest stop first can strand a stop in the opposite direction for a
+  // huge backtracking final leg, exactly what happened there. This
+  // function's caller explicitly promises to match "each driver's own
+  // navigation screen" — which DOES call TomTom — so this needs to too.
+  return { pickupStops, dropGroupList, lastPickupCoord };
+}
+
+// One driver's card on the Active Trips screen — split out from
+// AdminActiveTrips so it can call useSortedDropoffs itself (hooks can't be
+// called inside a .map() loop). ROOT-CAUSE FIX for a real reported bug
+// (trip 227): this screen's on-screen copy explicitly promises "Live
+// pickup/drop-off order exactly as it appears on each driver's own
+// navigation screen" — but it never actually called TomTom, only the
+// same synchronous greedy-nearest-neighbour haversine heuristic
+// DriverNavTab uses ONLY as a fallback while TomTom is unavailable/
+// pending. Confirmed by hand against trip 227's real coordinates: greedy
+// nearest-neighbour chases the single closest stop first (Bonteheuwel,
+// 8.96km) and can strand a stop in the opposite direction (Blouberg, N of
+// the pickup, while Bonteheuwel/Philippi are both S) for a huge
+// backtracking final leg — 44.67km total vs. a real road-aware order.
+// Now calls the exact same useSortedDropoffs/TomTom path DriverNavTab
+// uses (see that component's identical reorder-by-coord-match logic),
+// so the two screens are structurally guaranteed to agree, not just
+// usually agree.
+function ActiveDriverCard({ ds, driverTrips, state }) {
+  const driverUser = state.users.find(u => String(u.id) === String(ds.driver_id));
+  const { pickupStops, dropGroupList, lastPickupCoord } = computeLiveSequenceForDriver(driverTrips, state);
+  const allPickedUp = pickupStops.length > 0 && pickupStops.every(s => s.done);
+  const direction = driverTrips[0]?.direction || "OUTBOUND";
+  const tripKey = driverTrips.map(t => t.trip_id).join("-");
+  const destination = direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
+  const departAtEpoch = driverTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0] ?? null;
+  const navAnchor = lastPickupCoord || defaultCompanyAnchor(state);
+  const dropGroupCoords = dropGroupList.map(g => ({ lat: g.lat, lng: g.lng }));
+  // Called unconditionally (before any early return) — same rule as
+  // DriverNavTab's identical call.
+  const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, direction, tripKey, undefined, destination, departAtEpoch);
+  let dropStops;
+  if (tomtomSortedCoords && tomtomSortedCoords.length === dropGroupList.length) {
+    const coordKey = c => `${parseFloat(c.lat).toFixed(4)},${parseFloat(c.lng).toFixed(4)}`;
+    const groupByKey = Object.fromEntries(dropGroupList.map(g => [coordKey(g), g]));
+    const reordered = tomtomSortedCoords.map(c => groupByKey[coordKey(c)]).filter(Boolean);
+    const reorderedKeys = new Set(reordered.map(g => coordKey(g)));
+    const missed = dropGroupList.filter(g => !reorderedKeys.has(coordKey(g)));
+    dropStops = [...reordered, ...missed];
+  } else {
+    dropStops = sortDropoffsByProximity(dropGroupList, navAnchor);
+  }
+  return (
+    <Card>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{driverUser?.name || "Driver"}</span>
+        <StateBadge state={TRIP_STATE.IN_TRANSIT} />
+      </div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
+        {allPickedUp ? "Drop-offs" : "Pickups"}
+      </div>
+      {!allPickedUp ? (
+        pickupStops.map((s, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < pickupStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
+            <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : "rgba(245,166,35,.4)"}`, background: s.done ? "rgba(29,185,84,.15)" : "rgba(245,166,35,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: s.done ? COLORS.green : COLORS.amber, flexShrink: 0 }}>{i + 1}</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, textDecoration: s.done ? "line-through" : "none", color: s.done ? COLORS.ghost : COLORS.chalk }}>{s.agent_name}</div>
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>{s.label}</div>
+            </div>
+            {s.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
+          </div>
+        ))
+      ) : (
+        dropStops.map((g, i) => (
+          <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < dropStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
+            <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${g.done ? "rgba(29,185,84,.4)" : "rgba(232,58,58,.4)"}`, background: g.done ? "rgba(29,185,84,.15)" : "rgba(232,58,58,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: g.done ? COLORS.green : COLORS.red, flexShrink: 0 }}>{i + 1}</span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, textDecoration: g.done ? "line-through" : "none", color: g.done ? COLORS.ghost : COLORS.chalk }}>
+                {g.passengers.map(p => p.name).join(", ")}
+              </div>
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>{g.label}</div>
+            </div>
+            {g.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
+          </div>
+        ))
+      )}
+    </Card>
+  );
 }
 
 function AdminActiveTrips({ state }) {
@@ -19992,46 +20078,8 @@ function AdminActiveTrips({ state }) {
       {activeDrivers.length === 0 ? (
         <Empty icon="🚦" text="No drivers currently in transit" />
       ) : activeDrivers.map(ds => {
-        const driverUser = state.users.find(u => String(u.id) === String(ds.driver_id));
         const driverTrips = state.trips.filter(t => String(t.driver_id) === String(ds.driver_id) && t.state === TRIP_STATE.IN_TRANSIT);
-        const { pickupStops, dropStops } = computeLiveSequenceForDriver(driverTrips, state);
-        const allPickedUp = pickupStops.length > 0 && pickupStops.every(s => s.done);
-        return (
-          <Card key={ds.driver_id}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{driverUser?.name || "Driver"}</span>
-              <StateBadge state={TRIP_STATE.IN_TRANSIT} />
-            </div>
-            <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
-              {allPickedUp ? "Drop-offs" : "Pickups"}
-            </div>
-            {!allPickedUp ? (
-              pickupStops.map((s, i) => (
-                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < pickupStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
-                  <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${s.done ? "rgba(29,185,84,.4)" : "rgba(245,166,35,.4)"}`, background: s.done ? "rgba(29,185,84,.15)" : "rgba(245,166,35,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: s.done ? COLORS.green : COLORS.amber, flexShrink: 0 }}>{i + 1}</span>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, textDecoration: s.done ? "line-through" : "none", color: s.done ? COLORS.ghost : COLORS.chalk }}>{s.agent_name}</div>
-                    <div style={{ fontSize: 9, color: COLORS.ghost }}>{s.label}</div>
-                  </div>
-                  {s.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
-                </div>
-              ))
-            ) : (
-              dropStops.map((g, i) => (
-                <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: i < dropStops.length - 1 ? `1px solid ${COLORS.wire}` : "none" }}>
-                  <span style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${g.done ? "rgba(29,185,84,.4)" : "rgba(232,58,58,.4)"}`, background: g.done ? "rgba(29,185,84,.15)" : "rgba(232,58,58,.15)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, fontWeight: 800, color: g.done ? COLORS.green : COLORS.red, flexShrink: 0 }}>{i + 1}</span>
-                  <div style={{ flex: 1 }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, textDecoration: g.done ? "line-through" : "none", color: g.done ? COLORS.ghost : COLORS.chalk }}>
-                      {g.passengers.map(p => p.name).join(", ")}
-                    </div>
-                    <div style={{ fontSize: 9, color: COLORS.ghost }}>{g.label}</div>
-                  </div>
-                  {g.done && <span style={{ fontSize: 9, color: COLORS.green }}>✓</span>}
-                </div>
-              ))
-            )}
-          </Card>
-        );
+        return <ActiveDriverCard key={ds.driver_id} ds={ds} driverTrips={driverTrips} state={state} />;
       })}
     </div>
   );
