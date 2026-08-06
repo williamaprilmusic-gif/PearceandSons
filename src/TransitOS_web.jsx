@@ -14509,11 +14509,15 @@ function AdminTripDropoffs({ trip, state }) {
   // before it loaded. pickup_sequence_coords[0] is this trip's own
   // shared pickup coordinate (all OUTBOUND agents board at one location).
   const anchor = trip.pickup_sequence_coords?.[0] || defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
   // Ground truth over prediction for a completed trip — see
   // actualDropoffCoordOrder's comment for why this can genuinely differ
-  // from (or reverse) the freshly re-predicted `sorted` order above.
-  const finalCoords = actualDropoffCoordOrder(dropCoords, trip) || sorted || dropCoords;
+  // from (or reverse) a freshly re-predicted order. Computed before the
+  // hook call so its presence can also skip the TomTom fetch entirely
+  // (see useSortedDropoffs' skipFetch param) — no point spending a live
+  // API call predicting something that already, verifiably, happened.
+  const actualOrder = actualDropoffCoordOrder(dropCoords, trip);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch, !!actualOrder);
+  const finalCoords = actualOrder || sorted || dropCoords;
   if (finalCoords.length <= 1) return (
     <span style={{ fontSize: 10 }}><span style={{ color: COLORS.red }}>◎ </span>{finalCoords[0]?.label || trip.custom_dropoff}</span>
   );
@@ -14552,11 +14556,13 @@ function DriverTripDropoffs({ trip, state }) {
   // Same wrong-anchor fix as AdminTripDropoffs just above — see that
   // component's comment for the full explanation.
   const anchor = trip.pickup_sequence_coords?.[0] || defaultCompanyAnchor(state);
-  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch);
   // Ground truth over prediction for a completed trip — see
   // actualDropoffCoordOrder's comment for why this can genuinely differ
-  // from (or reverse) the freshly re-predicted `sorted` order above.
-  const finalCoords = actualDropoffCoordOrder(dropCoords, trip) || sorted || dropCoords;
+  // from (or reverse) a freshly re-predicted order, and useSortedDropoffs'
+  // skipFetch param for why this also skips the TomTom call entirely.
+  const actualOrder = actualDropoffCoordOrder(dropCoords, trip);
+  const [sorted] = useSortedDropoffs(dropCoords, anchor, trip.direction, trip.trip_id, undefined, trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null, trip.scheduled_time_epoch, !!actualOrder);
+  const finalCoords = actualOrder || sorted || dropCoords;
   if (finalCoords.length > 1) return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
       <span style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1 }}>DROP-OFFS ({finalCoords.length})</span>
@@ -16898,11 +16904,12 @@ function RelocateAgentPanel({ trip, agent, currentPickup, state, dispatch, onClo
 // nearest-neighbour otherwise.
 function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
   const destination = trip.direction === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination, trip.scheduled_time_epoch);
   // Ground truth over prediction for a completed trip — see
   // actualDropoffCoordOrder's comment for why this can genuinely differ
-  // from (or reverse) the freshly re-predicted `sorted` order below.
+  // from (or reverse) a freshly re-predicted order, and useSortedDropoffs'
+  // skipFetch param for why this also skips the TomTom call entirely.
   const actualOrder = actualDropoffCoordOrder(coords, trip);
+  const [sorted, loading, tomtomError] = useSortedDropoffs(coords, anchor, trip.direction, trip.trip_id, undefined, destination, trip.scheduled_time_epoch, !!actualOrder);
   const finalCoords = actualOrder || sorted || coords || [];
   if (finalCoords.length === 0) return null;
   return (
@@ -16944,10 +16951,17 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
 // and re-fetched against the corrected one, instead of silently persisting.
 const _TOMTOM_CACHE_VERSION = "v14-pickup-anchored-presort";
 const _tomtomSortCache = new Map(); // persists across renders, cleared on page reload
-function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null, departAtEpoch = null) {
+function useSortedDropoffs(coords, anchorCoord, direction, tripId, driverEndCoord, destinationCoord = null, departAtEpoch = null, skipFetch = false) {
   // TomTom optimisation applies to any multi-stop run regardless of direction —
   // the goal is always shortest total km, not direction-specific heuristics.
-  const isMultiStop = coords && coords.length > 1;
+  // skipFetch: the caller already has ground truth (a completed trip's real
+  // dropoff_timestamps, via actualDropoffCoordOrder) and will ignore whatever
+  // this hook returns — so don't waste a TomTom call computing a prediction
+  // nobody will use. Without this, every completed multi-stop trip shown in
+  // a list (e.g. AdminTrips with filter=ALL) fired its own background TomTom
+  // request purely to be discarded, which is both wasted API usage and an
+  // extra render (setSorted/setLoading firing later) for no visible effect.
+  const isMultiStop = coords && coords.length > 1 && !skipFetch;
   // Stable key: cache version + trip_id + sorted lat/lng fingerprint of the
   // coord set + the driver's end coord (if any) — a different driver (or a
   // driver whose home address changes) needs a fresh optimization, not a
