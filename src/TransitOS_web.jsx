@@ -14135,26 +14135,39 @@ function playAlertSound() {
     const ctx = sharedAudioCtx;
     if (ctx.state === "suspended") ctx.resume();
     const now = ctx.currentTime;
-    // A bright, upbeat 4-note ascending chime — per explicit request
-    // for "a popular tone." An actual copyrighted ringtone or song
-    // can't be used here (copyright applies regardless of framing —
-    // see the app's own copyright-compliance rules), so this is an
-    // ORIGINAL short pattern in the style of a cheerful notification
-    // chime, not a reproduction of any specific real product's sound.
-    // Replaces the previous flat 2-note beep with something more
-    // recognizable and pleasant as "a new message arrived."
-    [[880, now, 0.11], [1108, now + 0.1, 0.11], [1318, now + 0.2, 0.11], [1760, now + 0.32, 0.22]].forEach(([freq, start, dur]) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(0.5, start + 0.015);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(start);
-      osc.stop(start + dur + 0.02);
+    // POLYPHONIC — per explicit request. Previously a monophonic 4-note
+    // arpeggio (one oscillator/frequency at a time, in sequence). Same
+    // A-major shape (A5-C#6-E6, octave on the final step) and overall
+    // ascending-chime timing, but now the full triad sounds together at
+    // every step (multiple simultaneous voices, the actual definition
+    // of "polyphonic") with the step's own melody note singled out
+    // louder on top — a moving top line over a held chord, not a bare
+    // single tone. Still fully original/synthesized (no real recording,
+    // no copyrighted melody) — see the app's own copyright-compliance
+    // rules for why that matters here.
+    const chordTones = [880, 1108, 1318]; // A5, C#6, E6 — A major triad
+    const steps = [
+      { start: now,        dur: 0.16, lead: 880 },
+      { start: now + 0.1,  dur: 0.16, lead: 1108 },
+      { start: now + 0.2,  dur: 0.16, lead: 1318 },
+      { start: now + 0.32, dur: 0.26, lead: 1760, extra: 1760 }, // final step adds the octave for a fuller finish
+    ];
+    steps.forEach(({ start, dur, lead, extra }) => {
+      const freqs = extra ? [...chordTones, extra] : chordTones;
+      freqs.forEach(freq => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const peak = freq === lead ? 0.45 : 0.14;
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(peak, start + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(start);
+        osc.stop(start + dur + 0.02);
+      });
     });
   } catch (e) {
     // Never let a sound failure break the actual notification/toast —
@@ -14174,28 +14187,30 @@ function playRingtonePulse() {
     const ctx = sharedAudioCtx;
     if (ctx.state === "suspended") ctx.resume();
     const now = ctx.currentTime;
-    // Redesigned per explicit request for something that sounds nicer
-    // — the previous version replicated the REAL telecom dual-tone
-    // ring standard (440Hz+480Hz), which is authentic but has a harsh,
-    // buzzy quality that isn't pleasant to hear repeatedly. This is a
-    // gentle, warm 3-note ascending chime instead — a rounder
-    // "triangle" waveform (softer than a flat sine, much softer than a
-    // square/sawtooth) rather than the phone-buzz character. Still
-    // fully original/synthesized code, same as every sound in this
-    // app — no copyright concern, this is just a nicer-sounding
-    // pattern, not a real recording of anything.
-    [[523.25, now, 0.16], [659.25, now + 0.14, 0.16], [783.99, now + 0.28, 0.26]].forEach(([freq, start, dur]) => {
+    // POLYPHONIC — per explicit request. Previously a monophonic 3-note
+    // arpeggio (one oscillator/frequency at a time: C5 -> E5 -> G5).
+    // Same warm "triangle" waveform (softer than a flat sine, much
+    // softer than a square/sawtooth — deliberately avoids the harsh,
+    // buzzy character of the real telecom dual-tone ring standard this
+    // replaced) and the same C-major pitch set, but now the full triad
+    // sounds together on every pulse — multiple simultaneous voices,
+    // the actual definition of "polyphonic" — instead of one note at a
+    // time. Still fully original/synthesized code, no real recording,
+    // no copyright concern.
+    const chord = [523.25, 659.25, 783.99]; // C5, E5, G5 — C major triad
+    const dur = 0.32;
+    chord.forEach(freq => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "triangle";
       osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(0.4, start + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.3, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
       osc.connect(gain);
       gain.connect(ctx.destination);
-      osc.start(start);
-      osc.stop(start + dur + 0.02);
+      osc.start(now);
+      osc.stop(now + dur + 0.02);
     });
   } catch (e) {
     console.warn("[Ringtone] playback failed:", e.message);
