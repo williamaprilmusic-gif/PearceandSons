@@ -11106,7 +11106,18 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchCampaigns(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — per explicit request, and matching the
+    // main refetch cycle's own already-proven reasoning: this table's
+    // realtime subscription can silently drop (mobile network switch,
+    // device sleep, background throttling — this app's own established
+    // normal operating condition, not a rare edge case) with no retry
+    // short of someone else editing this exact table again. Unlike the
+    // main cycle, this one previously had ONLY the realtime path and a
+    // visibility-change refetch — no time-based fallback at all, so a
+    // dropped subscription could leave this data stale indefinitely
+    // until a full page reload.
+    const pollInterval = setInterval(fetchCampaigns, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchCampaigns]);
 
   useEffect(() => {
@@ -11118,7 +11129,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchCompanies(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle just above.
+    const pollInterval = setInterval(fetchCompanies, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchCompanies]);
 
   useEffect(() => {
@@ -11130,7 +11144,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchTickets(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above.
+    const pollInterval = setInterval(fetchTickets, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchTickets]);
 
   useEffect(() => {
@@ -11142,7 +11159,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchHighRiskZones(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above.
+    const pollInterval = setInterval(fetchHighRiskZones, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchHighRiskZones]);
 
   useEffect(() => {
@@ -11154,7 +11174,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchVehicles(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above.
+    const pollInterval = setInterval(fetchVehicles, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchVehicles]);
 
   useEffect(() => {
@@ -11166,7 +11189,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchVehicleMaintenanceLog(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above.
+    const pollInterval = setInterval(fetchVehicleMaintenanceLog, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchVehicleMaintenanceLog]);
 
   useEffect(() => {
@@ -11178,7 +11204,15 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchFeeRates(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above. Directly relevant to a real report:
+    // fee_rates is exactly the kind of "set once, rarely written again"
+    // table where a silently-dropped realtime subscription could leave
+    // an admin staring at stale rates (or a trips CSV export computed
+    // from stale rates) with no visible sign anything was wrong, and no
+    // periodic self-correction until this fix.
+    const pollInterval = setInterval(fetchFeeRates, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchFeeRates]);
 
   useEffect(() => {
@@ -11190,7 +11224,10 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchHazardReports(); };
     document.addEventListener("visibilitychange", onVisible);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
+    // 5-minute poll backstop — see the identical fix/reasoning on the
+    // campaigns fetch cycle above.
+    const pollInterval = setInterval(fetchHazardReports, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchHazardReports]);
 
   const dispatch = useCallback(async (action) => {
@@ -22744,17 +22781,31 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
     : state.companies.filter(c => clientCompanyIds.includes(c.id?.toString()));
 
   // Filter trips to this client's scope
+  // ROOT-CAUSE FIX — found via a dedicated audit: both branches below
+  // compared u.branch_id (hydrated straight from a bigint DB column, a
+  // real JS number — see userRowToApp) against a STRINGIFIED company id
+  // (co.id?.toString() / clientCompanyIds, which the surrounding code
+  // deliberately builds as strings a few lines above specifically
+  // because ids aren't guaranteed to already be strings). [].includes()
+  // and === both use strict equality, so a number never matches a
+  // string — agentIds was ALWAYS empty for both the master-filtering-by-
+  // company branch and the ordinary non-master client branch, meaning
+  // myTrips was always empty too. Every non-master Client Portal user
+  // saw zero trips on every tab, and a master admin filtering to one
+  // specific company also saw zero. Fixed by stringifying u.branch_id
+  // at both comparison points, matching the pattern already used
+  // correctly for visibleCompanies just above.
   const myTrips = state.trips.filter(t => {
     if (isMaster && companyFilter !== "all") {
       // Filter by selected company
       const co = state.companies.find(c => c.id?.toString() === companyFilter);
       if (!co) return false;
-      const agentIds = state.users.filter(u => u.branch_id === co.id?.toString()).map(u => u.id?.toString());
+      const agentIds = state.users.filter(u => u.branch_id?.toString() === co.id?.toString()).map(u => u.id?.toString());
       const tripAgents = [...(t.agent_ids || [])].map(String);
       return tripAgents.some(aid => agentIds.includes(aid));
     }
     if (isMaster) return true;
-    const agentIds = state.users.filter(u => clientCompanyIds.includes(u.branch_id)).map(u => u.id?.toString());
+    const agentIds = state.users.filter(u => clientCompanyIds.includes(u.branch_id?.toString())).map(u => u.id?.toString());
     const tripAgents = [...(t.agent_ids || [])].map(String);
     return tripAgents.some(aid => agentIds.includes(aid));
   });
