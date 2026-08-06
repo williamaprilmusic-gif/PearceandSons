@@ -3796,6 +3796,58 @@ async function tomtomNavRoute(fromCoord, toCoord) {
   }
 }
 
+// TomTom's official incident category enum (confirmed against real API
+// responses, not assumed) — there is genuinely no "police"/"speed camera"
+// category anywhere in this data, matching what was already established
+// when the Traffic product was account-blocked (see project memory).
+const TRAFFIC_INCIDENT_ICON = {
+  1: "🚨", 2: "🌫", 3: "⚠️", 4: "🌧", 5: "🧊", 6: "🐌",
+  7: "🚧", 8: "⛔", 9: "🚧", 10: "💨", 11: "🌊", 14: "🔧",
+};
+const TRAFFIC_INCIDENT_LABEL = {
+  1: "Accident", 2: "Fog", 3: "Dangerous conditions", 4: "Rain", 5: "Ice",
+  6: "Traffic jam", 7: "Lane closed", 8: "Road closed", 9: "Road works",
+  10: "Strong wind", 11: "Flooding", 14: "Broken down vehicle",
+};
+
+// Live traffic incidents (accidents/closures/jams/roadworks) within a
+// bounding box — the TomTom Traffic Incidents API v5, LIVE-VERIFIED
+// 2026-08-06 as now returning real 200 data (accidents, stationary/queuing
+// traffic, closures) across Cape Town, where this exact endpoint 403'd as
+// account-not-enabled every previous time it was checked (see project
+// memory) — the account has since gained access to the Traffic product.
+// Representative marker point is the midpoint of the incident's LineString
+// geometry (the affected road stretch), not one endpoint, so the marker
+// sits on the actual affected segment.
+async function tomtomTrafficIncidents(bounds) {
+  if (!TOMTOM_API_KEY || !bounds) return [];
+  try {
+    const fields = "{incidents{type,geometry{type,coordinates},properties{iconCategory,magnitudeOfDelay,events{description,code,iconCategory},startTime,endTime,from,to,length,delay}}}";
+    const bbox = `${bounds.minLng},${bounds.minLat},${bounds.maxLng},${bounds.maxLat}`;
+    const url = `https://api.tomtom.com/traffic/services/5/incidentDetails?key=${TOMTOM_API_KEY}&bbox=${encodeURIComponent(bbox)}&fields=${encodeURIComponent(fields)}&language=en-GB`;
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return (data.incidents || []).map(inc => {
+      const geom = inc.geometry;
+      const mid = geom?.type === "Point" ? geom.coordinates : geom?.coordinates?.[Math.floor((geom.coordinates.length || 0) / 2)];
+      if (!mid) return null;
+      const p = inc.properties || {};
+      return {
+        id: p.id || `${mid[0]},${mid[1]}`,
+        lat: mid[1], lng: mid[0],
+        iconCategory: p.iconCategory,
+        description: p.events?.[0]?.description || TRAFFIC_INCIDENT_LABEL[p.iconCategory] || "Traffic incident",
+        delaySec: p.delay ?? null,
+        from: p.from || null, to: p.to || null,
+      };
+    }).filter(Boolean);
+  } catch (e) {
+    console.warn("[TomTom] traffic incidents failed:", e.message);
+    return [];
+  }
+}
+
 // Runs one computeBestOrder request for a fixed set of free (reorderable)
 // stops plus one pinned end waypoint. Returns { order, km } — order is
 // freeStops reordered by TomTom + pinnedEnd appended, km is the ACTUAL total
@@ -15034,12 +15086,21 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
   const driverMarkerRef = useRef(null);
   const destMarkerRef = useRef(null);
   const hazardLayerRef = useRef(null);
+  const trafficFlowLayerRef = useRef(null);
+  const incidentLayerRef = useRef(null);
   const [route, setRoute] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [currentInstructionIdx, setCurrentInstructionIdx] = useState(0);
   const [followMode, setFollowMode] = useState(true);
   const [hazardReported, setHazardReported] = useState(false);
+  // "Show traffic" toggle — defaults ON to match Waze's own always-on
+  // traffic display, now that the TomTom Traffic product is confirmed
+  // live on this account (see tomtomTrafficIncidents). Drives both the
+  // colored flow-tile overlay and the incident markers together, since
+  // the user's request treated "show traffic" as one concept.
+  const [showTraffic, setShowTraffic] = useState(true);
+  const [trafficIncidents, setTrafficIncidents] = useState([]);
   const lastRouteFetchAtRef = useRef(0);
 
   const fetchRoute = useCallback(async (fromCoord) => {
@@ -15120,6 +15181,72 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     return () => { map.remove(); mapRef.current = null; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Toggle the colored traffic-flow tile overlay. Runs after the map-init
+  // effect above in source order, so on first mount mapRef.current is
+  // already set — same reasoning as the hazard-layer effect below.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (showTraffic) {
+      if (!trafficFlowLayerRef.current) {
+        trafficFlowLayerRef.current = L.tileLayer(
+          `https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=${TOMTOM_API_KEY}`,
+          { maxZoom: 22, opacity: 0.7 }
+        );
+      }
+      trafficFlowLayerRef.current.addTo(map);
+    } else if (trafficFlowLayerRef.current) {
+      map.removeLayer(trafficFlowLayerRef.current);
+    }
+  }, [showTraffic]);
+
+  // Fetch live traffic incidents (accidents/closures/jams/roadworks) in a
+  // padded bounding box around the current route, refreshing periodically
+  // since congestion changes faster than the route itself. Cleared
+  // whenever traffic is toggled off or there's no route to bound around.
+  useEffect(() => {
+    if (!showTraffic || !route?.points?.length) { setTrafficIncidents([]); return; }
+    let cancelled = false;
+    const fetchIncidents = async () => {
+      const lats = route.points.map(p => p.lat), lngs = route.points.map(p => p.lng);
+      const pad = 0.01; // ~1km buffer around the route
+      const bounds = {
+        minLat: Math.min(...lats) - pad, maxLat: Math.max(...lats) + pad,
+        minLng: Math.min(...lngs) - pad, maxLng: Math.max(...lngs) + pad,
+      };
+      const incidents = await tomtomTrafficIncidents(bounds);
+      if (!cancelled) setTrafficIncidents(incidents);
+    };
+    fetchIncidents();
+    const interval = setInterval(fetchIncidents, 3 * 60 * 1000);
+    return () => { cancelled = true; clearInterval(interval); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showTraffic, route]);
+
+  // Draw/redraw live traffic-incident markers whenever the fetched list
+  // changes. Same layer-group swap pattern as the hazard markers below.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (incidentLayerRef.current) map.removeLayer(incidentLayerRef.current);
+    const group = L.layerGroup();
+    trafficIncidents.forEach(inc => {
+      if (inc.lat == null || inc.lng == null) return;
+      L.marker([inc.lat, inc.lng], {
+        icon: L.divIcon({
+          className: "", iconSize: [22, 22],
+          html: `<div style="font-size:17px;line-height:22px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${TRAFFIC_INCIDENT_ICON[inc.iconCategory] || "❗"}</div>`,
+        }),
+      }).bindPopup(
+        `<b>${(inc.description || "").replace(/</g, "&lt;")}</b>` +
+        (inc.from ? `<br>${inc.from.replace(/</g, "&lt;")}${inc.to ? " → " + inc.to.replace(/</g, "&lt;") : ""}` : "") +
+        (inc.delaySec ? `<br><span style="opacity:.7">+${Math.round(inc.delaySec / 60)} min delay</span>` : "")
+      ).addTo(group);
+    });
+    group.addTo(map);
+    incidentLayerRef.current = group;
+  }, [trafficIncidents]);
 
   // Draw/redraw driver-reported hazard markers whenever the list changes —
   // the in-house peer-to-peer alert system standing in for Waze's own
@@ -15340,6 +15467,18 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
           <span style={{ fontSize: 11, color: COLORS.red }}>{error}</span>
         </div>
       )}
+      <button
+        onClick={() => setShowTraffic(s => !s)}
+        title={showTraffic ? "Hide traffic" : "Show traffic"}
+        style={{
+          position: "absolute", top: 10, right: onExit ? 54 : 10,
+          background: showTraffic ? "rgba(45,140,240,.25)" : "rgba(10,10,10,.85)",
+          border: `1px solid ${showTraffic ? COLORS.blue : COLORS.wire}`,
+          borderRadius: 20, width: 34, height: 34, fontSize: 15, cursor: "pointer", zIndex: 500,
+        }}
+      >
+        🚦
+      </button>
       {onExit && (
         <button onClick={onExit} style={{ position: "absolute", top: 10, right: 10, background: "rgba(10,10,10,.85)", border: `1px solid ${COLORS.wire}`, borderRadius: 20, width: 34, height: 34, color: COLORS.chalk, fontSize: 16, cursor: "pointer", zIndex: 500 }}>
           ✕
