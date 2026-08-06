@@ -16208,9 +16208,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
                   </div>
                 ))}
               </div>
-              <Button title={`🧭 NAVIGATE → PICKUP`} variant="waze" full
-                onClick={() => setNavTarget({ lat: curPickup.lat, lng: curPickup.lng, label: curPickup.label, isManual: curPickup.isManual })}
-                style={{ padding: 14, fontSize: 13 }} />
               <Button
                 title={`✓ ALL ${pickupStops.filter(s => !s.done).length} PASSENGERS ON BOARD`}
                 variant="green" full
@@ -16255,7 +16252,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
                   <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP ADDRESS</div>
                   <div style={{ fontSize: 13, fontWeight: 700 }}>{curPickup.label}</div>
                 </div>
-                <Button title={`🧭 NAVIGATE → PICKUP ${curPickupIdx + 1}`} variant="waze" full onClick={() => setNavTarget({ lat: curPickup.lat, lng: curPickup.lng, label: curPickup.label, isManual: curPickup.isManual })} style={{ padding: 16, fontSize: 14 }} />
                 <div style={{ display: "flex", gap: 8 }}>
                   <Button title={`✓ PICKED UP — ${curPickup.agent_name}`} variant="green" full onClick={() => confirmPickup(curPickup.trip_id, curPickup.agent_id)} style={{ flex: 2 }} />
                   <Button title="🚫 NO SHOW" variant="danger" full onClick={() => setNoShowFor({ trip_id: curPickup.trip_id, agent_id: curPickup.agent_id, agent_name: curPickup.agent_name })} style={{ flex: 1 }} />
@@ -16313,7 +16309,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
               <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>DROP-OFF ADDRESS</div>
               <div style={{ fontSize: 13, fontWeight: 700 }}>{curDrop.label}</div>
             </div>
-            <Button title={`🧭 NAVIGATE → DROP-OFF ${curDropIdx + 1}`} variant="waze" full onClick={() => setNavTarget({ lat: curDrop.lat, lng: curDrop.lng, label: curDrop.label, isManual: curDrop.isManual })} style={{ padding: 16, fontSize: 14 }} />
             <Button
               title={curDrop.passengers.length === 1
                 ? `🏁 DROPPED OFF — ${curDrop.passengers[0].name}`
