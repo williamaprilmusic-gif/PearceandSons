@@ -10814,19 +10814,39 @@ function useAppStore() {
   useEffect(() => {
     if (!supabase) return;
     refetch();
+    // Coalesce a burst of near-simultaneous table-change events into ONE
+    // trailing-edge refetch, instead of one full refetch per table per
+    // event. Found via a dedicated performance audit as the likely cause
+    // of reported UI lag: a single admin action (e.g. dispatching a trip)
+    // writes trips + driver_status + inserts a notifications row all
+    // within the same request — each independently fired this same
+    // refetch() before this fix, 2-3 near-simultaneous full reloads for
+    // one user action. Worse, this subscription lives in EVERY open
+    // session (admin/agent/driver tabs alike), so the fan-out multiplies
+    // by however many staff are logged in at once, not just the one
+    // acting user. refetch() replaces `state` wholesale and nothing in
+    // this file uses React.memo, so every one of those reloads re-renders
+    // the entire mounted UI tree — compounding bursts were the real cost,
+    // not any single refetch by itself.
+    let debounceHandle = null;
+    const debouncedRefetch = () => {
+      clearTimeout(debounceHandle);
+      debounceHandle = setTimeout(refetch, 600);
+    };
     const channel = supabase
       .channel("transitos-realtime")
-      .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, refetch)
-      .on("postgres_changes", { event: "*", schema: "public", table: "driver_status" }, refetch)
-      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, refetch)
-      .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, refetch)
-      .on("postgres_changes", { event: "*", schema: "public", table: "users" }, refetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, debouncedRefetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "driver_status" }, debouncedRefetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, debouncedRefetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "notifications" }, debouncedRefetch)
+      .on("postgres_changes", { event: "*", schema: "public", table: "users" }, debouncedRefetch)
       // direct_messages is NOT part of refetch() (it's fetched on-demand
       // per conversation thread, not downloaded into app state) — but we
       // DO need to know when it changes so MessagesTab and AdminContacts
       // can reload their conversation lists and show new messages in real
       // time. Incrementing dmVersion is enough: any component watching it
       // will re-run its load() without us having to plumb a callback here.
+      // Not debounced — a fast, isolated counter bump, not a full reload.
       .on("postgres_changes", { event: "*", schema: "public", table: "direct_messages" }, () => setDmVersion(v => v + 1))
       .subscribe();
 
@@ -10835,13 +10855,17 @@ function useAppStore() {
     // A 30-second interval ensures the app stays in sync even when the
     // WebSocket has quietly died, at the cost of one lightweight DB read
     // every 30s. New bookings, messages, calls and so on all arrive
-    // within one polling cycle at worst.
+    // within one polling cycle at worst. Calls refetch() directly (not
+    // debounced) — it's already on a controlled cadence, nothing to
+    // coalesce against.
     const pollInterval = setInterval(refetch, 30000);
 
     // Also refetch immediately whenever the tab/app comes back to the
     // foreground — a driver returning from Maps or an admin switching
     // back from another app gets fresh data instantly rather than waiting
-    // up to 60s for the next poll tick.
+    // up to 60s for the next poll tick. Direct call, not debounced — a
+    // deliberate user-facing action deserves an immediate response, not
+    // an extra 600ms wait.
     const onVisible = () => { if (document.visibilityState === "visible") refetch(); };
     document.addEventListener("visibilitychange", onVisible);
 
@@ -10849,6 +10873,7 @@ function useAppStore() {
       supabase.removeChannel(channel);
       clearInterval(pollInterval);
       document.removeEventListener("visibilitychange", onVisible);
+      clearTimeout(debounceHandle);
     };
   }, [refetch]);
 
