@@ -10333,7 +10333,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // followed. Overwriting these fields HERE — the one moment we
       // know the driver's true starting point — makes them reflect
       // what genuinely happened, for accurate reporting.
-      const { pickupOrder, dropoffOrder, totalRoadKm } = computeOptimalRoute(routeTrips, driver_coord);
+      const { pickupOrder, dropoffOrder, totalRoadKm: haversineTotalKm } = computeOptimalRoute(routeTrips, driver_coord);
+      const departAtEpochRecord = routeTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0] ?? null;
+      const orderedPickups = await buildPickupSequenceTomTom(routeTrips, driver_coord, departAtEpochRecord);
+      const dropOrdered = buildDropoffSequence(routeTrips, dropoffAnchor(routeTrips, orderedPickups, driver_coord));
       // pickupOrder/dropoffOrder are per-AGENT (one entry per passenger,
       // since a merged trip has several). pickupordernum/dropsequencenum
       // are per-TRIP fields (one number per trip row: "this trip is stop
@@ -10348,6 +10351,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       dropoffOrder.forEach((d, i) => {
         if (firstDropoffPosForTrip[d.trip_id] === undefined) firstDropoffPosForTrip[d.trip_id] = i + 1;
       });
+      // ROOT-CAUSE FIX, reported directly by the user against a real trip
+      // (227: expected ~45.8km, showed 60.3km) — the totalRoadKm above
+      // came from computeOptimalRoute, a pure greedy-nearest-neighbour
+      // HAVERSINE estimate (straight-line distance × ROAD_FACTOR) with NO
+      // real road-network awareness at all. Every OTHER place in this file
+      // that computes a driver's full route (ADD_AGENT, REMOVE_AGENT,
+      // RELOCATE_AGENT, CANCEL, AGENT_CANCEL, merge, ASSIGN_DRIVER — 7
+      // call sites) already uses a TomTom-real-distance-first pattern
+      // (buildPickupSequenceTomTom + tomtomRealRouteKm, haversine only as
+      // a fallback when TomTom is unavailable) — this was the one place
+      // left still haversine-only, and worse, it OVERWRITES the more
+      // accurate driver_route_km already set at dispatch time the moment
+      // the driver taps Start Trip, since the UI everywhere prefers
+      // route_total_km over driver_route_km. Matches the proven pattern
+      // now: real TomTom road distance for the actual driver_coord ->
+      // pickups -> drop-offs route, haversine only as a last resort.
+      const tomtomTotalKm = await tomtomRealRouteKm(driver_coord, orderedPickups, dropOrdered, departAtEpochRecord);
+      const totalRoadKm = tomtomTotalKm ?? haversineTotalKm;
+      console.log(`[RECORD_ROUTE] route: TomTom=${tomtomTotalKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${totalRoadKm.toFixed(1)} km`);
       for (const t of routeTrips) {
         await supabase.from("trips").update({
           routetotalkm: totalRoadKm,
