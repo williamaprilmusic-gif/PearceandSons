@@ -14983,6 +14983,18 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
           <Card key={trip.trip_id}>
             <div onClick={() => toggleTripExpanded(trip.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                {/* Direction indicator — green up-triangle for INBOUND
+                    (heading to the office), red down-triangle for
+                    OUTBOUND (heading out to drop-offs), per explicit
+                    request, so a driver scanning several trips at once
+                    can tell direction at a glance without expanding
+                    each card. */}
+                <span
+                  title={trip.direction === "INBOUND" ? "Inbound" : "Outbound"}
+                  style={{ fontSize: 11, color: trip.direction === "INBOUND" ? COLORS.green : COLORS.red, lineHeight: 1 }}
+                >
+                  {trip.direction === "INBOUND" ? "▲" : "▼"}
+                </span>
                 <span style={{ fontSize: 10, color: COLORS.amber, fontWeight: 700 }}>{trip.trip_id}</span>
                 <span style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 700 }}>
                   {passengers.length > 1
