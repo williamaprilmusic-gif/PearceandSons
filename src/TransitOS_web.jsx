@@ -2884,7 +2884,10 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
   // Safely wrap a value for CSV — escape quotes and wrap in quotes if needed
   const csvCell = (v) => {
     if (v == null || v === "") return "";
-    const s = String(v);
+    let s = String(v);
+    // CSV/formula-injection guard — see the identical fix/comment on the
+    // escapeCsv definitions elsewhere in this file for the full rationale.
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
     if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
       return `"${s.replace(/"/g, '""')}"`;
     }
@@ -17827,7 +17830,16 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
   ];
 
   const escapeCsv = (val) => {
-    const s = val == null ? "" : String(val);
+    let s = val == null ? "" : String(val);
+    // CSV/formula-injection guard — a field starting with =, +, -, or @
+    // can be interpreted as a formula by Excel/Sheets when this file is
+    // opened, potentially executing attacker-controlled content from a
+    // user-editable field (agent/driver name, pickup label, etc.).
+    // Prefixing with a single quote neutralizes it as a formula trigger
+    // while keeping the value readable. Found missing here (and in every
+    // other CSV export in this file, and the daily-trip-sheet edge
+    // function's mirror of this exact function) via a dedicated audit.
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
     // Must also catch a lone \r (not just \r\n) — matches the other CSV
     // escaper in this file (csvCell, compliance audit export) which
     // already checks for it; this one didn't, so a field containing a
@@ -18839,7 +18851,10 @@ function AdminHistory({ state, user, dispatch }) {
 function fleetUtilizationToCsv(rows) {
   const headers = ["Driver", "Trips", "Driving (hrs)", "Loading/Dispatch Lag (hrs)", "Gap Between Trips (hrs)"];
   const escapeCsv = (val) => {
-    const s = val == null ? "" : String(val);
+    let s = val == null ? "" : String(val);
+    // CSV/formula-injection guard — see the identical fix/comment on the
+    // other escapeCsv definitions in this file for the full rationale.
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const toHrs = (ms) => (ms / (1000 * 60 * 60)).toFixed(2);
@@ -21248,7 +21263,12 @@ function usersToCsv(users, driverStatusList) {
     "Vehicle", "Phone",
   ];
   const escapeCsv = (val) => {
-    const s = val == null ? "" : String(val);
+    let s = val == null ? "" : String(val);
+    // CSV/formula-injection guard — see the identical fix/comment on the
+    // other escapeCsv definitions in this file for the full rationale.
+    // Especially relevant here: this export includes Login/Password
+    // fields, a more sensitive target than most.
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
     // Must also catch a lone \r (not just \r\n) — matches the other CSV
     // escaper in this file (csvCell, compliance audit export) which
     // already checks for it; this one didn't, so a field containing a

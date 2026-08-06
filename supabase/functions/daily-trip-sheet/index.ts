@@ -220,7 +220,15 @@ serve(async (req) => {
   // as a real downloadable CSV, per explicit request — the HTML email is
   // readable but not something you can filter/sort/import elsewhere.
   const csvCell = (v: unknown) => {
-    const s = v == null ? "" : String(v);
+    let s = v == null ? "" : String(v);
+    // CSV/formula-injection guard — a field starting with =, +, -, or @
+    // can be interpreted as a formula by Excel/Sheets when this CSV
+    // attachment is opened, potentially executing attacker-controlled
+    // content from a user-editable field (agent name, pickup label,
+    // etc.). Prefixing with a single quote neutralizes it as a formula
+    // trigger while keeping the value readable. Found missing here (and
+    // in every escapeCsv/csvCell in the main app) via a dedicated audit.
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
     // Matches the client app's own CSV escaping (csvCell/escapeCsv) — must
     // catch a lone \r too, not just \r\n, or a stray carriage return in a
     // user-editable field (agent name, pickup label, etc.) could slip
