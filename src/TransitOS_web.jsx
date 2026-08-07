@@ -11263,13 +11263,22 @@ function useAppStore() {
 
     // Backstop polling — Supabase realtime subscriptions can silently
     // drop on mobile (network switch, device sleep, background throttling).
-    // A 30-second interval ensures the app stays in sync even when the
-    // WebSocket has quietly died, at the cost of one lightweight DB read
-    // every 30s. New bookings, messages, calls and so on all arrive
-    // within one polling cycle at worst. Calls refetch() directly (not
-    // debounced) — it's already on a controlled cadence, nothing to
-    // coalesce against.
-    const pollInterval = setInterval(refetch, 30000);
+    // This interval ensures the app stays in sync even when the WebSocket
+    // has quietly died. Widened from 30s to 3 minutes — found via a
+    // dedicated API-call-volume audit: refetch() is a 5-table fetch
+    // (users/driver_status/trips/messages/notifications), not "one
+    // lightweight DB read" as the interval's original comment claimed,
+    // and this runs continuously for every single logged-in session. At
+    // 30s that's the single largest API-call source in the whole app. The
+    // realtime subscription remains the PRIMARY sync path (this is only
+    // ever the fallback for a silently-dead socket), and the
+    // visibility-return refetch just below already gives instant recovery
+    // for the far more common "backgrounded then foregrounded" case — so
+    // this only needs to catch the rarer "stayed foregrounded but the
+    // socket died anyway" case, which doesn't need sub-minute freshness.
+    // Calls refetch() directly (not debounced) — it's already on a
+    // controlled cadence, nothing to coalesce against.
+    const pollInterval = setInterval(refetch, 3 * 60 * 1000);
 
     // Also refetch immediately whenever the tab/app comes back to the
     // foreground — a driver returning from Maps or an admin switching
@@ -14751,20 +14760,20 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   // for — mirrors the same DRIVER_CONFIRMED/IN_TRANSIT gate agentTrackingRefPoint
   // applies per-trip, computed here just to build the tracked list.
   const activeTrackedTrips = myTrips.filter(t => [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
-  // Periodic check for enabled-but-not-yet-fired reminders — see
-  // TRIP/CHECK_UPCOMING_REMINDERS. Previously only DriverApp and AdminApp
-  // ran this poll, meaning an agent's own reminder (which they themselves
-  // enabled by tapping REMIND) would only ever fire if a driver or admin
-  // happened to have the app open at the right moment — often not true,
-  // especially overnight. Every logged-in session now shares the load.
+  // One-shot check for enabled-but-not-yet-fired reminders on mount — see
+  // TRIP/CHECK_UPCOMING_REMINDERS. Used to also repeat every 5 minutes
+  // here AND independently in DriverApp AND AdminApp — found via a
+  // dedicated API-call-volume audit: with every agent/driver/admin
+  // session all re-running this same global (not session-scoped) check
+  // on their own timer, that was N+M+K redundant copies of the identical
+  // work every 5 minutes. A single server-side cron
+  // (check-upcoming-reminders) now runs it once, reliably, regardless of
+  // how many sessions are open — this dispatch stays only so an agent who
+  // just tapped REMIND sees instant feedback rather than waiting on the
+  // cron's next tick.
   useEffect(() => {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    const intervalId = setInterval(() => {
-      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    }, 5 * 60 * 1000);
-    return () => clearInterval(intervalId);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user) && !n.read);
   // Home-screen cards say "Tap to view details" — so land on THAT trip's
@@ -17144,14 +17153,18 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // identical effect for the full rationale. A driver having the app
   // open catching their OWN late trip is genuinely useful (lets them
   // self-correct sooner than waiting for dispatch to notice and call).
+  // Widened to 10 minutes and TRIP/CHECK_UPCOMING_REMINDERS removed from
+  // the repeating interval — see AdminApp's identical effect for why
+  // (found via a dedicated API-call-volume audit: every agent/driver/
+  // admin session was independently re-running the same global reminders
+  // check every 5 minutes; now a single server-side cron handles it).
   useEffect(() => {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
-      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    }, 5 * 60 * 1000);
+    }, 10 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -23268,8 +23281,22 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // (built alongside a server-side scheduled version too, so this gets
   // caught reliably even when nobody has the app open — see the
   // separate Edge Function package). Runs once immediately, then every
-  // 5 minutes, so an admin with the app open catches this without
-  // waiting on the server-side schedule.
+  // 10 minutes (widened from 5 — found via a dedicated API-call-volume
+  // audit; these are compliance sweeps with hour-scale windows, not
+  // something that needs sub-10-minute responsiveness, and every admin
+  // session was independently running all five of these), so an admin
+  // with the app open catches this without waiting on the server-side
+  // schedule.
+  //
+  // TRIP/CHECK_UPCOMING_REMINDERS is now a ONE-SHOT-only dispatch below,
+  // not repeated in the interval — same audit found this exact check was
+  // ALSO independently repeating in every agent's and driver's own app
+  // (see AgentApp/DriverApp), so N+M+K sessions were all redundantly
+  // re-running the same global check every 5 minutes. Moved to a single
+  // server-side cron (check-upcoming-reminders) that now runs it once,
+  // reliably, regardless of who has the app open — this dispatch stays
+  // only so an admin who just watched an agent enable REMIND sees instant
+  // feedback rather than waiting up to 10 minutes for the cron.
   useEffect(() => {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
@@ -23283,11 +23310,10 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
-      dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
       dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
-    }, 5 * 60 * 1000);
+    }, 10 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
