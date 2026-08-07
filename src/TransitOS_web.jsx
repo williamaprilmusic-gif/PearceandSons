@@ -23443,7 +23443,95 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+// AI ops assistant — chat panel calling the ai-ops-assistant edge function
+// (see that function's own header comment for the full design rationale:
+// read-only data snapshot handed to Claude, never a text-to-SQL agent).
+// Gated to Fleet Ops/Standard admins only, mirrored server-side by the
+// edge function itself (never trust the client-side tab gate alone — same
+// pattern every other permission-gated tab in this file already follows).
+function AdminAIAssistant({ user }) {
+  const [messages, setMessages] = useState([]); // [{ role: "user"|"assistant", content }]
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const scrollRef = useRef(null);
+  useEffect(() => { scrollRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages, loading]);
+
+  const ask = async () => {
+    const question = input.trim();
+    if (!question || loading) return;
+    setInput("");
+    setError(null);
+    const nextMessages = [...messages, { role: "user", content: question }];
+    setMessages(nextMessages);
+    setLoading(true);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-ops-assistant`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
+        },
+        // Only the last few turns — matches the edge function's own cap,
+        // no point sending more than it'll use.
+        body: JSON.stringify({ question, history: nextMessages.slice(0, -1).slice(-6) }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      setMessages(m => [...m, { role: "assistant", content: data.answer }]);
+    } catch (e) {
+      setError(e.message || "Couldn't reach the assistant — please try again.");
+      // Roll back the optimistically-added question so a retry doesn't
+      // duplicate it in the conversation history sent next time.
+      setMessages(m => m.slice(0, -1));
+      setInput(question);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="pad">
+      <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>AI OPS ASSISTANT</div>
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2, marginBottom: 12 }}>
+        Ask about today's active trips, driver status, open tickets, or vehicle maintenance.
+        Answers are generated from a live snapshot of current data only — not full trip history.
+      </div>
+      <Card style={{ display: "flex", flexDirection: "column", height: "60vh", minHeight: 360 }}>
+        <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 10, paddingRight: 4 }}>
+          {messages.length === 0 ? (
+            <Empty icon="🤖" text="Ask a question to get started, e.g. “which drivers are near their hours limit?”" />
+          ) : messages.map((m, i) => (
+            <div key={i} style={{
+              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+              maxWidth: "85%", background: m.role === "user" ? "rgba(245,166,35,0.1)" : COLORS.surface,
+              border: `1px solid ${m.role === "user" ? "rgba(245,166,35,0.3)" : COLORS.wire}`,
+              borderRadius: 6, padding: "8px 12px", fontSize: 12, color: COLORS.chalk, whiteSpace: "pre-wrap",
+            }}>
+              {m.content}
+            </div>
+          ))}
+          {loading && <div style={{ fontSize: 11, color: COLORS.ghost }}>Thinking…</div>}
+          <div ref={scrollRef} />
+        </div>
+        {error && <div style={{ fontSize: 10, color: COLORS.red, marginTop: 8 }}>{error}</div>}
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <input
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); ask(); } }}
+            placeholder="Ask a question about live operations…"
+            disabled={loading}
+            style={{ flex: 1, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px", color: COLORS.chalk, fontSize: 12 }}
+          />
+          <Button title={loading ? "…" : "ASK"} onClick={ask} disabled={loading || !input.trim()} size="sm" />
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -23466,6 +23554,9 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
     if (id === "vehicles") return hasAdminPermission(user, "manageAgentsDrivers");
     if (id === "utilization") return hasAdminPermission(user, "manageDispatch");
+    // Mirrors the ai-ops-assistant edge function's own server-side gate
+    // (Fleet Ops/Standard only) — see that function's header comment.
+    if (id === "ai") return hasAdminPermission(user, "manageDispatch");
     return true;
   });
   const [tab, setTab] = usePersistedTab("admin", user.id, "dashboard", visibleNav.map(t => t[0]));
@@ -23629,6 +23720,7 @@ function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "ai" && hasAdminPermission(user, "manageDispatch") && <AdminAIAssistant user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "contacts" && hasAdminPermission(user, "manageTrips") && <AdminContacts state={scopedState} dispatch={dispatch} user={user} call={call} />}
