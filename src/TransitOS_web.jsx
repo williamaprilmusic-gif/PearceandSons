@@ -4306,7 +4306,15 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
       realtime: { params: { eventsPerSecond: 10 } },
       global: {
         fetch: (url, options = {}) => {
-          if (_cachedSessionToken) {
+          // isJwtUsable — NOT just `if (_cachedSessionToken)`. See its own
+          // comment: an expired token attached here would 401 the ENTIRE
+          // request (PostgREST rejects the request outright, it does not
+          // fall back to anon-level access), for every table, the instant
+          // a long-lived tab crosses the token's 24h TTL. Omitting the
+          // header entirely for an expired/absent token correctly falls
+          // back to plain anon-key behavior instead, exactly as every
+          // request already worked before this override existed.
+          if (isJwtUsable(_cachedSessionToken)) {
             options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${_cachedSessionToken}` } };
           }
           return fetch(url, options);
@@ -6947,17 +6955,35 @@ function persistSessionToken(token) {
 // token found in storage after >24h doesn't get sent on every request
 // just to be rejected every time. Returns null (never throws) on any
 // malformed/missing token, same as a fresh login where issuance failed.
-function readStoredSessionTokenIfValid() {
+// Shared by readStoredSessionTokenIfValid below AND the Supabase client's
+// global.fetch override (see its own comment) — a session JWT that's
+// expired (or malformed) must NEVER be attached to a request. Confirmed
+// live against this project's own PostgREST: an invalid/expired
+// Authorization bearer token causes a hard 401 for the ENTIRE request
+// (PGRST301 "JWT cryptographic operation failed"), even against a table
+// whose policy would otherwise allow the anon key through — it does NOT
+// silently fall back to anon-level access the way a MISSING Authorization
+// header would. Since _cachedSessionToken is only ever checked for
+// validity at the moment it's first read from storage (page load/login),
+// a tab left open past the token's 24h TTL would otherwise start
+// silently 401ing on every single request, to every table, the instant
+// it expired — found via a dedicated review while designing the first
+// real per-table RLS policy, before it ever shipped as a live bug.
+function isJwtUsable(token) {
+  if (!token) return false;
   try {
-    const token = localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
-    if (!token) return null;
     // Same base64url→base64 padding as b64ToArrayBuf below (WebAuthn) —
     // atob() is not reliably lenient about missing padding across engines.
     const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
     const padded = b64.padEnd(b64.length + (4 - b64.length % 4) % 4, "=");
     const payload = JSON.parse(atob(padded));
-    if (!payload.exp || payload.exp * 1000 < Date.now()) return null;
-    return token;
+    return !!payload.exp && payload.exp * 1000 > Date.now();
+  } catch (e) { return false; }
+}
+function readStoredSessionTokenIfValid() {
+  try {
+    const token = localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
+    return isJwtUsable(token) ? token : null;
   } catch (e) { return null; }
 }
 
