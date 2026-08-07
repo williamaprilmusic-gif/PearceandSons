@@ -5369,15 +5369,23 @@ function appReducer(state, action) {
       // Driver-facing delay report (demo-mode parity). No trip_delays
       // table in the in-memory model, so this just raises the admin +
       // agent notifications the Supabase handler also raises.
+      // Ownership check was comparing trip.driver_id to the client-
+      // supplied action.driver_id (two values the caller effectively
+      // controls) instead of the real logged-in caller — found via a
+      // security sweep; the real Supabase handler for this exact action
+      // (see its own comment) already had this fixed, only this demo/
+      // offline-fallback path still had the gap. Uses action._caller_id,
+      // set from activeUserRef.current by the dispatch wrapper for every
+      // demo-mode action, same as the other demo-reducer identity fixes.
       const validReasons = ["Traffic", "Roadwork", "Accident", "Weather", "Vehicle Issue", "Other"];
       if (!validReasons.includes(action.reason)) return { ...state, _error: "Please choose a valid delay reason." };
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return { ...state, _error: "Trip not found" };
-      if (String(trip.driver_id) !== String(action.driver_id)) return { ...state, _error: "You're not the driver on this trip." };
+      if (String(trip.driver_id) !== String(action._caller_id)) return { ...state, _error: "You're not the driver on this trip." };
       if (![TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state)) {
         return { ...state, _error: "Delays can only be reported on an active trip." };
       }
-      const reportingDriver = state.users.find(u => String(u.id) === String(action.driver_id));
+      const reportingDriver = state.users.find(u => String(u.id) === String(action._caller_id));
       const nowTs = now();
       const adminNotif = {
         id: mkId(), type: "TRIP_DELAY", for_roles: [ROLE.ADMIN],
@@ -11416,8 +11424,21 @@ function useAppStore() {
   // data changes, so they're deliberately NOT part of the general
   // refetch() cycle above (which re-downloads users/trips/messages/
   // notifications — wasteful to do that on every GPS tick).
+  //
+  // Role-gated to DRIVER (reads their own live position as a start-trip
+  // fallback) + ADMIN (dispatch driver-selection + Live Map) — confirmed
+  // by grepping every `state.driver_positions` read site file-wide, no
+  // agent/client-portal consumer exists. Found via a dedicated security
+  // sweep: this was the one real-time GPS feed still missing the same
+  // role gate already applied to the 5 auxiliary tables (campaigns/
+  // vehicles/vehicle_maintenance_log/trip_fee_rates/hazard_reports) —
+  // meaning it was previously the ONE table whose "allow all" RLS policy
+  // couldn't safely be tightened yet, since anon/agent sessions were
+  // still fetching it unconditionally. Gating here first is the
+  // prerequisite for the matching DB-side restriction (see the
+  // driver_positions_require_auth migration).
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase || (myRole !== ROLE.DRIVER && myRole !== ROLE.ADMIN)) return;
     fetchDriverPositions();
     const channel = supabase
       .channel("transitos-driver-positions")
@@ -11431,7 +11452,7 @@ function useAppStore() {
     const onVisible = () => { if (document.visibilityState === "visible") fetchDriverPositions(); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
-  }, [fetchDriverPositions]);
+  }, [fetchDriverPositions, myRole]);
 
   // Role of the currently active user — used below to skip fetching/
   // subscribing/polling admin-only or driver+admin-only auxiliary tables
@@ -20426,78 +20447,77 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
 }
 
 // Lets an agent report a road delay/hazard the same way an admin (Route
-// Advisory) or driver (in-nav two-tap report) already can — per explicit
-// request. Agents don't have a live-nav-map context to grab a position
-// from (unlike a driving driver) and aren't usually posting a multi-hour
-// official advisory (unlike an admin), so this borrows the shape closest
-// to what an agent actually has available: RouteAdvisoryPanel's address-
-// search location picker, plus the driver flow's category-icon picker.
-// Dispatches the SAME DRIVER/REPORT_HAZARD action driver reports use
-// (source: "agent" so it displays/expires exactly like a driver's own
-// report — anonymous reporter, category icon, shorter relevance window —
-// not like an admin's longer-lived, name-attributed advisory).
+// Advisory) or driver (in-nav two-tap report) already can. Per explicit
+// follow-up correction: "must be exactly like Waze's — one click icons"
+// — the first version of this used an address-search-then-submit form,
+// which isn't that. Rebuilt as a true one-tap flow matching the driver's
+// own hazard-report picker exactly: grabs the agent's live GPS position
+// once (silently, on open — same as Waze reporting at your current
+// location, never asking you to search an address), then tapping a
+// category icon reports IMMEDIATELY at that position — no note field, no
+// separate submit button, no confirmation step. Dispatches the SAME
+// DRIVER/REPORT_HAZARD action driver reports use (source: "agent" so it
+// displays/expires exactly like a driver's own report — anonymous
+// reporter, category icon, shorter relevance window — not like an
+// admin's longer-lived, name-attributed advisory).
 function AgentReportDelayModal({ dispatch, onClose }) {
-  const [category, setCategory] = useState(null);
-  const [note, setNote] = useState("");
-  const [street, setStreet] = useState("");
   const [coord, setCoord] = useState(null);
-  const [posting, setPosting] = useState(false);
+  const [locError, setLocError] = useState(null);
+  const [reportedKey, setReportedKey] = useState(null); // category currently submitting / just submitted
   const [error, setError] = useState(null);
-  const [sent, setSent] = useState(false);
 
-  const post = async () => {
-    if (!category) { setError("Pick what kind of delay this is."); return; }
-    if (!coord) { setError("Search for the location and pick it from the results before reporting."); return; }
-    setPosting(true);
+  useEffect(() => {
+    if (!navigator.geolocation) { setLocError("Location isn't available on this device/browser."); return; }
+    navigator.geolocation.getCurrentPosition(
+      pos => setCoord({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+      err => setLocError(err.code === err.PERMISSION_DENIED
+        ? "Location permission denied — allow location access to report a delay."
+        : "Couldn't get your location — try again."),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
+    );
+  }, []);
+
+  const report = async (categoryKey) => {
+    if (!coord || reportedKey) return; // one tap, no double-fire while a report is already in flight
+    setReportedKey(categoryKey);
     setError(null);
     try {
-      await dispatch({ type: "DRIVER/REPORT_HAZARD", source: "agent", category, lat: coord.lat, lng: coord.lng, note: note.trim() || null });
-      setSent(true);
-      setTimeout(onClose, 1200);
+      await dispatch({ type: "DRIVER/REPORT_HAZARD", source: "agent", category: categoryKey, lat: coord.lat, lng: coord.lng });
+      setTimeout(onClose, 900);
     } catch (e) {
       setError(e.message || "Couldn't report the delay — please try again.");
-    } finally {
-      setPosting(false);
+      setReportedKey(null);
     }
   };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between" }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 14, alignItems: "center" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", width: "100%" }}>
           <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>⚠ REPORT A ROAD DELAY</span>
           <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
         </div>
-        {sent ? (
+        {reportedKey && !error ? (
           <div style={{ fontSize: 12, color: COLORS.green, padding: "12px 0" }}>✓ Reported — drivers will see it on their nav map.</div>
         ) : (
           <>
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>TYPE</span>
-              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                {HAZARD_CATEGORIES.map(c => (
-                  <button key={c.key} onClick={() => setCategory(c.key)}
-                    style={{
-                      display: "flex", flexDirection: "column", alignItems: "center", gap: 2, cursor: "pointer",
-                      background: category === c.key ? "rgba(245,166,35,0.12)" : "none",
-                      border: `1px solid ${category === c.key ? COLORS.amber : COLORS.wire}`,
-                      borderRadius: 6, padding: "6px 10px",
-                    }}>
-                    <span style={{ fontSize: 20, lineHeight: 1 }}>{c.icon}</span>
-                    <span style={{ fontSize: 8, color: category === c.key ? COLORS.amber : COLORS.ghost, fontWeight: 700, whiteSpace: "nowrap" }}>{c.label}</span>
-                  </button>
-                ))}
-              </div>
+            <div style={{ fontSize: 9, color: COLORS.ghost, textAlign: "center" }}>
+              {coord ? "Tap what you're seeing — reports at your current location." : locError || "Getting your location…"}
             </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>LOCATION</span>
-              <StreetInput value={street} placeholder="Search an address or area…"
-                preConfirmed={coord ? { label: street, area: "", lat: coord.lat, lng: coord.lng } : null}
-                onChange={({ street: s, coord: c, confirmed }) => { setStreet(s); if (confirmed) setCoord(c); }} />
+            <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
+              {HAZARD_CATEGORIES.map(c => (
+                <button key={c.key} onClick={() => report(c.key)} disabled={!coord || !!reportedKey}
+                  style={{
+                    display: "flex", flexDirection: "column", alignItems: "center", gap: 4,
+                    cursor: coord ? "pointer" : "not-allowed", background: "none", border: "none",
+                    opacity: coord ? 1 : 0.4, padding: "8px 6px",
+                  }}>
+                  <span style={{ fontSize: 30, lineHeight: 1 }}>{c.icon}</span>
+                  <span style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, whiteSpace: "nowrap" }}>{c.label}</span>
+                </button>
+              ))}
             </div>
-            <TextField label="Note (optional)" value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Backed up past the taxi rank" />
-            <Button title={posting ? "REPORTING…" : "⚠ REPORT DELAY"} variant="amber" size="sm" onClick={post} disabled={posting || !category} />
             {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
           </>
         )}
