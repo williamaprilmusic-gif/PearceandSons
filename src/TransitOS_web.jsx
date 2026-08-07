@@ -4333,7 +4333,7 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           if (usingToken) {
             options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${tokenAtRequestTime}` } };
           }
-          const res = await fetch(url, options);
+          let res = await fetch(url, options);
           // Self-healing — confirmed live in production logs the day this
           // shipped: a real session hit a hard 401 on EVERY table (not
           // just ones with tightened RLS), consistent with PostgREST
@@ -4351,10 +4351,23 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           // avoids clobbering a NEWER token that was installed (e.g. a
           // fresh login in another tab) while this now-stale request was
           // still in flight.
+          //
+          // Retry once before acting on a 401 — found live: a token that
+          // had JUST minted a successful login (proving it's genuinely
+          // valid) could still see the very next write get a single 401,
+          // then work fine again moments later on an unrelated request.
+          // That's a transient blip, not proof the token itself is bad —
+          // but the old code treated any single 401 as gospel and forced a
+          // full disruptive logout on the strength of it. A genuinely dead
+          // token fails identically on retry; a blip usually won't.
           if (usingToken && res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
-            _cachedSessionToken = null;
-            persistSessionToken(null);
-            notifySessionExpired();
+            await new Promise(r => setTimeout(r, 300));
+            res = await fetch(url, options);
+            if (res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
+              _cachedSessionToken = null;
+              persistSessionToken(null);
+              notifySessionExpired();
+            }
           }
           // Once the token's gone (cleared just above, or never present —
           // e.g. this tab's copy expired before the page even loaded), every
