@@ -2590,12 +2590,12 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   );
 }
 
-// ── In-app Waze navigation panel ─────────────────────────────────────────
-// Professional fleet apps can't actually embed Waze (Waze blocks iframes
-// and cross-origin embedding). What they DO is a persistent nav panel
-// that shows: current stop details, one-tap launch into Waze pre-loaded
-// with the destination, and trip progress — so it FEELS embedded.
-// This is the same technique Bolt and inDriver use on Android/iOS.
+// ── In-app navigation panel ──────────────────────────────────────────────
+// Persistent stop-progress sidebar: current stop details, NAVIGATE (hands
+// off to setNavTarget -> the embedded DriverNavMap, Leaflet+TomTom, live
+// position + turn-by-turn text — see project memory's Waze in-app nav
+// entry), and trip progress. Replaced an earlier design that launched the
+// external Waze app — kept the panel name since drivers already know it.
 function WazeNavPanel({ trip, user, state, setNavTarget }) {
   if (!trip) return null;
   const agentIds = trip.agent_ids || [];
@@ -7088,8 +7088,8 @@ function must(res) {
 // which TRIP/DISPATCH_MULTI/BULK_ASSIGN_DRIVER both delegate to), the
 // driver accepting (TRIP/ACCEPT), and the driver actually starting
 // navigation (TRIP/RECORD_ROUTE — the real "trip starts now" moment, not
-// TRIP/DRIVER_CONFIRM, matching that handler's own existing 2-hour-window
-// comment). Roadworthy cert stays advisory-only (DOC_TYPES.required:
+// TRIP/DRIVER_CONFIRM, matching that handler's own scheduled-time gate).
+// Roadworthy cert stays advisory-only (DOC_TYPES.required:
 // false), matching the driver-facing summary's own severity split.
 async function assertDriverDocsCurrent(driverId) {
   const { data: docsRow } = await supabase.from("driver_status").select("documents").eq("driverid", driverId).maybeSingle();
@@ -10157,7 +10157,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       const nowTs = nowEpoch();
-      must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id));
+      // .select("id") + a row-count check, not just must()'s error check —
+      // an UPDATE whose USING clause matches zero rows (e.g. a broken/
+      // expired session token failing the RLS auth check) returns a plain
+      // success with zero rows affected, not a Postgres error. must() alone
+      // can't tell that apart from a genuine success, and this handler's
+      // very next step announces "your driver has confirmed the trip" to
+      // every agent regardless — a false confirmation on a DB row that was
+      // never actually touched. Found in a dedicated audit of the RLS
+      // lockdown's write paths; same latent gap exists at ~30 other
+      // must(supabase....update/delete(...)) sites with no .select(),
+      // flagged in project memory as a scoped follow-up, not fixed here.
+      const confirmRes = must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id).select("id"));
+      if (!confirmRes.data || confirmRes.data.length === 0) throw new Error("Couldn't confirm the trip — your session may have expired. Please try again.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
@@ -16697,8 +16709,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const [startTripError, setStartTripError] = useState(null);
   const handleStartTrip = async () => {
     setStartTripError(null);
-    // A driver may only start a trip within 2 hours of its scheduled time,
-    // on the scheduled day itself — per explicit requirement. Checked
+    // A driver may not start a trip before its scheduled time — per
+    // explicit requirement (no early-start window at all). Checked
     // against the EARLIEST scheduled trip in this batch (a driver's
     // several active trips for the day are started together as one
     // route), so the restriction is based on whichever pickup comes
@@ -20494,16 +20506,18 @@ function AgentReportDelayModal({ dispatch, onClose }) {
   const [reportedKey, setReportedKey] = useState(null); // category currently submitting / just submitted
   const [error, setError] = useState(null);
 
-  useEffect(() => {
+  const getLocation = useCallback(() => {
     if (!navigator.geolocation) { setLocError("Location isn't available on this device/browser."); return; }
+    setLocError(null);
     navigator.geolocation.getCurrentPosition(
       pos => setCoord({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
       err => setLocError(err.code === err.PERMISSION_DENIED
         ? "Location permission denied — allow location access to report a delay."
-        : "Couldn't get your location — try again."),
+        : "Couldn't get your location — tap to try again."),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 30000 }
     );
   }, []);
+  useEffect(() => { getLocation(); }, [getLocation]);
 
   const report = async (categoryKey) => {
     if (!coord || reportedKey) return; // one tap, no double-fire while a report is already in flight
@@ -20533,6 +20547,11 @@ function AgentReportDelayModal({ dispatch, onClose }) {
             <div style={{ fontSize: 9, color: COLORS.ghost, textAlign: "center" }}>
               {coord ? "Tap what you're seeing — reports at your current location." : locError || "Getting your location…"}
             </div>
+            {!coord && locError && locError !== "Location isn't available on this device/browser." && (
+              <button onClick={getLocation} style={{ background: "none", border: `1px solid ${COLORS.amber}`, color: COLORS.amber, borderRadius: 6, padding: "6px 14px", fontSize: 10, fontWeight: 700, cursor: "pointer" }}>
+                ⟳ RETRY
+              </button>
+            )}
             <div style={{ display: "flex", gap: 10, justifyContent: "center", flexWrap: "wrap" }}>
               {HAZARD_CATEGORIES.map(c => (
                 <button key={c.key} onClick={() => report(c.key)} disabled={!coord || !!reportedKey}
@@ -23709,7 +23728,7 @@ function ClientPortalApp({ state, dispatch, user, hideHeader = false }) {
 
 // AI ops assistant — chat panel calling the ai-ops-assistant edge function
 // (see that function's own header comment for the full design rationale:
-// read-only data snapshot handed to Claude, never a text-to-SQL agent).
+// read-only data snapshot handed to Gemini, never a text-to-SQL agent).
 // Gated to Fleet Ops/Standard admins only, mirrored server-side by the
 // edge function itself (never trust the client-side tab gate alone — same
 // pattern every other permission-gated tab in this file already follows).
@@ -24281,13 +24300,14 @@ function AppInner() {
   // Defined AFTER handleLogout8 — same TDZ-safety convention as above.
   useEffect(() => {
     const onSessionExpired = () => {
+      if (!activeUser) return; // nobody logged in — nothing to expire/log out of
       setSessionExpired(true);
       pushToast("SESSION EXPIRED", "Your login has expired — logging you out. Please log back in.", COLORS.red);
       setTimeout(() => handleLogout8(), 2500);
     };
     window.addEventListener("transitos:session-expired", onSessionExpired);
     return () => window.removeEventListener("transitos:session-expired", onSessionExpired);
-  }, [pushToast, handleLogout8]);
+  }, [pushToast, handleLogout8, activeUser?.id]);
 
   // The event above only fires from a FAILED write — someone sitting on a
   // read-only screen (map view, trip list) with a dead token wouldn't get
