@@ -265,21 +265,53 @@ async function hashPasswordServer(password: string, salt: string): Promise<strin
 // deploy config). Mirrors handleSupabaseAction's AUTH/LOGIN verification
 // (salted-hash compare, with legacy-plaintext fallback for not-yet-upgraded
 // accounts) so behavior matches ordinary password login exactly.
-async function verifyPassword(supabase: ReturnType<typeof createClient>, userId: number, password: string): Promise<boolean> {
+// Brute-force protection — same login_attempts table/threshold as
+// session-login (see that function's own comment for the full rationale;
+// found missing here via the same dedicated security audit). Keyed by
+// "webauthn:<userId>" rather than a username, since this endpoint already
+// has a concrete numeric user_id at the point verifyPassword runs — a
+// distinct key namespace from session-login's "login:<username>" so the
+// two never collide or share a counter for what's really two separate
+// guessing surfaces against the same account.
+const MAX_FAILS = 5;
+const LOCKOUT_MS = 15 * 60 * 1000;
+async function verifyPassword(supabase: ReturnType<typeof createClient>, userId: number, password: string): Promise<boolean | 'locked'> {
   if (!password) return false;
+  const attemptKey = `webauthn:${userId}`;
+  const now = Date.now();
+  const { data: attemptRow } = await supabase.from('login_attempts')
+    .select('fail_count, locked_until').eq('attempt_key', attemptKey).maybeSingle();
+  if (attemptRow?.locked_until && attemptRow.locked_until > now) return 'locked';
+
   const { data: user } = await supabase.from('users')
     .select('passwordhash, passwordsalt, status').eq('id', userId).maybeSingle();
-  if (!user || user.status !== 'ACTIVE') return false;
-  if (user.passwordsalt) {
-    return (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash;
+  const valid = !!user && user.status === 'ACTIVE' && (
+    user.passwordsalt
+      ? (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash
+      : user.passwordhash === password
+  );
+  if (valid) {
+    await supabase.from('login_attempts').delete().eq('attempt_key', attemptKey);
+    return true;
   }
-  return user.passwordhash === password;
+  // Tracked even for a userId that doesn't resolve to a real/active
+  // account — same "no new enumeration side channel" reasoning as
+  // session-login.
+  const newCount = (attemptRow?.fail_count || 0) + 1;
+  const lockedUntil = newCount >= MAX_FAILS ? now + LOCKOUT_MS : null;
+  await supabase.from('login_attempts').upsert(
+    { attempt_key: attemptKey, fail_count: newCount, locked_until: lockedUntil, updated_at: now },
+    { onConflict: 'attempt_key' }
+  );
+  return false;
 }
 
 // ── Action handlers ────────────────────────────────────────────────────────
 async function registrationOptions(userId: number, username: string, password: string) {
   const supabase = db();
-  if (!(await verifyPassword(supabase, userId, password))) return err('Incorrect password', 401);
+  const pwCheck = await verifyPassword(supabase, userId, password);
+  if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
+  if (!pwCheck) return err('Incorrect password', 401);
   const challenge = randomChallenge();
   await supabase.from('webauthn_challenges')
     .delete().eq('user_id', userId).eq('type', 'registration');
@@ -322,7 +354,9 @@ async function register(userId: number, credential: {
   // directly (a caller isn't required to have gone through
   // registration-options first), so it must not rely on that earlier call
   // having checked anything.
-  if (!(await verifyPassword(supabase, userId, password))) return err('Incorrect password', 401);
+  const pwCheck = await verifyPassword(supabase, userId, password);
+  if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
+  if (!pwCheck) return err('Incorrect password', 401);
   // Fetch and validate challenge
   const { data: challengeRow } = await supabase
     .from('webauthn_challenges').select('*')

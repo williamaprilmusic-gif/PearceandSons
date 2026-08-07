@@ -4270,10 +4270,48 @@ import { createClient } from "@supabase/supabase-js";
 const SUPABASE_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_Kyne7Q6PJ2uKmcfslI-qNQ_CX-m7mxF";
 
+// Prerequisite for any real (non-"allow all") RLS policy — see the
+// project's own push_subscriptions migration history for why this exists:
+// a past attempt at a real per-user policy (`userid = auth.uid()`) on
+// that one table silently rejected (401) every single request and had to
+// be reverted, because auth.uid()/auth.jwt() were ALWAYS empty for this
+// app's traffic. Root cause (confirmed via that migration's own comment):
+// this app authenticates with a custom edge-function-issued JWT
+// (session-login), not a real GoTrue session — supabase.auth.setSession()
+// requires GoTrue to independently validate the token against its own
+// auth.users table via POST .../auth/v1/user, which always 400s for a
+// token that was never issued by GoTrue in the first place. When that
+// validation fails, the supabase-js client silently keeps using the bare
+// anon key for every subsequent request instead — so auth.uid()/
+// auth.jwt() genuinely had nothing to read, no matter what RLS policy
+// was written.
+//
+// The actual fix doesn't require GoTrue validation at all: PostgREST
+// verifies the JWT directly against the project's own JWT secret on each
+// request (the same secret session-login signs with) and populates
+// auth.uid()/auth.jwt() from ITS claims — independently of whether
+// supabase-js's own setSession() ever succeeded. A custom `global.fetch`
+// override reads _cachedSessionToken fresh on every call (not baked in at
+// client-creation time, so login/logout take effect immediately) and
+// attaches it as the Authorization header, bypassing setSession()/GoTrue
+// entirely. Purely additive today — every table's RLS policy is still
+// "allow all" for both anon and authenticated roles, so this changes
+// which Postgres role a logged-in request runs as (anon -> authenticated)
+// without changing what's visible. It's the prerequisite groundwork for
+// tightening individual tables' policies to something real, one at a
+// time, without repeating the push_subscriptions incident.
 const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
       realtime: { params: { eventsPerSecond: 10 } },
+      global: {
+        fetch: (url, options = {}) => {
+          if (_cachedSessionToken) {
+            options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${_cachedSessionToken}` } };
+          }
+          return fetch(url, options);
+        },
+      },
     })
   : null;
 
