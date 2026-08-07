@@ -3,7 +3,9 @@
 // AI-powered admin operations assistant, per explicit request ("implement
 // AI into this app"). Answers natural-language questions about live
 // operational data (active trips, driver status, open tickets, recent
-// vehicle maintenance) using Claude.
+// vehicle maintenance) using Google's Gemini API — chosen specifically for
+// its free tier (no ongoing cost for this feature's usage volume), per
+// explicit user decision after being offered Anthropic/OpenAI/Gemini/Groq.
 //
 // Deliberately READ-ONLY by design, not a text-to-SQL assistant: the model
 // never executes a query or writes anything. It's handed a bounded,
@@ -24,7 +26,6 @@
 // Financial (a money-focused, not ops-focused, tier — out of scope here).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import Anthropic from "https://esm.sh/@anthropic-ai/sdk@0.70.1?target=deno";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
@@ -32,7 +33,18 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 // cannot use a SUPABASE_ prefix, Supabase reserves that for its own
 // auto-injected platform variables.
 const JWT_SECRET = Deno.env.get("PROJECT_JWT_SECRETS");
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+// gemini-2.5-flash — a stable, well-established free-tier-eligible model
+// (Google's own free-tier docs list it alongside newer flash variants);
+// picked over a bleeding-edge model id for reliability on a feature that
+// needs to just work, not chase the newest release.
+const GEMINI_MODEL = "gemini-2.5-flash";
+// Raw REST, not the Google SDK — this project's other edge functions only
+// pull in an npm SDK via esm.sh when they need one (e.g. web-push, which
+// has no simple REST equivalent); Gemini's generateContent endpoint is a
+// single plain POST, so a direct fetch avoids any esm.sh/Deno Node-shim
+// compatibility risk from Google's SDK for no real benefit here.
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -88,14 +100,14 @@ Deno.serve(async (req) => {
     // Role/tier check — see header comment for why Viewer/Financial are
     // excluded. Rechecked server-side on every call, not trusted from the
     // client (matches this project's established pattern everywhere else).
-    // Deliberately checked BEFORE the ANTHROPIC_API_KEY presence check
-    // below, so an unauthorized caller always gets a clean 403 regardless
-    // of whether the key happens to be configured yet.
+    // Deliberately checked BEFORE the GEMINI_API_KEY presence check below,
+    // so an unauthorized caller always gets a clean 403 regardless of
+    // whether the key happens to be configured yet.
     const { data: caller } = await supabase.from("users").select("role, adminlevel, fullname").eq("id", callerId).maybeSingle();
     if (!caller || caller.role !== "ADMIN" || !["FLEET_OPS", "STANDARD"].includes(caller.adminlevel)) {
       return json({ ok: false, error: "This assistant is only available to Fleet Ops/Standard admins." }, 403);
     }
-    if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not configured — add it as an edge function secret.");
+    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured — add it as an edge function secret.");
 
     const { question, history } = await req.json();
     if (!question || typeof question !== "string" || !question.trim()) {
@@ -152,28 +164,43 @@ Deno.serve(async (req) => {
       })),
     };
 
-    const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-    const response = await anthropic.messages.create({
-      model: "claude-opus-5",
-      max_tokens: 1024,
-      output_config: { effort: "medium" },
-      system: `You are the internal operations assistant for Pearce & Sons, a staff transport dispatch company in Cape Town, South Africa. You are answering ${caller.fullname}, a Fleet Ops/Standard admin.
+    // Gemini's chat-turn role is "model", not "assistant" — translate our
+    // stored history (which uses "assistant", matching the client's own
+    // message-role convention) at the API boundary, not further upstream.
+    const geminiRes = await fetch(`${GEMINI_URL}?key=${GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: `You are the internal operations assistant for Pearce & Sons, a staff transport dispatch company in Cape Town, South Africa. You are answering ${caller.fullname}, a Fleet Ops/Standard admin.
 
-Answer ONLY using the JSON data snapshot in the user's message — never invent trips, drivers, tickets, or numbers that aren't in it. If the snapshot doesn't contain what's needed to answer, say so plainly instead of guessing. Times are SAST (UTC+2). Currency is South African Rand (R) where relevant. Keep answers concise — a sentence or short paragraph, not a report. The snapshot covers only ACTIVE (not yet completed/cancelled) trips, currently OPEN tickets, and current driver/vehicle state — it has no historical/archived data.`,
-      messages: [
-        ...safeHistory.map(m => ({ role: m.role as "user" | "assistant", content: m.content })),
-        { role: "user", content: `DATA SNAPSHOT:\n${JSON.stringify(snapshot)}\n\nQUESTION: ${question}` },
-      ],
+Answer ONLY using the JSON data snapshot in the user's message — never invent trips, drivers, tickets, or numbers that aren't in it. If the snapshot doesn't contain what's needed to answer, say so plainly instead of guessing. Times are SAST (UTC+2). Currency is South African Rand (R) where relevant. Keep answers concise — a sentence or short paragraph, not a report. The snapshot covers only ACTIVE (not yet completed/cancelled) trips, currently OPEN tickets, and current driver/vehicle state — it has no historical/archived data.` }],
+        },
+        contents: [
+          ...safeHistory.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
+          { role: "user", parts: [{ text: `DATA SNAPSHOT:\n${JSON.stringify(snapshot)}\n\nQUESTION: ${question}` }] },
+        ],
+        generationConfig: { maxOutputTokens: 1024 },
+      }),
     });
+    if (!geminiRes.ok) {
+      const errBody = await geminiRes.text();
+      throw new Error(`Gemini API error (${geminiRes.status}): ${errBody.slice(0, 500)}`);
+    }
+    const geminiData = await geminiRes.json();
 
-    // Claude Opus 5 runs elevated cybersecurity safeguards and can decline
-    // a request with a normal 200 + stop_reason: "refusal" rather than an
-    // error — must be checked before reading response.content.
-    if (response.stop_reason === "refusal") {
+    // A blocked/declined request surfaces as promptFeedback.blockReason
+    // (the whole prompt was rejected before any candidate was generated)
+    // or a candidate with finishReason "SAFETY"/"RECITATION" instead of
+    // "STOP" — neither is an HTTP error, so both must be checked before
+    // trusting candidates[0].content as a real answer.
+    const blockReason = geminiData?.promptFeedback?.blockReason;
+    const candidate = geminiData?.candidates?.[0];
+    if (blockReason || (candidate && candidate.finishReason && candidate.finishReason !== "STOP" && candidate.finishReason !== "MAX_TOKENS")) {
       return json({ ok: false, error: "The assistant declined to answer that question." });
     }
-    const textBlock = response.content.find((b): b is Anthropic.TextBlock => b.type === "text");
-    return json({ ok: true, answer: textBlock?.text || "" });
+    const answer = (candidate?.content?.parts || []).map((p: { text?: string }) => p.text || "").join("");
+    return json({ ok: true, answer });
   } catch (e) {
     console.error("[ai-ops-assistant]", e instanceof Error ? e.message : String(e));
     return json({ ok: false, error: "Internal error: " + (e instanceof Error ? e.message : String(e)) }, 500);
