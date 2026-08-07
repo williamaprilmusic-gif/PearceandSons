@@ -18446,14 +18446,19 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
         t.admin_note || "",
-        // Trip Fee — same value repeats on every passenger row for a
-        // multi-passenger trip (matches how every other trip-level field
-        // in this export already repeats per row), NOT split per agent.
-        // The TOTAL row below sums per unique trip, not per row, so a
-        // multi-passenger trip's fee is never double-counted in the total.
+        // Trip Fee — split evenly across every agent merged onto this trip,
+        // so each passenger row shows only THAT agent's own share, not the
+        // full trip total repeated on every row (was flagged by the user
+        // as confusing — the whole trip's cost looked like it belonged to
+        // each individual agent). agentIds.length is exactly the number of
+        // rows this trip produces (one per merged agent), so dividing by
+        // it means the per-row values always sum back to the trip's real
+        // total. The TOTAL row below still sums tripFeeAmount() directly
+        // per unique trip (not by summing these per-row shares), so it's
+        // unaffected by this split either way.
         ...(feeRates ? [
           { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal", pending: "Pending" }[tripFeeCategory(t)],
-          tripFeeAmount(t, feeRates).toFixed(2),
+          (tripFeeAmount(t, feeRates) / agentIds.length).toFixed(2),
           // Driver payment — same per-trip value repeats on every passenger
           // row (matches the Trip Fee convention above); the TOTAL row sums
           // per unique trip, never per row.
