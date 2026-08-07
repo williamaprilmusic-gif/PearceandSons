@@ -24186,14 +24186,6 @@ function AppInner() {
   // fresh token, so any earlier expiry no longer applies).
   const [sessionExpired, setSessionExpired] = useState(false);
   useEffect(() => { setSessionExpired(false); }, [activeUser?.id]);
-  useEffect(() => {
-    const onSessionExpired = () => {
-      setSessionExpired(true);
-      pushToast("SESSION EXPIRED", "Your login has expired — log out and back in to keep syncing.", COLORS.red);
-    };
-    window.addEventListener("transitos:session-expired", onSessionExpired);
-    return () => window.removeEventListener("transitos:session-expired", onSessionExpired);
-  }, [pushToast]);
 
   // Previously this fired a toast for ANY new notification added anywhere
   // in the system, regardless of who it was actually for — an agent would
@@ -24276,6 +24268,41 @@ function AppInner() {
   const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
     useSessionTimeout(activeUser, handleLogout8);
 
+  // Session token went bad (expired, or rejected server-side for any other
+  // reason) and every write this device makes is now silently failing RLS
+  // — see notifySessionExpired's own comment for why this needs a real
+  // signal rather than just a log line. Merely nudging the person to log
+  // out manually (an earlier version of this fix) isn't enough — the write
+  // failures keep piling up silently in the background until they actually
+  // notice and act, which for something like live GPS tracking or a trip
+  // booking is real operational impact in the meantime. Force it instead:
+  // show the reason for a moment, then log them out outright so the next
+  // thing they see is the login screen, not a banner they can miss.
+  // Defined AFTER handleLogout8 — same TDZ-safety convention as above.
+  useEffect(() => {
+    const onSessionExpired = () => {
+      setSessionExpired(true);
+      pushToast("SESSION EXPIRED", "Your login has expired — logging you out. Please log back in.", COLORS.red);
+      setTimeout(() => handleLogout8(), 2500);
+    };
+    window.addEventListener("transitos:session-expired", onSessionExpired);
+    return () => window.removeEventListener("transitos:session-expired", onSessionExpired);
+  }, [pushToast, handleLogout8]);
+
+  // The event above only fires from a FAILED write — someone sitting on a
+  // read-only screen (map view, trip list) with a dead token wouldn't get
+  // caught until they happen to act, e.g. mid-booking. Proactively poll
+  // token validity instead of waiting for that. 15s initial delay avoids
+  // false-firing during the async window right after a fresh login before
+  // applySessionToken's fetch has actually landed.
+  useEffect(() => {
+    if (!activeUser?.id || !supabase) return;
+    const check = () => { if (!isJwtUsable(_cachedSessionToken)) notifySessionExpired(); };
+    const t = setTimeout(check, 15000);
+    const iv = setInterval(check, 60000);
+    return () => { clearTimeout(t); clearInterval(iv); };
+  }, [activeUser?.id]);
+
   useEffect(() => {
     if (state._error && !state.active_user_id) setLoginError(state._error);
   }, [state._error, state.active_user_id]);
@@ -24330,12 +24357,12 @@ function AppInner() {
 
       {sessionExpired && activeUser && (
         <div style={{ position: "sticky", top: 0, zIndex: 500, background: COLORS.red, color: "#fff", padding: "8px 14px", fontSize: 11, fontWeight: 700, textAlign: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, flexWrap: "wrap" }}>
-          <span>⚠ Your session has expired — trip updates, positions, and alerts aren't syncing.</span>
+          <span>⚠ Your session has expired — logging you out. Please log back in to keep syncing.</span>
           <button
             onClick={handleLogout8}
             style={{ background: "#fff", color: COLORS.red, border: "none", borderRadius: 4, padding: "4px 12px", fontSize: 11, fontWeight: 800, cursor: "pointer" }}
           >
-            LOG OUT & LOG BACK IN
+            LOG OUT NOW
           </button>
         </div>
       )}
