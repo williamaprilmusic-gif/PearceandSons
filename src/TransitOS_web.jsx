@@ -395,11 +395,13 @@ const CAPACITY_WARN_PCT = 0.75;
 
 // ── State machine ──
 const TRIP_TRANSITIONS = {
-  // NOTE: ASSIGNED is a reserved intermediate state — the current reducer
-  // (TRIP/ASSIGN_DRIVER) auto-confirms and jumps straight to DRIVER_CONFIRMED,
-  // so ASSIGNED is never actually produced today. Kept in the state machine
-  // and UI checks (StateBadge, active-trip filters) for forward compatibility
-  // if a manual "awaiting driver confirmation" step is reintroduced later.
+  // ASSIGNED is a real, produced state — TRIP/ASSIGN_DRIVER sets status:
+  // ASSIGNED with driveraccepted: false; the driver must separately fire
+  // TRIP/ACCEPT (then TRIP/DRIVER_CONFIRM) to reach DRIVER_CONFIRMED. (An
+  // older version of this comment claimed ASSIGN_DRIVER auto-confirmed
+  // straight to DRIVER_CONFIRMED — no longer true, see assertTripTransition
+  // call site in TRIP/ASSIGN_DRIVER, which now validates against ASSIGNED
+  // to match.)
   [TRIP_STATE.UNASSIGNED_BOOKING]: [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.ASSIGNED]:           [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.ARCHIVED_CANCELLED],
   [TRIP_STATE.DRIVER_CONFIRMED]:   [TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_CANCELLED],
@@ -2481,6 +2483,14 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   const [queued, setQueued] = React.useState(false);
   const [sendError, setSendError] = React.useState(null);
   const [armTimeout, setArmTimeout] = React.useState(null);
+  // Closes the gap between tapping CONFIRM and the outcome (sent/queued/
+  // error) actually resolving — GPS lookup + dispatch can take a few
+  // real seconds, during which armed/sent/queued/sendError were ALL
+  // false, so the UI silently reverted to the plain idle SOS button. A
+  // second tap during that window started a whole new arm→confirm cycle
+  // and could fire a duplicate alert. Guards fire() against re-entry and
+  // renders an explicit "SENDING…" state instead of the idle button.
+  const [sending, setSending] = React.useState(false);
 
   const arm = () => {
     setArmed(true);
@@ -2489,9 +2499,11 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
   };
 
   const fire = async () => {
+    if (sending) return;
     if (armTimeout) clearTimeout(armTimeout);
     setArmed(false);
     setSendError(null);
+    setSending(true);
     // Get GPS if available
     let gpsStr = "GPS unavailable";
     try {
@@ -2521,8 +2533,16 @@ function SOSButton({ user, tripId, driverName, dispatch }) {
       } else {
         setSendError(e.message || "Couldn't send the alert — please try again.");
       }
+    } finally {
+      setSending(false);
     }
   };
+
+  if (sending) return (
+    <div style={{ background: "rgba(220,53,69,0.12)", border: `1px solid ${COLORS.red}`, borderRadius: 6, padding: "10px 14px", textAlign: "center" }}>
+      <div style={{ fontSize: 12, fontWeight: 800, color: COLORS.red }}>🚨 SENDING SOS…</div>
+    </div>
+  );
 
   if (sent) return (
     <div style={{ background: "rgba(220,53,69,0.12)", border: "1px solid rgba(220,53,69,0.5)", borderRadius: 6, padding: "10px 14px", textAlign: "center" }}>
@@ -6816,6 +6836,49 @@ function persistActiveUserId(id) {
   } catch (e) { /* private browsing / storage blocked — session just won't persist */ }
 }
 
+// The session JWT (see fetchSessionToken/applySessionToken below) was
+// deliberately kept in-memory-only when first introduced — but that meant
+// _cachedSessionToken reset to null on every single page reload/PWA
+// relaunch, while activeUserRef stayed "logged in" via the id persisted
+// above. Found via a dedicated audit: the token is the ONLY thing
+// send-push-notification's Authorization check accepts, so from the
+// second page load of any session onward, every push notification this
+// app sends (driver ETA, SOS, trip updates, DMs — everything routed
+// through insertNotification) silently stopped delivering, with no error
+// surfaced anywhere, until the user explicitly logged out and back in.
+// Persisting the token carries no additional exposure beyond what
+// persisting the user id already accepted (same localStorage, same
+// origin, same "no re-auth needed to keep using the app" tradeoff this
+// file's own header comment above already made) — this token doesn't
+// grant anything activeUserRef.current doesn't already implicitly grant
+// today (no RLS reads it yet, per fetchSessionToken's header comment).
+const SESSION_TOKEN_STORAGE_KEY = "transitos_session_token";
+function persistSessionToken(token) {
+  try {
+    if (token == null) localStorage.removeItem(SESSION_TOKEN_STORAGE_KEY);
+    else localStorage.setItem(SESSION_TOKEN_STORAGE_KEY, token);
+  } catch (e) { /* private browsing / storage blocked — same fallback as persistActiveUserId */ }
+}
+// Restores a persisted token only if it isn't already expired — a client-
+// side exp check (no signature verification needed here; the server-side
+// verifySessionToken in each edge function is the real gate) so a stale
+// token found in storage after >24h doesn't get sent on every request
+// just to be rejected every time. Returns null (never throws) on any
+// malformed/missing token, same as a fresh login where issuance failed.
+function readStoredSessionTokenIfValid() {
+  try {
+    const token = localStorage.getItem(SESSION_TOKEN_STORAGE_KEY);
+    if (!token) return null;
+    // Same base64url→base64 padding as b64ToArrayBuf below (WebAuthn) —
+    // atob() is not reliably lenient about missing padding across engines.
+    const b64 = token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64.padEnd(b64.length + (4 - b64.length % 4) % 4, "=");
+    const payload = JSON.parse(atob(padded));
+    if (!payload.exp || payload.exp * 1000 < Date.now()) return null;
+    return token;
+  } catch (e) { return null; }
+}
+
 /* ---------- PASSWORD HASHING ----------
    SHA-256(salt + password) via the built-in Web Crypto API — no new
    dependency. This replaces plaintext storage in the users table:
@@ -7224,10 +7287,11 @@ async function fetchSessionToken(username, password) {
 // fetch() (e.g. send-push-notification, which isn't a supabase.from()
 // call and doesn't go through PostgREST's header handling at all) reads
 // this plain variable instead.
-let _cachedSessionToken = null;
+let _cachedSessionToken = readStoredSessionTokenIfValid();
 async function applySessionToken(token) {
   if (!token) return;
   _cachedSessionToken = token;
+  persistSessionToken(token);
 }
 
 // `refetch` (reloads users + driver_status + trips + messages +
@@ -7370,6 +7434,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       activeUserRef.current = null;
       persistActiveUserId(null);
+      _cachedSessionToken = null;
+      persistSessionToken(null);
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above
       // (same active_user_id timing reasoning applies symmetrically to
       // logout clearing it).
@@ -10979,7 +11045,24 @@ function useAppStore() {
   // sync cadence.
   const fetchTickets = useCallback(async () => {
     if (!supabase) return;
-    const { data, error } = await supabase.from("tickets").select("*").order("createdat", { ascending: false });
+    // Was an unfiltered select("*") — every logged-in session (agent,
+    // driver, or admin alike) pulled EVERY ticket in the system into
+    // client state, including other people's free-text complaints and
+    // admin replies. The UI only ever rendered the caller's own tickets
+    // (myTickets filtered by agent_id), but the full dataset still sat in
+    // memory, inspectable via devtools or the raw network response — same
+    // leak class as the unfiltered trip-chat list fixed earlier this
+    // session, just not caught in that pass. Admins still see everything
+    // (that's their job here); anyone else is scoped to their own tickets
+    // at the query level, mirroring fetchDirectMessages/
+    // fetchMyConversations' existing recipient-scoped pattern. Defaults to
+    // the restrictive (own-tickets-only) branch if the current user's role
+    // hasn't loaded yet — fails closed, not open.
+    const myId = activeUserRef.current;
+    const myRole = supaStateRef.current?.users?.find(u => String(u.id) === String(myId))?.role;
+    let ticketsQuery = supabase.from("tickets").select("*").order("createdat", { ascending: false });
+    if (myRole !== ROLE.ADMIN) ticketsQuery = ticketsQuery.eq("agentid", myId);
+    const { data, error } = await ticketsQuery;
     if (error) return;
     setTickets((data || []).map(t => ({
       id: t.id, agent_id: t.agentid, trip_id: t.tripid, category: t.category, message: t.message,
@@ -14122,6 +14205,25 @@ function useWebRTCCall(currentUser) {
     cleanup();
     setCallState(CALL_STATE.IDLE);
   }, [cleanup, closeIncomingCallNotification]);
+
+  // Auto-decline an incoming call that's never answered. Previously
+  // nothing timed this out — RINGING_INCOMING only ever changed via an
+  // explicit Accept/Decline tap or a broadcast from the caller, so a
+  // callee who simply didn't respond (missed it, app backgrounded and
+  // never brought forward) stayed stuck on "Incoming call…" forever. Worse:
+  // the inbox offer handler above rejects any FURTHER real incoming call
+  // as "busy" whenever callStateRef.current !== IDLE, so being stuck here
+  // silently broke the ability to receive any other call too, recoverable
+  // only by a full page reload. 35s — slightly longer than startCall's own
+  // 30s give-up window — so a call that's genuinely about to be answered
+  // is never raced by this timing out first. Reuses declineCall exactly
+  // as if the callee had tapped DECLINE, so the caller still gets a real
+  // "declined" broadcast rather than just silently timing out on their end.
+  useEffect(() => {
+    if (callState !== CALL_STATE.RINGING_INCOMING) return;
+    const ringTimeout = setTimeout(() => declineCall(), 35000);
+    return () => clearTimeout(ringTimeout);
+  }, [callState, declineCall]);
 
   const resetAfterEnd = useCallback(() => setCallState(CALL_STATE.IDLE), []);
 
