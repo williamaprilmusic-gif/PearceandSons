@@ -6343,7 +6343,11 @@ function appReducer(state, action) {
 // id columns are bigint (DB-generated), not app-generated USR_/TRP_
 // strings — see ADMIN/CREATE_USER and TRIP/BOOK for insert+readback.
 function userRowToApp(row) {
-  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username, pass: row.passwordhash }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
+  // auth.pass (passwordhash) was dropped here — nothing in the real
+  // Supabase-backed UI ever reads it (only auth.login, for username
+  // display); it was pure over-retention that sat in every session's
+  // client state. See AUTH/LOGIN's comment for the full incident.
+  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
   // Home address is meaningful for both agents (pickup point) and drivers
   // (which area they live in, for assignment purposes) — not agent-only.
   if ((row.role === ROLE.AGENT || row.role === ROLE.DRIVER) && row.homelat != null) {
@@ -6452,7 +6456,14 @@ async function fetchAllFromSupabase() {
     .order("id", { ascending: false });
 
   const [usersRes, driversRes, tripsRes] = await Promise.all([
-    supabase.from("users").select("*").order("id"),
+    // Explicit column list — NEVER select("*") here. passwordhash/
+    // passwordsalt must never transit this query: it feeds state.users,
+    // retained in every logged-in session's memory (including external
+    // Client Portal accounts) for the app's lifetime. See AUTH/LOGIN's
+    // comment for the full incident this was found as part of. Every
+    // field userRowToApp actually reads is listed explicitly here — add
+    // to both places together if a new field is ever needed.
+    supabase.from("users").select("id, role, fullname, staffnumber, username, isonline, phone, homelat, homelng, homeaddress, homearea, branchid, branchhistory, campaignid, adminlevel, scopedcompanyids").order("id"),
     supabase.from("driver_status").select("*"),
     tripsQuery,
   ]);
@@ -7320,8 +7331,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       //   - signature is valid against the stored public key
       //   - challenge matches and hasn't expired
       //   - sign count is incrementing (no cloned authenticator)
+      // Explicit column list, no passwordhash/passwordsalt — biometric
+      // already fully verified identity via the webauthn edge function,
+      // this query only needs status + enough fields for refetch() below
+      // to have something to merge against before the real fetchAllFromSupabase
+      // hydration lands. See AUTH/LOGIN's comment for why select("*") on
+      // users is never used anywhere in this file anymore.
       const { data: bioUser, error: bioErr } = await supabase
-        .from("users").select("*").eq("id", action.user_id).maybeSingle();
+        .from("users").select("id, role, status, fullname").eq("id", action.user_id).maybeSingle();
       if (bioErr || !bioUser) throw new Error("User not found");
       if (bioUser.status !== "ACTIVE") throw new Error("Account is not active");
       // See applySessionToken — additive/non-blocking, no RLS depends on
@@ -7348,48 +7365,61 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "AUTH/LOGIN": {
-      // Fetch by username only, verify the password client-side — the old
-      // version matched passwordhash in the query itself, which only works
-      // for plaintext. Salted accounts (passwordsalt set) compare SHA-256
-      // digests; legacy plaintext accounts still match directly and are
-      // upgraded to salted-hash in place on this first successful login.
-      const { data, error } = await supabase.from("users").select("*").eq("username", action.login).maybeSingle();
-      if (error) throw error;
-      if (!data) throw new Error("Invalid credentials");
-      let valid = false;
-      if (data.passwordsalt) {
-        valid = (await hashPassword(action.pass, data.passwordsalt)) === data.passwordhash;
-      } else {
-        valid = data.passwordhash === action.pass;
+      // Verification (password/salt compare + ACTIVE-status check) and the
+      // legacy-plaintext lazy hash-upgrade now happen ENTIRELY server-side
+      // in session-login (service-role key) — the client never reads
+      // passwordhash/passwordsalt at all anymore.
+      //
+      // FOUND VIA A DEDICATED SECURITY AUDIT (2026-08-07): the old version
+      // of this case did `supabase.from("users").select("*")` — through
+      // the PUBLIC anon key — to verify the password client-side. Postgres
+      // grants on `users` had SELECT on passwordhash/passwordsalt open to
+      // the anon role, and RLS on this table is "allow all" (no row-level
+      // policy). That combination meant ANYONE holding the public anon key
+      // (necessarily shipped in this client bundle — there's no way to
+      // ship a Supabase client app without it) could query
+      // passwordhash/passwordsalt directly via PostgREST for any known or
+      // guessed username, or bulk-dump every row's hash+salt with no
+      // filter at all, with zero need to ever open this app or log in —
+      // a fully offline-crackable credential set for the entire company,
+      // reachable by literally anyone. Made worse by fetchAllFromSupabase
+      // (the main app-wide state sync) ALSO doing an unscoped select("*")
+      // and userRowToApp RETAINING passwordhash in every session's
+      // state.users for the app's lifetime — meaning any already-logged-in
+      // agent, driver, or external Client Portal account could see every
+      // other employee's hash via React DevTools alone. Closed on three
+      // layers: (1) this case no longer requests those columns at all —
+      // fetchSessionToken/session-login independently re-verifies
+      // password+status server-side using the service-role key, which
+      // bypasses grants/RLS entirely; (2) fetchAllFromSupabase and every
+      // other users select() were narrowed to explicit safe columns
+      // (see their own comments); (3) a DB migration
+      // (revoke_anon_select_on_password_columns_v2 — Supabase migration
+      // history, not a local file) revoked anon/authenticated SELECT on
+      // passwordhash/passwordsalt/mfasecret outright — so even a direct
+      // PostgREST call bypassing this app's UI entirely can no longer
+      // read any of those columns, closing the vulnerability at its
+      // actual root rather than just in this one code path. (v1 of that
+      // migration didn't actually take effect — a column-level REVOKE
+      // can't narrow an existing table-level GRANT in Postgres; v2
+      // correctly revokes the table-level grant and re-grants SELECT on
+      // just the safe column list.)
+      //
+      // Trade-off accepted knowingly: if session-login is unreachable,
+      // login now fails outright with no client-side fallback — the same
+      // shape biometric login (AUTH/LOGIN_BIOMETRIC above) already
+      // accepted, and the only way to structurally prevent the anon key
+      // from ever being handed a password hash to compare against.
+      let loginTokenResult;
+      try {
+        loginTokenResult = await fetchSessionToken(action.login, action.pass);
+      } catch (e) {
+        throw new Error(e.message || "Invalid credentials");
       }
-      if (!valid) throw new Error("Invalid credentials");
-      // Biometric login has always enforced this (both client-side and in
-      // the webauthn edge function) — password login never did, so a
-      // suspended/offboarded account could still sign in normally with
-      // just a password even though the exact same account was correctly
-      // blocked via fingerprint. Closing that gap here.
-      if (data.status !== "ACTIVE") throw new Error("Account is not active");
-      // See applySessionToken — additive/non-blocking, no RLS depends on
-      // this yet. Applied BEFORE the lazy hash-upgrade write below: once
-      // RLS requires a valid app token to write to `users` (see the "admin
-      // or self can write users" policy), that write would otherwise run
-      // on the bare anon key (no token yet) and silently no-op — the
-      // account would never actually get upgraded off plaintext.
-      try { await applySessionToken((await fetchSessionToken(action.login, action.pass)).token); }
-      catch (e) { console.warn("[Auth] session token issuance failed (login still proceeds):", e.message); }
-      if (!data.passwordsalt) {
-        // Lazy upgrade — best-effort: a failed upgrade never blocks the
-        // login itself, the account just stays plaintext until next time.
-        try {
-          const upSalt = makeSalt();
-          const upHash = await hashPassword(action.pass, upSalt);
-          await supabase.from("users").update({ passwordsalt: upSalt, passwordhash: upHash }).eq("id", data.id);
-        } catch (e) {
-          console.warn("[Auth] lazy hash upgrade failed (login still ok):", e.message);
-        }
-      }
-      activeUserRef.current = data.id;
-      persistActiveUserId(data.id);
+      await applySessionToken(loginTokenResult.token);
+      const loggedInUserId = loginTokenResult.user.id;
+      activeUserRef.current = loggedInUserId;
+      persistActiveUserId(loggedInUserId);
       // Per explicit decision: "online" means logged in right now — set
       // the instant login succeeds, no idle timeout. Best-effort (a
       // failed update here shouldn't block a successful login). Per a
@@ -7397,9 +7427,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // users.isonline for everyone, with driver_status.isonline kept in
       // sync too (not removed) since existing driver-specific screens
       // already read it from there.
-      await supabase.from("users").update({ isonline: true }).eq("id", data.id).then(() => {}, () => {});
-      if (data.role === ROLE.DRIVER) {
-        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", data.id).then(() => {}, () => {});
+      await supabase.from("users").update({ isonline: true }).eq("id", loggedInUserId).then(() => {}, () => {});
+      if (loginTokenResult.user.role === ROLE.DRIVER) {
+        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", loggedInUserId).then(() => {}, () => {});
       }
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above.
       await refetch();
@@ -7554,7 +7584,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return results;
     }
     case "ADMIN/UPDATE_USER": {
-      const { data: target } = await supabase.from("users").select("*").eq("id", action.user_id).single();
+      // Explicit column list, no passwordhash/passwordsalt — this admin
+      // edit form never reads or displays either (a new password, when
+      // provided, is written fresh below via makeSalt()/hashPassword(),
+      // never read back from the existing row first). See AUTH/LOGIN's
+      // comment for why select("*") on users is never used in this file.
+      const { data: target } = await supabase.from("users").select("id, role, fullname, staffnumber, username, homelat, homelng, branchid, branchhistory").eq("id", action.user_id).single();
       if (!target) throw new Error("User not found");
       // Editing an admin account needs manageAdmins; editing an agent/driver
       // only needs manageAgentsDrivers — checked against the target's role,

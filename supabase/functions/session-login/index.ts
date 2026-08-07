@@ -49,6 +49,13 @@ function base64url(bytes: Uint8Array): string {
   return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
+// Matches the client's makeSalt() exactly (App.jsx) — 16 random bytes, hex.
+function makeSalt(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // Self-contained HS256 JWT signer — no external JWT library. Signs with the
 // project's real JWT secret so PostgREST's own JWT verification (used by
 // every RLS policy that reads auth.jwt()/auth.uid()) accepts this token
@@ -73,11 +80,18 @@ async function login(username: string, password: string) {
     .select('id, username, fullname, role, adminlevel, status, passwordhash, passwordsalt')
     .eq('username', username).maybeSingle();
   if (!user) return err('Invalid credentials');
-  // Same verification as the client's AUTH/LOGIN (salted-hash compare, with
-  // legacy-plaintext fallback for not-yet-upgraded accounts) — this function
-  // does NOT perform the lazy hash-upgrade write; that stays exclusively in
-  // the client's AUTH/LOGIN action so there's only one place that mutates
-  // passwordhash/passwordsalt.
+  // Same verification the client's AUTH/LOGIN used to do (salted-hash
+  // compare, with legacy-plaintext fallback for not-yet-upgraded accounts)
+  // — now done here EXCLUSIVELY. Per a 2026-08-07 security audit: the
+  // client-side version required selecting passwordhash/passwordsalt
+  // through the public anon key, and since those columns had anon SELECT
+  // granted with no RLS restricting rows, anyone holding the (necessarily
+  // public) anon key could read any/every account's hash directly via
+  // PostgREST, without ever needing to log in. This service-role client
+  // bypasses grants/RLS entirely, so it's the only place that still needs
+  // — or is still able — to read these two columns; a DB migration
+  // (revoke_anon_select_on_password_columns_v2, Supabase migration
+  // history) revoked anon/authenticated SELECT on them outright.
   let valid: boolean;
   if (user.passwordsalt) {
     valid = (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash;
@@ -86,6 +100,19 @@ async function login(username: string, password: string) {
   }
   if (!valid) return err('Invalid credentials');
   if (user.status !== 'ACTIVE') return err('Account is not active');
+  // Lazy upgrade — moved here from the client's AUTH/LOGIN action (which
+  // no longer has any path that reads/writes these columns at all). Same
+  // best-effort semantics: a failed upgrade never blocks the login itself,
+  // the account just stays plaintext until next time.
+  if (!user.passwordsalt) {
+    try {
+      const upSalt = makeSalt();
+      const upHash = await hashPasswordServer(password, upSalt);
+      await supabase.from('users').update({ passwordsalt: upSalt, passwordhash: upHash }).eq('id', user.id);
+    } catch (e) {
+      console.warn('[session-login] lazy hash upgrade failed (login still ok):', e instanceof Error ? e.message : String(e));
+    }
+  }
   return json(await issueSession(user));
 }
 
