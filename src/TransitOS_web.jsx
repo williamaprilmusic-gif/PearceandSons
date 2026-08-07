@@ -9862,7 +9862,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // now() only applies on INSERT, not UPDATE, so omitting the column
       // here would leave it stale rather than refreshed — send a proper
       // ISO timestamp string instead.
-      must(await supabase.from("driver_status").update({ state: DRIVER_STATE.BUSY, currenttripid: action.trip_id, updatedat: new Date(nowTs).toISOString() }).eq("driverid", action.driver_id));
+      // .select("driverid") + row-count check — see TRIP/DRIVER_CONFIRM's
+      // own comment. Real double-booking risk if this silently no-ops: the
+      // trip write above already succeeded, but the driver would still
+      // show AVAILABLE and could be handed a second trip on top of this one.
+      const assignBusyRes = must(await supabase.from("driver_status").update({ state: DRIVER_STATE.BUSY, currenttripid: action.trip_id, updatedat: new Date(nowTs).toISOString() }).eq("driverid", action.driver_id).select("driverid"));
+      if (!assignBusyRes.data || assignBusyRes.data.length === 0) throw new Error("Trip assigned, but couldn't update the driver's status — please refresh and check manually.");
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
@@ -10201,10 +10206,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
       // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
-      must(await supabase.from("trips").update({
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment for why must()'s error-only check can't catch a zero-row
+      // RLS-blocked update, same real class of gap on this sibling handler.
+      const acceptRes = must(await supabase.from("trips").update({
         status: TRIP_STATE.DRIVER_CONFIRMED,
         driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
-      }).eq("id", action.trip_id));
+      }).eq("id", action.trip_id).select("id"));
+      if (!acceptRes.data || acceptRes.data.length === 0) throw new Error("Couldn't accept the trip — your session may have expired. Please try again.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       // Two separate insertNotification calls, not one row with
       // for_roles:[AGENT,ADMIN] + for_user_ids:tripAgentIds — insertNotification
@@ -10354,7 +10363,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // action.driver_id too). Re-point to the verified value once.
       action = { ...action, driver_id: tripRow.driverid };
       const nowTs = nowEpoch();
-      must(await supabase.from("trips").update({
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment; same real gap on this state-transition handler.
+      const declineRes = must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
         driveraccepted: false,
         declinedby: [...(tripRow.declinedby || []), action.driver_id],
@@ -10366,7 +10377,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         rejectiondriverid: action.driver_id,
         isexception: true,
         updatedat: nowTs,
-      }).eq("id", action.trip_id));
+      }).eq("id", action.trip_id).select("id"));
+      if (!declineRes.data || declineRes.data.length === 0) throw new Error("Couldn't decline the trip — your session may have expired. Please try again.");
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", action.driver_id)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       if (!remaining || remaining.length === 0) {
@@ -10434,7 +10446,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           },
         };
       }
-      must(await supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, pickuplocations: newPickupLocations, updatedat: nowTs }).eq("id", action.trip_id));
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment; this handler records real passenger pickup state, so a
+      // silently-blocked write here is a genuine safety/dispatch-accuracy
+      // issue, not just a cosmetic staleness.
+      const pickupRes = must(await supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, pickuplocations: newPickupLocations, updatedat: nowTs }).eq("id", action.trip_id).select("id"));
+      if (!pickupRes.data || pickupRes.data.length === 0) throw new Error("Couldn't confirm pickup — your session may have expired. Please try again.");
       if (allPickedUp) {
         await insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
@@ -10502,7 +10519,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (allDroppedOff) {
         // All agents dropped off — complete the trip
         assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
-        must(await supabase.from("trips").update({
+        // .select("id") + row-count checks on both writes below — see
+        // TRIP/DRIVER_CONFIRM's own comment. Same real safety/dispatch-
+        // accuracy stakes as CONFIRM_AGENT_PICKUP above: a silently-blocked
+        // completion leaves the trip mid-lifecycle while the driver's own
+        // UI has already moved on, and a silently-blocked driver_status
+        // write leaves them stuck BUSY/unavailable for new dispatch.
+        const completeRes = must(await supabase.from("trips").update({
           status: TRIP_STATE.ARCHIVED_COMPLETED,
           completedat: nowTs,
           actualdistancekm: tripRow.estdistancekm,
@@ -10510,16 +10533,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           dropofftimestamps: newDropoffTimestamps,
           dropofflocations: newDropoffLocations,
           updatedat: nowTs,
-        }).eq("id", action.trip_id));
+        }).eq("id", action.trip_id).select("id"));
+        if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
         // Update driver state
         const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
           .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
         const stillBusy = (remaining || []).filter(r => String(r.id) !== String(action.trip_id));
-        must(await supabase.from("driver_status").update({
+        const freeRes = must(await supabase.from("driver_status").update({
           state: stillBusy.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY,
           currenttripid: stillBusy[0]?.id || null,
           updatedat: new Date(nowTs).toISOString(),
-        }).eq("driverid", tripRow.driverid));
+        }).eq("driverid", tripRow.driverid).select("driverid"));
+        if (!freeRes.data || freeRes.data.length === 0) throw new Error("Trip completed, but couldn't update your driver status — please refresh.");
         // Notify agents
         const agentNotifs = tripAgentIds.map(aid => ({
           type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
@@ -10530,13 +10555,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           message: `Trip ${action.trip_id} archived.`, trip_id: action.trip_id, ts: nowTs, read: false });
         for (const n of agentNotifs) await insertNotification(n);
       } else {
-        // Partial — just save this agent's dropoff
-        must(await supabase.from("trips").update({
+        // Partial — just save this agent's dropoff. Same row-count check
+        // as the completion branch above.
+        const partialDropoffRes = must(await supabase.from("trips").update({
           completeddropoffs: newCompletedDropoffs,
           dropofftimestamps: newDropoffTimestamps,
           dropofflocations: newDropoffLocations,
           updatedat: nowTs,
-        }).eq("id", action.trip_id));
+        }).eq("id", action.trip_id).select("id"));
+        if (!partialDropoffRes.data || partialDropoffRes.data.length === 0) throw new Error("Couldn't confirm dropoff — your session may have expired. Please try again.");
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -10585,10 +10612,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         note: action.note?.trim() || null,
       };
       const newNoShows = [...(tripRow.noshows || []), noShowRecord];
-      must(await supabase.from("trips").update({
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment; same stakes as CONFIRM_AGENT_PICKUP/DROPOFF above.
+      const noShowRes = must(await supabase.from("trips").update({
         status: nsNewState, intransitat: nsInTransitAt, completedat: nsCompletedAt, completedpickups: nsNewCompleted,
         noshows: newNoShows, isexception: true, updatedat: nsNowTs,
-      }).eq("id", action.trip_id));
+      }).eq("id", action.trip_id).select("id"));
+      if (!noShowRes.data || noShowRes.data.length === 0) throw new Error("Couldn't record the no-show — your session may have expired. Please try again.");
       // If the trip just auto-completed, free the driver the same way
       // ADMIN_CANCEL/AGENT_CANCEL already do.
       if (nsNewState === TRIP_STATE.ARCHIVED_COMPLETED && tripRow.driverid) {
@@ -11280,6 +11310,17 @@ function useAppStore() {
     // the restrictive (own-tickets-only) branch if the current user's role
     // hasn't loaded yet — fails closed, not open.
     const myId = activeUserRef.current;
+    // Nobody logged in yet (pre-login boot, or between logout and the next
+    // login) — fail closed by not fetching at all, rather than falling
+    // through to the `.eq("agentid", myId)` branch below with myId still
+    // null. That doesn't fail closed the way the comment above intends: a
+    // null id serializes to the URL as `agentid=eq.null`, and since
+    // `agentid` is bigint (not nullable-comparison-aware the way `.is()`
+    // is), Postgres tries to parse the literal string "null" as a bigint
+    // and throws `invalid input syntax for type bigint: "null"` — a real
+    // error, firing on every unauthenticated boot-sequence refetch, not a
+    // graceful empty result.
+    if (myId == null) { setTickets([]); return; }
     const myRole = supaStateRef.current?.users?.find(u => String(u.id) === String(myId))?.role;
     let ticketsQuery = supabase.from("tickets").select("*").order("createdat", { ascending: false });
     if (myRole !== ROLE.ADMIN) ticketsQuery = ticketsQuery.eq("agentid", myId);
