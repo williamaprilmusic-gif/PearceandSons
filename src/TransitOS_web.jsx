@@ -6847,6 +6847,31 @@ function persistActiveUserId(id) {
   } catch (e) { /* private browsing / storage blocked — session just won't persist */ }
 }
 
+// Remembers the username of the last successful BIOMETRIC login on this
+// device — per explicit requirement: after the first successful biometric
+// login, the user should be able to log back in without typing anything at
+// all. Deliberately separate from ACTIVE_USER_STORAGE_KEY: that one only
+// covers staying logged in across a reload of an already-open session;
+// this one is what LoginScreen reads when a FRESH login screen is actually
+// shown (explicit logout, expired persisted session, storage cleared for
+// just that key, etc.) so it can pre-fill the username and auto-fire the
+// WebAuthn prompt instead of presenting empty username/password fields.
+// Not cleared on logout — same "remember this device" semantics most apps
+// use; the real security boundary stays the WebAuthn signature check
+// itself (a different person picking up the device gets prompted but the
+// server-side credential/signature match still correctly fails for them).
+const LAST_BIOMETRIC_USERNAME_KEY = "transitos_last_biometric_username";
+function persistLastBiometricUsername(username) {
+  try {
+    if (!username) localStorage.removeItem(LAST_BIOMETRIC_USERNAME_KEY);
+    else localStorage.setItem(LAST_BIOMETRIC_USERNAME_KEY, username);
+  } catch (e) { /* private browsing / storage blocked — just won't auto-fill next time */ }
+}
+function readLastBiometricUsername() {
+  try { return localStorage.getItem(LAST_BIOMETRIC_USERNAME_KEY) || ""; }
+  catch (e) { return ""; }
+}
+
 // The session JWT (see fetchSessionToken/applySessionToken below) was
 // deliberately kept in-memory-only when first introduced — but that meant
 // _cachedSessionToken reset to null on every single page reload/PWA
@@ -11927,7 +11952,16 @@ function LocationSelector({ mode, setMode, companyId, setCompanyId, state, stree
    LOGIN SCREEN
    ============================================================ */
 function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
-  const [login, setLogin] = useState("");
+  // Pre-filled from the last successful biometric login on this device —
+  // see persistLastBiometricUsername's header comment. wasPrefilled tracks
+  // whether the CURRENT value in the field came from that remembered
+  // username (vs. the person typing their own) — the auto-fire effect
+  // below only fires for the remembered case, so a first-time/shared-device
+  // user manually typing a username that happens to have a credential
+  // doesn't get an unrequested native biometric prompt fired at them.
+  const rememberedUsername = React.useMemo(() => readLastBiometricUsername(), []);
+  const [login, setLogin] = useState(rememberedUsername);
+  const [wasPrefilled, setWasPrefilled] = useState(!!rememberedUsername);
   const [pass, setPass] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -11980,12 +12014,34 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
       if (!result) { setBiometricError("No biometric registered for this account."); return; }
       // Biometric verified — log in directly (bypass password)
       await onBiometricLogin(result.userId, result.sessionToken);
+      // Per explicit requirement: after this first successful biometric
+      // login, remember the username on this device so the next visit can
+      // skip straight to an automatic biometric prompt — no typing at all.
+      persistLastBiometricUsername(login);
     } catch (e) {
       setBiometricError(e.message || "Biometric login failed.");
     } finally {
       setBiometricLoading(false);
     }
   };
+
+  // Auto-fire the biometric prompt with zero taps when this screen loads
+  // with a remembered username from a prior successful biometric login —
+  // the actual "without inputting any information" requirement. Fires
+  // once per mount, only for the remembered (not manually-typed) case, and
+  // only once hasCredential has genuinely confirmed a credential exists
+  // (avoids firing against a stale/removed enrollment and getting an
+  // avoidable error). If it fails or is cancelled, biometricError surfaces
+  // normally and the person can fall back to password — same as tapping
+  // the button manually would.
+  const autoFiredRef = React.useRef(false);
+  React.useEffect(() => {
+    if (autoFiredRef.current) return;
+    if (!wasPrefilled || !showBiometricBtn || !hasCredential || biometricLoading) return;
+    autoFiredRef.current = true;
+    handleBiometricLogin();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wasPrefilled, showBiometricBtn, hasCredential]);
 
   const isIos = (/iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) && !/crios|fxios|edgios/i.test(navigator.userAgent);
   const isApp = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
@@ -12011,7 +12067,7 @@ function LoginScreen({ users, onLogin, onBiometricLogin, error }) {
         </div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <TextField label="Username" value={login} onChange={e => setLogin(e.target.value)} autoCapitalize="off"
+          <TextField label="Username" value={login} onChange={e => { setLogin(e.target.value); setWasPrefilled(false); }} autoCapitalize="off"
             onKeyDown={e => e.key === "Enter" && handleSubmit()} />
           <TextField label="Password" type="password" value={pass} onChange={e => setPass(e.target.value)}
             onKeyDown={e => e.key === "Enter" && handleSubmit()} />
