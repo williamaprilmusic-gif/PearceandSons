@@ -7587,6 +7587,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       persistActiveUserId(null);
       _cachedSessionToken = null;
       persistSessionToken(null);
+      // Found via a security audit: the passive/auto-fire biometric login
+      // (persistLastBiometricUsername, see its own header comment) was
+      // never cleared on logout — meaning once ANYONE completed one
+      // biometric login on a shared/kiosk device, LoginScreen would keep
+      // silently auto-firing a native biometric prompt for that exact
+      // username forever, on every future visit, with zero typed input,
+      // regardless of who explicitly logged out or who's now standing at
+      // the device. Since a platform authenticator verifies "a valid
+      // biometric enrolled on this OS," not "this specific human," anyone
+      // whose own fingerprint/face is enrolled on the device's sensor
+      // could complete that zero-touch prompt and land in the outgoing
+      // user's account. Clearing it here (not on every app close — this
+      // app is explicitly meant to skip re-typing across ordinary
+      // relaunches, only an actual logout should force the next visitor
+      // to type a username again) closes that window without touching
+      // the zero-touch behavior the user explicitly asked for between one
+      // logout and the next.
+      persistLastBiometricUsername(null);
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above
       // (same active_user_id timing reasoning applies symmetrically to
       // logout clearing it).
@@ -11407,6 +11425,32 @@ function useAppStore() {
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchDriverPositions]);
 
+  // Role of the currently active user — used below to skip fetching/
+  // subscribing/polling admin-only or driver+admin-only auxiliary tables
+  // for sessions that will never render anything from them (an agent or
+  // driver session was previously opening a realtime channel + 5-min poll
+  // for campaigns/vehicles/vehicle_maintenance_log/trip_fee_rates
+  // regardless of role — all four are only ever read from admin-only
+  // components, confirmed by grepping every `state.<table>` reference —
+  // found via a dedicated resource-usage audit). Computed via useMemo
+  // (not read inline) so its VALUE stays referentially stable across
+  // ordinary refetches — `supaState.users` gets a new array identity on
+  // every refetch, but the derived role string doesn't change unless a
+  // real login/logout/role-edit happens — so the role-gated effects below
+  // don't tear down and recreate their subscriptions on every routine
+  // data refresh. Same "stable primitive dependency, not a raw changing
+  // reference" fix shape as the earlier GPS-tracking effect-churn bug
+  // (see project memory) — activeUserRef.current is a ref (not itself
+  // reactive), but it's already holding the fresh post-login value by the
+  // time the render triggered by that login's own refetch runs, so
+  // reading it here at render time is safe and correct, matching how
+  // fetchTickets already reads it for its own role-based query scoping.
+  const myRole = useMemo(() => {
+    const uid = activeUserRef.current;
+    if (uid == null) return null;
+    return supaState?.users?.find(u => String(u.id) === String(uid))?.role ?? null;
+  }, [supaState?.users, activeUserRef.current]);
+
   // Each of these 5 auxiliary fetch cycles (campaigns/companies/tickets/
   // high_risk_zones/fee_rates) has ONLY its own realtime subscription —
   // unlike the main refetch() cycle above, none of them has a polling
@@ -11420,7 +11464,13 @@ function useAppStore() {
   // only on an actual visibility change) — the same recovery path the
   // main cycle already relies on for its own resilience.
   useEffect(() => {
-    if (!supabase) return;
+    // Campaigns only ever renders inside admin-only components
+    // (AdminCampaigns management screen, the campaign dropdown on the
+    // admin user-edit form, and an admin profile view's campaign-name
+    // lookup) — confirmed by grepping every `state.campaigns` reference
+    // file-wide. An agent/driver/client-portal session gains nothing
+    // from this channel+poll ever firing, so skip it entirely for them.
+    if (!supabase || myRole !== ROLE.ADMIN) return;
     fetchCampaigns();
     const channel = supabase
       .channel("transitos-campaigns")
@@ -11440,7 +11490,7 @@ function useAppStore() {
     // until a full page reload.
     const pollInterval = setInterval(fetchCampaigns, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchCampaigns]);
+  }, [fetchCampaigns, myRole]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -11488,7 +11538,13 @@ function useAppStore() {
   }, [fetchHighRiskZones]);
 
   useEffect(() => {
-    if (!supabase) return;
+    // vehicles/vehicle_maintenance_log only ever render inside Fleet Ops'
+    // admin-only screens (AdminVehicles-style fleet management + service
+    // log panels) — confirmed by grepping every `state.vehicles`/
+    // `state.vehicle_maintenance_log` reference file-wide. Skipped
+    // entirely for agent/driver/client-portal sessions, same reasoning as
+    // the campaigns gate just above.
+    if (!supabase || myRole !== ROLE.ADMIN) return;
     fetchVehicles();
     const channel = supabase
       .channel("transitos-vehicles")
@@ -11500,10 +11556,11 @@ function useAppStore() {
     // campaigns fetch cycle above.
     const pollInterval = setInterval(fetchVehicles, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchVehicles]);
+  }, [fetchVehicles, myRole]);
 
   useEffect(() => {
-    if (!supabase) return;
+    // See the vehicles gate immediately above — same admin-only reasoning.
+    if (!supabase || myRole !== ROLE.ADMIN) return;
     fetchVehicleMaintenanceLog();
     const channel = supabase
       .channel("transitos-vehicle-maintenance-log")
@@ -11515,10 +11572,18 @@ function useAppStore() {
     // campaigns fetch cycle above.
     const pollInterval = setInterval(fetchVehicleMaintenanceLog, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchVehicleMaintenanceLog]);
+  }, [fetchVehicleMaintenanceLog, myRole]);
 
   useEffect(() => {
-    if (!supabase) return;
+    // trip_fee_rates only ever renders inside admin screens gated behind
+    // the viewTripFees/manageFeeRates permissions (Fleet Ops/Financial
+    // admin tiers, both ROLE.ADMIN with different admin_level) — no
+    // agent/driver/client-portal component reads state.fee_rates at all.
+    // Gating broadly on ROLE.ADMIN (not the narrower permission) is
+    // deliberate: Standard/Viewer admins fetching this small, rarely-
+    // written single-row table costs nothing extra worth special-casing,
+    // and keeps this gate as simple/low-risk as the sibling ones above.
+    if (!supabase || myRole !== ROLE.ADMIN) return;
     fetchFeeRates();
     const channel = supabase
       .channel("transitos-fee-rates")
@@ -11535,10 +11600,15 @@ function useAppStore() {
     // periodic self-correction until this fix.
     const pollInterval = setInterval(fetchFeeRates, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchFeeRates]);
+  }, [fetchFeeRates, myRole]);
 
   useEffect(() => {
-    if (!supabase) return;
+    // hazard_reports only ever renders inside DriverNavMap (driver hazard
+    // markers + report button) and RouteAdvisoryPanel (admin-posted
+    // advisories, part of the admin live-map tooling) — confirmed by
+    // grepping every `state.hazard_reports` reference file-wide. An
+    // agent/client-portal session never reads this at all.
+    if (!supabase || (myRole !== ROLE.ADMIN && myRole !== ROLE.DRIVER)) return;
     fetchHazardReports();
     const channel = supabase
       .channel("transitos-hazard-reports")
@@ -11550,7 +11620,7 @@ function useAppStore() {
     // campaigns fetch cycle above.
     const pollInterval = setInterval(fetchHazardReports, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchHazardReports]);
+  }, [fetchHazardReports, myRole]);
 
   const dispatch = useCallback(async (action) => {
     if (useFallback || !supabase) {
@@ -11594,7 +11664,12 @@ function useAppStore() {
       // Keep the persisted session in sync in demo mode too — the
       // Supabase path does the equivalent inside handleSupabaseAction.
       if (action.type === "AUTH/LOGIN") persistActiveUserId(result.active_user_id);
-      if (action.type === "AUTH/LOGOUT") persistActiveUserId(null);
+      // Mirrors the equivalent clear inside the real handleSupabaseAction
+      // AUTH/LOGOUT case (see its own comment) — the demo/offline fallback
+      // path has its own separate logout branch (appReducer's AUTH/LOGOUT
+      // case above) that never touches localStorage itself, so this is
+      // the one place that needs to run for both paths alike.
+      if (action.type === "AUTH/LOGOUT") { persistActiveUserId(null); persistLastBiometricUsername(null); }
       // Match the Supabase handler's return contract: TRIP/BOOK hands back
       // the new trip's id (the reducer prepends it) so the booking form
       // can roll a multi-leg booking back if a later leg fails.
@@ -18336,6 +18411,21 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
     // One row per passenger — each has their own pickup/dropoff address,
     // timing, and GPS location even on a shared multi-passenger trip.
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
+    // Per-agent Trip Fee shares, computed once per trip in integer cents so
+    // they always sum EXACTLY back to the trip's real fee — a naive
+    // (fee / agentIds.length).toFixed(2) done independently per row can be
+    // off by a cent overall on a non-cleanly-divisible split (e.g. R50÷3 =
+    // R16.67×3 = R50.01), found via a security/correctness audit. Any
+    // leftover cent(s) from the division go to the trip's LAST agent row,
+    // a fixed, deterministic rule so re-exporting the same trip always
+    // produces the same split.
+    const feeShareCentsByIdx = !feeRates ? null : (() => {
+      const totalCents = Math.round(tripFeeAmount(t, feeRates) * 100);
+      const n = agentIds.length;
+      const base = Math.floor(totalCents / n);
+      const remainder = totalCents - base * n;
+      return agentIds.map((_, i) => base + (i === n - 1 ? remainder : 0));
+    })();
     agentIds.forEach((aid, aidIdx) => {
       const agentUser = aid != null ? users?.find(u => String(u.id) === String(aid)) : null;
 
@@ -18446,19 +18536,17 @@ function exportTripsToCsv(trips, users, driverStatusList = [], filenamePrefix = 
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
         t.admin_note || "",
-        // Trip Fee — split evenly across every agent merged onto this trip,
-        // so each passenger row shows only THAT agent's own share, not the
-        // full trip total repeated on every row (was flagged by the user
-        // as confusing — the whole trip's cost looked like it belonged to
-        // each individual agent). agentIds.length is exactly the number of
-        // rows this trip produces (one per merged agent), so dividing by
-        // it means the per-row values always sum back to the trip's real
-        // total. The TOTAL row below still sums tripFeeAmount() directly
-        // per unique trip (not by summing these per-row shares), so it's
-        // unaffected by this split either way.
+        // Trip Fee — split across every agent merged onto this trip (in
+        // exact integer cents, see feeShareCentsByIdx above), so each
+        // passenger row shows only THAT agent's own share, not the full
+        // trip total repeated on every row (was flagged by the user as
+        // confusing — the whole trip's cost looked like it belonged to
+        // each individual agent). The TOTAL row below still sums
+        // tripFeeAmount() directly per unique trip (not by summing these
+        // per-row shares), so it's unaffected by this split either way.
         ...(feeRates ? [
           { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal", pending: "Pending" }[tripFeeCategory(t)],
-          (tripFeeAmount(t, feeRates) / agentIds.length).toFixed(2),
+          (feeShareCentsByIdx[aidIdx] / 100).toFixed(2),
           // Driver payment — same per-trip value repeats on every passenger
           // row (matches the Trip Fee convention above); the TOTAL row sums
           // per unique trip, never per row.
@@ -20834,9 +20922,30 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
 }
 
 function AdminActiveTrips({ state }) {
-  const activeDrivers = state.driver_status.filter(ds =>
-    state.trips.some(t => String(t.driver_id) === String(ds.driver_id) && t.state === TRIP_STATE.IN_TRANSIT)
-  );
+  // Was an unmemoized O(drivers×trips) scan (activeDrivers' .filter, each
+  // running its own .some over every trip) PLUS a second full re-filter of
+  // every trip per active driver, all recomputed inline on every render —
+  // flagged by a prior session's performance audit but left unfixed as
+  // "cheap at current fleet size," then reconfirmed by a later resource-
+  // usage audit as still-unfixed, quick-to-fix waste. Since this component
+  // has no local state of its own, every one of these renders is driven
+  // purely by `state` changing (i.e. every debounced refetch, fleet-wide,
+  // for as long as this admin tab stays mounted) — memoizing keeps the
+  // O(drivers×trips) work tied to the SAME state actually changing size
+  // (driver_status/trips), not to unrelated parent re-renders.
+  const { activeDrivers, driverTripsById } = useMemo(() => {
+    const inTransitTrips = state.trips.filter(t => t.state === TRIP_STATE.IN_TRANSIT);
+    const byId = new Map();
+    for (const t of inTransitTrips) {
+      const key = String(t.driver_id);
+      if (!byId.has(key)) byId.set(key, []);
+      byId.get(key).push(t);
+    }
+    return {
+      activeDrivers: state.driver_status.filter(ds => byId.has(String(ds.driver_id))),
+      driverTripsById: byId,
+    };
+  }, [state.driver_status, state.trips]);
   return (
     <div className="pad">
       <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>ACTIVE TRIPS</div>
@@ -20847,10 +20956,9 @@ function AdminActiveTrips({ state }) {
       </div>
       {activeDrivers.length === 0 ? (
         <Empty icon="🚦" text="No drivers currently in transit" />
-      ) : activeDrivers.map(ds => {
-        const driverTrips = state.trips.filter(t => String(t.driver_id) === String(ds.driver_id) && t.state === TRIP_STATE.IN_TRANSIT);
-        return <ActiveDriverCard key={ds.driver_id} ds={ds} driverTrips={driverTrips} state={state} />;
-      })}
+      ) : activeDrivers.map(ds => (
+        <ActiveDriverCard key={ds.driver_id} ds={ds} driverTrips={driverTripsById.get(String(ds.driver_id)) || []} state={state} />
+      ))}
     </div>
   );
 }
