@@ -14722,52 +14722,131 @@ function setAlertSoundMuted(muted) {
 }
 
 let sharedAudioCtx = null;
+function getAudioCtx() {
+  if (!sharedAudioCtx) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null; // unsupported browser — silently skip, never crash the app over this
+    sharedAudioCtx = new AudioContextClass();
+  }
+  if (sharedAudioCtx.state === "suspended") sharedAudioCtx.resume();
+  return sharedAudioCtx;
+}
+// Shared oscillator-note helper — every tone below is built from one or
+// more calls to this, instead of each tone repeating the same
+// create-oscillator/create-gain/ramp-envelope boilerplate.
+function scheduleNote(ctx, { start, dur, freq, type = "sine", peak = 0.35 }) {
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.0001, start);
+  gain.gain.exponentialRampToValueAtTime(peak, start + 0.015);
+  gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(start);
+  osc.stop(start + dur + 0.02);
+}
+
+// Selectable alert/ring tones — per explicit request ("a few tones for
+// alerts and ringing that users can change"). All fully original/
+// synthesized (no real recordings, no copyrighted melodies — same
+// copyright-compliance reasoning as the original single tones these
+// replace) since there's no browser API that can read a device's actual
+// system ringtone/alert-sound library (a real platform limitation, not
+// something this app can work around) — see also project memory on this.
+// Each tone's play(ctx, now) schedules its own oscillators; id "chime"/
+// "classic" are the exact original sounds, kept byte-for-byte as the
+// default so nobody's existing (unset) preference silently changes.
+const ALERT_TONES = [
+  {
+    id: "chime", label: "Chime",
+    play: (ctx, now) => {
+      const chordTones = [880, 1108, 1318]; // A5, C#6, E6 — A major triad
+      const steps = [
+        { start: now,        dur: 0.16, lead: 880 },
+        { start: now + 0.1,  dur: 0.16, lead: 1108 },
+        { start: now + 0.2,  dur: 0.16, lead: 1318 },
+        { start: now + 0.32, dur: 0.26, lead: 1760, extra: 1760 },
+      ];
+      steps.forEach(({ start, dur, lead, extra }) => {
+        const freqs = extra ? [...chordTones, extra] : chordTones;
+        freqs.forEach(freq => scheduleNote(ctx, { start, dur, freq, type: "sine", peak: freq === lead ? 0.45 : 0.14 }));
+      });
+    },
+  },
+  {
+    id: "bell", label: "Bell",
+    play: (ctx, now) => {
+      // Single struck note with a quiet octave overtone on top — a
+      // simple "ding" character, distinct from the chime's arpeggio.
+      scheduleNote(ctx, { start: now, dur: 0.55, freq: 987.77, type: "triangle", peak: 0.4 }); // B5
+      scheduleNote(ctx, { start: now, dur: 0.35, freq: 1975.5, type: "sine", peak: 0.12 });    // B6 overtone
+    },
+  },
+  {
+    id: "buzz", label: "Buzz",
+    play: (ctx, now) => {
+      // Two short low square-wave pulses — a more urgent/attention-
+      // grabbing character than the melodic chime/bell.
+      scheduleNote(ctx, { start: now,        dur: 0.11, freq: 220, type: "square", peak: 0.28 });
+      scheduleNote(ctx, { start: now + 0.16, dur: 0.11, freq: 220, type: "square", peak: 0.28 });
+    },
+  },
+  {
+    id: "pop", label: "Pop",
+    play: (ctx, now) => {
+      // Two very short, soft high pops — the most minimal/subtle option.
+      scheduleNote(ctx, { start: now,        dur: 0.06, freq: 1400, type: "sine", peak: 0.22 });
+      scheduleNote(ctx, { start: now + 0.09, dur: 0.06, freq: 1760, type: "sine", peak: 0.22 });
+    },
+  },
+];
+const RING_TONES = [
+  {
+    id: "classic", label: "Classic",
+    play: (ctx, now) => {
+      const chord = [523.25, 659.25, 783.99]; // C5, E5, G5 — C major triad
+      chord.forEach(freq => scheduleNote(ctx, { start: now, dur: 0.32, freq, type: "triangle", peak: 0.3 }));
+    },
+  },
+  {
+    id: "marimba", label: "Marimba",
+    play: (ctx, now) => {
+      // A short rolling 4-note triangle-wave arpeggio — warmer/more
+      // melodic than the classic held chord.
+      [392, 493.88, 587.33, 783.99].forEach((freq, i) => // G4, B4, D5, G5
+        scheduleNote(ctx, { start: now + i * 0.09, dur: 0.22, freq, type: "triangle", peak: 0.32 }));
+    },
+  },
+  {
+    id: "pulse", label: "Pulse",
+    play: (ctx, now) => {
+      // Alternating two-tone pattern (evokes a classic telecom ring
+      // cadence, but fully synthesized/original — no real ring sample).
+      scheduleNote(ctx, { start: now,        dur: 0.18, freq: 440, type: "sine", peak: 0.32 });
+      scheduleNote(ctx, { start: now + 0.22, dur: 0.18, freq: 587.33, type: "sine", peak: 0.32 });
+    },
+  },
+];
+const ALERT_TONE_PREF_KEY = "transitos_alert_tone";
+const RING_TONE_PREF_KEY = "transitos_ring_tone";
+function getTonePref(key, tones) {
+  try {
+    const saved = localStorage.getItem(key);
+    return tones.find(t => t.id === saved) || tones[0];
+  } catch (e) { return tones[0]; }
+}
+function setTonePref(key, toneId) {
+  try { localStorage.setItem(key, toneId); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+}
 
 function playAlertSound() {
   if (isAlertSoundMuted()) return;
   try {
-    if (!sharedAudioCtx) {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) return; // unsupported browser — silently skip, never crash the app over this
-      sharedAudioCtx = new AudioContextClass();
-    }
-    const ctx = sharedAudioCtx;
-    if (ctx.state === "suspended") ctx.resume();
-    const now = ctx.currentTime;
-    // POLYPHONIC — per explicit request. Previously a monophonic 4-note
-    // arpeggio (one oscillator/frequency at a time, in sequence). Same
-    // A-major shape (A5-C#6-E6, octave on the final step) and overall
-    // ascending-chime timing, but now the full triad sounds together at
-    // every step (multiple simultaneous voices, the actual definition
-    // of "polyphonic") with the step's own melody note singled out
-    // louder on top — a moving top line over a held chord, not a bare
-    // single tone. Still fully original/synthesized (no real recording,
-    // no copyrighted melody) — see the app's own copyright-compliance
-    // rules for why that matters here.
-    const chordTones = [880, 1108, 1318]; // A5, C#6, E6 — A major triad
-    const steps = [
-      { start: now,        dur: 0.16, lead: 880 },
-      { start: now + 0.1,  dur: 0.16, lead: 1108 },
-      { start: now + 0.2,  dur: 0.16, lead: 1318 },
-      { start: now + 0.32, dur: 0.26, lead: 1760, extra: 1760 }, // final step adds the octave for a fuller finish
-    ];
-    steps.forEach(({ start, dur, lead, extra }) => {
-      const freqs = extra ? [...chordTones, extra] : chordTones;
-      freqs.forEach(freq => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = freq;
-        const peak = freq === lead ? 0.45 : 0.14;
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(peak, start + 0.015);
-        gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(start);
-        osc.stop(start + dur + 0.02);
-      });
-    });
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    getTonePref(ALERT_TONE_PREF_KEY, ALERT_TONES).play(ctx, ctx.currentTime);
   } catch (e) {
     // Never let a sound failure break the actual notification/toast —
     // audio is enhancement, not core functionality.
@@ -14778,39 +14857,9 @@ function playAlertSound() {
 let ringtoneIntervalId = null;
 function playRingtonePulse() {
   try {
-    if (!sharedAudioCtx) {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) return;
-      sharedAudioCtx = new AudioContextClass();
-    }
-    const ctx = sharedAudioCtx;
-    if (ctx.state === "suspended") ctx.resume();
-    const now = ctx.currentTime;
-    // POLYPHONIC — per explicit request. Previously a monophonic 3-note
-    // arpeggio (one oscillator/frequency at a time: C5 -> E5 -> G5).
-    // Same warm "triangle" waveform (softer than a flat sine, much
-    // softer than a square/sawtooth — deliberately avoids the harsh,
-    // buzzy character of the real telecom dual-tone ring standard this
-    // replaced) and the same C-major pitch set, but now the full triad
-    // sounds together on every pulse — multiple simultaneous voices,
-    // the actual definition of "polyphonic" — instead of one note at a
-    // time. Still fully original/synthesized code, no real recording,
-    // no copyright concern.
-    const chord = [523.25, 659.25, 783.99]; // C5, E5, G5 — C major triad
-    const dur = 0.32;
-    chord.forEach(freq => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "triangle";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.3, now + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + dur + 0.02);
-    });
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    getTonePref(RING_TONE_PREF_KEY, RING_TONES).play(ctx, ctx.currentTime);
   } catch (e) {
     console.warn("[Ringtone] playback failed:", e.message);
   }
@@ -14827,11 +14876,50 @@ function stopRingtone() {
   }
 }
 
-// Controls notification/alert beeps ONLY (playAlertSound) — deliberately
-// does NOT affect the call ringtone (startRingtone/playRingtonePulse),
-// per explicit decision: missing an incoming call matters more than
-// missing a notification beep, so calls always ring regardless of this
-// setting.
+// Row of tappable tone pills — tapping one both selects it (persists to
+// localStorage) and plays it immediately as a preview, the standard
+// pattern for a sound picker. Shared between the alert-tone and ring-tone
+// pickers below (same shape, different tone set/pref key).
+function TonePicker({ label, tones, prefKey }) {
+  const [selected, setSelected] = useState(() => getTonePref(prefKey, tones).id);
+  const pick = (tone) => {
+    setSelected(tone.id);
+    setTonePref(prefKey, tone.id);
+    try {
+      const ctx = getAudioCtx();
+      if (ctx) tone.play(ctx, ctx.currentTime);
+    } catch (e) { /* preview failure is non-fatal — selection is already saved */ }
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>{label}</span>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {tones.map(t => (
+          <button key={t.id} onClick={() => pick(t)}
+            style={{
+              fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 4, cursor: "pointer",
+              background: selected === t.id ? "rgba(245,166,35,0.12)" : "none",
+              border: `1px solid ${selected === t.id ? COLORS.amber : COLORS.wire}`,
+              color: selected === t.id ? COLORS.amber : COLORS.ghost,
+            }}>
+            {selected === t.id ? "▶ " : ""}{t.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Controls notification/alert beeps (playAlertSound) — the mute toggle
+// deliberately does NOT affect the call ringtone (startRingtone/
+// playRingtonePulse), per explicit decision: missing an incoming call
+// matters more than missing a notification beep, so calls always ring
+// regardless of this setting. The tone PICKERS below are independent of
+// that mute toggle — per explicit request ("a few tones for alerts and
+// ringing that users can change"), both the alert beep and the ring have
+// their own selectable set of a few original, synthesized tones (no
+// browser API exists to read a phone's actual system ringtone library —
+// see ALERT_TONES' own header comment).
 function AlertSoundToggle() {
   const [muted, setMuted] = useState(isAlertSoundMuted());
   const toggle = () => {
@@ -14841,7 +14929,11 @@ function AlertSoundToggle() {
     if (!next) playAlertSound(); // quick confirmation beep when re-enabling
   };
   return (
-    <Button title={muted ? "🔇 ALERT SOUND: OFF" : "🔔 ALERT SOUND: ON"} variant="ghost" size="sm" full onClick={toggle} />
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <Button title={muted ? "🔇 ALERT SOUND: OFF" : "🔔 ALERT SOUND: ON"} variant="ghost" size="sm" full onClick={toggle} />
+      <TonePicker label="ALERT TONE" tones={ALERT_TONES} prefKey={ALERT_TONE_PREF_KEY} />
+      <TonePicker label="RING TONE" tones={RING_TONES} prefKey={RING_TONE_PREF_KEY} />
+    </div>
   );
 }
 
