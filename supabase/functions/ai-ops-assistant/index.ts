@@ -34,11 +34,18 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 // auto-injected platform variables.
 const JWT_SECRET = Deno.env.get("PROJECT_JWT_SECRETS");
 const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
-// gemini-2.5-flash — a stable, well-established free-tier-eligible model
-// (Google's own free-tier docs list it alongside newer flash variants);
-// picked over a bleeding-edge model id for reliability on a feature that
-// needs to just work, not chase the newest release.
-const GEMINI_MODEL = "gemini-2.5-flash";
+// gemini-flash-latest — an ALIAS Google keeps pointed at its current
+// recommended flash model, not a specific dated model id. Found the hard
+// way: gemini-2.5-flash (the originally-chosen "stable" id) turned out to
+// already be "no longer available to new users" — a specific model id can
+// be deprecated out from under this function with zero warning, but an
+// alias like this one is Google's own mechanism for avoiding exactly that.
+// Confirmed working end-to-end against the real free-tier key before
+// deploying (gemini-2.5-flash and gemini-2.5-flash-lite both 404'd as
+// deprecated-for-new-accounts; gemini-2.0-flash hit a zero-quota free-tier
+// limit; gemini-flash-latest and gemini-3.5-flash both worked — picked the
+// alias over the dated 3.5 id for the same future-proofing reason).
+const GEMINI_MODEL = "gemini-flash-latest";
 // Raw REST, not the Google SDK — this project's other edge functions only
 // pull in an npm SDK via esm.sh when they need one (e.g. web-push, which
 // has no simple REST equivalent); Gemini's generateContent endpoint is a
