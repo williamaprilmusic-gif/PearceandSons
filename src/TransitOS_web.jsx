@@ -11445,7 +11445,7 @@ function useAppStore() {
   // time the render triggered by that login's own refetch runs, so
   // reading it here at render time is safe and correct, matching how
   // fetchTickets already reads it for its own role-based query scoping.
-  const myRole = useMemo(() => {
+  const myRole = React.useMemo(() => {
     const uid = activeUserRef.current;
     if (uid == null) return null;
     return supaState?.users?.find(u => String(u.id) === String(uid))?.role ?? null;
@@ -20933,7 +20933,7 @@ function AdminActiveTrips({ state }) {
   // for as long as this admin tab stays mounted) — memoizing keeps the
   // O(drivers×trips) work tied to the SAME state actually changing size
   // (driver_status/trips), not to unrelated parent re-renders.
-  const { activeDrivers, driverTripsById } = useMemo(() => {
+  const { activeDrivers, driverTripsById } = React.useMemo(() => {
     const inTransitTrips = state.trips.filter(t => t.state === TRIP_STATE.IN_TRANSIT);
     const byId = new Map();
     for (const t of inTransitTrips) {
