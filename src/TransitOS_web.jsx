@@ -44,6 +44,7 @@ const STATE_BADGE_MAP = {
   BUSY:               { bg: "rgba(245,166,35,0.12)", fg: COLORS.amber,  border: "rgba(245,166,35,0.25)", label: "BUSY" },
   FULLY_BOOKED:       { bg: "rgba(232,58,58,0.15)",  fg: COLORS.red,    border: "rgba(232,58,58,0.3)",   label: "FULLY BOOKED" },
   OFFLINE:            { bg: "rgba(78,95,116,0.15)",  fg: COLORS.ghost,  border: "rgba(78,95,116,0.3)",   label: "OFFLINE" },
+  UNAVAILABLE:        { bg: "rgba(232,58,58,0.15)",  fg: COLORS.red,    border: "rgba(232,58,58,0.3)",   label: "UNAVAILABLE" },
 };
 const ROLE_BADGE_MAP = {
   ADMIN:  { bg: "rgba(124,77,255,0.15)", fg: COLORS.purple, border: "rgba(124,77,255,0.3)" },
@@ -10004,18 +10005,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "DRIVER/REPORT_HAZARD": {
       // In-house peer-to-peer hazard alert, standing in for Waze's own
       // crowd-sourced reports (no accessible API to pull that from — see
-      // project memory). Any authenticated driver can report — no
-      // permission gate beyond being logged in, matching how a real-world
-      // "hazard ahead" call-out works. Identity is derived server-side
-      // from activeUserRef, never trusted from the client payload — same
+      // project memory). Any authenticated user can report — no permission
+      // gate beyond being logged in, matching how a real-world "hazard
+      // ahead" call-out works. Identity is derived server-side from
+      // activeUserRef, never trusted from the client payload — same
       // pattern as every other identity-shaped action this session.
+      // Kept the DRIVER/ action-type name (not renamed to something
+      // role-neutral) to minimize the diff, but this is now shared by
+      // agents too — see AgentReportDelayModal, which dispatches this
+      // exact case with source: "agent" so it renders/expires like a
+      // driver's own report (same category icon, same anonymous-reporter
+      // treatment, same shorter relevance window) rather than an admin's
+      // longer-lived, name-attributed advisory.
       const { data: reportingDriver } = await supabase.from("users").select("id, name").eq("id", activeUserRef.current).maybeSingle();
       if (!reportingDriver) throw new Error("Driver not found.");
       if (action.lat == null || action.lng == null || !isValidCoord({ lat: action.lat, lng: action.lng })) {
         throw new Error("Invalid location for hazard report.");
       }
       must(await supabase.from("hazard_reports").insert({
-        driverid: reportingDriver.id, drivername: reportingDriver.name,
+        driverid: reportingDriver.id, drivername: reportingDriver.name, source: action.source === "agent" ? "agent" : "driver",
         category: action.category || "hazard", lat: action.lat, lng: action.lng,
         note: action.note || null, tripid: action.trip_id ?? null, createdat: nowEpoch(),
       }));
@@ -14947,6 +14955,14 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
   const [jumpTripId, setJumpTripId] = useState(null);
   const goToTrip = (trip) => { setJumpTripId(trip?.trip_id ?? null); setTab("trips"); };
   const call = useWebRTCCall(user);
+  // Per explicit request — agents can now report a road delay the same
+  // way admins (Route Advisory) and drivers (in-nav report) already
+  // could. See AgentReportDelayModal's own header comment for why the
+  // form shape differs slightly from both (address search, not live GPS
+  // or a full advisory). Reachable from every tab via the header button
+  // below, same "always accessible" reasoning as the driver nav map's own
+  // report button.
+  const [showReportDelay, setShowReportDelay] = useState(false);
 
   const { isOnline, syncing, syncResult } = useOfflineSync(dispatch);
 
@@ -14957,10 +14973,12 @@ function AgentApp({ state, dispatch, user, notifClickHandlerRef }) {
       <div style={{ background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", position: "sticky", top: 0, zIndex: 10 }}>
         <img src={LOGO_DATA_URI} alt="Pearce & Sons" style={{ height: 32, width: 32, objectFit: "contain" }} />
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => setShowReportDelay(true)} title="Report a road delay" style={{ background: "none", border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "4px 7px", cursor: "pointer", fontSize: 13, lineHeight: 1 }}>⚠</button>
           {myNotifs.length > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 6px", fontSize: 9, fontWeight: 800, color: "#000" }}>{myNotifs.length}</span>}
           <RoleBadge role={ROLE.AGENT} />
         </div>
       </div>
+      {showReportDelay && <AgentReportDelayModal dispatch={dispatch} onClose={() => setShowReportDelay(false)} />}
 
       <div style={{ flex: 1, overflowY: "auto" }}>
         {tab === "home" && <AgentHomeTab myTrips={myTrips} dispatch={dispatch} goToTrip={goToTrip} setTab={setTab} />}
@@ -20305,6 +20323,87 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
   );
 }
 
+// Lets an agent report a road delay/hazard the same way an admin (Route
+// Advisory) or driver (in-nav two-tap report) already can — per explicit
+// request. Agents don't have a live-nav-map context to grab a position
+// from (unlike a driving driver) and aren't usually posting a multi-hour
+// official advisory (unlike an admin), so this borrows the shape closest
+// to what an agent actually has available: RouteAdvisoryPanel's address-
+// search location picker, plus the driver flow's category-icon picker.
+// Dispatches the SAME DRIVER/REPORT_HAZARD action driver reports use
+// (source: "agent" so it displays/expires exactly like a driver's own
+// report — anonymous reporter, category icon, shorter relevance window —
+// not like an admin's longer-lived, name-attributed advisory).
+function AgentReportDelayModal({ dispatch, onClose }) {
+  const [category, setCategory] = useState(null);
+  const [note, setNote] = useState("");
+  const [street, setStreet] = useState("");
+  const [coord, setCoord] = useState(null);
+  const [posting, setPosting] = useState(false);
+  const [error, setError] = useState(null);
+  const [sent, setSent] = useState(false);
+
+  const post = async () => {
+    if (!category) { setError("Pick what kind of delay this is."); return; }
+    if (!coord) { setError("Search for the location and pick it from the results before reporting."); return; }
+    setPosting(true);
+    setError(null);
+    try {
+      await dispatch({ type: "DRIVER/REPORT_HAZARD", source: "agent", category, lat: coord.lat, lng: coord.lng, note: note.trim() || null });
+      setSent(true);
+      setTimeout(onClose, 1200);
+    } catch (e) {
+      setError(e.message || "Couldn't report the delay — please try again.");
+    } finally {
+      setPosting(false);
+    }
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>⚠ REPORT A ROAD DELAY</span>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+        </div>
+        {sent ? (
+          <div style={{ fontSize: 12, color: COLORS.green, padding: "12px 0" }}>✓ Reported — drivers will see it on their nav map.</div>
+        ) : (
+          <>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>TYPE</span>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {HAZARD_CATEGORIES.map(c => (
+                  <button key={c.key} onClick={() => setCategory(c.key)}
+                    style={{
+                      display: "flex", flexDirection: "column", alignItems: "center", gap: 2, cursor: "pointer",
+                      background: category === c.key ? "rgba(245,166,35,0.12)" : "none",
+                      border: `1px solid ${category === c.key ? COLORS.amber : COLORS.wire}`,
+                      borderRadius: 6, padding: "6px 10px",
+                    }}>
+                    <span style={{ fontSize: 20, lineHeight: 1 }}>{c.icon}</span>
+                    <span style={{ fontSize: 8, color: category === c.key ? COLORS.amber : COLORS.ghost, fontWeight: 700, whiteSpace: "nowrap" }}>{c.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>LOCATION</span>
+              <StreetInput value={street} placeholder="Search an address or area…"
+                preConfirmed={coord ? { label: street, area: "", lat: coord.lat, lng: coord.lng } : null}
+                onChange={({ street: s, coord: c, confirmed }) => { setStreet(s); if (confirmed) setCoord(c); }} />
+            </div>
+            <TextField label="Note (optional)" value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. Backed up past the taxi rank" />
+            <Button title={posting ? "REPORTING…" : "⚠ REPORT DELAY"} variant="amber" size="sm" onClick={post} disabled={posting || !category} />
+            {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function AdminLiveMap({ state, user, dispatch }) {
   const [selectedDriverId, setSelectedDriverId] = useState(null);
   const [showAdvisoryPanel, setShowAdvisoryPanel] = useState(false);
@@ -21455,10 +21554,21 @@ function AdminDrivers({ state, user, dispatch }) {
                 )}
               </div>
               <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                <StateBadge state={full ? "FULLY_BOOKED" : ds.state} />
-                {ds.is_unavailable && (
-                  <span style={{ fontSize: 8, color: COLORS.red, fontWeight: 700, border: `1px solid ${COLORS.red}`, padding: "2px 5px", borderRadius: 2 }}>UNAVAILABLE</span>
-                )}
+                {/* Bug found via direct user report: this used to render
+                    BOTH a green "AVAILABLE" badge (from ds.state, which is
+                    auto-computed purely from whether the driver has an
+                    active trip) AND a separate red "UNAVAILABLE" tag (from
+                    ds.is_unavailable, a driver's own manual "don't assign
+                    me" toggle) at the same time — the two flags are
+                    independent, so a driver with zero active trips who'd
+                    also manually gone unavailable showed as both available
+                    and unavailable simultaneously. is_unavailable is the
+                    more specific, deliberately-set reason a driver can't
+                    be assigned, so it now takes priority in the single
+                    badge shown, ahead of the auto-computed AVAILABLE/BUSY
+                    state (FULLY_BOOKED still wins over everything — a
+                    driver at capacity can't take more work either way). */}
+                <StateBadge state={full ? "FULLY_BOOKED" : ds.is_unavailable ? "UNAVAILABLE" : ds.state} />
               </div>
             </div>
             <CapacityBar load={load} capacity={driverCapacityList} />
@@ -21552,7 +21662,11 @@ function UserProfilePanel({ u, driverStatus, state }) {
           <Row label="COMPANY">{branch?.label || u.branch_id || "—"}</Row>
           <Row label="VEHICLE">{driverStatus?.vehicle || "—"}</Row>
           <Row label="CONTACT PHONE">{driverStatus?.phone || "—"}</Row>
-          <Row label="CURRENT STATE"><StateBadge state={driverStatus?.state || DRIVER_STATE.AVAILABLE} /></Row>
+          {/* Same fix as AdminDrivers' list-row badge — a driver's manual
+              is_unavailable toggle must take priority over the
+              auto-computed AVAILABLE/BUSY state, or this shows "AVAILABLE"
+              for a driver who deliberately opted out of new assignments. */}
+          <Row label="CURRENT STATE"><StateBadge state={driverStatus?.is_unavailable ? "UNAVAILABLE" : (driverStatus?.state || DRIVER_STATE.AVAILABLE)} /></Row>
         </>
       )}
 
