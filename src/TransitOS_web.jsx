@@ -11773,7 +11773,6 @@ function GpsBlock({ coord }) {
 }
 
 function DriverAvatar({ name, size = 42, isOnline, isAway = false }) {
-  const init = (name || "?").split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
   const dotSize = Math.max(8, Math.round(size * 0.28));
   // Online only means "actively in the app" now — away (logged in, but
   // the app is backgrounded/not the focused tab) is a distinct middle
@@ -11784,9 +11783,20 @@ function DriverAvatar({ name, size = 42, isOnline, isAway = false }) {
   const presenceLabel = !isOnline ? "Offline" : isAway ? "Away" : "Online";
   const presenceColor = !isOnline ? COLORS.ghost : isAway ? COLORS.amber : COLORS.green;
   return (
-    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
-      <div className="driver-av" style={{ width: size, height: size, fontSize: size * 0.38, borderRadius: size * 0.07 }}>
-        {init}
+    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }} title={name || undefined}>
+      {/* Was a two-letter initials badge — replaced with an actual car
+          silhouette per explicit request ("make the drivers icon look
+          like a real car"). Simple outlined side-profile (windshield
+          slant + body + two wheels), not an emoji — emoji car glyphs
+          render inconsistently across platforms/OSes, an inline SVG stays
+          crisp and matches the app's own amber accent color exactly. */}
+      <div className="driver-av" style={{ width: size, height: size, borderRadius: size * 0.07 }}>
+        <svg viewBox="0 0 24 24" width={size * 0.62} height={size * 0.62} fill="none" stroke={COLORS.amber} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3 13l1.5-4.5A2 2 0 0 1 6.4 7h11.2a2 2 0 0 1 1.9 1.5L21 13" />
+          <path d="M3 13h18v3a1 1 0 0 1-1 1h-1a1 1 0 0 1-1-1v-1H6v1a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-3z" />
+          <circle cx="7.5" cy="17" r="1.5" fill={COLORS.amber} stroke="none" />
+          <circle cx="16.5" cy="17" r="1.5" fill={COLORS.amber} stroke="none" />
+        </svg>
       </div>
       {isOnline != null && (
         <span
