@@ -4301,6 +4301,19 @@ const SUPABASE_ANON_KEY = "sb_publishable_Kyne7Q6PJ2uKmcfslI-qNQ_CX-m7mxF";
 // without changing what's visible. It's the prerequisite groundwork for
 // tightening individual tables' policies to something real, one at a
 // time, without repeating the push_subscriptions incident.
+// Surfaces the "your writes are silently failing" state to the UI (see
+// AppInner's listener). Module-scope, not React state — this fires from
+// inside the raw fetch override below, well outside any component. Rate-
+// limited to once a minute: once a token goes bad every write retries on
+// its own cadence (GPS persist every ~25s, notification/late-start checks
+// on their own poll), and without this gate each one would re-fire a toast.
+let _lastSessionExpiredNotifyAt = 0;
+function notifySessionExpired() {
+  const now = Date.now();
+  if (now - _lastSessionExpiredNotifyAt < 60000) return;
+  _lastSessionExpiredNotifyAt = now;
+  try { window.dispatchEvent(new CustomEvent("transitos:session-expired")); } catch (e) { /* no window (SSR/test) */ }
+}
 const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
   ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
@@ -4341,6 +4354,19 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           if (usingToken && res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
             _cachedSessionToken = null;
             persistSessionToken(null);
+            notifySessionExpired();
+          }
+          // Once the token's gone (cleared just above, or never present —
+          // e.g. this tab's copy expired before the page even loaded), every
+          // write to a table whose RLS now requires auth (most of them, as
+          // of the 2026-08-07 sweep — no longer just "users-table writes"
+          // per the comment above, which predates that sweep) fails forever
+          // with no token left to self-heal FROM. That's silent to the
+          // person using the app — GET-reads keep working fine, so nothing
+          // looks broken until you check the network tab. Surface it instead.
+          const method = (options.method || "GET").toUpperCase();
+          if (!usingToken && ["POST", "PATCH", "PUT", "DELETE"].includes(method) && (res.status === 401 || res.status === 403)) {
+            notifySessionExpired();
           }
           return res;
         },
@@ -5807,24 +5833,21 @@ function appReducer(state, action) {
 
     case "TRIP/RECORD_ROUTE": {
       // Demo/fallback-mode equivalent of the Supabase handler's case —
-      // same 2-hour start-trip enforcement, and records route_total_km
-      // (the field name this app-side state actually reads) across every
-      // trip in the batch. Previously this action had no local reducer
-      // case at all and silently no-opped via the switch's default,
-      // meaning demo mode had no server-side enforcement whatsoever and
-      // route_total_km was never populated.
+      // same start-trip enforcement (cannot start before the booked
+      // time), and records route_total_km (the field name this app-side
+      // state actually reads) across every trip in the batch. Previously
+      // this action had no local reducer case at all and silently
+      // no-opped via the switch's default, meaning demo mode had no
+      // server-side enforcement whatsoever and route_total_km was never
+      // populated.
       const { trips: rrTrips, driver_coord: rrDriverCoord } = action;
       if (!rrTrips || rrTrips.length === 0) return state;
       const rrEarliestScheduled = rrTrips
         .map(t => t.scheduled_time_epoch)
         .filter(Boolean)
         .sort((a, b) => a - b)[0];
-      if (rrEarliestScheduled != null) {
-        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-        const windowOpensAt = rrEarliestScheduled - TWO_HOURS_MS;
-        if (Date.now() < windowOpensAt) {
-          return { ...state, _error: "Start trip denied — trips can only be started within 2 hours of the scheduled time." };
-        }
+      if (rrEarliestScheduled != null && Date.now() < rrEarliestScheduled) {
+        return { ...state, _error: "Start trip denied — this trip cannot be started before its scheduled time." };
       }
       const { pickupOrder: rrPickupOrder, dropoffOrder: rrDropoffOrder, totalRoadKm: rrTotalRoadKm } = computeOptimalRoute(rrTrips, rrDriverCoord);
       const rrTripIds = new Set(rrTrips.map(t => t.trip_id));
@@ -10638,15 +10661,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
     case "TRIP/RECORD_ROUTE": {
-      // Server-side enforcement of the "start trip" 2-hour window — this
-      // is the actual moment a trip starts (Waze opens right after this
-      // succeeds), not TRIP/DRIVER_CONFIRM (accepting a trip assignment
-      // can legitimately happen hours or a day in advance and must NOT be
-      // blocked by this restriction — only genuinely starting navigation
-      // should be). The client already checks this before calling, but
-      // this guards against a request reaching the backend directly or a
-      // stale client. Checked against the EARLIEST scheduled trip in this
-      // batch, matching the client-side check.
+      // Server-side enforcement that a trip cannot be started before its
+      // booked time — this is the actual moment a trip starts (Waze opens
+      // right after this succeeds), not TRIP/DRIVER_CONFIRM (accepting a
+      // trip assignment can legitimately happen hours or a day in advance
+      // and must NOT be blocked by this restriction — only genuinely
+      // starting navigation should be). The client already checks this
+      // before calling, but this guards against a request reaching the
+      // backend directly or a stale client. Checked against the EARLIEST
+      // scheduled trip in this batch, matching the client-side check.
       const { trips: routeTrips, driver_coord } = action;
       // Ownership check — every other action that writes to a trip row
       // checks driverid against the caller; this one previously didn't, so
@@ -10663,12 +10686,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         .map(t => t.scheduled_time_epoch)
         .filter(Boolean)
         .sort((a, b) => a - b)[0];
-      if (earliestScheduled != null) {
-        const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-        const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
-        if (Date.now() < windowOpensAt) {
-          throw new Error("Start trip denied — trips can only be started within 2 hours of the scheduled time.");
-        }
+      if (earliestScheduled != null && Date.now() < earliestScheduled) {
+        throw new Error("Start trip denied — this trip cannot be started before its scheduled time.");
       }
       // Computes the full optimized route (driver's ACTUAL current
       // position at the moment they tapped Start Trip -> every pickup ->
@@ -16691,15 +16710,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       .filter(Boolean)
       .sort((a, b) => a - b)[0];
     if (earliestScheduled != null) {
-      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
       const now = Date.now();
-      const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
-      if (now < windowOpensAt) {
-        const minutesEarly = Math.ceil((windowOpensAt - now) / 60000);
+      if (now < earliestScheduled) {
+        const minutesEarly = Math.ceil((earliestScheduled - now) / 60000);
         const hrs = Math.floor(minutesEarly / 60);
         const mins = minutesEarly % 60;
         const waitStr = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
-        setStartTripError(`Start trip denied — trips can only be started within 2 hours of the scheduled time. Try again in ${waitStr}.`);
+        setStartTripError(`Start trip denied — this trip cannot be started before its scheduled time. Try again in ${waitStr}.`);
         return;
       }
     }
@@ -16962,13 +16979,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
           {(() => {
             const earliestScheduled = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0];
             if (earliestScheduled == null) return null;
-            const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-            const windowOpensAt = earliestScheduled - TWO_HOURS_MS;
-            if (Date.now() >= windowOpensAt) return null;
-            const opensAtLabel = new Date(windowOpensAt).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
+            if (Date.now() >= earliestScheduled) return null;
+            const opensAtLabel = new Date(earliestScheduled).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
             return (
               <div style={{ fontSize: 10, color: COLORS.amber, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "6px 10px" }}>
-                🔒 Trips can only be started within 2 hours of the scheduled time — opens at {opensAtLabel}.
+                🔒 This trip cannot be started before its scheduled time — opens at {opensAtLabel}.
               </div>
             );
           })()}
@@ -24161,6 +24176,25 @@ function AppInner() {
     if (activeUser?.id && supabase) subscribeToPushNotifications(activeUser.id);
   }, [activeUser?.id]);
 
+  // Session token went bad (expired, or rejected server-side for any other
+  // reason) and every write this device makes is now silently failing RLS
+  // — see notifySessionExpired's own comment for why this needs a real,
+  // sticky, user-facing signal rather than just a log line. A toast alone
+  // isn't enough here (it auto-dismisses in ~4s and this is easy to miss
+  // mid-shift); the sticky banner below stays until they actually log back
+  // in. Resets whenever the logged-in user changes (a fresh login means a
+  // fresh token, so any earlier expiry no longer applies).
+  const [sessionExpired, setSessionExpired] = useState(false);
+  useEffect(() => { setSessionExpired(false); }, [activeUser?.id]);
+  useEffect(() => {
+    const onSessionExpired = () => {
+      setSessionExpired(true);
+      pushToast("SESSION EXPIRED", "Your login has expired — log out and back in to keep syncing.", COLORS.red);
+    };
+    window.addEventListener("transitos:session-expired", onSessionExpired);
+    return () => window.removeEventListener("transitos:session-expired", onSessionExpired);
+  }, [pushToast]);
+
   // Previously this fired a toast for ANY new notification added anywhere
   // in the system, regardless of who it was actually for — an agent would
   // get a toast about another agent's ticket, a driver's delay report,
@@ -24292,6 +24326,18 @@ function AppInner() {
           onStayLoggedIn={resetSessionTimer}
           onLogout={handleLogout8}
         />
+      )}
+
+      {sessionExpired && activeUser && (
+        <div style={{ position: "sticky", top: 0, zIndex: 500, background: COLORS.red, color: "#fff", padding: "8px 14px", fontSize: 11, fontWeight: 700, textAlign: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, flexWrap: "wrap" }}>
+          <span>⚠ Your session has expired — trip updates, positions, and alerts aren't syncing.</span>
+          <button
+            onClick={handleLogout8}
+            style={{ background: "#fff", color: COLORS.red, border: "none", borderRadius: 4, padding: "4px 12px", fontSize: 11, fontWeight: 800, cursor: "pointer" }}
+          >
+            LOG OUT & LOG BACK IN
+          </button>
+        </div>
       )}
       <div className="toast-stack">
         {toasts.map(t => (
