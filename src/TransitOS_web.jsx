@@ -4305,7 +4305,7 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
       auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
       realtime: { params: { eventsPerSecond: 10 } },
       global: {
-        fetch: (url, options = {}) => {
+        fetch: async (url, options = {}) => {
           // isJwtUsable — NOT just `if (_cachedSessionToken)`. See its own
           // comment: an expired token attached here would 401 the ENTIRE
           // request (PostgREST rejects the request outright, it does not
@@ -4314,10 +4314,34 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           // header entirely for an expired/absent token correctly falls
           // back to plain anon-key behavior instead, exactly as every
           // request already worked before this override existed.
-          if (isJwtUsable(_cachedSessionToken)) {
-            options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${_cachedSessionToken}` } };
+          const tokenAtRequestTime = _cachedSessionToken;
+          const usingToken = isJwtUsable(tokenAtRequestTime);
+          if (usingToken) {
+            options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${tokenAtRequestTime}` } };
           }
-          return fetch(url, options);
+          const res = await fetch(url, options);
+          // Self-healing — confirmed live in production logs the day this
+          // shipped: a real session hit a hard 401 on EVERY table (not
+          // just ones with tightened RLS), consistent with PostgREST
+          // rejecting the whole request over a bad Authorization header.
+          // The client-side expiry pre-check above can only catch expiry —
+          // it can't catch every reason a token might be rejected
+          // server-side, and with no recovery path a device would keep
+          // resending the same bad token forever, 401ing on everything,
+          // until an explicit logout/login. If we attached a token and
+          // got a 401 back, treat the token itself as the problem: clear
+          // it so every subsequent request falls back to the anon key
+          // (still works for every SELECT — only the users-table writes
+          // this session tightened actually need a fresh login to work
+          // again). The tokenAtRequestTime === _cachedSessionToken guard
+          // avoids clobbering a NEWER token that was installed (e.g. a
+          // fresh login in another tab) while this now-stale request was
+          // still in flight.
+          if (usingToken && res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
+            _cachedSessionToken = null;
+            persistSessionToken(null);
+          }
+          return res;
         },
       },
     })
