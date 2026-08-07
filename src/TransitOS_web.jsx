@@ -11419,6 +11419,45 @@ function useAppStore() {
     };
   }, [refetch]);
 
+  // Role of the currently active user — used below to skip fetching/
+  // subscribing/polling admin-only or driver+admin-only auxiliary tables
+  // for sessions that will never render anything from them (an agent or
+  // driver session was previously opening a realtime channel + 5-min poll
+  // for campaigns/vehicles/vehicle_maintenance_log/trip_fee_rates
+  // regardless of role — all four are only ever read from admin-only
+  // components, confirmed by grepping every `state.<table>` reference —
+  // found via a dedicated resource-usage audit). Computed via useMemo
+  // (not read inline) so its VALUE stays referentially stable across
+  // ordinary refetches — `supaState.users` gets a new array identity on
+  // every refetch, but the derived role string doesn't change unless a
+  // real login/logout/role-edit happens — so the role-gated effects below
+  // don't tear down and recreate their subscriptions on every routine
+  // data refresh. Same "stable primitive dependency, not a raw changing
+  // reference" fix shape as the earlier GPS-tracking effect-churn bug
+  // (see project memory) — activeUserRef.current is a ref (not itself
+  // reactive), but it's already holding the fresh post-login value by the
+  // time the render triggered by that login's own refetch runs, so
+  // reading it here at render time is safe and correct, matching how
+  // fetchTickets already reads it for its own role-based query scoping.
+  //
+  // MUST be declared before every effect below that reads it (driver
+  // positions + the 5 auxiliary tables) — a real production outage found
+  // via a security sweep's own follow-up: this declaration briefly sat
+  // AFTER the driver_positions effect that references myRole in its
+  // dependency array, which is evaluated synchronously at that point in
+  // useAppStore's top-to-bottom execution, not deferred like the effect
+  // body itself. Reading a `const` before its own declaration line throws
+  // a temporal-dead-zone ReferenceError — "Cannot access 'myRole' before
+  // initialization" (minified to a single letter in production) — on
+  // EVERY render, for EVERY session, since useAppStore mounts before
+  // login even renders. Confirmed via live client_errors crash reports
+  // from real devices immediately after this bug's deploy.
+  const myRole = React.useMemo(() => {
+    const uid = activeUserRef.current;
+    if (uid == null) return null;
+    return supaState?.users?.find(u => String(u.id) === String(uid))?.role ?? null;
+  }, [supaState?.users, activeUserRef.current]);
+
   // Separate, lightweight subscription for live driver positions — these
   // update every ~8s per active driver, far more often than trip/user
   // data changes, so they're deliberately NOT part of the general
@@ -11453,32 +11492,6 @@ function useAppStore() {
     document.addEventListener("visibilitychange", onVisible);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchDriverPositions, myRole]);
-
-  // Role of the currently active user — used below to skip fetching/
-  // subscribing/polling admin-only or driver+admin-only auxiliary tables
-  // for sessions that will never render anything from them (an agent or
-  // driver session was previously opening a realtime channel + 5-min poll
-  // for campaigns/vehicles/vehicle_maintenance_log/trip_fee_rates
-  // regardless of role — all four are only ever read from admin-only
-  // components, confirmed by grepping every `state.<table>` reference —
-  // found via a dedicated resource-usage audit). Computed via useMemo
-  // (not read inline) so its VALUE stays referentially stable across
-  // ordinary refetches — `supaState.users` gets a new array identity on
-  // every refetch, but the derived role string doesn't change unless a
-  // real login/logout/role-edit happens — so the role-gated effects below
-  // don't tear down and recreate their subscriptions on every routine
-  // data refresh. Same "stable primitive dependency, not a raw changing
-  // reference" fix shape as the earlier GPS-tracking effect-churn bug
-  // (see project memory) — activeUserRef.current is a ref (not itself
-  // reactive), but it's already holding the fresh post-login value by the
-  // time the render triggered by that login's own refetch runs, so
-  // reading it here at render time is safe and correct, matching how
-  // fetchTickets already reads it for its own role-based query scoping.
-  const myRole = React.useMemo(() => {
-    const uid = activeUserRef.current;
-    if (uid == null) return null;
-    return supaState?.users?.find(u => String(u.id) === String(uid))?.role ?? null;
-  }, [supaState?.users, activeUserRef.current]);
 
   // Each of these 5 auxiliary fetch cycles (campaigns/companies/tickets/
   // high_risk_zones/fee_rates) has ONLY its own realtime subscription —
