@@ -6464,7 +6464,15 @@ async function fetchAllFromSupabase() {
     // field userRowToApp actually reads is listed explicitly here — add
     // to both places together if a new field is ever needed.
     supabase.from("users").select("id, role, fullname, staffnumber, username, isonline, phone, homelat, homelng, homeaddress, homearea, branchid, branchhistory, campaignid, adminlevel, scopedcompanyids").order("id"),
-    supabase.from("driver_status").select("*"),
+    // Explicit column list — same reasoning as the users select above.
+    // Was select("*"), so every logged-in agent client (not just admins)
+    // received every driver's raw document-expiry dates in memory. Lower
+    // sensitivity than passwordhash (dates only, never rendered in any
+    // agent-facing UI — only DriverDocSummary/DriverDocEditor, both
+    // admin-only), but same unfiltered-fetch shape as the ticket leak
+    // fixed elsewhere this session, closed here for consistency. Every
+    // field driverStatusRowToApp actually reads is listed explicitly.
+    supabase.from("driver_status").select("driverid, state, currenttripid, vehicle, phone, capacity, isonline, isaway, isunavailable, availability_schedule, documents, unavailablereason, unavailablenote"),
     tripsQuery,
   ]);
   const firstError = usersRes.error || driversRes.error || tripsRes.error;
