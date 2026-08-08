@@ -1,16 +1,57 @@
-# React + Vite
+# TransitOS — Pearce & Sons Staff Transport
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A dispatch and staff-transport management app: agents book rides, drivers run them with in-app turn-by-turn navigation, and admins (Fleet Ops / Standard / Viewer / Financial tiers) dispatch, track, and bill for it. Deployed live at `pearceand-sons.vercel.app`.
 
-Currently, two official plugins are available:
+## Stack
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- **Client**: React 19, single-page app, no router (view switching is plain `useState`). Vite build.
+- **Backend**: Supabase — Postgres (with row-level security), realtime subscriptions, and Deno edge functions.
+- **Auth**: a **custom** JWT system, not Supabase's native GoTrue. `supabase/functions/session-login` mints HS256-signed tokens after checking the password server-side; `supabase/functions/webauthn` does the same for biometric/passkey login. Every RLS policy in the database checks `auth.jwt() ->> 'app_user_id'` against these tokens, not `auth.uid()`.
+- **Maps/nav**: Leaflet + TomTom tiles for the driver's in-app navigation (not an external Waze handoff), a hand-rolled SVG Web Mercator projection for the admin live-fleet map.
+- **Push**: Web Push (VAPID keys), sent from `supabase/functions/send-push-notification`.
+- **AI**: an admin-only ops-assistant chat backed by Google Gemini (`supabase/functions/ai-ops-assistant`), answering from a bounded read-only data snapshot — never runs SQL itself.
 
-## React Compiler
+## Layout
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+```
+src/TransitOS_web.jsx      Almost the entire client app — shared constants/helpers,
+                            the demo-mode reducer, real Supabase action handlers,
+                            and the Agent/Driver/ClientPortal UI. Large by design;
+                            see inline comments before restructuring anything.
+src/admin/AdminSection.jsx Every admin-only screen (dashboard, dispatch, live map,
+                            vehicles, users, tickets, CSV exports, AI assistant,
+                            financial). Dynamically imported (React.lazy) so
+                            agent/driver sessions never download this code.
+src/main.jsx                Entry point.
+supabase/functions/*        Edge functions — session-login, webauthn,
+                            send-push-notification, ai-ops-assistant, and 3
+                            pg_cron-scheduled jobs (check-late-start,
+                            check-upcoming-reminders, daily-trip-sheet,
+                            trip-history-retention).
+public/                     Static assets — icons, manifest, service worker.
+```
 
-## Expanding the ESLint configuration
+There is no separate backend server — Vercel serves the static client build, and everything server-side is a Supabase edge function or a direct RLS-protected Postgres query from the client.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+## Running locally
+
+```
+npm install
+npm run dev       # Vite dev server
+npm run build     # production build (also what Vercel runs on push to main)
+npm run lint      # ESLint — real bug-catching rules (no-undef, rules-of-hooks)
+                   # are errors; missing-hook-dependency warnings need individual
+                   # judgment, not a blind fix — several are intentional
+```
+
+`.env` holds local secrets (Supabase URL/anon key, TomTom key, etc.) — gitignored, not `VITE_`-prefixed where it shouldn't be bundled into the client. There is no automated test suite; correctness is verified via `npm run build`, `npm run lint`, and live-testing against the real Supabase project before deploying.
+
+## Deploying
+
+Push to `main` — Vercel auto-deploys. Database migrations and edge function deploys are applied directly against the live Supabase project (ref `kwkgiylwnafwimxqmjwk`) as part of the same change, not through a separate CI pipeline; there isn't one beyond Vercel's own build-on-push.
+
+## Things that aren't obvious from the code alone
+
+- **Two separate "money" concepts, kept deliberately apart everywhere**: Trip Fee (billed to the client, per agent, by that agent's own outcome on the trip) and Driver Payment (paid to the driver, reference-only). Never conflate the two — see `agentFeeAmount`/`tripDriverPayment` in `TransitOS_web.jsx`.
+- **The demo/fallback reducer and the real Supabase handler implement the same business rules twice** (offline/demo-mode support). This has been a real source of bugs when the two copies drift — if you change a rule in one, check the other.
+- **RLS auth check pattern**: every policy uses `((select auth.jwt()) ->> 'app_user_id') is not null` — the `select` wrapper matters for query performance (unwrapped `auth.jwt()` calls re-evaluate per row).

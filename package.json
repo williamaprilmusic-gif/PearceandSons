@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "lint": "eslint ."
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.50.0",
@@ -15,8 +16,13 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@babel/eslint-parser": "^8.0.1",
     "@babel/parser": "^7.29.8",
+    "@babel/preset-react": "^8.0.1",
     "@vitejs/plugin-react": "^6.0.3",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "vite": "^8.1.1"
   }
 }

@@ -4,7 +4,13 @@ const babelParser = require("@babel/eslint-parser");
 
 module.exports = [
   {
-    files: ["src/App.jsx"],
+    // FIXED (2026-08-08, improvement audit): was ["src/App.jsx"] — that
+    // file was renamed to src/TransitOS_web.jsx a while back, so this
+    // config matched nothing and every rule below (including real
+    // bug-catching ones like no-undef and react-hooks/rules-of-hooks)
+    // was silently never enforced. Also picks up src/admin/AdminSection.jsx,
+    // which didn't exist when this config was first written.
+    files: ["src/**/*.jsx"],
     languageOptions: {
       parser: babelParser,
       ecmaVersion: 2022,
@@ -66,12 +72,18 @@ module.exports = [
         requestIdleCallback: "readonly",
         cancelIdleCallback: "readonly",
         structuredClone: "readonly",
+        CustomEvent: "readonly",
+        Headers: "readonly",
+        DOMParser: "readonly",
         Notification_: "readonly",
       },
     },
     plugins: {
       react,
       "react-hooks": reactHooks,
+    },
+    settings: {
+      react: { version: "detect" },
     },
     rules: {
       "no-undef": "error",
