@@ -1067,6 +1067,25 @@ function distinctWeekDays(trips) {
 // each trip (which is just that one trip's own pickup-to-dropoff line).
 const ROAD_FACTOR = 1.35; // same straight-line-to-road approximation used elsewhere in the app
 
+// Early-start window for the "start trip" restriction below — per explicit
+// requirement: a driver may start up to 2h early if the EARLIEST-scheduled
+// trip in the batch has more than 6 passengers, otherwise only 1h early.
+// Passenger count is agent_ids.length, matching how passenger counts are
+// computed everywhere else in this file (e.g. the PASSENGERS summary card).
+const TRIP_EARLY_START_LARGE_MS = 2 * 60 * 60 * 1000;
+const TRIP_EARLY_START_SMALL_MS = 60 * 60 * 1000;
+function earliestScheduledTrip(trips) {
+  return (trips || [])
+    .filter(t => t.scheduled_time_epoch != null)
+    .sort((a, b) => a.scheduled_time_epoch - b.scheduled_time_epoch)[0] || null;
+}
+function tripStartWindowOpensAt(trip) {
+  if (!trip || trip.scheduled_time_epoch == null) return null;
+  const paxCount = trip.agent_ids?.length || 1;
+  const windowMs = paxCount > 6 ? TRIP_EARLY_START_LARGE_MS : TRIP_EARLY_START_SMALL_MS;
+  return trip.scheduled_time_epoch - windowMs;
+}
+
 function computeOptimalRoute(trips, driverCurrentCoord) {
   // Last-resort fallback only — the caller (TRIP/RECORD_ROUTE) always
   // resolves and passes a real coordinate first. No `state` available
@@ -5880,19 +5899,17 @@ function appReducer(state, action) {
     case "TRIP/RECORD_ROUTE": {
       // Demo/fallback-mode equivalent of the Supabase handler's case —
       // same start-trip enforcement (cannot start before the booked
-      // time), and records route_total_km (the field name this app-side
-      // state actually reads) across every trip in the batch. Previously
-      // this action had no local reducer case at all and silently
-      // no-opped via the switch's default, meaning demo mode had no
-      // server-side enforcement whatsoever and route_total_km was never
-      // populated.
+      // time, with a passenger-count-dependent early-start window — see
+      // tripStartWindowOpensAt), and records route_total_km (the field
+      // name this app-side state actually reads) across every trip in
+      // the batch. Previously this action had no local reducer case at
+      // all and silently no-opped via the switch's default, meaning demo
+      // mode had no server-side enforcement whatsoever and
+      // route_total_km was never populated.
       const { trips: rrTrips, driver_coord: rrDriverCoord } = action;
       if (!rrTrips || rrTrips.length === 0) return state;
-      const rrEarliestScheduled = rrTrips
-        .map(t => t.scheduled_time_epoch)
-        .filter(Boolean)
-        .sort((a, b) => a - b)[0];
-      if (rrEarliestScheduled != null && Date.now() < rrEarliestScheduled) {
+      const rrWindowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(rrTrips));
+      if (rrWindowOpensAt != null && Date.now() < rrWindowOpensAt) {
         return { ...state, _error: "Start trip denied — this trip cannot be started before its scheduled time." };
       }
       const { pickupOrder: rrPickupOrder, dropoffOrder: rrDropoffOrder, totalRoadKm: rrTotalRoadKm } = computeOptimalRoute(rrTrips, rrDriverCoord);
@@ -10757,7 +10774,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // starting navigation should be). The client already checks this
       // before calling, but this guards against a request reaching the
       // backend directly or a stale client. Checked against the EARLIEST
-      // scheduled trip in this batch, matching the client-side check.
+      // scheduled trip in this batch, matching the client-side check —
+      // and that trip's own passenger count decides the early-start
+      // window (see tripStartWindowOpensAt): >6 passengers gets 2h early,
+      // otherwise 1h.
       const { trips: routeTrips, driver_coord } = action;
       // Ownership check — every other action that writes to a trip row
       // checks driverid against the caller; this one previously didn't, so
@@ -10770,11 +10790,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         throw new Error("This trip isn't assigned to you.");
       }
       await assertDriverDocsCurrent(activeUserRef.current);
-      const earliestScheduled = routeTrips
-        .map(t => t.scheduled_time_epoch)
-        .filter(Boolean)
-        .sort((a, b) => a - b)[0];
-      if (earliestScheduled != null && Date.now() < earliestScheduled) {
+      const windowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(routeTrips));
+      if (windowOpensAt != null && Date.now() < windowOpensAt) {
         throw new Error("Start trip denied — this trip cannot be started before its scheduled time.");
       }
       // Computes the full optimized route (driver's ACTUAL current
@@ -16796,22 +16813,20 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const [startTripError, setStartTripError] = useState(null);
   const handleStartTrip = async () => {
     setStartTripError(null);
-    // A driver may not start a trip before its scheduled time — per
-    // explicit requirement (no early-start window at all). Checked
-    // against the EARLIEST scheduled trip in this batch (a driver's
-    // several active trips for the day are started together as one
-    // route), so the restriction is based on whichever pickup comes
-    // first. Trips already IN_TRANSIT or DRIVER_CONFIRMED with a route
-    // already recorded are unaffected — this only gates the initial
-    // "start trip" action itself.
-    const earliestScheduled = myActiveTrips
-      .map(t => t.scheduled_time_epoch)
-      .filter(Boolean)
-      .sort((a, b) => a - b)[0];
-    if (earliestScheduled != null) {
+    // A driver may not start a trip before its scheduled time, except for
+    // a passenger-count-dependent early-start window — see
+    // tripStartWindowOpensAt. Checked against the EARLIEST scheduled trip
+    // in this batch (a driver's several active trips for the day are
+    // started together as one route), so the restriction — and the window
+    // size, based on that trip's own passenger count — is based on
+    // whichever pickup comes first. Trips already IN_TRANSIT or
+    // DRIVER_CONFIRMED with a route already recorded are unaffected —
+    // this only gates the initial "start trip" action itself.
+    const windowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(myActiveTrips));
+    if (windowOpensAt != null) {
       const now = Date.now();
-      if (now < earliestScheduled) {
-        const minutesEarly = Math.ceil((earliestScheduled - now) / 60000);
+      if (now < windowOpensAt) {
+        const minutesEarly = Math.ceil((windowOpensAt - now) / 60000);
         const hrs = Math.floor(minutesEarly / 60);
         const mins = minutesEarly % 60;
         const waitStr = hrs > 0 ? `${hrs}h ${mins}m` : `${mins}m`;
@@ -17076,10 +17091,10 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
             </div>
           ))}
           {(() => {
-            const earliestScheduled = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0];
-            if (earliestScheduled == null) return null;
-            if (Date.now() >= earliestScheduled) return null;
-            const opensAtLabel = new Date(earliestScheduled).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
+            const windowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(myActiveTrips));
+            if (windowOpensAt == null) return null;
+            if (Date.now() >= windowOpensAt) return null;
+            const opensAtLabel = new Date(windowOpensAt).toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
             return (
               <div style={{ fontSize: 10, color: COLORS.amber, background: "rgba(245,166,35,.08)", border: "1px solid rgba(245,166,35,.25)", borderRadius: 4, padding: "6px 10px" }}>
                 🔒 This trip cannot be started before its scheduled time — opens at {opensAtLabel}.
