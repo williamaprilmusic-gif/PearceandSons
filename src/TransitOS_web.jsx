@@ -4331,7 +4331,29 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           const tokenAtRequestTime = _cachedSessionToken;
           const usingToken = isJwtUsable(tokenAtRequestTime);
           if (usingToken) {
-            options = { ...options, headers: { ...options.headers, Authorization: `Bearer ${tokenAtRequestTime}` } };
+            // REAL ROOT CAUSE, found by reading supabase-js's actual current
+            // source (fetchWithAuth in packages/core/supabase-js/src/lib/
+            // fetch.ts): it constructs `init.headers` as a genuine `Headers`
+            // instance (`new Headers(init?.headers)`) before ever calling a
+            // custom `global.fetch`, and Headers does NOT expose its entries
+            // as enumerable own properties. `{ ...options.headers, ... }`
+            // therefore produced an EMPTY plain object every time this ran
+            // against a real Headers instance — silently discarding every
+            // header supabase-js had just set, including `apikey`, keeping
+            // only Authorization. Whether a given call's `options.headers`
+            // arrived as a Headers instance or a plain object (varying by
+            // internal code path — SELECT vs INSERT/UPDATE, postgrest-js's
+            // own request construction, etc.) is exactly the kind of
+            // implementation-detail-dependent split that would explain the
+            // "works for reads, intermittently fails for writes, no
+            // reliable repro via a hand-built curl request" pattern seen
+            // live today. Constructing a real Headers object here handles
+            // every possible input shape (Headers instance, plain object,
+            // array of pairs) correctly and preserves everything already
+            // set, only overriding Authorization.
+            const mergedHeaders = new Headers(options.headers);
+            mergedHeaders.set("Authorization", `Bearer ${tokenAtRequestTime}`);
+            options = { ...options, headers: mergedHeaders };
           }
           let res = await fetch(url, options);
           // Self-healing — confirmed live in production logs the day this
