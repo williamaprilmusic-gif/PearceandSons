@@ -16661,15 +16661,28 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
       return wasSuccessful ? feeRates.driver_pay_per_agent_zar : 0;
     };
     // Extra-km driver pay is a genuine TRIP-level cost (total distance
-    // driven, not attributable to one specific passenger) — attributed to
-    // only the FIRST passenger row of each trip (0 on every other row of
-    // the same trip), not repeated on every row. Deliberate, not an
-    // oversight: a naive column SUM in Excel/Sheets — exactly what an
-    // accountant will actually do — must equal the true total without
-    // needing to know to de-duplicate by trip_id first; repeating it on
-    // every row would silently multiply it by however many agents share
-    // that trip the moment someone just selects the column and sums it.
-    const tripExtraKmPay = feeRates ? tripDriverPayment(t, feeRates).perExtraKm : 0;
+    // driven once, not run once per passenger) — but per explicit
+    // follow-up request, it still needs to land as EACH agent's own real
+    // number on their own row, not sit as one lump number under a single
+    // agent while the others on the same trip show zero (an earlier
+    // version of this fix did exactly that, and was correctly called out
+    // as still "one number for 3 agents" just relocated rather than
+    // shared). Split evenly across every agent on the trip instead, in
+    // exact integer cents so the shares always sum back to the real
+    // total — same technique this file used for Trip Fee before Trip Fee
+    // switched to full-rate-per-agent; extra-km pay stays a genuine
+    // shared trip-level cost, so splitting (not multiplying) is still the
+    // right model for it specifically. Any leftover cent from a
+    // non-cleanly-divisible split goes to the trip's LAST agent row, a
+    // fixed, deterministic rule so re-exporting the same trip always
+    // produces the same split.
+    const extraKmShareCentsByIdx = !feeRates ? null : (() => {
+      const totalCents = Math.round(tripDriverPayment(t, feeRates).perExtraKm * 100);
+      const n = agentIds.length;
+      const base = Math.floor(totalCents / n);
+      const remainder = totalCents - base * n;
+      return agentIds.map((_, i) => base + (i === n - 1 ? remainder : 0));
+    })();
     agentIds.forEach((aid, aidIdx) => {
       const agentUser = aid != null ? users?.find(u => String(u.id) === String(aid)) : null;
 
@@ -16792,7 +16805,7 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
           const feeCat = agentFeeCategory(t, aid);
           const feeAmt = agentFeeAmount(t, aid, feeRates);
           const driverPayPerAgent = agentDriverPayShare(aid);
-          const driverPayExtraKm = aidIdx === 0 ? tripExtraKmPay : 0;
+          const driverPayExtraKm = extraKmShareCentsByIdx[aidIdx] / 100;
           categoryTotals[feeCat].count += 1;
           categoryTotals[feeCat].fee += feeAmt;
           categoryTotals[feeCat].driverPay += driverPayPerAgent;
