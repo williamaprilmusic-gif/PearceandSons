@@ -20,7 +20,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # jsdom 30's bundled undici needs newer Node internals than 20
+          # provides (webidl.util.markAsUncloneable is missing there),
+          # which makes `npm test` fail on Node 20 with a real 32/32-passing
+          # suite. Node 22 (current LTS) has it — confirmed locally.
+          node-version: 22
           cache: npm
 
       - run: npm ci
