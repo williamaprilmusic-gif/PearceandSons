@@ -17430,16 +17430,58 @@ class AppErrorBoundary extends React.Component {
     // and a failed report must never prevent that.
     try {
       if (supabase) {
+        const message = error?.message || String(error);
+        const createdAt = nowEpoch();
         supabase.from("client_errors").insert({
-          userid: readStoredActiveUserId(), message: error?.message || String(error),
+          userid: readStoredActiveUserId(), message,
           stack: error?.stack || null, componentstack: info?.componentStack || null,
-          url: window.location.href, useragent: navigator.userAgent, createdat: nowEpoch(),
+          url: window.location.href, useragent: navigator.userAgent, createdat: createdAt,
         }).then(() => {}, () => {});
-        insertNotification({
-          type: "APP_CRASH", for_roles: [ROLE.ADMIN],
-          message: `⚠ App crash: ${error?.message || String(error)}`,
-          ts: nowEpoch(), read: false,
-        }).catch(() => {});
+        // Targeted at real admin user ids (for_user_ids), not a for_roles
+        // broadcast — insertNotification only sends a real push for
+        // targeted user ids (userid: null broadcasts are filtered out of
+        // pushTargets, see its own comment), so the old broadcast-only
+        // version of this call never actually reached anyone's phone.
+        // Falls back to the broadcast if the lookup fails (e.g. crash
+        // happened pre-login, no valid session to read `users` with yet).
+        supabase.from("users").select("id").eq("role", ROLE.ADMIN).then(
+          ({ data: admins }) => {
+            const adminIds = (admins || []).map(a => a.id);
+            insertNotification({
+              type: "APP_CRASH",
+              ...(adminIds.length ? { for_user_ids: adminIds } : { for_roles: [ROLE.ADMIN] }),
+              message: `⚠ App crash: ${message}`,
+              ts: nowEpoch(), read: false,
+            }).catch(() => {});
+          },
+          () => {
+            insertNotification({
+              type: "APP_CRASH", for_roles: [ROLE.ADMIN],
+              message: `⚠ App crash: ${message}`,
+              ts: nowEpoch(), read: false,
+            }).catch(() => {});
+          }
+        );
+        // Escalation on top of the push above: a dedicated email alert via
+        // the crash-alert edge function, since push depends on some admin
+        // device already holding a live subscription — not guaranteed —
+        // while email always reaches someone. Throttled per browser
+        // session by error message (not per crash occurrence), so a
+        // render loop re-throwing the same error can't spam the inbox;
+        // the DB row and in-app notification above stay unthrottled since
+        // those are just records, not interruptions.
+        const alertKey = "transitos_crash_alerted_" + message.slice(0, 120);
+        let alreadyAlerted = false;
+        try { alreadyAlerted = sessionStorage.getItem(alertKey) === "1"; } catch (e) {}
+        if (!alreadyAlerted && SUPABASE_URL) {
+          try { sessionStorage.setItem(alertKey, "1"); } catch (e) {}
+          fetch(`${SUPABASE_URL}/functions/v1/crash-alert`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message, created_at: createdAt, url: window.location.href }),
+            signal: AbortSignal.timeout(15000),
+          }).catch(() => {});
+        }
       }
     } catch (e) { /* best-effort — never let crash reporting itself throw */ }
   }

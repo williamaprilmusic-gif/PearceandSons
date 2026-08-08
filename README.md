@@ -57,6 +57,8 @@ Push to `main` — Vercel auto-deploys. `.github/workflows/ci.yml` runs build/li
 
 Client-side crash reporting exists in two layers, both active without any setup: `AppErrorBoundary` (render errors) and `dispatch`'s catch block (failed Supabase actions — RLS denials, network errors) in `TransitOS_web.jsx` both write to the `client_errors` table and notify admins in-app. Optionally, both also report to Sentry (`@sentry/react`) if `VITE_SENTRY_DSN` is set as a Vercel env var — inert otherwise. To enable it: sign up for Sentry's free tier, create a React project, and add its DSN as `VITE_SENTRY_DSN` in Vercel's project settings, then redeploy.
 
+`AppErrorBoundary` specifically escalates further: it targets the in-app notification at real admin user ids (not a role broadcast) so it actually fires a push to admin devices, and also calls the `crash-alert` edge function to send an email via Resend — throttled per browser session per error message so a crash loop can't spam the inbox. `crash-alert` requires a matching `client_errors` row to already exist (anti-forgery, same pattern as `send-push-notification`) before it'll send anything, so it can't be triggered by an arbitrary direct POST.
+
 ## Things that aren't obvious from the code alone
 
 - **Two separate "money" concepts, kept deliberately apart everywhere**: Trip Fee (billed to the client, per agent, by that agent's own outcome on the trip) and Driver Payment (paid to the driver, reference-only). Never conflate the two — see `agentFeeAmount`/`tripDriverPayment` in `TransitOS_web.jsx`.

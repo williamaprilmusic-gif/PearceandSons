@@ -75,6 +75,7 @@ module.exports = [
         CustomEvent: "readonly",
         Headers: "readonly",
         DOMParser: "readonly",
+        AbortSignal: "readonly",
         Notification_: "readonly",
       },
     },
