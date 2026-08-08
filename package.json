@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.50.0",
@@ -23,6 +24,8 @@
     "eslint": "^9.39.5",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "vite": "^8.1.1"
+    "jsdom": "^30.0.1",
+    "vite": "^8.1.1",
+    "vitest": "^4.1.10"
   }
 }

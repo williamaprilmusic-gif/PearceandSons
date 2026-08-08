@@ -1,0 +1,39 @@
+name: CI
+
+# Runs on every push and PR against main — the "does it break" gate.
+# This has real precedent: several fixes this project shipped needed a
+# second pass specifically because a build-breaking mistake (a missing
+# `export`, a stray reference to a moved component) only surfaced when
+# `npm run build` was actually run. This catches that automatically,
+# before Vercel's own deploy-on-push does the same thing live.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Lint
+        # Real bug-catching rules (no-undef, react-hooks/rules-of-hooks)
+        # are errors and fail CI; missing-hook-dependency warnings do not
+        # — those need individual judgment, not a blind fix, so they're
+        # surfaced in the log but don't block a merge on their own.
+        run: npm run lint
+
+      - name: Test
+        run: npm test
