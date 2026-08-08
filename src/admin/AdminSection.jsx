@@ -73,7 +73,7 @@ import {
   supabase,
   tomtomTrafficIncidents,
   tripDriverPayment,
-  tripFeeAmount,
+  tripTotalFeeAmount,
   tripNoShowRisk,
   tripNoun,
   tripNounCap,
@@ -2531,13 +2531,17 @@ function AdminProfileSearch({ state, user, dispatch }) {
   // On-screen totals — per explicit request ("the finance admin side
   // still doesn't capture the total of the trip per agent and also the
   // total trip cost"). These figures already existed, correctly computed,
-  // inside the CSV's trailing TOTAL row (tripFeeAmount/tripDriverPayment,
-  // same as exportTripsToCsv) — but were never actually shown anywhere on
-  // screen, only reachable by downloading and opening the export. De-dupe
+  // inside the CSV's trailing GRAND TOTAL row (tripTotalFeeAmount/
+  // tripDriverPayment, same as exportTripsToCsv) — but were never
+  // actually shown anywhere on screen, only reachable by downloading and
+  // opening the export. De-dupe
   // by trip_id first (same convention the CSV total row already uses) so
   // a multi-passenger trip's fee/pay isn't counted once per passenger row.
+  // tripTotalFeeAmount already sums every agent's own outcome-based share
+  // for a trip (see its own comment) — this matches the CSV export's
+  // grand total exactly, both now built on the same per-agent model.
   const uniqueTripsForTotal = Array.from(new Map(allTrips.map(t => [t.trip_id, t])).values());
-  const totalTripFee = state.fee_rates ? uniqueTripsForTotal.reduce((sum, t) => sum + (tripFeeAmount(t, state.fee_rates) || 0), 0) : null;
+  const totalTripFee = state.fee_rates ? uniqueTripsForTotal.reduce((sum, t) => sum + (tripTotalFeeAmount(t, state.fee_rates) || 0), 0) : null;
   const totalDriverPay = state.fee_rates ? uniqueTripsForTotal.reduce((sum, t) => sum + (tripDriverPayment(t, state.fee_rates)?.total || 0), 0) : null;
 
   return (
@@ -2941,13 +2945,13 @@ function AdminHistory({ state, user, dispatch }) {
         const filteredResults = results.filter(t => (t.is_exception ? showException : showNormal));
         // On-screen totals — per explicit request ("the finance admin
         // side still doesn't capture... the total trip cost"). Same
-        // figures the CSV's trailing TOTAL row already computes
-        // (tripFeeAmount/tripDriverPayment), de-duped by trip_id first so
-        // a multi-passenger trip's fee/pay isn't counted once per
-        // passenger row — just never previously surfaced anywhere
-        // outside the downloaded export itself.
+        // figures the CSV's trailing GRAND TOTAL row already computes
+        // (tripTotalFeeAmount/tripDriverPayment — each agent billed by
+        // their own outcome on the trip, summed), de-duped by trip_id
+        // first so a multi-passenger trip's fee/pay isn't counted once
+        // per passenger row.
         const uniqueFilteredTrips = Array.from(new Map(filteredResults.map(t => [t.trip_id, t])).values());
-        const totalTripFee = state.fee_rates ? uniqueFilteredTrips.reduce((sum, t) => sum + (tripFeeAmount(t, state.fee_rates) || 0), 0) : null;
+        const totalTripFee = state.fee_rates ? uniqueFilteredTrips.reduce((sum, t) => sum + (tripTotalFeeAmount(t, state.fee_rates) || 0), 0) : null;
         const totalDriverPay = state.fee_rates ? uniqueFilteredTrips.reduce((sum, t) => sum + (tripDriverPayment(t, state.fee_rates)?.total || 0), 0) : null;
         return (
         <>

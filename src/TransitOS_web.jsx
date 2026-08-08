@@ -16444,15 +16444,25 @@ export function exceptionLabel(t) {
   return labels.join(" + ");
 }
 
-// Precedence when more than one billing category applies to the same
-// trip: ARCHIVED_CANCELLED (late cancellation) means the trip never
-// actually ran, so it's mutually exclusive with the others by
+// Per-AGENT billing category — found broken via a direct user report
+// (2026-08-08): this used to be computed once per TRIP, so if 2 agents
+// shared a ride and only 1 no-showed, the ENTIRE trip — including the
+// agent who actually completed it — got billed at the No-Show rate.
+// Per explicit decision, each agent is now billed by their OWN outcome:
+// no_shows carries real per-agent data (individual agent_id entries), so
+// that check is now scoped to THIS agent specifically. late_booking and
+// late_cancellation stay whole-trip properties (no per-agent data exists
+// for "was this specific agent added to the trip late" — a trip is
+// booked as one event; only the per-passenger PICKUP/DROPOFF outcome —
+// no-show — is genuinely individual), so those two still apply uniformly
+// to every agent on the trip. Precedence when more than one category
+// could apply: ARCHIVED_CANCELLED (late cancellation) means the trip
+// never actually ran, so it's mutually exclusive with the others by
 // construction (only a LATE cancellation gets archived — an on-time one
-// deletes cleanly, never reaching this state). A completed trip that was
-// both booked late AND had a no-show is billed as a no-show — the more
-// consequential outcome — rather than double-counted or picking one
-// arbitrarily.
-function tripFeeCategory(t) {
+// deletes cleanly, never reaching this state). This agent being booked
+// late AND no-showing is billed as a no-show — the more consequential
+// outcome — rather than double-counted or picking one arbitrarily.
+export function agentFeeCategory(t, aid) {
   // Fee category is only meaningful for a RESOLVED trip — per explicit
   // decision, an active/unresolved trip (still UNASSIGNED_BOOKING,
   // ASSIGNED, DRIVER_CONFIRMED, or IN_TRANSIT) must not count toward any
@@ -16462,13 +16472,14 @@ function tripFeeCategory(t) {
   const isResolved = t.state === TRIP_STATE.ARCHIVED_COMPLETED || t.state === TRIP_STATE.ARCHIVED_CANCELLED;
   if (!isResolved) return "pending";
   if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) return "late_cancellation";
-  if (t.no_shows && t.no_shows.length > 0) return "no_show";
+  const thisAgentNoShow = aid != null && (t.no_shows || []).some(ns => String(ns.agent_id) === String(aid));
+  if (thisAgentNoShow) return "no_show";
   if (t.late_booking_flag) return "late_booking";
   return "normal";
 }
-export function tripFeeAmount(t, feeRates) {
+export function agentFeeAmount(t, aid, feeRates) {
   if (!feeRates) return null;
-  const cat = tripFeeCategory(t);
+  const cat = agentFeeCategory(t, aid);
   // Pending (unresolved) trips contribute 0, not null — callers
   // (exportTripsToCsv's row-push calls .toFixed() on this directly, and
   // the on-screen totals sum it) both rely on a real number here, and 0
@@ -16480,9 +16491,23 @@ export function tripFeeAmount(t, feeRates) {
     : cat === "late_booking" ? feeRates.late_booking_zar
     : feeRates.normal_zar;
 }
+// Trip's true total revenue — the FULL category rate billed to EACH
+// agent on the trip, summed (not one flat fee divided across however
+// many agents share the ride). Per explicit decision (2026-08-08),
+// matching how driver pay already works: more passengers sharing a trip
+// means more revenue for that trip, not the same revenue split thinner.
+// Used for on-screen "TOTAL TRIP COST" summaries; the CSV's own grand
+// total is a plain sum of its already-correct per-row amounts, so it
+// doesn't need to call this separately, but the two always agree.
+export function tripTotalFeeAmount(t, feeRates) {
+  if (!feeRates) return null;
+  const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
+  return agentIds.reduce((sum, aid) => sum + (agentFeeAmount(t, aid, feeRates) || 0), 0);
+}
 
 // Driver payment reference — what Pearce & Sons pays the DRIVER for this trip,
-// distinct from tripFeeAmount above (what's billed TO the client). Only
+// distinct from agentFeeAmount/tripTotalFeeAmount above (what's billed TO
+// the client). Only
 // defined for a genuinely completed trip — "per agent SUCCESSFUL trip"
 // means an agent actually transported, not merely booked, so a cancelled
 // or still-in-progress trip earns nothing here (yet). Agent count prefers
@@ -16605,26 +16630,46 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
     return entries.map(a => `${a.username} — ${a.actionType}${a.details ? ` (${a.details})` : ""} @ ${fmtTs(a.timestamp)}`).join(" | ");
   };
 
+  // Category subtotals + grand totals, accumulated as real rows are built
+  // below — an accountant-usable export means every number an accountant
+  // will actually compute (select the Trip Fee column, hit SUM; select
+  // Driver Pay - Per Agent, hit SUM) must equal these totals with no
+  // hidden dedup-by-trip-id step required, unlike the old per-trip-
+  // aggregate design this replaced.
+  const categoryOrder = ["normal", "late_booking", "late_cancellation", "no_show", "pending"];
+  const categoryLabel = { normal: "Normal", late_booking: "Late Booking", late_cancellation: "Late Cancellation", no_show: "No Show", pending: "Pending" };
+  const categoryTotals = feeRates ? Object.fromEntries(categoryOrder.map(c => [c, { count: 0, fee: 0, driverPay: 0 }])) : null;
+  let grandTotalFee = 0, grandTotalDriverPayPerAgent = 0, grandTotalDriverPayExtraKm = 0;
+
   const rows = [];
   trips.forEach(t => {
     // One row per passenger — each has their own pickup/dropoff address,
     // timing, and GPS location even on a shared multi-passenger trip.
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
-    // Per-agent Trip Fee shares, computed once per trip in integer cents so
-    // they always sum EXACTLY back to the trip's real fee — a naive
-    // (fee / agentIds.length).toFixed(2) done independently per row can be
-    // off by a cent overall on a non-cleanly-divisible split (e.g. R50÷3 =
-    // R16.67×3 = R50.01), found via a security/correctness audit. Any
-    // leftover cent(s) from the division go to the trip's LAST agent row,
-    // a fixed, deterministic rule so re-exporting the same trip always
-    // produces the same split.
-    const feeShareCentsByIdx = !feeRates ? null : (() => {
-      const totalCents = Math.round(tripFeeAmount(t, feeRates) * 100);
-      const n = agentIds.length;
-      const base = Math.floor(totalCents / n);
-      const remainder = totalCents - base * n;
-      return agentIds.map((_, i) => base + (i === n - 1 ? remainder : 0));
-    })();
+    // Driver Pay - Per Agent: each successfully-dropped-off agent's own
+    // flat share (driver_pay_per_agent_zar), 0 for a no-show. Found
+    // broken via a direct user report: this used to show
+    // tripDriverPayment().perAgent — the driver's payment SUMMED ACROSS
+    // EVERY agent on the trip — repeated identically on every passenger's
+    // row, so a 3-agent trip showed the same 3x-inflated number against
+    // each individual agent.
+    const successfulDropoffAgentIds = (t.completed_dropoffs && t.completed_dropoffs.length > 0)
+      ? new Set(t.completed_dropoffs.map(String)) : null;
+    const agentDriverPayShare = (aid) => {
+      if (!feeRates || t.state !== TRIP_STATE.ARCHIVED_COMPLETED || aid == null) return 0;
+      const wasSuccessful = successfulDropoffAgentIds ? successfulDropoffAgentIds.has(String(aid)) : true;
+      return wasSuccessful ? feeRates.driver_pay_per_agent_zar : 0;
+    };
+    // Extra-km driver pay is a genuine TRIP-level cost (total distance
+    // driven, not attributable to one specific passenger) — attributed to
+    // only the FIRST passenger row of each trip (0 on every other row of
+    // the same trip), not repeated on every row. Deliberate, not an
+    // oversight: a naive column SUM in Excel/Sheets — exactly what an
+    // accountant will actually do — must equal the true total without
+    // needing to know to de-duplicate by trip_id first; repeating it on
+    // every row would silently multiply it by however many agents share
+    // that trip the moment someone just selects the column and sums it.
+    const tripExtraKmPay = feeRates ? tripDriverPayment(t, feeRates).perExtraKm : 0;
     agentIds.forEach((aid, aidIdx) => {
       const agentUser = aid != null ? users?.find(u => String(u.id) === String(aid)) : null;
 
@@ -16735,48 +16780,74 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         delaySummary(t.trip_id),
         auditSummary(t.trip_id),
         t.admin_note || "",
-        // Trip Fee — split across every agent merged onto this trip (in
-        // exact integer cents, see feeShareCentsByIdx above), so each
-        // passenger row shows only THAT agent's own share, not the full
-        // trip total repeated on every row (was flagged by the user as
-        // confusing — the whole trip's cost looked like it belonged to
-        // each individual agent). The TOTAL row below still sums
-        // tripFeeAmount() directly per unique trip (not by summing these
-        // per-row shares), so it's unaffected by this split either way.
-        ...(feeRates ? [
-          { late_cancellation: "Late Cancellation", no_show: "No Show", late_booking: "Late Booking", normal: "Normal", pending: "Pending" }[tripFeeCategory(t)],
-          (feeShareCentsByIdx[aidIdx] / 100).toFixed(2),
-          // Driver payment — same per-trip value repeats on every passenger
-          // row (matches the Trip Fee convention above); the TOTAL row sums
-          // per unique trip, never per row.
-          tripDriverPayment(t, feeRates).perAgent.toFixed(2),
-          tripDriverPayment(t, feeRates).perExtraKm.toFixed(2),
-          tripDriverPayment(t, feeRates).total.toFixed(2),
-        ] : []),
+        // Trip Fee — billed at THIS agent's own outcome for this trip
+        // (per explicit decision, 2026-08-08): a no-show agent bills at
+        // the No Show rate, a normally-completed agent at Normal, etc.,
+        // independent of what happened to any other agent sharing the
+        // same ride. Each row is this agent's real, complete, defensible
+        // amount — not a fraction of a shared pool — so summing this
+        // column directly gives the correct grand total with no special
+        // handling needed.
+        ...(feeRates ? (() => {
+          const feeCat = agentFeeCategory(t, aid);
+          const feeAmt = agentFeeAmount(t, aid, feeRates);
+          const driverPayPerAgent = agentDriverPayShare(aid);
+          const driverPayExtraKm = aidIdx === 0 ? tripExtraKmPay : 0;
+          categoryTotals[feeCat].count += 1;
+          categoryTotals[feeCat].fee += feeAmt;
+          categoryTotals[feeCat].driverPay += driverPayPerAgent;
+          grandTotalFee += feeAmt;
+          grandTotalDriverPayPerAgent += driverPayPerAgent;
+          grandTotalDriverPayExtraKm += driverPayExtraKm;
+          return [
+            categoryLabel[feeCat],
+            feeAmt.toFixed(2),
+            driverPayPerAgent.toFixed(2),
+            driverPayExtraKm.toFixed(2),
+            (driverPayPerAgent + driverPayExtraKm).toFixed(2),
+          ];
+        })() : []),
       ]);
     });
   });
 
   if (feeRates) {
-    // Sum per UNIQUE trip_id, not per row — a multi-passenger trip's fee
-    // must only be counted once even though it appears on several rows.
-    const seenTripIds = new Set();
-    let totalFee = 0;
-    let totalDriverPay = 0;
-    trips.forEach(t => {
-      if (seenTripIds.has(t.trip_id)) return;
-      seenTripIds.add(t.trip_id);
-      totalFee += tripFeeAmount(t, feeRates);
-      totalDriverPay += tripDriverPayment(t, feeRates).total;
-    });
-    const blankRow = headers.map(() => "");
-    const totalRow = headers.map(() => "");
     // Column order (see headers above): Fee Category, Trip Fee (ZAR),
     // Driver Pay - Per Agent, Driver Pay - Extra KM, Driver Pay - Total.
-    totalRow[headers.length - 5] = "TOTAL";
-    totalRow[headers.length - 4] = totalFee.toFixed(2);
-    totalRow[headers.length - 1] = totalDriverPay.toFixed(2);
-    rows.push(blankRow, totalRow);
+    const feeCatColIdx = headers.length - 5;
+    const feeColIdx = headers.length - 4;
+    const driverPayAgentColIdx = headers.length - 3;
+    const driverPayTotalColIdx = headers.length - 1;
+
+    const blankRow = headers.map(() => "");
+    rows.push(blankRow);
+
+    // Per-category subtotals — lets an accountant reconcile "how much
+    // revenue came from no-shows this period" etc. without re-deriving it
+    // by hand. Driver-Pay-Extra-KM is deliberately left blank here (it's
+    // a route-distance cost, not tied to fee category — mixing it into
+    // this breakdown would be misleading); it only appears in the grand
+    // total below.
+    categoryOrder.forEach(cat => {
+      const { count, fee, driverPay } = categoryTotals[cat];
+      if (count === 0) return;
+      const subtotalRow = headers.map(() => "");
+      subtotalRow[0] = `SUBTOTAL — ${categoryLabel[cat]} (${count} agent${count !== 1 ? "s" : ""})`;
+      subtotalRow[feeCatColIdx] = categoryLabel[cat];
+      subtotalRow[feeColIdx] = fee.toFixed(2);
+      subtotalRow[driverPayAgentColIdx] = driverPay.toFixed(2);
+      rows.push(subtotalRow);
+    });
+
+    const grandTotalDriverPay = grandTotalDriverPayPerAgent + grandTotalDriverPayExtraKm;
+    const totalRow = headers.map(() => "");
+    totalRow[0] = "GRAND TOTAL";
+    totalRow[feeCatColIdx] = "TOTAL";
+    totalRow[feeColIdx] = grandTotalFee.toFixed(2);
+    totalRow[driverPayAgentColIdx] = grandTotalDriverPayPerAgent.toFixed(2);
+    totalRow[driverPayAgentColIdx + 1] = grandTotalDriverPayExtraKm.toFixed(2);
+    totalRow[driverPayTotalColIdx] = grandTotalDriverPay.toFixed(2);
+    rows.push(totalRow);
   }
 
   // BOM prefix so Excel opens UTF-8 CSVs correctly.
