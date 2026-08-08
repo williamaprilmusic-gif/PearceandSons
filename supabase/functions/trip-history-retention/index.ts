@@ -206,6 +206,12 @@ Deno.serve(async (req) => {
         from: FROM, to: [TO], subject, html,
         attachments: [{ filename: csvFilename, content: csvBase64 }],
       }),
+      // ADDED (2026-08-08, improvement audit): no explicit timeout meant
+      // a hung Resend call relied entirely on the platform's own
+      // function timeout — worth being explicit here specifically since
+      // a stuck call mid-loop would also stall every remaining backlog
+      // day this run was about to process.
+      signal: AbortSignal.timeout(20000),
     });
     const resendBody = await resendRes.json();
 

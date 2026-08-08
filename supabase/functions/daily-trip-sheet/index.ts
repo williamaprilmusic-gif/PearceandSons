@@ -271,6 +271,10 @@ serve(async (req) => {
       from: FROM, to: [TO], subject, html,
       attachments: [{ filename: csvFilename, content: csvBase64 }],
     }),
+    // ADDED (2026-08-08, improvement audit): no explicit timeout meant a
+    // hung Resend call relied entirely on the platform's own function
+    // timeout to eventually kill it.
+    signal: AbortSignal.timeout(20000),
   });
 
   const resendBody = await resendRes.json();

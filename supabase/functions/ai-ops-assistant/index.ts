@@ -114,6 +114,26 @@ Deno.serve(async (req) => {
     if (!caller || caller.role !== "ADMIN" || !["FLEET_OPS", "STANDARD"].includes(caller.adminlevel)) {
       return json({ ok: false, error: "This assistant is only available to Fleet Ops/Standard admins." }, 403);
     }
+
+    // Rate limit — ADDED (2026-08-08, improvement audit): every call here
+    // spends real Gemini API quota/cost, unlike most of this project's
+    // other endpoints, and this one previously had no cooldown at all
+    // (session-login/webauthn have login_attempts-based lockout; this had
+    // nothing). A simple per-user minimum gap, not a full daily cap — see
+    // the check_and_record_ai_assistant_call migration's own comment for
+    // why this is proportionate for a small internal admin tool.
+    const { data: rateLimitRows, error: rateLimitErr } = await supabase.rpc("check_and_record_ai_assistant_call", {
+      p_user_id: callerId, p_now_ms: Date.now(), p_min_gap_ms: 3000,
+    });
+    if (rateLimitErr) {
+      console.error("[ai-ops-assistant] rate-limit check failed:", rateLimitErr.message);
+      // Fail OPEN, not closed — a broken rate-limit check must never be
+      // the reason a legitimate admin can't use the assistant.
+    } else if (rateLimitRows?.[0] && !rateLimitRows[0].allowed) {
+      const retrySec = Math.ceil((rateLimitRows[0].retry_after_ms ?? 0) / 1000);
+      return json({ ok: false, error: `Please wait ${retrySec}s before asking another question.` }, 429);
+    }
+
     if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured — add it as an edge function secret.");
 
     const { question, history } = await req.json();
@@ -136,16 +156,21 @@ Deno.serve(async (req) => {
     // tickets, and current driver/vehicle state — capped row counts so a
     // busy fleet day can't balloon the prompt size or cost.
     const nowMs = Date.now();
+    // .abortSignal on every query — ADDED (2026-08-08, improvement
+    // audit): none of these had an explicit timeout, compounding the
+    // same "relies entirely on the platform timeout" gap as the Gemini
+    // call below if Postgres is ever slow to respond.
     const [tripsRes, driverStatusRes, ticketsRes, maintRes, usersRes] = await Promise.all([
       supabase.from("trips")
         .select("id, status, scheduleddate, scheduledtimestr, direction, agentid, extraagentids, driverid, latebookingflag, longdistanceflag, driverrouteexceedspolicy, noshows, dispute")
         .not("status", "in", "(ARCHIVED_COMPLETED,ARCHIVED_CANCELLED)")
         .order("scheduleddate", { ascending: true })
-        .limit(150),
-      supabase.from("driver_status").select("driverid, isonline, isaway, capacity, vehicle").limit(100),
-      supabase.from("tickets").select("agentid, category, status, createdat").eq("status", "OPEN").order("createdat", { ascending: false }).limit(50),
-      supabase.from("vehicle_maintenance_log").select("vehicleid, servicedate, servicetype").order("servicedate", { ascending: false }).limit(20),
-      supabase.from("users").select("id, fullname").limit(300),
+        .limit(150)
+        .abortSignal(AbortSignal.timeout(10000)),
+      supabase.from("driver_status").select("driverid, isonline, isaway, capacity, vehicle").limit(100).abortSignal(AbortSignal.timeout(10000)),
+      supabase.from("tickets").select("agentid, category, status, createdat").eq("status", "OPEN").order("createdat", { ascending: false }).limit(50).abortSignal(AbortSignal.timeout(10000)),
+      supabase.from("vehicle_maintenance_log").select("vehicleid, servicedate, servicetype").order("servicedate", { ascending: false }).limit(20).abortSignal(AbortSignal.timeout(10000)),
+      supabase.from("users").select("id, fullname").limit(300).abortSignal(AbortSignal.timeout(10000)),
     ]);
     const userName = (id: unknown) => (usersRes.data || []).find((u: { id: unknown }) => String(u.id) === String(id))?.fullname || String(id ?? "");
     const sast = (ms: number | null | undefined) => ms ? new Date(ms).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : null;
@@ -189,6 +214,13 @@ Answer ONLY using the JSON data snapshot in the user's message — never invent 
         ],
         generationConfig: { maxOutputTokens: 1024 },
       }),
+      // ADDED (2026-08-08, improvement audit): no explicit timeout meant
+      // a hung Gemini call relied entirely on the platform's own
+      // function-timeout to eventually kill it — this bounds it
+      // explicitly so a slow/stuck upstream call fails fast with a real
+      // error instead of leaving the admin's chat spinner stuck for the
+      // platform's full timeout window.
+      signal: AbortSignal.timeout(25000),
     });
     if (!geminiRes.ok) {
       const errBody = await geminiRes.text();

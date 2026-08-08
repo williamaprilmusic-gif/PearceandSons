@@ -204,7 +204,20 @@ Deno.serve(async (req) => {
     // same batch.
     for (const sub of subs || []) {
       try {
-        await webpush.sendNotification(sub.subscription, payload);
+        // ADDED (2026-08-08, improvement audit): web-push's
+        // sendNotification() has no built-in per-call timeout option, so
+        // a single hung push-service connection previously had no
+        // app-level bound at all — worse than the other edge functions'
+        // equivalent gap, since this call runs inside a sequential loop
+        // (deliberately not Promise.all, see the comment above), so one
+        // stuck request would stall delivery to every subscriber still
+        // waiting behind it in the same batch, not just fail gracefully
+        // for itself. Promise.race with a timeout, since the library
+        // doesn't accept an AbortSignal directly.
+        await Promise.race([
+          webpush.sendNotification(sub.subscription, payload),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("push send timed out")), 15000)),
+        ]);
         sentCount++;
       } catch (e) {
         // 404/410 from the push service means this subscription is
