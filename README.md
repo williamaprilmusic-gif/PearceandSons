@@ -42,13 +42,20 @@ npm run build     # production build (also what Vercel runs on push to main)
 npm run lint      # ESLint — real bug-catching rules (no-undef, rules-of-hooks)
                    # are errors; missing-hook-dependency warnings need individual
                    # judgment, not a blind fix — several are intentional
+npm test          # Vitest — pure business-logic unit tests (fee/pay calculations,
+                   # admin scoping, doc/vehicle expiry, driver-hours math). Imports
+                   # straight from TransitOS_web.jsx; no rendered-component tests yet.
 ```
 
-`.env` holds local secrets (Supabase URL/anon key, TomTom key, etc.) — gitignored, not `VITE_`-prefixed where it shouldn't be bundled into the client. There is no automated test suite; correctness is verified via `npm run build`, `npm run lint`, and live-testing against the real Supabase project before deploying.
+`.env` holds local secrets (Supabase URL/anon key, TomTom key, etc.) — gitignored, not `VITE_`-prefixed where it shouldn't be bundled into the client.
 
 ## Deploying
 
-Push to `main` — Vercel auto-deploys. Database migrations and edge function deploys are applied directly against the live Supabase project (ref `kwkgiylwnafwimxqmjwk`) as part of the same change, not through a separate CI pipeline; there isn't one beyond Vercel's own build-on-push.
+Push to `main` — Vercel auto-deploys. `.github/workflows/ci.yml` runs build/lint/test on every push and PR against `main` as a fail-fast gate (GitHub Actions, `ubuntu-latest`, Node 22 — Node 20 doesn't work, see the workflow's own comment). Database migrations and edge function deploys are applied directly against the live Supabase project (ref `kwkgiylwnafwimxqmjwk`) as part of the same change, not through that pipeline.
+
+## Error tracking
+
+Client-side crash reporting exists in two layers, both active without any setup: `AppErrorBoundary` (render errors) and `dispatch`'s catch block (failed Supabase actions — RLS denials, network errors) in `TransitOS_web.jsx` both write to the `client_errors` table and notify admins in-app. Optionally, both also report to Sentry (`@sentry/react`) if `VITE_SENTRY_DSN` is set as a Vercel env var — inert otherwise. To enable it: sign up for Sentry's free tier, create a React project, and add its DSN as `VITE_SENTRY_DSN` in Vercel's project settings, then redeploy.
 
 ## Things that aren't obvious from the code alone
 

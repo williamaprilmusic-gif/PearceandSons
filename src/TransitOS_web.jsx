@@ -7,6 +7,7 @@ import React, { useState, useReducer, useEffect, useRef, useCallback, lazy, Susp
 // is needed.
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import * as Sentry from "@sentry/react";
 
 /* ============================================================
    Pearce & Sons — Corporate Transport Operations Platform (Web)
@@ -10804,6 +10805,10 @@ function useAppStore() {
       // themselves; that's an explicit choice at the call site now,
       // not an accidental one baked into dispatch itself.
       setSupaError(e.message);
+      // Dispatch failures (RLS denials, network errors, bad server
+      // responses) never reach AppErrorBoundary — they're caught right
+      // here, not thrown during render — so they need their own report.
+      Sentry.captureException(e, { extra: { action_type: action?.type } });
       throw e;
     }
   }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports, fetchVehicles, fetchVehicleMaintenanceLog]);
@@ -17412,6 +17417,9 @@ class AppErrorBoundary extends React.Component {
   static getDerivedStateFromError(error) { return { error }; }
   componentDidCatch(error, info) {
     console.error("[Pearce & Sons] render error:", error, info);
+    // No-op until VITE_SENTRY_DSN is set (see main.jsx) — safe to call
+    // unconditionally either way.
+    Sentry.captureException(error, { extra: { componentStack: info?.componentStack } });
     // Previously this only went to console.error — if a driver's app
     // crashed mid-trip, nobody found out unless they manually
     // screenshotted the fallback screen and messaged someone (see that
