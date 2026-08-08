@@ -1,16 +1,27 @@
 // trip-history-retention/index.ts
 //
 // Per explicit request: the app should only keep up to 2 months of trip
-// history in the live database — anything older gets exported to a full
-// CSV and emailed via Resend (same integration daily-trip-sheet already
-// uses), THEN removed from the trips table. Runs once a day via pg_cron,
-// same CRON_AUTH_TOKEN pattern as daily-trip-sheet/check-late-start.
+// history in the live database. Processes ONE calendar day at a time —
+// per explicit follow-up request (2026-08-08): each email must be a
+// single day's trip sheet, not a bulk multi-day export. Example given:
+// if today is 31 July, the retention window is 1 June through today, so
+// the 1 June trip sheet is emailed and ONLY THEN is 1 June's data
+// deleted. Runs once a day via pg_cron, same CRON_AUTH_TOKEN pattern as
+// daily-trip-sheet/check-late-start.
 //
-// Safety property: the export must succeed BEFORE anything is deleted.
-// If the Resend send fails for any reason, this function returns an error
-// and deletes nothing — the same batch is picked up again on the next
-// scheduled run, so a transient email failure can never silently destroy
-// data that was never actually captured anywhere else.
+// Steady-state behavior: exactly one new calendar day ages past the
+// 2-month mark each day this runs, so normally this sends exactly one
+// email per run. If the job missed runs (or on the very first run after
+// this feature shipped), there may be a backlog of several days still
+// within the live DB despite being older than the cutoff — this walks
+// them oldest-first, one email + one day's deletion at a time, until
+// caught up to the 2-month window or a send/delete fails.
+//
+// Safety property per day: that day's export must succeed BEFORE that
+// day's rows are deleted. If a day's Resend send fails, processing stops
+// there — earlier days in the same run that already succeeded stay
+// deleted (already safely emailed), but this day and any older backlog
+// beyond it are left untouched and retried on the next scheduled run.
 //
 // Only ARCHIVED_COMPLETED/ARCHIVED_CANCELLED trips are ever swept — a
 // trip that's somehow still not in a terminal state 2+ months after its
@@ -26,19 +37,19 @@
 // FK note (verified against the live schema before writing this): trips
 // is referenced by messages and feedbacks with ON DELETE NO ACTION — a
 // delete on trips would fail outright if either still has matching rows,
-// so both are explicitly purged first. notifications/driver_positions/
-// driver_position_log/tickets/audit_logs/driver_status all SET NULL their
-// tripid/currenttripid automatically; trip_delays CASCADEs. All of that
-// is intentional: those tables keep their own content, they just lose the
-// now-meaningless reference to a trip that no longer exists.
+// so both are explicitly purged first, per day. notifications/
+// driver_positions/driver_position_log/tickets/audit_logs/driver_status
+// all SET NULL their tripid/currenttripid automatically; trip_delays
+// CASCADEs. All of that is intentional: those tables keep their own
+// content, they just lose the now-meaningless reference to a trip that
+// no longer exists.
 
-import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
 import { encodeBase64 } from "https://deno.land/std@0.208.0/encoding/base64.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 
 const TERMINAL_STATES = ["ARCHIVED_COMPLETED", "ARCHIVED_CANCELLED"];
 
-serve(async (req) => {
+Deno.serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
   // Same sandbox-domain constraint documented in daily-trip-sheet/index.ts
   // — Resend's onboarding@resend.dev sender can only deliver to the
@@ -82,6 +93,12 @@ serve(async (req) => {
     const dd = String(s.getUTCDate()).padStart(2, "0");
     return `${y}/${m}/${dd}`;
   };
+  const humanDate = (str: string) => {
+    const [y, m, d] = str.split("/").map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-ZA", {
+      weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC",
+    });
+  };
   const now = new Date();
   const cutoffDate = new Date(now.getTime());
   cutoffDate.setUTCMonth(cutoffDate.getUTCMonth() - 2);
@@ -105,13 +122,13 @@ serve(async (req) => {
   const rows = oldTrips ?? [];
   if (rows.length === 0) {
     console.log("Nothing older than", cutoffStr, "— nothing to export or purge.");
-    return json({ ok: true, purged: 0, cutoff: cutoffStr });
+    return json({ ok: true, cutoff: cutoffStr, days: [] });
   }
 
-  const tripIds = rows.map((t: Record<string, unknown>) => t.id);
-
   // Driver names — trips only store driverid, not a denormalized name
-  // (unlike agentname, which IS denormalized on the row already).
+  // (unlike agentname, which IS denormalized on the row already). Fetched
+  // once for every row in this run, not per-day, since the same driver
+  // can appear across multiple days' backlog.
   const driverIds = [...new Set(rows.map((t: Record<string, unknown>) => t.driverid).filter(Boolean))];
   const { data: drivers } = driverIds.length > 0
     ? await sb.from("users").select("id, fullname").in("id", driverIds)
@@ -119,16 +136,20 @@ serve(async (req) => {
   const driverMap: Record<string, string> = {};
   for (const d of (drivers ?? [])) driverMap[String(d.id)] = d.fullname;
 
-  // ── CSV export — the only remaining copy of this data once purged, so
-  // this is deliberately more complete than daily-trip-sheet's summary
-  // CSV (includes route distance, fee category is left to the dedicated
-  // financial export elsewhere; this is the operational trip record).
+  // Group by scheduleddate — rows already arrive sorted ascending by the
+  // query's own .order(), so insertion order into this Map is oldest-day-
+  // first, which is exactly the order this must process (and delete) in.
+  const byDate = new Map<string, Record<string, unknown>[]>();
+  for (const t of rows) {
+    const d = t.scheduleddate as string;
+    if (!byDate.has(d)) byDate.set(d, []);
+    byDate.get(d)!.push(t);
+  }
+
   const csvCell = (v: unknown) => {
     let s = v == null ? "" : String(v);
-    // Same CSV/formula-injection guard as every other CSV export in this
-    // app (daily-trip-sheet, the main client's escapeCsv/csvCell) — a
-    // field starting with =, +, -, or @ can be interpreted as a formula
-    // by Excel/Sheets when opened.
+    // CSV/formula-injection guard — a field starting with =, +, -, or @
+    // can be interpreted as a formula by Excel/Sheets when opened.
     if (/^[=+\-@]/.test(s)) s = "'" + s;
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
@@ -137,82 +158,95 @@ serve(async (req) => {
     "Agent", "Extra Passengers", "Driver", "Pickup", "Drop-off",
     "Route Distance (km)", "Booked At", "Completed At", "No-Shows",
   ];
-  const csvRows = rows.map((t: Record<string, unknown>) => {
-    const bookedAt = t.bookedat ? new Date(t.bookedat as number).toISOString() : "";
-    const completedAt = t.completedat ? new Date(t.completedat as number).toISOString() : "";
-    return [
-      t.id, t.scheduleddate, t.scheduledtimestr ?? "", t.status, t.direction ?? "",
-      t.agentname ?? "", ((t.extraagentids as unknown[]) ?? []).length,
-      t.driverid ? (driverMap[String(t.driverid)] ?? "Unknown") : "Unassigned",
-      t.pickuplocation ?? t.pickuplabel ?? "", t.dropofflocation ?? t.dropofflabel ?? "",
-      t.driverroutekm ?? "", bookedAt, completedAt,
-      ((t.noshows as unknown[]) ?? []).length,
-    ].map(csvCell).join(",");
-  });
-  const csvContent = "﻿" + [csvHeaders.map(csvCell).join(","), ...csvRows].join("\r\n"); // BOM for Excel
-  const oldestDate = rows[0].scheduleddate as string;
-  const newestDate = rows[rows.length - 1].scheduleddate as string;
-  const csvFilename = `trip-history_${oldestDate.replace(/\//g, "-")}_to_${newestDate.replace(/\//g, "-")}.csv`;
-  const csvBase64 = encodeBase64(new TextEncoder().encode(csvContent));
 
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+  const dayResults: { date: string; exported: number; purged: number; resendId?: string; error?: string }[] = [];
+
+  for (const [date, dayRows] of byDate) {
+    const dayTripIds = dayRows.map((t: Record<string, unknown>) => t.id);
+
+    const csvRows = dayRows.map((t: Record<string, unknown>) => {
+      const bookedAt = t.bookedat ? new Date(t.bookedat as number).toISOString() : "";
+      const completedAt = t.completedat ? new Date(t.completedat as number).toISOString() : "";
+      return [
+        t.id, t.scheduleddate, t.scheduledtimestr ?? "", t.status, t.direction ?? "",
+        t.agentname ?? "", ((t.extraagentids as unknown[]) ?? []).length,
+        t.driverid ? (driverMap[String(t.driverid)] ?? "Unknown") : "Unassigned",
+        t.pickuplocation ?? t.pickuplabel ?? "", t.dropofflocation ?? t.dropofflabel ?? "",
+        t.driverroutekm ?? "", bookedAt, completedAt,
+        ((t.noshows as unknown[]) ?? []).length,
+      ].map(csvCell).join(",");
+    });
+    const csvContent = "﻿" + [csvHeaders.map(csvCell).join(","), ...csvRows].join("\r\n"); // BOM for Excel
+    const csvFilename = `trip-sheet_${date.replace(/\//g, "-")}.csv`;
+    const csvBase64 = encodeBase64(new TextEncoder().encode(csvContent));
+
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="background:#0d0d0d;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:0">
 <div style="max-width:640px;margin:0 auto;padding:24px 16px">
   <div style="background:#1a1a1a;border-radius:8px;padding:20px 24px;margin-bottom:20px;border-left:4px solid #f5a623">
-    <h1 style="margin:0 0 4px;font-size:20px;color:#fff">🗄 Trip History Retention Sweep</h1>
+    <h1 style="margin:0 0 4px;font-size:20px;color:#fff">🗄 Trip Sheet Archive — ${humanDate(date)}</h1>
     <p style="margin:0;font-size:13px;color:#888">Generated ${now.toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" })} SAST</p>
   </div>
   <p style="font-size:13px;line-height:1.6">
-    <strong style="color:#f5a623">${rows.length}</strong> trip${rows.length !== 1 ? "s" : ""} scheduled between
-    <strong>${oldestDate}</strong> and <strong>${newestDate}</strong> (older than the app's 2-month retention window)
-    ${rows.length !== 1 ? "have" : "has"} been exported to the attached CSV and permanently removed from the app.
+    <strong style="color:#f5a623">${dayRows.length}</strong> trip${dayRows.length !== 1 ? "s" : ""} scheduled on
+    <strong>${date}</strong> — this is the oldest day still in the app, now past the 2-month retention window.
+    ${dayRows.length !== 1 ? "They have" : "It has"} been exported to the attached CSV and will be permanently removed from the app immediately after this email is sent successfully.
   </p>
-  <p style="font-size:12px;color:#666">This is the only remaining copy of this data — keep this email/attachment somewhere durable.</p>
+  <p style="font-size:12px;color:#666">This is the only remaining copy of this day's trip data — keep this email/attachment somewhere durable.</p>
 </div></body></html>`;
 
-  const subject = `🗄 Trip History Retention — ${rows.length} trip${rows.length !== 1 ? "s" : ""} archived out (${oldestDate} to ${newestDate})`;
+    const subject = `🗄 Trip Sheet Archive — ${date} (${dayRows.length} trip${dayRows.length !== 1 ? "s" : ""}) — exported and removed`;
 
-  console.log("Sending retention export:", subject);
+    console.log("Sending retention export for", date, "—", dayRows.length, "trips.");
 
-  const resendRes = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: FROM, to: [TO], subject, html,
-      attachments: [{ filename: csvFilename, content: csvBase64 }],
-    }),
-  });
-  const resendBody = await resendRes.json();
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: FROM, to: [TO], subject, html,
+        attachments: [{ filename: csvFilename, content: csvBase64 }],
+      }),
+    });
+    const resendBody = await resendRes.json();
 
-  if (!resendRes.ok) {
-    console.error("Resend failed:", resendRes.status, JSON.stringify(resendBody));
-    // Deliberately no deletion below this point — see header comment.
-    return json({ error: `Resend ${resendRes.status}: ${JSON.stringify(resendBody)}`, purged: 0 }, 500);
+    if (!resendRes.ok) {
+      console.error("Resend failed for", date, ":", resendRes.status, JSON.stringify(resendBody));
+      // Deliberately no deletion for this day or any older backlog beyond
+      // it — see header comment. Days already processed earlier in this
+      // same loop stay deleted (already safely emailed); stop here.
+      dayResults.push({ date, exported: dayRows.length, purged: 0, error: `Resend ${resendRes.status}` });
+      break;
+    }
+
+    // ── Purge this day only — reachable only after this day's export
+    // succeeded. Explicit deletes first for the two NO ACTION foreign
+    // keys (messages, feedbacks); everything else SET NULLs/CASCADEs
+    // automatically once the trips rows themselves are deleted.
+    const { error: msgDelErr } = await sb.from("messages").delete().in("tripid", dayTripIds);
+    if (msgDelErr) {
+      console.error("Failed to purge messages for", date, "(trip rows NOT deleted, will retry next run):", msgDelErr.message);
+      dayResults.push({ date, exported: dayRows.length, purged: 0, resendId: resendBody.id, error: "purge messages failed" });
+      break;
+    }
+    const { error: fbDelErr } = await sb.from("feedbacks").delete().in("tripid", dayTripIds);
+    if (fbDelErr) {
+      console.error("Failed to purge feedbacks for", date, "(trip rows NOT deleted, will retry next run):", fbDelErr.message);
+      dayResults.push({ date, exported: dayRows.length, purged: 0, resendId: resendBody.id, error: "purge feedbacks failed" });
+      break;
+    }
+    const { error: tripDelErr } = await sb.from("trips").delete().in("id", dayTripIds);
+    if (tripDelErr) {
+      console.error("Failed to purge trips for", date, "after successful export (messages/feedbacks for these ids are already gone):", tripDelErr.message);
+      dayResults.push({ date, exported: dayRows.length, purged: 0, resendId: resendBody.id, error: "purge trips failed" });
+      break;
+    }
+
+    console.log(`Purged ${dayTripIds.length} trips for ${date} after successful export.`);
+    dayResults.push({ date, exported: dayRows.length, purged: dayTripIds.length, resendId: resendBody.id });
   }
-  console.log("Export email sent, Resend id:", resendBody.id, "— proceeding to purge", tripIds.length, "trips.");
 
-  // ── Purge — only reachable after a confirmed-successful export above.
-  // Explicit deletes first for the two NO ACTION foreign keys (messages,
-  // feedbacks); everything else SET NULLs/CASCADEs automatically once the
-  // trips rows themselves are deleted.
-  const { error: msgDelErr } = await sb.from("messages").delete().in("tripid", tripIds);
-  if (msgDelErr) {
-    console.error("Failed to purge messages for old trips (trips NOT deleted, will retry next run):", msgDelErr.message);
-    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
-  }
-  const { error: fbDelErr } = await sb.from("feedbacks").delete().in("tripid", tripIds);
-  if (fbDelErr) {
-    console.error("Failed to purge feedbacks for old trips (trips NOT deleted, will retry next run):", fbDelErr.message);
-    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
-  }
-  const { error: tripDelErr } = await sb.from("trips").delete().in("id", tripIds);
-  if (tripDelErr) {
-    console.error("Failed to purge trips after successful export (messages/feedbacks for these ids are already gone):", tripDelErr.message);
-    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
-  }
-
-  console.log(`Purged ${tripIds.length} trips after successful export.`);
-  return json({ ok: true, exported: rows.length, purged: tripIds.length, cutoff: cutoffStr, resendId: resendBody.id });
+  const totalPurged = dayResults.reduce((n, d) => n + d.purged, 0);
+  return json({ ok: true, cutoff: cutoffStr, days: dayResults, totalPurged });
 });
 
 function json(data: unknown, status = 200): Response {
