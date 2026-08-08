@@ -4352,17 +4352,28 @@ const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY)
           // fresh login in another tab) while this now-stale request was
           // still in flight.
           //
-          // Retry once before acting on a 401 — found live: a token that
-          // had JUST minted a successful login (proving it's genuinely
-          // valid) could still see the very next write get a single 401,
-          // then work fine again moments later on an unrelated request.
-          // That's a transient blip, not proof the token itself is bad —
-          // but the old code treated any single 401 as gospel and forced a
-          // full disruptive logout on the strength of it. A genuinely dead
-          // token fails identically on retry; a blip usually won't.
+          // Retry with backoff before acting on a 401 — found live: a token
+          // that had JUST minted a successful login (proving it's genuinely
+          // valid, re-confirmed server-side independently multiple times)
+          // could still see the very next write get a 401, then succeed
+          // again minutes later, in a repeating pattern — not a permanently
+          // dead token, something intermittent (leading theory: a burst of
+          // near-simultaneous requests right around login — the boot-
+          // sequence refetch, push-subscription sync, realtime socket all
+          // firing together — tripping a connection/burst-level limit that
+          // a single isolated request never hits). A single 300ms retry
+          // wasn't enough to reliably ride that out. Three attempts with
+          // growing backoff (300ms/800ms) gives a transient condition real
+          // room to clear before this gives up and forces a disruptive
+          // logout. A genuinely dead/expired token fails identically all
+          // three times and still ends up clearing exactly as before.
           if (usingToken && res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
-            await new Promise(r => setTimeout(r, 300));
-            res = await fetch(url, options);
+            const backoffsMs = [300, 800];
+            for (const delay of backoffsMs) {
+              if (res.status !== 401) break;
+              await new Promise(r => setTimeout(r, delay));
+              res = await fetch(url, options);
+            }
             if (res.status === 401 && tokenAtRequestTime === _cachedSessionToken) {
               _cachedSessionToken = null;
               persistSessionToken(null);
