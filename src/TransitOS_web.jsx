@@ -24410,6 +24410,43 @@ function AppInner() {
     return () => { clearTimeout(t); clearInterval(iv); };
   }, [activeUser?.id]);
 
+  // A tab/PWA left open across a deploy keeps executing the JS bundle it
+  // had loaded at open time forever — the service worker's cache-first
+  // strategy for hashed JS/CSS (public/sw.js) only ever helps a NEW page
+  // load pick up a NEW deploy; it does nothing for a session that's
+  // already running. Confirmed in production (2026-08-08): a fleet admin's
+  // Android session kept looping session-login -> immediate write 401 for
+  // several minutes after the real fix (ab69dc9, the Headers-spread bug)
+  // had already deployed, because that session had never re-navigated
+  // since before the deploy and was still executing the pre-fix bundle.
+  // Detect this by re-fetching index.html (bypassing HTTP cache) and
+  // comparing the module script it references against the one THIS page
+  // actually loaded — not just decorative, since a stale bundle here
+  // silently fails every RLS-gated write, not merely missing a cosmetic
+  // update. Not gated on activeUser — the exact incident this fixes was a
+  // login screen itself stuck retrying on a dead bundle.
+  useEffect(() => {
+    const currentSrc = document.querySelector('script[type="module"]')?.getAttribute("src");
+    if (!currentSrc) return;
+    const check = async () => {
+      try {
+        const res = await fetch("/index.html", { cache: "no-store" });
+        if (!res.ok) return;
+        const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+        const freshSrc = doc.querySelector('script[type="module"]')?.getAttribute("src");
+        if (freshSrc && freshSrc !== currentSrc) {
+          pushToast("UPDATING", "A new version is available — reloading…", COLORS.blue);
+          setTimeout(() => window.location.reload(), 2000);
+        }
+      } catch (e) { /* offline or network hiccup — try again next interval */ }
+    };
+    const t = setTimeout(check, 20000);
+    const iv = setInterval(check, 300000);
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearTimeout(t); clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); };
+  }, [pushToast]);
+
   useEffect(() => {
     if (state._error && !state.active_user_id) setLoginError(state._error);
   }, [state._error, state.active_user_id]);
