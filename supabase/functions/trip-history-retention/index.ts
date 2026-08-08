@@ -50,11 +50,19 @@ serve(async (req) => {
   const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
   const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
   // Same dedicated shared secret as daily-trip-sheet/check-late-start —
-  // see those files' header comments for why this is a literal constant
-  // rather than the platform service-role key.
-  const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
+  // see those files' header comments for why this is a real edge-function
+  // secret rather than the platform service-role key.
+  //
+  // FIXED (2026-08-08): this was a plaintext literal committed to git,
+  // identical across 4 functions — found via a dedicated security audit.
+  // This function is the highest-stakes of the four: a leaked token meant
+  // anyone with repo read access could trigger unscheduled, repeated
+  // PERMANENT DELETION of trip/message/feedback rows. Moved to a real
+  // secret; the old literal is compromised (it lived in git history) and
+  // is no longer accepted.
+  const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 
-  if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
+  if (!CRON_AUTH_TOKEN || req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
     return json({ error: "Unauthorized" }, 401);
   }
   if (!RESEND_KEY) return json({ error: "Missing Resend_API_Key secret" }, 500);
@@ -91,7 +99,7 @@ serve(async (req) => {
 
   if (fetchErr) {
     console.error("DB fetch error:", fetchErr.message);
-    return json({ error: "DB fetch error: " + fetchErr.message }, 500);
+    return json({ error: "Internal error — please try again." }, 500);
   }
 
   const rows = oldTrips ?? [];
@@ -190,17 +198,17 @@ serve(async (req) => {
   const { error: msgDelErr } = await sb.from("messages").delete().in("tripid", tripIds);
   if (msgDelErr) {
     console.error("Failed to purge messages for old trips (trips NOT deleted, will retry next run):", msgDelErr.message);
-    return json({ error: "Failed to purge messages: " + msgDelErr.message, purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
+    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
   }
   const { error: fbDelErr } = await sb.from("feedbacks").delete().in("tripid", tripIds);
   if (fbDelErr) {
     console.error("Failed to purge feedbacks for old trips (trips NOT deleted, will retry next run):", fbDelErr.message);
-    return json({ error: "Failed to purge feedbacks: " + fbDelErr.message, purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
+    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
   }
   const { error: tripDelErr } = await sb.from("trips").delete().in("id", tripIds);
   if (tripDelErr) {
     console.error("Failed to purge trips after successful export (messages/feedbacks for these ids are already gone):", tripDelErr.message);
-    return json({ error: "Failed to purge trips: " + tripDelErr.message, purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
+    return json({ error: "Internal error — please try again.", purged: 0, exported: rows.length, resendId: resendBody.id }, 500);
   }
 
   console.log(`Purged ${tripIds.length} trips after successful export.`);

@@ -35,7 +35,13 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 // constant here, matched by the literal value in the pg_cron job's SQL
 // (both under this codebase's direct control, not dependent on guessing
 // which key format Supabase currently injects), can't drift the same way.
-const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
+// FIXED (2026-08-08): this was a plaintext literal committed to git,
+// identical across 4 functions — found via a dedicated security audit.
+// Anyone with repo read access had standing, permanent access to invoke
+// these functions directly, bypassing the cron schedule entirely. Moved
+// to a real edge-function secret; the old literal is compromised (it
+// lived in git history) and is no longer accepted.
+const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 
 Deno.serve(async (req) => {
   try {
@@ -44,7 +50,7 @@ Deno.serve(async (req) => {
     // so it's not real access control. Require CRON_AUTH_TOKEN instead —
     // see the comment on its declaration above for why this isn't the
     // service role key.
-    if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
+    if (!CRON_AUTH_TOKEN || req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401, headers: { "Content-Type": "application/json" },
       });
@@ -106,7 +112,7 @@ Deno.serve(async (req) => {
     });
   } catch (e) {
     console.error("check-late-start failed:", e.message);
-    return new Response(JSON.stringify({ ok: false, error: e.message }), {
+    return new Response(JSON.stringify({ ok: false, error: "Internal error — please try again." }), {
       status: 500, headers: { "Content-Type": "application/json" },
     });
   }

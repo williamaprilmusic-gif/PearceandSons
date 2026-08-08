@@ -33,12 +33,23 @@ serve(async (req) => {
   // sb_secret_ key format, and the platform-injected
   // SUPABASE_SERVICE_ROLE_KEY this function reads at runtime no longer
   // matches the legacy-JWT-format token hardcoded in the pg_cron job's
-  // Authorization header. A literal constant here, matched by the literal
-  // value in the pg_cron job's SQL — both under this codebase's direct
-  // control — can't drift the same way.
-  const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
+  // Authorization header. A real edge-function secret (set via the
+  // Supabase dashboard), matched by the same value in the pg_cron job's
+  // SQL — both under this codebase's direct control — can't drift the
+  // same way a platform-injected key can.
+  //
+  // FIXED (2026-08-08): this was previously a plaintext literal committed
+  // to git in all 4 cron-triggered functions, identical across each —
+  // found via a dedicated security audit. Anyone with repo read access
+  // had standing, permanent access to invoke these functions directly,
+  // bypassing the schedule entirely — worst case on this codebase's other
+  // cron functions is trip-history-retention, which uses the same token
+  // to gate permanent data deletion. Moved to a real secret; the old
+  // literal must be treated as compromised (it lived in git history) and
+  // is no longer accepted.
+  const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 
-  if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
+  if (!CRON_AUTH_TOKEN || req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
     return json({ error: "Unauthorized" }, 401);
   }
 
@@ -76,7 +87,7 @@ serve(async (req) => {
 
   if (tripErr) {
     console.error("DB error:", tripErr.message);
-    return json({ error: "DB error: " + tripErr.message }, 500);
+    return json({ error: "Internal error — please try again." }, 500);
   }
 
   const { data: drivers } = await sb.from("users").select("id, fullname").eq("role", "DRIVER");

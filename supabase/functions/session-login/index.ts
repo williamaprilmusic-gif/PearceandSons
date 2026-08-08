@@ -42,6 +42,25 @@ async function hashPasswordServer(password: string, salt: string): Promise<strin
   const digest = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
 }
+async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+// Constant-time comparison of two equal-format hex strings — a plain ===
+// on a password hash short-circuits on the first differing character,
+// which is a real (if narrow, over-network low-severity) timing side
+// channel. Found via a dedicated security audit. Both inputs must already
+// be same-length hex (hashPasswordServer's digest output, or a raw value
+// pre-hashed with sha256Hex to normalize length before comparing) — a
+// length mismatch is treated as a mismatch without scanning further,
+// which leaks nothing new since both call sites here always pass
+// same-format values on the "real" side.
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 function base64url(bytes: Uint8Array): string {
   let str = '';
@@ -93,16 +112,17 @@ async function checkAndTrackAttempt(supabase: ReturnType<typeof db>, key: string
   return { locked: false };
 }
 async function recordFailure(supabase: ReturnType<typeof db>, key: string): Promise<void> {
-  const now = Date.now();
-  const { data: row } = await supabase.from('login_attempts').select('fail_count, locked_until').eq('attempt_key', key).maybeSingle();
-  // By the time this runs, checkAndTrackAttempt (called first, above) has
-  // already confirmed any existing lockout has expired or never existed —
-  // so any prior fail_count here is from an already-ended window, safe to
-  // just increment rather than needing to re-derive whether it's "still
-  // live."
-  const newCount = (row?.fail_count || 0) + 1;
-  const lockedUntil = newCount >= MAX_FAILS ? now + LOCKOUT_MS : null;
-  await supabase.from('login_attempts').upsert({ attempt_key: key, fail_count: newCount, locked_until: lockedUntil, updated_at: now }, { onConflict: 'attempt_key' });
+  // Atomic read-increment-write via a single upsert statement (see the
+  // increment_login_fail_count migration) rather than a separate
+  // select-then-upsert — the old two-step version had a TOCTOU race where
+  // several concurrent guesses against the same key could each read the
+  // same stale fail_count before any upsert landed, undercounting
+  // failures and letting more than MAX_FAILS attempts through before
+  // lockout actually engaged. Found via a dedicated security audit.
+  const { error } = await supabase.rpc('increment_login_fail_count', {
+    p_attempt_key: key, p_max_fails: MAX_FAILS, p_lockout_ms: LOCKOUT_MS, p_now_ms: Date.now(),
+  });
+  if (error) console.error('[session-login] increment_login_fail_count failed:', error.message);
 }
 async function clearAttempts(supabase: ReturnType<typeof db>, key: string): Promise<void> {
   await supabase.from('login_attempts').delete().eq('attempt_key', key);
@@ -134,9 +154,12 @@ async function login(username: string, password: string) {
   // history) revoked anon/authenticated SELECT on them outright.
   let valid: boolean;
   if (user.passwordsalt) {
-    valid = (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash;
+    valid = timingSafeEqualHex(await hashPasswordServer(password, user.passwordsalt), user.passwordhash);
   } else {
-    valid = user.passwordhash === password;
+    // Legacy plaintext path — both sides are hashed first purely to
+    // normalize length before the constant-time compare (raw plaintext
+    // strings would otherwise leak their length trivially).
+    valid = timingSafeEqualHex(await sha256Hex(password), await sha256Hex(user.passwordhash));
   }
   if (!valid) { await recordFailure(supabase, attemptKey); return err('Invalid credentials'); }
   // Reaching here required the correct password — clear any accumulated
@@ -197,6 +220,11 @@ Deno.serve(async (req: Request) => {
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error('[session-login]', body.action, msg);
-    return err('Internal error: ' + msg, 500);
+    // Generic message to the client — this endpoint is reachable
+    // unauthenticated, so the real exception detail (query/column info,
+    // library internals) must stay server-side-only, in the console.error
+    // above, not round-trip into the response body. Found via a dedicated
+    // security audit.
+    return err('Internal error — please try again.', 500);
   }
 });

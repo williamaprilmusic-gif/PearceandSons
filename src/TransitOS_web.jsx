@@ -7479,15 +7479,20 @@ function withUpdatedAtGuard(query, expectedUpdatedAt) {
   return expectedUpdatedAt == null ? query.is("updatedat", expectedUpdatedAt) : query.eq("updatedat", expectedUpdatedAt);
 }
 
-// ── Real session tokens (STAGE 1/2 of the auth/RLS migration) ─────────────
+// ── Real session tokens ─────────────────────────────────────────────────
 // Mints a Postgres-verifiable session token by independently re-checking the
 // account's password server-side (supabase/functions/session-login), then
 // hands it to supabase-js so every subsequent request carries a real,
 // signature-verified Authorization header instead of just the shared anon
-// key. This is intentionally NON-BLOCKING and NON-FATAL — no RLS policy
-// reads this token yet (that's a deliberately separate, later cutover step
-// requiring its own sign-off), so a failure here must never stop a login
-// that otherwise succeeded under the existing (client-side-only) checks.
+// key. RLS on users/messages/trips/notifications/driver_status/
+// driver_positions/push_subscriptions now DOES depend on this token's
+// app_user_id claim (auth.jwt() ->> 'app_user_id') — the cutover this
+// comment used to describe as "later" has already happened. Login itself
+// stays non-fatal on a minting failure (a bad/unreachable session-login
+// call doesn't block an otherwise-successful login), but every write made
+// afterward without a usable token will now fail RLS — see the custom
+// global.fetch override's Headers-handling fix and notifySessionExpired()
+// for how a missing/expired token is now surfaced instead of failing silently.
 const SESSION_LOGIN_URL = "https://kwkgiylwnafwimxqmjwk.supabase.co/functions/v1/session-login";
 async function fetchSessionToken(username, password) {
   const res = await fetch(SESSION_LOGIN_URL, {
@@ -9112,7 +9117,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // trip's driverid field itself was cleared, and the FK constraint
       // blocks the delete regardless of which driver still points at it.
       await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
-      must(await supabase.from("trips").delete().eq("id", action.trip_id));
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment for why must()'s error-only check can't catch a zero-row
+      // RLS-blocked delete. Here specifically: without this, an agent
+      // whose delete got silently blocked would see their booking
+      // reported as cancelled while it still exists server-side.
+      const cancelDelRes = must(await supabase.from("trips").delete().eq("id", action.trip_id).select("id"));
+      if (!cancelDelRes.data || cancelDelRes.data.length === 0) throw new Error("Couldn't cancel — your session may have expired. Please try again.");
       await supabase.from("notifications").delete().eq("tripid", action.trip_id);
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -10255,7 +10266,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const rateAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       if (!rateAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("You're not on this trip.");
       const newRatings = { ...(tripRow?.agentratings || {}), [action.agent_id]: { stars: action.stars, note: action.note || null, rated_at: nowEpoch() } };
-      must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id));
+      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
+      // comment; without it a silently-blocked rating write reports
+      // success to the agent with nothing actually saved.
+      const rateRes = must(await supabase.from("trips").update({ agentratings: newRatings, updatedat: nowEpoch() }).eq("id", action.trip_id).select("id"));
+      if (!rateRes.data || rateRes.data.length === 0) throw new Error("Couldn't submit your rating — your session may have expired. Please try again.");
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -10742,18 +10757,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           label: dropoffLabel || null,
         };
       });
-      must(await supabase.from("trips").update({
+      // .select("id") + row-count checks on both writes below — see
+      // TRIP/DRIVER_CONFIRM's own comment (identical sibling logic to
+      // CONFIRM_AGENT_DROPOFF's completion branch, which already has this
+      // guard — this handler was missing it). A silently-blocked
+      // completion leaves the trip mid-lifecycle while the driver's own
+      // UI has already moved on, and a silently-blocked driver_status
+      // write leaves them stuck BUSY/unavailable for new dispatch.
+      const completeRes = must(await supabase.from("trips").update({
         status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: tripRow.estdistancekm,
         completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, dropofflocations: newDropoffLocations, updatedat: nowTs,
-      }).eq("id", action.trip_id));
+      }).eq("id", action.trip_id).select("id"));
+      if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       const stillBusy = (remaining || []).filter(r => String(r.id) !== String(action.trip_id));
-      must(await supabase.from("driver_status").update({
+      const freeRes = must(await supabase.from("driver_status").update({
         state: stillBusy.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY,
         currenttripid: stillBusy[0]?.id || null,
         updatedat: new Date(nowTs).toISOString(),
-      }).eq("driverid", tripRow.driverid));
+      }).eq("driverid", tripRow.driverid).select("driverid"));
+      if (!freeRes.data || freeRes.data.length === 0) throw new Error("Trip completed, but couldn't update your driver status — please refresh.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       const agentNotifs = tripAgentIds.map(aid => ({
         type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
@@ -12960,6 +12984,7 @@ function AgentEtaNotifierForTrip({ trip, state, user }) {
 
 function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
   // Agent-facing cancel — works for BOTH a still-unassigned booking
   // (TRIP/CANCEL, the original narrow rollback primitive) and, per
   // explicit decision, an already-assigned trip too (TRIP/AGENT_CANCEL,
@@ -16837,8 +16862,18 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     try {
       for (const trip of myActiveTrips) {
         if (trip.state === TRIP_STATE.ASSIGNED) {
+          // TRIP/ACCEPT alone already promotes ASSIGNED -> DRIVER_CONFIRMED
+          // (driveraccepted/acceptedat/confirmedat all set in one step —
+          // see its own handler). A follow-up TRIP/DRIVER_CONFIRM call used
+          // to run right after this, but that action's own transition
+          // guard requires the trip to still be in ASSIGNED — by the time
+          // it ran the trip was already DRIVER_CONFIRMED from the ACCEPT
+          // call moments earlier, so it always threw "DRIVER_CONFIRMED ->
+          // DRIVER_CONFIRMED ILLEGAL" and Start Trip failed outright for
+          // any trip that hadn't been separately accepted beforehand.
+          // Found via a dedicated audit; confirmed identical (non-drifted)
+          // in both the demo reducer and the real Supabase handler.
           await dispatch({ type: "TRIP/ACCEPT", trip_id: trip.trip_id });
-          await dispatch({ type: "TRIP/DRIVER_CONFIRM", trip_id: trip.trip_id });
         }
       }
       // Use the driver's live GPS position if tracking has picked one up
@@ -23861,6 +23896,14 @@ function AdminAIAssistant({ user }) {
         // no point sending more than it'll use.
         body: JSON.stringify({ question, history: nextMessages.slice(0, -1).slice(-6) }),
       });
+      // This is a raw fetch to an edge function, not a supabase.from()
+      // call — it doesn't go through the central global.fetch wrapper's
+      // 401-retry/notifySessionExpired() handling, so that signal has to
+      // be raised here explicitly. Without this, an admin whose token
+      // expired mid-chat just saw a generic "Request failed (401)" error
+      // bubble with no path back to a working session, unlike every other
+      // screen in the app.
+      if (res.status === 401 || res.status === 403) notifySessionExpired();
       const data = await res.json();
       if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
       setMessages(m => [...m, { role: "assistant", content: data.answer }]);

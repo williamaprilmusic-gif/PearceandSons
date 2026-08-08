@@ -226,6 +226,7 @@ Deno.serve(async (req) => {
 
     return json({ ok: true, sent: sentCount, staleRemoved: staleEndpoints.length, targeted: (subs || []).length });
   } catch (e) {
-    return json({ ok: false, error: e.message }, 500);
+    console.error("[send-push-notification]", e instanceof Error ? e.message : String(e));
+    return json({ ok: false, error: "Internal error — please try again." }, 500);
   }
 });

@@ -33,12 +33,15 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 // Same dedicated shared secret as daily-trip-sheet/check-late-start — see
 // check-late-start's own comment on its declaration for why this is a
-// literal constant rather than the platform service-role key.
-const CRON_AUTH_TOKEN = "2e032b24f3d9b86c5dec616d999a17f71ba43255707af8335a61e2cc65fd6108";
+// real edge-function secret rather than the platform service-role key.
+// FIXED (2026-08-08): was a plaintext literal committed to git, identical
+// across 4 functions — see check-late-start's comment for the full
+// rationale. The old literal is compromised and no longer accepted.
+const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 
 Deno.serve(async (req) => {
   try {
-    if (req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
+    if (!CRON_AUTH_TOKEN || req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401, headers: { "Content-Type": "application/json" },
       });
@@ -83,7 +86,7 @@ Deno.serve(async (req) => {
     });
   } catch (e) {
     console.error("check-upcoming-reminders failed:", e instanceof Error ? e.message : String(e));
-    return new Response(JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) }), {
+    return new Response(JSON.stringify({ ok: false, error: "Internal error — please try again." }), {
       status: 500, headers: { "Content-Type": "application/json" },
     });
   }

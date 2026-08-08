@@ -250,6 +250,18 @@ async function hashPasswordServer(password: string, salt: string): Promise<strin
   const digest = await crypto.subtle.digest('SHA-256', data);
   return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
 }
+async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+// Constant-time comparison — see session-login's identical helper for the
+// full rationale (found via the same dedicated security audit).
+function timingSafeEqualHex(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
 
 // CRITICAL — this is the fix for a confirmed account-takeover vulnerability:
 // registrationOptions()/register() used to accept a client-supplied user_id
@@ -287,8 +299,10 @@ async function verifyPassword(supabase: ReturnType<typeof createClient>, userId:
     .select('passwordhash, passwordsalt, status').eq('id', userId).maybeSingle();
   const valid = !!user && user.status === 'ACTIVE' && (
     user.passwordsalt
-      ? (await hashPasswordServer(password, user.passwordsalt)) === user.passwordhash
-      : user.passwordhash === password
+      ? timingSafeEqualHex(await hashPasswordServer(password, user.passwordsalt), user.passwordhash)
+      // Legacy plaintext path — both sides hashed first purely to
+      // normalize length before the constant-time compare.
+      : timingSafeEqualHex(await sha256Hex(password), await sha256Hex(user.passwordhash))
   );
   if (valid) {
     await supabase.from('login_attempts').delete().eq('attempt_key', attemptKey);
@@ -296,13 +310,12 @@ async function verifyPassword(supabase: ReturnType<typeof createClient>, userId:
   }
   // Tracked even for a userId that doesn't resolve to a real/active
   // account — same "no new enumeration side channel" reasoning as
-  // session-login.
-  const newCount = (attemptRow?.fail_count || 0) + 1;
-  const lockedUntil = newCount >= MAX_FAILS ? now + LOCKOUT_MS : null;
-  await supabase.from('login_attempts').upsert(
-    { attempt_key: attemptKey, fail_count: newCount, locked_until: lockedUntil, updated_at: now },
-    { onConflict: 'attempt_key' }
-  );
+  // session-login. Atomic increment via RPC — see session-login's
+  // recordFailure for the TOCTOU race this fixes (same shared DB function).
+  const { error: incErr } = await supabase.rpc('increment_login_fail_count', {
+    p_attempt_key: attemptKey, p_max_fails: MAX_FAILS, p_lockout_ms: LOCKOUT_MS, p_now_ms: now,
+  });
+  if (incErr) console.error('[webauthn] increment_login_fail_count failed:', incErr.message);
   return false;
 }
 
@@ -583,6 +596,8 @@ Deno.serve(async (req: Request) => {
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error('[webauthn]', body.action, msg);
-    return err('Internal error: ' + msg, 500);
+    // Generic message to the client — reachable unauthenticated for
+    // several actions here, real exception detail must stay server-side.
+    return err('Internal error — please try again.', 500);
   }
 });

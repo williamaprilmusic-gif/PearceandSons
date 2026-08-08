@@ -210,6 +210,6 @@ Answer ONLY using the JSON data snapshot in the user's message — never invent 
     return json({ ok: true, answer });
   } catch (e) {
     console.error("[ai-ops-assistant]", e instanceof Error ? e.message : String(e));
-    return json({ ok: false, error: "Internal error: " + (e instanceof Error ? e.message : String(e)) }, 500);
+    return json({ ok: false, error: "Internal error — please try again." }, 500);
   }
 });
