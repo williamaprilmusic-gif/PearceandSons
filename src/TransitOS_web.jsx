@@ -13639,6 +13639,7 @@ const ALERT_TONES = [
   // every existing call site — playAlertSound, TonePicker's tap-to-preview
   // — needs zero changes.
   { id: "dragon-alert", label: "Dragon Alert", play: () => playFileTone("dragon-alert", "/sounds/alerts/dragon-alert.mp3") },
+  { id: "incoming-msg", label: "Incoming Message", play: () => playFileTone("incoming-msg", "/sounds/alerts/incoming-msg.mp3") },
   { id: "message-notify", label: "Message", play: () => playFileTone("message-notify", "/sounds/alerts/message-notify.mp3") },
   { id: "notify-011", label: "Notify 011", play: () => playFileTone("notify-011", "/sounds/alerts/notify-011.mp3") },
   { id: "notify-024", label: "Notify 024", play: () => playFileTone("notify-024", "/sounds/alerts/notify-024.mp3") },
