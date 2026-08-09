@@ -13555,12 +13555,38 @@ function getCachedToneAudio(id, url) {
   }
   return el;
 }
+// The one-shot preview/alert clip currently mid-play, if any — separate
+// from ringtoneAudioEl (an actively-ringing call must never be cut off by
+// an unrelated preview tap or notification chime, so the two are never
+// stopped by the same code path).
+let currentOneShotEl = null;
+function stopOneShotPreview() {
+  // Guard against a real cross-contamination case: getCachedToneAudio
+  // reuses ONE Audio element per tone id, so if a user previews a ring
+  // tone in settings (a one-shot play, currentOneShotEl = that element)
+  // and a real call then starts ringing with that same tone selected,
+  // startRingtone takes over that identical element for the live ring.
+  // currentOneShotEl is left stale-pointing at it — without this check,
+  // any later unrelated alert would call stopOneShotPreview and silently
+  // cut off the live incoming-call ring. Ownership has moved to the ring
+  // path by then, so just drop the stale reference instead of stopping it.
+  if (currentOneShotEl && currentOneShotEl !== ringtoneAudioEl) {
+    currentOneShotEl.pause();
+    currentOneShotEl.currentTime = 0;
+  }
+  currentOneShotEl = null;
+}
 function playFileTone(id, url) {
+  // Stop whatever one-shot tone is still mid-play first — per explicit
+  // request, picking a new tone in the picker must cut the previous
+  // preview off immediately rather than letting them overlap.
+  stopOneShotPreview();
   const el = getCachedToneAudio(id, url);
   el.loop = false; // guard: alert tones are always one-shot, even if this
                     // element was left mid-loop by a prior ring-tone use
   el.currentTime = 0;
   el.play().catch(e => console.warn("[AlertSound] playback failed:", e.message));
+  currentOneShotEl = el;
 }
 
 // Shared oscillator-note helper — every tone below is built from one or
@@ -13770,12 +13796,24 @@ function stopRingtone() {
 // Row of tappable tone pills — tapping one both selects it (persists to
 // localStorage) and plays it immediately as a preview, the standard
 // pattern for a sound picker. Shared between the alert-tone and ring-tone
-// pickers below (same shape, different tone set/pref key).
+// pickers below (same shape, different tone set/pref key). Collapsed by
+// default — per explicit request, after the tone lists grew from a
+// handful of built-in options to 25+ once user-supplied audio files were
+// added, always showing every pill made this panel take up too much
+// space. The currently selected tone's name stays visible in the header
+// even collapsed, so picking a tone once and closing the list doesn't
+// hide what's actually selected.
 function TonePicker({ label, tones, prefKey }) {
   const [selected, setSelected] = useState(() => getTonePref(prefKey, tones).id);
+  const [expanded, setExpanded] = useState(false);
+  const selectedTone = tones.find(t => t.id === selected) || tones[0];
   const pick = (tone) => {
     setSelected(tone.id);
     setTonePref(prefKey, tone.id);
+    // Stop first, unconditionally — covers switching TO an oscillator tone
+    // while a file-based preview is still mid-play (playFileTone already
+    // handles file-to-file, but an oscillator tone's play() never calls it).
+    stopOneShotPreview();
     try {
       const ctx = getAudioCtx();
       if (ctx) tone.play(ctx, ctx.currentTime);
@@ -13783,20 +13821,26 @@ function TonePicker({ label, tones, prefKey }) {
   };
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>{label}</span>
-      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-        {tones.map(t => (
-          <button key={t.id} onClick={() => pick(t)}
-            style={{
-              fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 4, cursor: "pointer",
-              background: selected === t.id ? "rgba(245,166,35,0.12)" : "none",
-              border: `1px solid ${selected === t.id ? COLORS.amber : COLORS.wire}`,
-              color: selected === t.id ? COLORS.amber : COLORS.ghost,
-            }}>
-            {selected === t.id ? "▶ " : ""}{t.label}
-          </button>
-        ))}
+      <div onClick={() => setExpanded(e => !e)} style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+        <span style={{ fontSize: 9, color: COLORS.ghost, flexShrink: 0 }}>{expanded ? "▾" : "▸"}</span>
+        <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>{label}</span>
+        <span style={{ fontSize: 9, color: COLORS.amber, fontWeight: 700 }}>{selectedTone.label}</span>
       </div>
+      {expanded && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {tones.map(t => (
+            <button key={t.id} onClick={() => pick(t)}
+              style={{
+                fontSize: 10, fontWeight: 700, padding: "5px 10px", borderRadius: 4, cursor: "pointer",
+                background: selected === t.id ? "rgba(245,166,35,0.12)" : "none",
+                border: `1px solid ${selected === t.id ? COLORS.amber : COLORS.wire}`,
+                color: selected === t.id ? COLORS.amber : COLORS.ghost,
+              }}>
+              {selected === t.id ? "▶ " : ""}{t.label}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
