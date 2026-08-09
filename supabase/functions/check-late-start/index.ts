@@ -66,10 +66,19 @@ Deno.serve(async (req) => {
 
     let flaggedCount = 0;
     for (const t of confirmedTrips || []) {
-      // scheduleddate is "YYYY/MM/DD", scheduledtime is "HH:MM" — same
-      // parsing convention the main app uses throughout.
+      // scheduleddate is "YYYY/MM/DD", scheduledtimestr is "HH:MM" — same
+      // parsing convention the main app uses throughout. FIXED (2026-08-09):
+      // this used to read t.scheduledtime, which is actually a bigint
+      // column (not the "HH:MM" string this comment always claimed) —
+      // .split(":") on a number throws immediately, caught by the outer
+      // try/catch as a 500. Only manifested when a real DRIVER_CONFIRMED
+      // trip actually reached this line (i.e. only during the exact
+      // situation this function exists to catch), which is why it looked
+      // "intermittent" rather than reliably broken — quiet periods with
+      // nothing to flag returned 200 trivially without ever reaching the
+      // buggy line.
       const [y, m, d] = (t.scheduleddate || "").split("/").map(Number);
-      const [hh, mm] = (t.scheduledtime || "").split(":").map(Number);
+      const [hh, mm] = (t.scheduledtimestr || "").split(":").map(Number);
       if (!y || !m || !d || hh == null || mm == null) continue; // malformed — skip rather than false-positive
       // scheduleddate/time are SAST (UTC+2) wall-clock values, but this
       // function runs in UTC — new Date(y, m-1, d, hh, mm) would build the
@@ -92,14 +101,14 @@ Deno.serve(async (req) => {
       const notifRows = [
         {
           title: "TRIP LATE START", type: "TRIP_LATE_START", forroles: ["ADMIN"], userid: null,
-          message: `⚠ Trip ${t.id} hasn't started — scheduled for ${t.scheduleddate} ${t.scheduledtime}, driver ${driverName} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
+          message: `⚠ Trip ${t.id} hasn't started — scheduled for ${t.scheduleddate} ${t.scheduledtimestr}, driver ${driverName} still hasn't begun the pickup ${Math.floor(minutesLate)} min later.`,
           tripid: t.id, timestamp: nowTs, isread: false,
         },
       ];
       if (t.driverid) {
         notifRows.push({
           title: "TRIP LATE START", type: "TRIP_LATE_START", forroles: ["DRIVER"], userid: t.driverid,
-          message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtime} — please begin the pickup or contact dispatch if there's a delay.`,
+          message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtimestr} — please begin the pickup or contact dispatch if there's a delay.`,
           tripid: t.id, timestamp: nowTs, isread: false,
         });
       }
