@@ -13538,6 +13538,31 @@ function getAudioCtx() {
   if (sharedAudioCtx.state === "suspended") sharedAudioCtx.resume();
   return sharedAudioCtx;
 }
+
+// Module-scope cache of file-based tone Audio elements, keyed by tone id —
+// mirrors sharedAudioCtx's lazy-singleton pattern just above. Reused across
+// plays so a rapid string of alerts (or a call ringing/re-ringing) doesn't
+// re-fetch/re-decode the file each time. Playback failure (autoplay block,
+// missing file) is swallowed the same way scheduleNote's callers already
+// do — a bad sound must never break the actual notification/call flow.
+const toneAudioCache = new Map();
+function getCachedToneAudio(id, url) {
+  let el = toneAudioCache.get(id);
+  if (!el) {
+    el = new Audio(url);
+    el.preload = "auto";
+    toneAudioCache.set(id, el);
+  }
+  return el;
+}
+function playFileTone(id, url) {
+  const el = getCachedToneAudio(id, url);
+  el.loop = false; // guard: alert tones are always one-shot, even if this
+                    // element was left mid-loop by a prior ring-tone use
+  el.currentTime = 0;
+  el.play().catch(e => console.warn("[AlertSound] playback failed:", e.message));
+}
+
 // Shared oscillator-note helper — every tone below is built from one or
 // more calls to this, instead of each tone repeating the same
 // create-oscillator/create-gain/ramp-envelope boilerplate.
@@ -13608,6 +13633,19 @@ const ALERT_TONES = [
       scheduleNote(ctx, { start: now + 0.09, dur: 0.06, freq: 1760, type: "sine", peak: 0.22 });
     },
   },
+  // Real audio-file tones, added per explicit request — user-supplied
+  // royalty-free clips bundled into public/sounds/alerts/. Same play(ctx,
+  // now) signature as the oscillator tones above (ctx/now unused here) so
+  // every existing call site — playAlertSound, TonePicker's tap-to-preview
+  // — needs zero changes.
+  { id: "dragon-alert", label: "Dragon Alert", play: () => playFileTone("dragon-alert", "/sounds/alerts/dragon-alert.mp3") },
+  { id: "message-notify", label: "Message", play: () => playFileTone("message-notify", "/sounds/alerts/message-notify.mp3") },
+  { id: "notify-011", label: "Notify 011", play: () => playFileTone("notify-011", "/sounds/alerts/notify-011.mp3") },
+  { id: "notify-024", label: "Notify 024", play: () => playFileTone("notify-024", "/sounds/alerts/notify-024.mp3") },
+  { id: "notify-026", label: "Notify 026", play: () => playFileTone("notify-026", "/sounds/alerts/notify-026.mp3") },
+  { id: "notify-036", label: "Notify 036", play: () => playFileTone("notify-036", "/sounds/alerts/notify-036.mp3") },
+  { id: "notify-051", label: "Notify 051", play: () => playFileTone("notify-051", "/sounds/alerts/notify-051.mp3") },
+  { id: "simple-notify", label: "Simple", play: () => playFileTone("simple-notify", "/sounds/alerts/simple-notify.mp3") },
 ];
 const RING_TONES = [
   {
@@ -13635,6 +13673,29 @@ const RING_TONES = [
       scheduleNote(ctx, { start: now + 0.22, dur: 0.18, freq: 587.33, type: "sine", peak: 0.32 });
     },
   },
+  // Real audio-file ring tones — user-supplied royalty-free clips bundled
+  // into public/sounds/rings/. type: "file" + url are consumed only by
+  // startRingtone (below), which loops these continuously while a call is
+  // ringing instead of the 2s oscillator-pulse pattern; play(ctx, now)
+  // still exists with the same signature as the oscillator tones so
+  // TonePicker's tap-to-preview (a one-shot play, not a loop) works
+  // unmodified for these too.
+  { id: "classic-telephone", label: "Telephone", type: "file", url: "/sounds/rings/classic-telephone.mp3", play: () => playFileTone("classic-telephone", "/sounds/rings/classic-telephone.mp3") },
+  { id: "jump", label: "Jump", type: "file", url: "/sounds/rings/jump.mp3", play: () => playFileTone("jump", "/sounds/rings/jump.mp3") },
+  { id: "mysterious", label: "Mysterious", type: "file", url: "/sounds/rings/mysterious.mp3", play: () => playFileTone("mysterious", "/sounds/rings/mysterious.mp3") },
+  { id: "ring-005", label: "Ring 005", type: "file", url: "/sounds/rings/ring-005.mp3", play: () => playFileTone("ring-005", "/sounds/rings/ring-005.mp3") },
+  { id: "ring-009", label: "Ring 009", type: "file", url: "/sounds/rings/ring-009.mp3", play: () => playFileTone("ring-009", "/sounds/rings/ring-009.mp3") },
+  { id: "ring-011", label: "Ring 011", type: "file", url: "/sounds/rings/ring-011.mp3", play: () => playFileTone("ring-011", "/sounds/rings/ring-011.mp3") },
+  { id: "ring-021", label: "Ring 021", type: "file", url: "/sounds/rings/ring-021.mp3", play: () => playFileTone("ring-021", "/sounds/rings/ring-021.mp3") },
+  { id: "ring-040", label: "Ring 040", type: "file", url: "/sounds/rings/ring-040.mp3", play: () => playFileTone("ring-040", "/sounds/rings/ring-040.mp3") },
+  { id: "ring-050", label: "Ring 050", type: "file", url: "/sounds/rings/ring-050.mp3", play: () => playFileTone("ring-050", "/sounds/rings/ring-050.mp3") },
+  { id: "ring-055", label: "Ring 055", type: "file", url: "/sounds/rings/ring-055.mp3", play: () => playFileTone("ring-055", "/sounds/rings/ring-055.mp3") },
+  { id: "ring-058", label: "Ring 058", type: "file", url: "/sounds/rings/ring-058.mp3", play: () => playFileTone("ring-058", "/sounds/rings/ring-058.mp3") },
+  { id: "ring-059", label: "Ring 059", type: "file", url: "/sounds/rings/ring-059.mp3", play: () => playFileTone("ring-059", "/sounds/rings/ring-059.mp3") },
+  { id: "ring-068", label: "Ring 068", type: "file", url: "/sounds/rings/ring-068.mp3", play: () => playFileTone("ring-068", "/sounds/rings/ring-068.mp3") },
+  { id: "ring-085", label: "Ring 085", type: "file", url: "/sounds/rings/ring-085.mp3", play: () => playFileTone("ring-085", "/sounds/rings/ring-085.mp3") },
+  { id: "ring-089", label: "Ring 089", type: "file", url: "/sounds/rings/ring-089.mp3", play: () => playFileTone("ring-089", "/sounds/rings/ring-089.mp3") },
+  { id: "ring-091", label: "Ring 091", type: "file", url: "/sounds/rings/ring-091.mp3", play: () => playFileTone("ring-091", "/sounds/rings/ring-091.mp3") },
 ];
 const ALERT_TONE_PREF_KEY = "transitos_alert_tone";
 const RING_TONE_PREF_KEY = "transitos_ring_tone";
@@ -13662,6 +13723,7 @@ function playAlertSound() {
 }
 
 let ringtoneIntervalId = null;
+let ringtoneAudioEl = null; // the looping file-based ring's Audio element, when active
 function playRingtonePulse() {
   try {
     const ctx = getAudioCtx();
@@ -13672,14 +13734,35 @@ function playRingtonePulse() {
   }
 }
 function startRingtone() {
-  if (ringtoneIntervalId != null) return; // already ringing — don't stack intervals
-  playRingtonePulse();
-  ringtoneIntervalId = setInterval(playRingtonePulse, 2000);
+  if (ringtoneIntervalId != null || ringtoneAudioEl != null) return; // already ringing
+  const tone = getTonePref(RING_TONE_PREF_KEY, RING_TONES);
+  if (tone.type === "file") {
+    // A real ringtone clip loops naturally instead of the oscillator
+    // path's 2s re-trigger pulse — cleaner and closer to how an actual
+    // phone ringtone is meant to be heard.
+    try {
+      const el = getCachedToneAudio(tone.id, tone.url);
+      el.loop = true;
+      el.currentTime = 0;
+      el.play().catch(e => console.warn("[Ringtone] playback failed:", e.message));
+      ringtoneAudioEl = el;
+    } catch (e) {
+      console.warn("[Ringtone] playback failed:", e.message);
+    }
+  } else {
+    playRingtonePulse();
+    ringtoneIntervalId = setInterval(playRingtonePulse, 2000);
+  }
 }
 function stopRingtone() {
   if (ringtoneIntervalId != null) {
     clearInterval(ringtoneIntervalId);
     ringtoneIntervalId = null;
+  }
+  if (ringtoneAudioEl != null) {
+    ringtoneAudioEl.pause();
+    ringtoneAudioEl.currentTime = 0;
+    ringtoneAudioEl = null;
   }
 }
 
