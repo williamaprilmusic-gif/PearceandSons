@@ -3295,7 +3295,15 @@ function AdminDispatch({ state, dispatch }) {
     : availableDrivers;
 
   const handleDispatch = async () => {
-    if (!primaryTrip || !selectedDriverId || overCapacity) return;
+    // FOUND VIA AUDIT (2026-08-09): was `|| overCapacity` — overCapacity
+    // is totalSeats > the bare DRIVER_CAPACITY default (4), unrelated to
+    // which driver is actually selected. availableDriversRaw (above) has
+    // already filtered the whole picker down to drivers whose OWN real
+    // capacity fits totalSeats, so any selectedDriverId reaching this
+    // point is by construction already capacity-valid — gating on the
+    // generic constant here just wrongly blocked dispatch to a real,
+    // available bigger vehicle (e.g. capacity 6) whenever totalSeats > 4.
+    if (!primaryTrip || !selectedDriverId) return;
     const driverName = state.users.find(u => String(u.id) === String(selectedDriverId))?.name;
     try {
       if (isWeekBookingSelection) {
@@ -3503,8 +3511,13 @@ function AdminDispatch({ state, dispatch }) {
             const isNearest = String(ds.driver_id) === String(nearestDriverId);
             const isUnavailable = !!ds.is_unavailable;
             return (
-              <div key={ds.driver_id} onClick={() => !declined && !overCapacity && !isUnavailable && setSelectedDriverId(ds.driver_id)}
-                style={{ cursor: (declined || overCapacity || isUnavailable) ? "not-allowed" : "pointer", opacity: (declined || isUnavailable) ? .35 : 1, background: sel ? COLORS.amber : COLORS.card, border: `1px solid ${sel ? COLORS.amber2 : isNearest ? COLORS.green : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 8 }}>
+              // Same fix as handleDispatch above — every driver reaching
+              // this .map() already passed availableDriversRaw's real
+              // per-driver capacity check, so gating selectability on the
+              // generic overCapacity (bare DRIVER_CAPACITY=4) here wrongly
+              // greyed out an already-valid bigger vehicle.
+              <div key={ds.driver_id} onClick={() => !declined && !isUnavailable && setSelectedDriverId(ds.driver_id)}
+                style={{ cursor: (declined || isUnavailable) ? "not-allowed" : "pointer", opacity: (declined || isUnavailable) ? .35 : 1, background: sel ? COLORS.amber : COLORS.card, border: `1px solid ${sel ? COLORS.amber2 : isNearest ? COLORS.green : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 8 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <span style={{ fontSize: 13, fontWeight: 700, fontFamily: FONTS.head, color: sel ? COLORS.ink : COLORS.chalk }}>{u?.name}</span>
                   <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -3550,7 +3563,7 @@ function AdminDispatch({ state, dispatch }) {
                   </span>
                 )}
                 <CapacityBar load={load} capacity={driverCapacityDispatch} />
-                {sel && !overCapacity && (
+                {sel && (
                   <Button
                     title={isWeekBookingSelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"}
                     variant="amber" full onClick={(e) => { e.stopPropagation(); handleDispatch(); }}

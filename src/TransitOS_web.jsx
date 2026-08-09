@@ -4687,6 +4687,17 @@ function appReducer(state, action) {
       }
       const newCompletedDropoffs = [...new Set([...(trip.completed_dropoffs || []), action.agent_id])];
       const allDroppedOff = trip.agent_ids.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      // FOUND VIA AUDIT (2026-08-09): missing the already-completed guard
+      // its real-handler counterpart has (and that CONFIRM_AGENT_PICKUP,
+      // its own sibling case just above, already has for the IN_TRANSIT
+      // transition). Without it, a replayed/duplicate dropoff confirmation
+      // against an already-completed trip re-ran the completion branch
+      // below unconditionally, silently re-stamping completed_at with a
+      // fresh timestamp on every replay — corrupting anything downstream
+      // that trusts it (hours-worked calculations, CSV exports, trip-
+      // duration metrics). Treat a replay as a no-op success instead,
+      // matching the real handler's identical fix.
+      if (trip.state === TRIP_STATE.ARCHIVED_COMPLETED) return state;
       if (allDroppedOff) {
         // All agents dropped — complete the trip
         const drvStatus = state.driver_status.find(d => String(d.driver_id) === String(trip.driver_id));
@@ -8992,8 +9003,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // stays client-authored free text (not an identity field the audit
       // trail relies on) — same treatment as action.phone on TRIP/BOOK.
       const { data: sosSender } = await supabase.from("users").select("id, fullname").eq("id", activeUserRef.current).maybeSingle();
+      // FOUND VIA AUDIT (2026-08-09): was for_roles: [ROLE.ADMIN] — a
+      // broadcast, which insertNotification's push-fanout never actually
+      // sends a push for (only targeted for_user_ids notifications reach a
+      // phone — see its own comment). For the one truly life-safety-
+      // critical alert in this app, that meant "zero friction for a
+      // genuine emergency" (this case's own header comment) was true for
+      // the in-app row but not for actually reaching anyone whose phone
+      // wasn't already open to the app. Targeted at real admin ids now, so
+      // it actually pushes. Falls back to the old broadcast only if the
+      // lookup itself fails — never LESS reliable than before.
+      const { data: sosAdmins } = await supabase.from("users").select("id").eq("role", ROLE.ADMIN);
+      const sosAdminIds = (sosAdmins || []).map(a => a.id);
       await insertNotification({
-        type: "SOS_ALERT", for_roles: [ROLE.ADMIN],
+        type: "SOS_ALERT",
+        ...(sosAdminIds.length ? { for_user_ids: sosAdminIds } : { for_roles: [ROLE.ADMIN] }),
         message: action.message,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       });
@@ -16703,7 +16727,15 @@ export function tripTotalFeeAmount(t, feeRates) {
 export function tripDriverPayment(t, feeRates) {
   if (!feeRates) return null;
   if (t.state !== TRIP_STATE.ARCHIVED_COMPLETED) return { perAgent: 0, perExtraKm: 0, total: 0 };
-  const successfulAgentCount = (t.completed_dropoffs && t.completed_dropoffs.length > 0)
+  // FOUND VIA AUDIT (2026-08-09): was `t.completed_dropoffs && t.completed_dropoffs.length > 0`,
+  // which treats "completed_dropoffs was never tracked" (null/undefined,
+  // a legacy trip) and "completed_dropoffs is a real, correctly-tracked
+  // EMPTY array" (every agent no-showed) identically — both fell through
+  // to counting the raw agent_ids list, silently overpaying the driver's
+  // full per-agent rate on a trip where nobody was actually dropped off.
+  // `!= null` only falls back to the raw list when the field was truly
+  // never populated, and correctly yields 0 for a genuine empty array.
+  const successfulAgentCount = t.completed_dropoffs != null
     ? t.completed_dropoffs.length : (t.agent_ids || []).length;
   const roadKm = t.actual_distance_km != null ? t.actual_distance_km * ROAD_FACTOR
     : t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0;
@@ -16837,7 +16869,13 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
     // EVERY agent on the trip — repeated identically on every passenger's
     // row, so a 3-agent trip showed the same 3x-inflated number against
     // each individual agent.
-    const successfulDropoffAgentIds = (t.completed_dropoffs && t.completed_dropoffs.length > 0)
+    // FOUND VIA AUDIT (2026-08-09): same class of bug as tripDriverPayment's
+    // own fix — `t.completed_dropoffs && ...length > 0` treated "never
+    // tracked" (null/undefined) and "tracked, correctly empty" (every
+    // agent no-showed) identically, both falling through to `wasSuccessful
+    // = true` below and overpaying every row on an all-no-show completed
+    // trip. `!= null` only treats it as "not tracked" when truly absent.
+    const successfulDropoffAgentIds = t.completed_dropoffs != null
       ? new Set(t.completed_dropoffs.map(String)) : null;
     const agentDriverPayShare = (aid) => {
       if (!feeRates || t.state !== TRIP_STATE.ARCHIVED_COMPLETED || aid == null) return 0;

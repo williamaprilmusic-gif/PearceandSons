@@ -123,6 +123,34 @@ describe("tripDriverPayment — paid to the driver, per successful agent + extra
     expect(result.perExtraKm).toBe(0); // 20km * 1.35 = 27km, under the 40km threshold
   });
 
+  it("pays nothing when every agent no-showed (completed_dropoffs explicitly empty, not absent) — regression for a real overpay bug found via audit", () => {
+    // completed_dropoffs: [] (tracked, genuinely empty) must NOT be
+    // treated the same as completed_dropoffs being absent/untracked —
+    // the bug was `t.completed_dropoffs && t.completed_dropoffs.length > 0`
+    // falling through to the raw agent_ids count for BOTH cases, silently
+    // paying the driver's full per-agent rate on a trip where nobody was
+    // actually dropped off.
+    const trip = {
+      state: TRIP_STATE.ARCHIVED_COMPLETED,
+      agent_ids: [1, 2, 3],
+      completed_dropoffs: [], // tracked, and the real answer is nobody succeeded
+      est_distance_km: 20,
+    };
+    const result = tripDriverPayment(trip, feeRates);
+    expect(result.perAgent).toBe(0);
+  });
+
+  it("falls back to the raw agent count only when completed_dropoffs was never tracked at all", () => {
+    const trip = {
+      state: TRIP_STATE.ARCHIVED_COMPLETED,
+      agent_ids: [1, 2, 3],
+      // no completed_dropoffs field at all — a legacy trip predating that column
+      est_distance_km: 20,
+    };
+    const result = tripDriverPayment(trip, feeRates);
+    expect(result.perAgent).toBe(120); // falls back to all 3 agents * 40
+  });
+
   it("pays extra-km once the road-factored distance exceeds the 40km threshold", () => {
     const trip = {
       state: TRIP_STATE.ARCHIVED_COMPLETED,
