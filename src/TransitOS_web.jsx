@@ -12530,6 +12530,9 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // Stationary: driver in IN_TRANSIT but speed < 2 km/h for 8+ minutes
       // Speeding: speed > 130 km/h — insurance/compliance threshold
       // Each fires at most once per trip per category (guarded by refs).
+      // isActiveTrip declared here (moved up from just above the stationary
+      // block below) so BOTH speeding and stationary can gate on it.
+      const isActiveTrip = activeTripsRef.current?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
       if (currentTripId && speedKmh != null && user?.id && supabase) {
         const STATIONARY_THRESHOLD_KMH = 2;
         const STATIONARY_DURATION_MS = 8 * 60 * 1000; // 8 min
@@ -12540,8 +12543,17 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         }
         const sa = geofenceTriggeredRef.current.speedAlerts;
 
-        // Speeding alert — fire once per trip if speed > 130
-        if (speedKmh > SPEED_THRESHOLD_KMH && !sa.speedingFired[currentTripId]) {
+        // Speeding alert — fire once per trip if speed > 130.
+        // FOUND VIA AUDIT (2026-08-09): missing the isActiveTrip/IN_TRANSIT
+        // gate its sibling stationary check just below already had.
+        // currentTripId falls back to the driver's first ASSIGNED-but-not-
+        // yet-accepted trip when nothing is IN_TRANSIT (see trackedTripId's
+        // own comment — deliberate for position-logging purposes) — without
+        // this gate, a driver simply speeding on their own time (or even
+        // just accelerating in a driveway) while an unrelated future trip
+        // sat unaccepted in their queue got misattributed as "SPEEDING on
+        // trip X" for a trip they hadn't even started.
+        if (isActiveTrip && speedKmh > SPEED_THRESHOLD_KMH && !sa.speedingFired[currentTripId]) {
           sa.speedingFired[currentTripId] = true;
           insertNotification({
             type: "SPEED_ANOMALY", for_roles: [ROLE.ADMIN],
@@ -12559,7 +12571,6 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         // all (stationaryFired already true from the previous trip, never
         // reset since the driver never moved fast enough in between) —
         // either way misattributed to/suppressed for the wrong trip.
-        const isActiveTrip = activeTripsRef.current?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
         if (isActiveTrip && speedKmh < STATIONARY_THRESHOLD_KMH) {
           if (!sa.stationaryStart[currentTripId]) sa.stationaryStart[currentTripId] = now;
           if (!sa.stationaryFired[currentTripId] && now - sa.stationaryStart[currentTripId] >= STATIONARY_DURATION_MS) {
@@ -12675,10 +12686,22 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // two independent flags so a driver who lingers in the nearby ring
       // and later actually enters still gets the escalated warning (not
       // silently swallowed by the nearby alert having already fired).
-      // Not gated to IN_TRANSIT specifically (unlike the deviation check)
-      // — real physical risk to the driver doesn't care about the app's
-      // internal trip state machine, only whether they're actually there.
-      if (supabase && user?.id && currentTripId && highRiskZonesRef.current?.length) {
+      // FIXED (2026-08-09), found via a direct user report: this used to
+      // NOT gate on IN_TRANSIT at all, on the reasoning that "real physical
+      // risk doesn't care about the app's trip state machine." That
+      // reasoning broke in practice because currentTripId itself isn't
+      // always "the trip the driver is currently driving" — it falls back
+      // to the driver's first ASSIGNED-but-not-yet-accepted trip whenever
+      // nothing is IN_TRANSIT (see trackedTripId's own comment, kept that
+      // way deliberately for position-logging purposes). A driver simply
+      // sitting at home with an unaccepted, unstarted trip in their queue
+      // got a "you are entering/near a high-risk area" alert attributed to
+      // that trip — the driver's real (home) location just happened to be
+      // near a flagged zone, with no relationship at all to actually
+      // driving anywhere for this trip. isActiveTrip (same IN_TRANSIT gate
+      // already used by the stationary/deviation checks above) fixes this
+      // the same way: only alert when the driver is actually en route.
+      if (supabase && user?.id && currentTripId && isActiveTrip && highRiskZonesRef.current?.length) {
         if (!geofenceTriggeredRef.current.highRiskFired) geofenceTriggeredRef.current.highRiskFired = {};
         const hrFired = geofenceTriggeredRef.current.highRiskFired;
         const NEARBY_BUFFER_KM = 1; // outer ring beyond the zone's own radius
