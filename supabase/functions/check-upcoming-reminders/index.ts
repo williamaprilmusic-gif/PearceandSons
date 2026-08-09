@@ -72,12 +72,36 @@ Deno.serve(async (req) => {
       const tripAgentIds = [t.agentid, ...(t.extraagentids || [])].filter(Boolean);
       if (tripAgentIds.length === 0) continue;
 
+      const reminderTitle = "UPCOMING TRIP";
+      const reminderMessage = `Reminder: your trip from ${t.pickuplocation} departs at ${t.scheduledtimestr || t.scheduledtime}.`;
       const notifRows = tripAgentIds.map((agentId: number) => ({
-        title: "UPCOMING TRIP", type: "UPCOMING_TRIP", forroles: ["AGENT"], userid: agentId,
-        message: `Reminder: your trip from ${t.pickuplocation} departs at ${t.scheduledtimestr || t.scheduledtime}.`,
+        title: reminderTitle, type: "UPCOMING_TRIP", forroles: ["AGENT"], userid: agentId,
+        message: reminderMessage,
         tripid: t.id, timestamp: nowMs, isread: false,
       }));
       await supabase.from("notifications").insert(notifRows);
+      // FOUND VIA AUDIT (2026-08-09): this function's whole documented
+      // purpose is reliability when nobody has the app open — but it only
+      // ever wrote the DB row above, never actually pushed. A reminder for
+      // someone with the app fully closed sat unseen until they happened
+      // to reopen it, which for a trip reminder could be after the window
+      // already passed. One call covers every agent on this trip since
+      // they all share the identical message (send-push-notification
+      // matches on exact message text + a timestamp window, not per-id).
+      // AWAITED, not fire-and-forget — unlike the client's insertNotification
+      // (a long-lived browser tab, where an un-awaited promise just keeps
+      // running), this function's invocation ends shortly after returning,
+      // which could abort an in-flight, unawaited push before it completes.
+      // Still best-effort: a failed push must never affect the reminder's
+      // own "fired" outcome below, so the error is only logged, not thrown.
+      if (SUPABASE_URL && CRON_AUTH_TOKEN) {
+        await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${CRON_AUTH_TOKEN}` },
+          body: JSON.stringify({ user_ids: tripAgentIds, title: reminderTitle, message: reminderMessage, type: "UPCOMING_TRIP", trip_id: t.id, ts: nowMs }),
+          signal: AbortSignal.timeout(15000),
+        }).catch(e => console.warn("[check-upcoming-reminders] push failed:", e.message));
+      }
       firedCount++;
     }
 

@@ -105,14 +105,33 @@ Deno.serve(async (req) => {
           tripid: t.id, timestamp: nowTs, isread: false,
         },
       ];
+      const driverMessage = `⚠ Trip ${t.id} was due to start at ${t.scheduledtimestr} — please begin the pickup or contact dispatch if there's a delay.`;
       if (t.driverid) {
         notifRows.push({
           title: "TRIP LATE START", type: "TRIP_LATE_START", forroles: ["DRIVER"], userid: t.driverid,
-          message: `⚠ Trip ${t.id} was due to start at ${t.scheduledtimestr} — please begin the pickup or contact dispatch if there's a delay.`,
+          message: driverMessage,
           tripid: t.id, timestamp: nowTs, isread: false,
         });
       }
       await supabase.from("notifications").insert(notifRows);
+      // FOUND VIA AUDIT (2026-08-09): this function's whole documented
+      // purpose is reliability regardless of whether anyone's logged in —
+      // but it only ever wrote the DB row above, never actually pushed.
+      // The driver most likely to actually be late and away from the app
+      // (mid-shift, phone in a pocket) is exactly the one this couldn't
+      // reach. Targeted only at the driver row — the admin row above stays
+      // a broadcast, matching this project's existing admin-FYI pattern
+      // elsewhere. Awaited (not fire-and-forget) since this function's
+      // invocation ends shortly after returning — see
+      // check-upcoming-reminders' identical comment for why.
+      if (t.driverid && SUPABASE_URL && CRON_AUTH_TOKEN) {
+        await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Authorization": `Bearer ${CRON_AUTH_TOKEN}` },
+          body: JSON.stringify({ user_ids: [t.driverid], title: "TRIP LATE START", message: driverMessage, type: "TRIP_LATE_START", trip_id: t.id, ts: nowTs }),
+          signal: AbortSignal.timeout(15000),
+        }).catch(e => console.warn("[check-late-start] push failed:", e.message));
+      }
       flaggedCount++;
     }
 

@@ -92,6 +92,20 @@ const VAPID_CONTACT_EMAIL = Deno.env.get("VAPID_CONTACT_EMAIL") || "app@pearcean
 // Same secret as session-login/webauthn — cannot use a SUPABASE_ prefix,
 // Supabase reserves that for its own auto-injected platform variables.
 const JWT_SECRET = Deno.env.get("PROJECT_JWT_SECRETS");
+// Same shared secret check-late-start/check-upcoming-reminders/
+// daily-trip-sheet/trip-history-retention already use to authenticate
+// themselves to pg_cron. Accepted here as an ALTERNATIVE to a real user
+// session token — added 2026-08-09 so those two scheduled functions can
+// actually push a reminder/late-start notification to a closed app
+// instead of only ever writing a DB row nobody sees until they happen to
+// reopen it (found via a dedicated logic audit: neither previously called
+// this function at all). Safe to accept a second caller-identity path
+// here specifically because verifySessionToken was never the actual
+// anti-abuse boundary — the notifications-row-match check further down
+// (fix #3 in this file's own history) is what prevents arbitrary content
+// from being pushed, and that check is completely unaffected by which
+// credential got the caller past this first gate.
+const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -135,8 +149,10 @@ async function verifySessionToken(authHeader: string | null): Promise<number | n
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   try {
-    const callerId = await verifySessionToken(req.headers.get("authorization"));
-    if (!callerId) return json({ ok: false, error: "Unauthorized — a valid session token is required" }, 401);
+    const authHeader = req.headers.get("authorization");
+    const isCronCaller = !!CRON_AUTH_TOKEN && authHeader === `Bearer ${CRON_AUTH_TOKEN}`;
+    const callerId = isCronCaller ? null : await verifySessionToken(authHeader);
+    if (!isCronCaller && !callerId) return json({ ok: false, error: "Unauthorized — a valid session token is required" }, 401);
 
     if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
       throw new Error("VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not configured — see this function's README to generate a real keypair.");

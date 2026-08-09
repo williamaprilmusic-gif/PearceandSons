@@ -12614,18 +12614,23 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           if (navTarget?.lat) {
             const devKm = haversineKm(latitude, longitude, navTarget.lat, navTarget.lng);
             const DEVIATION_THRESHOLD_KM = 0.6; // 600 m
-            // Keyed by currentTripId — same fix/reasoning as the stationary
-            // tracking above. A shared, un-keyed deviationCount/
-            // deviationAlertFired meant a driver who finished one trip
-            // off-course and immediately started the next one could have a
-            // stale "already fired" flag silently suppress a genuine new
-            // deviation alert on the new trip.
+            // Keyed by trip AND the specific stop/agent being navigated to
+            // (devMinKey) — same fix/reasoning as the stationary tracking
+            // above, but consistently applied to ALL THREE trackers now.
+            // Previously devCount/devFired were keyed only by currentTripId
+            // while devMinKm was keyed by trip+stop — harmless in practice
+            // only because devMinKm resetting on a new leg makes the very
+            // first tick's regressedKm come out as 0, which happens to also
+            // reset devCount/devFired via the "back on course" branch below
+            // before they could matter. Correct by construction is better
+            // than correct by that coincidence: a shared, un-keyed tracker
+            // meant a driver who finished one trip off-course and
+            // immediately started the next one could have a stale "already
+            // fired" flag silently suppress a genuine new deviation alert
+            // on the new trip — the same failure mode this fully-consistent
+            // keying now rules out structurally rather than incidentally.
             if (!geofenceTriggeredRef.current.deviationCount) geofenceTriggeredRef.current.deviationCount = {};
             if (!geofenceTriggeredRef.current.deviationAlertFired) geofenceTriggeredRef.current.deviationAlertFired = {};
-            // Closest-approach tracker — keyed by trip AND the specific
-            // stop/agent being navigated to, so advancing to a new stop
-            // (or a totally different trip) starts a fresh baseline
-            // instead of inheriting a stale "closest" from a prior leg.
             if (!geofenceTriggeredRef.current.deviationMinKm) geofenceTriggeredRef.current.deviationMinKm = {};
             const devCount = geofenceTriggeredRef.current.deviationCount;
             const devFired = geofenceTriggeredRef.current.deviationAlertFired;
@@ -12635,9 +12640,9 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             if (devMinKm[devMinKey] == null || devKm < devMinKm[devMinKey]) devMinKm[devMinKey] = devKm;
             const regressedKm = devKm - devMinKm[devMinKey];
             if (regressedKm > DEVIATION_THRESHOLD_KM) {
-              devCount[currentTripId] = (devCount[currentTripId] || 0) + 1;
-              if (devCount[currentTripId] >= 2 && !devFired[currentTripId]) {
-                devFired[currentTripId] = true;
+              devCount[devMinKey] = (devCount[devMinKey] || 0) + 1;
+              if (devCount[devMinKey] >= 2 && !devFired[devMinKey]) {
+                devFired[devMinKey] = true;
                 if (supabase && user?.id) {
                   insertNotification({
                     type: "ROUTE_DEVIATION", for_roles: [ROLE.ADMIN],
@@ -12649,40 +12654,69 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             } else {
               // Back on course (at or closer than the best approach so far) —
               // reset counter and allow future alert if they regress again
-              devCount[currentTripId] = 0;
-              devFired[currentTripId] = false;
+              devCount[devMinKey] = 0;
+              devFired[devMinKey] = false;
             }
           }
         }
       }
       // Feature: High-risk-zone proximity alert ────────────────────────────
-      // Warns the driver the moment they come within a flagged high-risk
-      // area's radius, and notifies admins for visibility — fires once per
-      // zone per trip (not on every GPS tick), same trip-scoped "already
-      // fired" tracking as the stationary/deviation alerts above. Not
-      // gated to IN_TRANSIT specifically (unlike the deviation check) —
-      // real physical risk to the driver doesn't care about the app's
+      // TWO-TIER per explicit request (2026-08-09): previously a single
+      // check (distKm <= zone.radius_km) always said "entering," even for
+      // a driver just driving past on a nearby road within that radius but
+      // never actually crossing into the zone's real danger footprint —
+      // "entering" is an actionable caution, not something to cry wolf on
+      // every drive-by. Now: a wider outer ring (NEARBY_BUFFER_KM beyond
+      // the zone's own configured radius) gets the lighter "nearby"
+      // heads-up, and only actually crossing INTO the zone's real radius
+      // gets the stronger "Caution. Entering" wording. Each tier fires at
+      // most once per zone per trip — same trip-scoped "already fired"
+      // tracking as the stationary/deviation alerts above, now split into
+      // two independent flags so a driver who lingers in the nearby ring
+      // and later actually enters still gets the escalated warning (not
+      // silently swallowed by the nearby alert having already fired).
+      // Not gated to IN_TRANSIT specifically (unlike the deviation check)
+      // — real physical risk to the driver doesn't care about the app's
       // internal trip state machine, only whether they're actually there.
       if (supabase && user?.id && currentTripId && highRiskZonesRef.current?.length) {
         if (!geofenceTriggeredRef.current.highRiskFired) geofenceTriggeredRef.current.highRiskFired = {};
         const hrFired = geofenceTriggeredRef.current.highRiskFired;
+        const NEARBY_BUFFER_KM = 1; // outer ring beyond the zone's own radius
         for (const zone of highRiskZonesRef.current) {
           if (!zone.active || zone.lat == null || zone.lng == null || !zone.radius_km) continue;
-          const fireKey = `${currentTripId}:${zone.id}`;
-          if (hrFired[fireKey]) continue;
+          const enteredKey = `${currentTripId}:${zone.id}:entered`;
+          const nearbyKey = `${currentTripId}:${zone.id}:nearby`;
           const distKm = haversineKm(latitude, longitude, zone.lat, zone.lng);
           if (distKm <= zone.radius_km) {
-            hrFired[fireKey] = true;
-            insertNotification({
-              type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
-              message: `⚠ You are entering a high-risk area (${zone.label}) — please stay alert and watch your surroundings.`,
-              trip_id: currentTripId, ts: Date.now(), read: false,
-            }).catch(() => {});
-            insertNotification({
-              type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
-              message: `⚠ Driver ${user.name || user.id} is entering a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
-              trip_id: currentTripId, ts: Date.now(), read: false,
-            }).catch(() => {});
+            // Actually inside the zone's real danger radius.
+            if (!hrFired[enteredKey]) {
+              hrFired[enteredKey] = true;
+              insertNotification({
+                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
+                message: `⚠ Caution. Entering a high-risk area (${zone.label}) — please stay alert and watch your surroundings.`,
+                trip_id: currentTripId, ts: Date.now(), read: false,
+              }).catch(() => {});
+              insertNotification({
+                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
+                message: `⚠ Caution: Driver ${user.name || user.id} is entering a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
+                trip_id: currentTripId, ts: Date.now(), read: false,
+              }).catch(() => {});
+            }
+          } else if (distKm <= zone.radius_km + NEARBY_BUFFER_KM) {
+            // Close by, but hasn't actually crossed into the zone itself.
+            if (!hrFired[nearbyKey]) {
+              hrFired[nearbyKey] = true;
+              insertNotification({
+                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
+                message: `Nearby high-risk area (${zone.label}).`,
+                trip_id: currentTripId, ts: Date.now(), read: false,
+              }).catch(() => {});
+              insertNotification({
+                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
+                message: `Driver ${user.name || user.id} is near a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
+                trip_id: currentTripId, ts: Date.now(), read: false,
+              }).catch(() => {});
+            }
           }
         }
       }
