@@ -6727,7 +6727,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // to type a username again) closes that window without touching
       // the zero-touch behavior the user explicitly asked for between one
       // logout and the next.
-      persistLastBiometricUsername(null);
+      //
+      // EXCEPTION, per explicit follow-up request (2026-08-10):
+      // system_initiated logouts (idle-timeout auto-logout, dead-session-
+      // token auto-logout — see handleLogout8's own comment for the exact
+      // list) skip this clear. Those aren't the user handing the device to
+      // someone else; it's the same person coming back to a session the
+      // APP ended, so the next visit should still auto-fire biometric with
+      // zero taps, same as an ordinary relaunch. Only the deliberate
+      // sidebar "LOGOUT" button (dispatched with no flag) still clears it.
+      if (!action.system_initiated) persistLastBiometricUsername(null);
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above
       // (same active_user_id timing reasoning applies symmetrically to
       // logout clearing it).
@@ -10804,7 +10813,12 @@ function useAppStore() {
       // path has its own separate logout branch (appReducer's AUTH/LOGOUT
       // case above) that never touches localStorage itself, so this is
       // the one place that needs to run for both paths alike.
-      if (action.type === "AUTH/LOGOUT") { persistActiveUserId(null); persistLastBiometricUsername(null); }
+      // See handleSupabaseAction's identical AUTH/LOGOUT case for why
+      // system_initiated skips the biometric-username clear.
+      if (action.type === "AUTH/LOGOUT") {
+        persistActiveUserId(null);
+        if (!action.system_initiated) persistLastBiometricUsername(null);
+      }
       // Match the Supabase handler's return contract: TRIP/BOOK hands back
       // the new trip's id (the reducer prepends it) so the booking form
       // can roll a multi-leg booking back if a later leg fails.
@@ -17898,8 +17912,18 @@ function AppInner() {
 
   // Session timeout — defined AFTER dispatchWithToast so the logout callback
   // can safely reference it without hitting the temporal dead zone.
+  // system_initiated: true — this callback backs the idle-timeout
+  // auto-logout (useSessionTimeout below), the session-warning modal's
+  // "Log Out" button, and the expired-session banner's "LOG OUT NOW"
+  // button (see the sessionExpired effect below) — none of these are the
+  // user choosing to hand the device to someone else, they're all the
+  // app itself ending a session whose token is dead or about to be. Per
+  // explicit follow-up request: unlike the deliberate sidebar "LOGOUT"
+  // button (dispatched directly elsewhere, no flag), a system-initiated
+  // logout should NOT clear the remembered biometric username — see
+  // AUTH/LOGOUT's own handling of this flag for the full reasoning.
   const handleLogout8 = React.useCallback(() => {
-    dispatchWithToast({ type: "AUTH/LOGOUT" });
+    dispatchWithToast({ type: "AUTH/LOGOUT", system_initiated: true });
   }, [dispatchWithToast]);
   const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
     useSessionTimeout(activeUser, handleLogout8);
