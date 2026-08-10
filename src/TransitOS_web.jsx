@@ -12550,7 +12550,17 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // Each fires at most once per trip per category (guarded by refs).
       // isActiveTrip declared here (moved up from just above the stationary
       // block below) so BOTH speeding and stationary can gate on it.
-      const isActiveTrip = activeTripsRef.current?.some(t => String(t.trip_id) === String(currentTripId) && t.state === "IN_TRANSIT");
+      // FOUND VIA AUDIT: this originally gated strictly on IN_TRANSIT,
+      // which correctly excludes the ASSIGNED-but-unaccepted trip
+      // currentTripId falls back to (the actual bug this gate exists to
+      // fix — see the FIXED (2026-08-09) comments below) but ALSO
+      // excluded DRIVER_CONFIRMED — a driver who has genuinely accepted
+      // the trip and is actively driving to the pickup, before tapping
+      // Start Trip. That's real, currently-occurring risk (speeding,
+      // entering a high-risk zone) on a real accepted job, silently
+      // unmonitored. Matches isActiveTripForTracking's existing broader
+      // definition used elsewhere in this file for the same distinction.
+      const isActiveTrip = activeTripsRef.current?.some(t => String(t.trip_id) === String(currentTripId) && (t.state === "DRIVER_CONFIRMED" || t.state === "IN_TRANSIT"));
       if (currentTripId && speedKmh != null && user?.id && supabase) {
         const STATIONARY_THRESHOLD_KMH = 2;
         const STATIONARY_DURATION_MS = 8 * 60 * 1000; // 8 min

@@ -43,43 +43,56 @@ Deno.serve(async (req) => {
   const now = new Date();
   const sevenDaysAgo = now.getTime() - 7 * 24 * 60 * 60 * 1000;
 
-  const { data: trips, error: tripErr } = await sb
-    .from("trips")
-    .select("id, status, driverid, scheduledtime, intransitat, confirmedat, completedat, bookedat, noshows")
-    .eq("status", "ARCHIVED_COMPLETED")
-    .gte("completedat", sevenDaysAgo);
+  // FOUND VIA AUDIT: these 4 queries don't depend on each other but were
+  // awaited one after another — Promise.all cuts this cron run's DB-wait
+  // time to roughly the slowest single query instead of the sum of all
+  // four.
+  const [
+    { data: trips, error: tripErr },
+    { data: drivers },
+    { data: openTicketsRows },
+    { data: openDisputeRows },
+  ] = await Promise.all([
+    sb.from("trips")
+      .select("id, status, driverid, scheduledtime, intransitat, confirmedat, completedat, bookedat, noshows")
+      .eq("status", "ARCHIVED_COMPLETED")
+      .gte("completedat", sevenDaysAgo),
+    sb.from("users").select("id, fullname").eq("role", "DRIVER"),
+    // Open tickets/disputes — current snapshot, not a 7-day window. Per
+    // explicit follow-up: tickets/disputes only ever fired ONE
+    // notification when opened and never resurfaced (see check-stale-
+    // oversight, which now re-escalates them directly) — this gives
+    // admins a standing weekly reminder of the current backlog even for
+    // ones still inside their first 24h grace window. Same OPEN/DRIVER_
+    // RESPONDED "still needs an admin decision" filter check-stale-
+    // oversight uses for disputes.
+    sb.from("tickets").select("id").eq("status", "OPEN"),
+    sb.from("trips").select("id")
+      .not("dispute", "is", null)
+      .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED"),
+  ]);
   if (tripErr) {
     console.error("DB error (trips):", tripErr.message);
     return json({ error: "Internal error — please try again." }, 500);
   }
 
-  const { data: drivers } = await sb.from("users").select("id, fullname").eq("role", "DRIVER");
   const driverName = (id: unknown) => (drivers ?? []).find((d: { id: unknown }) => String(d.id) === String(id))?.fullname || String(id ?? "");
-
-  // ── Open tickets/disputes — current snapshot, not a 7-day window ───────
-  // Per explicit follow-up: tickets/disputes only ever fired ONE
-  // notification when opened and never resurfaced (see check-stale-
-  // oversight, which now re-escalates them directly) — this line gives
-  // admins a standing weekly reminder of the current backlog even for
-  // ones still inside their first 24h grace window. Same OPEN/DRIVER_
-  // RESPONDED "still needs an admin decision" filter check-stale-
-  // oversight uses for disputes.
-  const { data: openTicketsRows } = await sb.from("tickets").select("id").eq("status", "OPEN");
-  const { data: openDisputeRows } = await sb.from("trips").select("id")
-    .not("dispute", "is", null)
-    .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED");
   const openTicketCount = (openTicketsRows ?? []).length;
   const openDisputeCount = (openDisputeRows ?? []).length;
 
   // ── SLA on-time report — mirrors computeSlaReport exactly ──────────────
-  type SlaAgg = { name: string; total: number; onTime: number; lateMin: number[] };
+  // driver_id kept alongside name (not just name) so the CSV join below
+  // can match on id — FOUND VIA AUDIT: two drivers sharing a display
+  // name would otherwise silently misattribute utilization stats between
+  // them in a name-based join.
+  type SlaAgg = { driver_id: string; name: string; total: number; onTime: number; lateMin: number[] };
   const slaByDriver: Record<string, SlaAgg> = {};
   for (const t of trips ?? []) {
     if (!t.driverid || !t.scheduledtime || !t.intransitat) continue;
     const deltaMin = (Number(t.intransitat) - Number(t.scheduledtime)) / 60000;
     const onTime = deltaMin <= SLA_GRACE_MINUTES;
     const key = String(t.driverid);
-    if (!slaByDriver[key]) slaByDriver[key] = { name: driverName(t.driverid), total: 0, onTime: 0, lateMin: [] };
+    if (!slaByDriver[key]) slaByDriver[key] = { driver_id: key, name: driverName(t.driverid), total: 0, onTime: 0, lateMin: [] };
     slaByDriver[key].total++;
     if (onTime) slaByDriver[key].onTime++;
     else slaByDriver[key].lateMin.push(Math.round(deltaMin));
@@ -224,7 +237,7 @@ Deno.serve(async (req) => {
   const csvHeaders = ["Driver", "Trips Completed", "On-Time %", "Avg Late (min)", "Driving (h)", "Loading (h)", "Gap (h)"];
   const utilByDriverId: Record<string, UtilRow> = Object.fromEntries(utilRows.map(u => [u.driver_id, u]));
   const csvRows = slaRows.map(d => {
-    const util = Object.values(utilByDriverId).find(u => u.driver_name === d.name);
+    const util = utilByDriverId[d.driver_id];
     return [
       d.name, d.total, d.rate != null ? Math.round(d.rate * 100) : "", d.avgLateMin || "",
       util ? hrs(util.driving_ms) : "", util ? hrs(util.loading_ms) : "", util ? hrs(util.gap_ms) : "",
