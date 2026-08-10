@@ -4977,6 +4977,43 @@ function appReducer(state, action) {
       return { ...state, trips: uaNewTrips, notifications: [...uaNewNotifs, ...state.notifications], _error: null };
     }
 
+    case "TRIP/CHECK_STUCK_IN_TRANSIT": {
+      // The other end of what CHECK_LATE_START covers: that one catches a
+      // trip that never started, this catches one that started and never
+      // got marked complete (driver forgot to tap COMPLETE, app crashed
+      // mid-trip, etc.) — a real gap, since nothing previously watched for
+      // a trip sitting at IN_TRANSIT indefinitely. Same 3-hour threshold
+      // and notified-flag-to-avoid-repeat pattern as every other sweep
+      // here.
+      const STUCK_IN_TRANSIT_MS = 3 * 60 * 60 * 1000;
+      const sitNowTs = now();
+      let sitAnyFired = false;
+      const sitNewNotifs = [];
+      const sitNewTrips = state.trips.map(t => {
+        if (t.state !== TRIP_STATE.IN_TRANSIT || t.stuck_in_transit_notified) return t;
+        if (!t.in_transit_at_epoch) return t;
+        const msStuck = Date.now() - t.in_transit_at_epoch;
+        if (msStuck < STUCK_IN_TRANSIT_MS) return t;
+        sitAnyFired = true;
+        const driverUser = state.users.find(u => String(u.id) === String(t.driver_id));
+        sitNewNotifs.push({
+          id: mkId(), type: "TRIP_STUCK_IN_TRANSIT", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${t.trip_id} has been IN TRANSIT for ${Math.floor(msStuck / 3600000)}h with no completion — driver ${driverUser?.name || t.driver_id} may have forgotten to mark it complete.`,
+          trip_id: t.trip_id, ts: sitNowTs, read: false,
+        });
+        if (t.driver_id) {
+          sitNewNotifs.push({
+            id: mkId(), type: "TRIP_STUCK_IN_TRANSIT", for_roles: [ROLE.DRIVER], for_user_ids: [t.driver_id],
+            message: `⚠ Trip ${t.trip_id} still shows as in progress — please mark it complete if you've finished, or contact dispatch.`,
+            trip_id: t.trip_id, ts: sitNowTs, read: false,
+          });
+        }
+        return { ...t, stuck_in_transit_notified: true };
+      });
+      if (!sitAnyFired) return state; // nothing changed — avoid a pointless re-render/refetch
+      return { ...state, trips: sitNewTrips, notifications: [...sitNewNotifs, ...state.notifications], _error: null };
+    }
+
     case "TRIP/RECORD_ROUTE": {
       // Demo/fallback-mode equivalent of the Supabase handler's case —
       // same start-trip enforcement (cannot start before the booked
@@ -5340,6 +5377,35 @@ function appReducer(state, action) {
       return { ...state, tickets: newTickets, notifications: [...updateNotif, ...state.notifications], _error: null };
     }
 
+    case "TICKET/CHECK_STALE": {
+      // Previously a ticket fired exactly one TICKET_OPENED notification
+      // and never re-surfaced if left unaddressed — same single-fire, no
+      // re-escalation gap already fixed for unassigned bookings. Re-fires
+      // once every 24h while still OPEN, using stale_notified_at the same
+      // way every other periodic sweep in this file uses its own
+      // *_notified flag to avoid re-firing every poll cycle.
+      const STALE_TICKET_MS = 24 * 60 * 60 * 1000;
+      const tcsNowTs = now();
+      let tcsAnyFired = false;
+      const tcsNewNotifs = [];
+      const tcsNewTickets = (state.tickets || []).map(t => {
+        if (t.status !== "OPEN") return t;
+        const age = Date.now() - t.created_at;
+        if (age < STALE_TICKET_MS) return t;
+        const lastNotified = t.stale_notified_at || 0;
+        if (Date.now() - lastNotified < STALE_TICKET_MS) return t;
+        tcsAnyFired = true;
+        tcsNewNotifs.push({
+          id: mkId(), type: "TICKET_STALE", for_roles: [ROLE.ADMIN],
+          message: `🎫 Ticket ${t.id} (${t.category}) has been open ${Math.round(age / 3600000)}h with no resolution.`,
+          trip_id: t.trip_id, ts: tcsNowTs, read: false,
+        });
+        return { ...t, stale_notified_at: Date.now() };
+      });
+      if (!tcsAnyFired) return state; // nothing changed — avoid a pointless re-render/refetch
+      return { ...state, tickets: tcsNewTickets, notifications: [...tcsNewNotifs, ...state.notifications], _error: null };
+    }
+
     case "ADMIN/CREATE_COMPANY": {
       if (!action.name?.trim()) return { ...state, _error: "Company name is required." };
       if (!action.address?.lat) {
@@ -5525,6 +5591,38 @@ function appReducer(state, action) {
           ...t.dispute, state: action.outcome, resolution_note: action.resolution_note, resolved_at: Date.now(),
         } } : t
       )};
+    }
+
+    case "TRIP/CHECK_STALE_DISPUTES": {
+      // Same re-escalation gap/fix shape as TICKET/CHECK_STALE just above
+      // — a filed dispute fired one TRIP_DISPUTE notification and never
+      // re-surfaced. OPEN and DRIVER_RESPONDED both still need an admin
+      // decision (only the two RESOLVED_* states are actually done), so
+      // both count as "unresolved" here. stale_notified_at lives inside
+      // the dispute jsonb itself rather than as a new trip-level column,
+      // since the dispute is already a single nested object.
+      const STALE_DISPUTE_MS = 24 * 60 * 60 * 1000;
+      const tcdNowTs = now();
+      let tcdAnyFired = false;
+      const tcdNewNotifs = [];
+      const tcdNewTrips = state.trips.map(t => {
+        if (!t.dispute) return t;
+        const isUnresolved = t.dispute.state === DISPUTE_STATE.OPEN || t.dispute.state === DISPUTE_STATE.DRIVER_RESPONDED;
+        if (!isUnresolved) return t;
+        const age = Date.now() - t.dispute.filed_at;
+        if (age < STALE_DISPUTE_MS) return t;
+        const lastNotified = t.dispute.stale_notified_at || 0;
+        if (Date.now() - lastNotified < STALE_DISPUTE_MS) return t;
+        tcdAnyFired = true;
+        tcdNewNotifs.push({
+          id: mkId(), type: "DISPUTE_STALE", for_roles: [ROLE.ADMIN],
+          message: `⚠ Dispute on trip ${t.trip_id} (${t.dispute.category}) has been unresolved for ${Math.round(age / 3600000)}h.`,
+          trip_id: t.trip_id, ts: tcdNowTs, read: false,
+        });
+        return { ...t, dispute: { ...t.dispute, stale_notified_at: Date.now() } };
+      });
+      if (!tcdAnyFired) return state; // nothing changed — avoid a pointless re-render/refetch
+      return { ...state, trips: tcdNewTrips, notifications: [...tcdNewNotifs, ...state.notifications], _error: null };
     }
 
     case "TRIP/SET_SHARE_TOKEN": {
@@ -7641,6 +7739,31 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
+    case "TICKET/CHECK_STALE": {
+      // See the in-memory reducer's identical case for the full rationale.
+      // No permission check — periodic background check, same convention
+      // as every other sweep in this file.
+      const STALE_TICKET_MS = 24 * 60 * 60 * 1000;
+      const { data: openTickets } = await supabase.from("tickets").select("*").eq("status", "OPEN");
+      if (!openTickets || openTickets.length === 0) return;
+      const tcsNowTsSb = nowEpoch();
+      let tcsAnyFiredSb = false;
+      for (const t of openTickets) {
+        const age = Date.now() - t.createdat;
+        if (age < STALE_TICKET_MS) continue;
+        const lastNotified = t.stalenotifiedat || 0;
+        if (Date.now() - lastNotified < STALE_TICKET_MS) continue;
+        tcsAnyFiredSb = true;
+        await supabase.from("tickets").update({ stalenotifiedat: Date.now() }).eq("id", t.id);
+        await insertNotification({
+          type: "TICKET_STALE", for_roles: [ROLE.ADMIN],
+          message: `🎫 Ticket ${t.id} (${t.category}) has been open ${Math.round(age / 3600000)}h with no resolution.`,
+          trip_id: t.tripid, ts: tcsNowTsSb, read: false,
+        });
+      }
+      if (tcsAnyFiredSb) { if (extraRefetchers.fetchTickets) await extraRefetchers.fetchTickets(); else refetch(); } // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
     case "DM/REPLY": {
       // Agent/driver side of a DM conversation — no admin-permission
       // gate (unlike DM/SEND), since this has to work for whichever
@@ -8828,6 +8951,38 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "TRIP/CHECK_STALE_DISPUTES": {
+      // See the in-memory reducer's identical case for the full rationale.
+      // No permission check — periodic background check, same convention
+      // as every other sweep in this file. Filters in Postgres on
+      // dispute->>'state' rather than fetching every trip and filtering
+      // in JS — dispute is a jsonb column, not a dedicated table/index,
+      // but this app's trip volume is small enough that the ->> filter
+      // is still cheap and avoids downloading every trip row to check one.
+      const { data: disputedTrips } = await supabase.from("trips").select("id, dispute")
+        .not("dispute", "is", null)
+        .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED");
+      if (!disputedTrips || disputedTrips.length === 0) return;
+      const STALE_DISPUTE_MS = 24 * 60 * 60 * 1000;
+      const tcdNowTsSb = nowEpoch();
+      let tcdAnyFiredSb = false;
+      for (const t of disputedTrips) {
+        const age = Date.now() - t.dispute.filed_at;
+        if (age < STALE_DISPUTE_MS) continue;
+        const lastNotified = t.dispute.stale_notified_at || 0;
+        if (Date.now() - lastNotified < STALE_DISPUTE_MS) continue;
+        tcdAnyFiredSb = true;
+        await supabase.from("trips").update({ dispute: { ...t.dispute, stale_notified_at: Date.now() } }).eq("id", t.id);
+        await insertNotification({
+          type: "DISPUTE_STALE", for_roles: [ROLE.ADMIN],
+          message: `⚠ Dispute on trip ${t.id} (${t.dispute.category}) has been unresolved for ${Math.round(age / 3600000)}h.`,
+          trip_id: t.id, ts: tcdNowTsSb, read: false,
+        });
+      }
+      if (tcdAnyFiredSb) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
+
     case "TRIP/SET_SHARE_TOKEN": {
       // Admin-facing only (see copyShareLink's one call site, on the admin
       // user-detail screen). Previously had no permission gate: any
@@ -9761,6 +9916,39 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         });
       }
       if (uaAnyFiredSb) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
+    case "TRIP/CHECK_STUCK_IN_TRANSIT": {
+      // See the in-memory reducer's identical case for the full rationale.
+      // Same no-permission-check reasoning as CHECK_LATE_START above.
+      const STUCK_IN_TRANSIT_MS = 3 * 60 * 60 * 1000;
+      const { data: inTransitTrips } = await supabase.from("trips").select("*")
+        .eq("status", TRIP_STATE.IN_TRANSIT)
+        .or("stuckintransitnotified.is.null,stuckintransitnotified.eq.false");
+      if (!inTransitTrips || inTransitTrips.length === 0) return;
+      const sitNowTsSb = nowEpoch();
+      let sitAnyFiredSb = false;
+      for (const t of inTransitTrips) {
+        if (!t.intransitat) continue;
+        const msStuck = Date.now() - t.intransitat;
+        if (msStuck < STUCK_IN_TRANSIT_MS) continue;
+        sitAnyFiredSb = true;
+        await supabase.from("trips").update({ stuckintransitnotified: true }).eq("id", t.id);
+        const { data: driverUserRow } = t.driverid ? await supabase.from("users").select("fullname").eq("id", t.driverid).maybeSingle() : { data: null };
+        await insertNotification({
+          type: "TRIP_STUCK_IN_TRANSIT", for_roles: [ROLE.ADMIN],
+          message: `⚠ Trip ${t.id} has been IN TRANSIT for ${Math.floor(msStuck / 3600000)}h with no completion — driver ${driverUserRow?.fullname || t.driverid} may have forgotten to mark it complete.`,
+          trip_id: t.id, ts: sitNowTsSb, read: false,
+        });
+        if (t.driverid) {
+          await insertNotification({
+            type: "TRIP_STUCK_IN_TRANSIT", for_roles: [ROLE.DRIVER], for_user_ids: [t.driverid],
+            message: `⚠ Trip ${t.id} still shows as in progress — please mark it complete if you've finished, or contact dispatch.`,
+            trip_id: t.id, ts: sitNowTsSb, read: false,
+          });
+        }
+      }
+      if (sitAnyFiredSb) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
     case "TRIP/CHECK_UPCOMING_REMINDERS": {
@@ -11763,7 +11951,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.

@@ -56,6 +56,21 @@ Deno.serve(async (req) => {
   const { data: drivers } = await sb.from("users").select("id, fullname").eq("role", "DRIVER");
   const driverName = (id: unknown) => (drivers ?? []).find((d: { id: unknown }) => String(d.id) === String(id))?.fullname || String(id ?? "");
 
+  // ── Open tickets/disputes — current snapshot, not a 7-day window ───────
+  // Per explicit follow-up: tickets/disputes only ever fired ONE
+  // notification when opened and never resurfaced (see check-stale-
+  // oversight, which now re-escalates them directly) — this line gives
+  // admins a standing weekly reminder of the current backlog even for
+  // ones still inside their first 24h grace window. Same OPEN/DRIVER_
+  // RESPONDED "still needs an admin decision" filter check-stale-
+  // oversight uses for disputes.
+  const { data: openTicketsRows } = await sb.from("tickets").select("id").eq("status", "OPEN");
+  const { data: openDisputeRows } = await sb.from("trips").select("id")
+    .not("dispute", "is", null)
+    .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED");
+  const openTicketCount = (openTicketsRows ?? []).length;
+  const openDisputeCount = (openDisputeRows ?? []).length;
+
   // ── SLA on-time report — mirrors computeSlaReport exactly ──────────────
   type SlaAgg = { name: string; total: number; onTime: number; lateMin: number[] };
   const slaByDriver: Record<string, SlaAgg> = {};
@@ -170,6 +185,17 @@ Deno.serve(async (req) => {
       <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:2px">${l}</div>
     </div>`).join("")}
   </div>
+
+  <div style="display:flex;gap:12px;margin-bottom:20px">
+    ${[
+      [openTicketCount, "Open Tickets", openTicketCount > 0 ? "#f5a623" : "#1db954"],
+      [openDisputeCount, "Open Disputes", openDisputeCount > 0 ? "#e83a3a" : "#1db954"],
+    ].map(([n, l, c]) => `<div style="background:#1a1a1a;border-radius:6px;padding:10px 18px;flex:1;text-align:center">
+      <div style="font-size:22px;font-weight:800;color:${c}">${n}</div>
+      <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:2px">${l}</div>
+    </div>`).join("")}
+  </div>
+  <p style="font-size:10px;color:#555;margin-top:-14px;margin-bottom:20px">Current backlog snapshot, not scoped to the past 7 days — an admin now also gets a re-escalation alert for any ticket/dispute still open 24h+ (see check-stale-oversight), this is just the standing weekly total.</p>
 
   <div style="font-size:13px;font-weight:700;color:#f5a623;letter-spacing:2px;text-transform:uppercase;margin:24px 0 10px;border-bottom:1px solid #2a2a2a;padding-bottom:6px">
     ⏱ SLA On-Time Report (${SLA_GRACE_MINUTES} min grace)
