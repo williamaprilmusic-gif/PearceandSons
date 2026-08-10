@@ -15255,8 +15255,7 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
   );
 }
 
-function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, driverPosition }) {
-  const [tripStarted, setTripStarted] = useState(false);
+function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, tripStarted, setTripStarted, driverPosition }) {
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
   const [noShowFor, setNoShowFor] = useState(null); // { trip_id, agent_id, agent_name } | null
@@ -16222,6 +16221,16 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // switching to another tab (Messages, Alerts, etc.) and back to Navigate
   // doesn't lose the active route; { lat, lng, label, isManual } | null.
   const [navTarget, setNavTarget] = useState(null);
+  // Same reasoning, same fix — FOUND VIA AUDIT: this was local to
+  // DriverNavTab (`useState(false)`), which fully unmounts/remounts every
+  // time the driver switches away from and back to the Navigate tab
+  // (DriverNavTab is only rendered behind `tab === "navigate"` below), so
+  // a driver mid-trip who glanced at Messages or Alerts and came back was
+  // silently dropped back onto the pre-start "Ready to go? START TRIP"
+  // screen — even though the trip was already under way with real
+  // pickup/dropoff progress — and tapping START TRIP again would
+  // re-dispatch TRIP/RECORD_ROUTE on an already-in-progress trip.
+  const [tripStarted, setTripStarted] = useState(false);
 
   // Register handler for NOTIFICATION_CLICKED — drivers mostly get
   // trip notifications and DMs. Jump to Navigate for an active trip
@@ -16325,7 +16334,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
       </div>
       <div style={{ flex: 1, overflowY: "auto" }}>
         {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} setNavTarget={setNavTarget} />}
-        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} navTarget={navTarget} setNavTarget={setNavTarget} driverPosition={location.position} />}
+        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} navTarget={navTarget} setNavTarget={setNavTarget} tripStarted={tripStarted} setTripStarted={setTripStarted} driverPosition={location.position} />}
         {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "history" && <DriverHistoryTab myTrips={myTrips} state={state} />}
