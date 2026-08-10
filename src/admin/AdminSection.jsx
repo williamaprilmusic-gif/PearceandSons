@@ -80,8 +80,7 @@ import {
   unifiedAddressSearch,
   usePersistedTab,
   useSortedDropoffs,
-  useWebRTCCall,
-  vehicleServiceStatus
+  useWebRTCCall
 } from "../TransitOS_web.jsx";
 
 function hasAdminPermission(user, permission) {
@@ -4568,269 +4567,6 @@ function DriverSafetyModal({ driverId, driverName, onClose }) {
   );
 }
 
-function VehicleServiceModal({ vehicle, dispatch, onClose }) {
-  const [serviceDate, setServiceDate] = useState("");
-  const [odometerKm, setOdometerKm] = useState(vehicle.odometer_km != null ? String(vehicle.odometer_km) : "");
-  const [serviceType, setServiceType] = useState("");
-  const [note, setNote] = useState("");
-  const [costZar, setCostZar] = useState("");
-  const [nextServiceDate, setNextServiceDate] = useState(vehicle.next_service_date || "");
-  const [nextServiceKm, setNextServiceKm] = useState(vehicle.next_service_km != null ? String(vehicle.next_service_km) : "");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState(null);
-
-  const save = async () => {
-    if (!serviceType.trim()) { setError("Enter a service type."); return; }
-    setSaving(true);
-    setError(null);
-    try {
-      await dispatch({
-        type: "ADMIN/LOG_VEHICLE_MAINTENANCE", vehicle_id: vehicle.id,
-        service_date: serviceDate || null, odometer_km: odometerKm ? Number(odometerKm) : null,
-        service_type: serviceType.trim(), note: note.trim() || null,
-        cost_zar: costZar ? Number(costZar) : null,
-        next_service_date: nextServiceDate || null, next_service_km: nextServiceKm ? Number(nextServiceKm) : null,
-      });
-      onClose();
-    } catch (e) {
-      setError(e.message || "Couldn't log service — please try again.");
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
-      onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between" }}>
-          <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>🔧 LOG SERVICE — {vehicle.registration}</span>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
-        </div>
-        <TextField label="Service Type" value={serviceType} onChange={e => setServiceType(e.target.value)} placeholder="e.g. Oil change, brake pads" />
-        <div>
-          <label style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, display: "block", marginBottom: 4 }}>SERVICE DATE</label>
-          <input type="date" value={serviceDate} onChange={e => setServiceDate(e.target.value)}
-            style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box" }} />
-        </div>
-        <TextField label="Odometer at Service (km)" value={odometerKm} onChange={e => setOdometerKm(e.target.value)} placeholder="e.g. 85000" />
-        <TextField label="Cost (ZAR, optional)" value={costZar} onChange={e => setCostZar(e.target.value)} placeholder="e.g. 1500" />
-        <TextField label="Note (optional)" value={note} onChange={e => setNote(e.target.value)} placeholder="Any extra detail" />
-        <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5, marginTop: 4 }}>NEXT SERVICE DUE (optional — advances the reminder)</div>
-        <div>
-          <label style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, display: "block", marginBottom: 4 }}>NEXT SERVICE DATE</label>
-          <input type="date" value={nextServiceDate} onChange={e => setNextServiceDate(e.target.value)}
-            style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12, boxSizing: "border-box" }} />
-        </div>
-        <TextField label="Next Service KM" value={nextServiceKm} onChange={e => setNextServiceKm(e.target.value)} placeholder="e.g. 90000" />
-        {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
-        <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
-          <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onClose} disabled={saving} />
-          <Button title={saving ? "SAVING…" : "✓ LOG SERVICE"} variant="amber" style={{ flex: 1 }} onClick={save} disabled={saving || !serviceType.trim()} />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AdminVehicles({ state, user, dispatch }) {
-  const emptyForm = { registration: "", make: "", model: "", year: "", odometer_km: "" };
-  const [addingOpen, setAddingOpen] = useState(false);
-  const [newVeh, setNewVeh] = useState(emptyForm);
-  const [adding, setAdding] = useState(false);
-  const [error, setError] = useState(null);
-  const [serviceModalFor, setServiceModalFor] = useState(null);
-  const [expandedHistoryFor, setExpandedHistoryFor] = useState(null);
-  const [archivingId, setArchivingId] = useState(null);
-  const [confirmingArchiveId, setConfirmingArchiveId] = useState(null);
-  // ADMIN/UPDATE_VEHICLE was defined server-side (correcting a typo'd
-  // registration/make/model/year) but had no way to actually reach it from
-  // the UI — LOG SERVICE only ever advances odometer/next-service fields,
-  // never the vehicle's own identity details. Closes that gap.
-  const [editingId, setEditingId] = useState(null);
-  const [editVeh, setEditVeh] = useState(emptyForm);
-  const [savingEdit, setSavingEdit] = useState(false);
-
-  const startEdit = (v) => {
-    setEditingId(v.id);
-    setEditVeh({ registration: v.registration || "", make: v.make || "", model: v.model || "", year: v.year != null ? String(v.year) : "", odometer_km: "" });
-  };
-
-  const saveEdit = async (id) => {
-    if (!editVeh.registration.trim()) { setError("Enter a registration number."); return; }
-    setSavingEdit(true);
-    setError(null);
-    try {
-      await dispatch({
-        type: "ADMIN/UPDATE_VEHICLE", vehicle_id: id, registration: editVeh.registration.trim(),
-        make: editVeh.make.trim() || null, model: editVeh.model.trim() || null,
-        year: editVeh.year ? Number(editVeh.year) : null,
-      });
-      setEditingId(null);
-    } catch (e) {
-      setError(e.message || "Couldn't update the vehicle — please try again.");
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  const activeVehicles = (state.vehicles || []).filter(v => v.active);
-
-  const addVehicle = async () => {
-    if (!newVeh.registration.trim()) { setError("Enter a registration number."); return; }
-    setAdding(true);
-    setError(null);
-    try {
-      await dispatch({
-        type: "ADMIN/CREATE_VEHICLE", registration: newVeh.registration.trim(),
-        make: newVeh.make.trim() || null, model: newVeh.model.trim() || null,
-        year: newVeh.year ? Number(newVeh.year) : null,
-        odometer_km: newVeh.odometer_km ? Number(newVeh.odometer_km) : 0,
-      });
-      setNewVeh(emptyForm);
-      setAddingOpen(false);
-    } catch (e) {
-      setError(e.message || "Couldn't add the vehicle — please try again.");
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  const archiveVehicle = async (id) => {
-    setArchivingId(id);
-    try {
-      await dispatch({ type: "ADMIN/ARCHIVE_VEHICLE", vehicle_id: id });
-      setConfirmingArchiveId(null);
-    } catch (e) {
-      setError(e.message || "Couldn't archive the vehicle — please try again.");
-    } finally {
-      setArchivingId(null);
-    }
-  };
-
-  const assignDriver = async (vehicleId, driverId) => {
-    setError(null);
-    try {
-      await dispatch({ type: "ADMIN/ASSIGN_VEHICLE_TO_DRIVER", vehicle_id: vehicleId, driver_id: driverId || null });
-    } catch (e) {
-      setError(e.message || "Couldn't assign the driver — please try again.");
-    }
-  };
-
-  return (
-    <div className="pad">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <SectionHeader label={`Vehicles (${activeVehicles.length})`} />
-        <Button title={addingOpen ? "CANCEL" : "+ ADD VEHICLE"} variant={addingOpen ? "ghost" : "amber"} size="sm" onClick={() => setAddingOpen(v => !v)} />
-      </div>
-      {addingOpen && (
-        <Card>
-          <TextField label="Registration" value={newVeh.registration} onChange={e => setNewVeh(f => ({ ...f, registration: e.target.value }))} placeholder="e.g. CA 123-456" />
-          <TextField label="Make (optional)" value={newVeh.make} onChange={e => setNewVeh(f => ({ ...f, make: e.target.value }))} placeholder="e.g. Toyota" />
-          <TextField label="Model (optional)" value={newVeh.model} onChange={e => setNewVeh(f => ({ ...f, model: e.target.value }))} placeholder="e.g. Quantum" />
-          <TextField label="Year (optional)" value={newVeh.year} onChange={e => setNewVeh(f => ({ ...f, year: e.target.value }))} placeholder="e.g. 2022" />
-          <TextField label="Current Odometer (km)" value={newVeh.odometer_km} onChange={e => setNewVeh(f => ({ ...f, odometer_km: e.target.value }))} placeholder="e.g. 80000" />
-          <Button title={adding ? "ADDING…" : "+ ADD VEHICLE"} variant="amber" size="sm" onClick={addVehicle} disabled={adding || !newVeh.registration.trim()} />
-        </Card>
-      )}
-      {error && <span style={{ fontSize: 10, color: COLORS.red }}>{error}</span>}
-      {activeVehicles.length === 0 ? <Empty icon="🚐" text="No vehicles registered" /> : activeVehicles.map(v => {
-        const driverUser = state.users.find(u => String(u.id) === String(v.assigned_driver_id));
-        const { status, kmLeft } = vehicleServiceStatus(v);
-        const history = (state.vehicle_maintenance_log || []).filter(l => String(l.vehicle_id) === String(v.id));
-        return (
-          <Card key={v.id}>
-            {editingId === v.id ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                <TextField label="Registration" value={editVeh.registration} onChange={e => setEditVeh(f => ({ ...f, registration: e.target.value }))} />
-                <TextField label="Make" value={editVeh.make} onChange={e => setEditVeh(f => ({ ...f, make: e.target.value }))} />
-                <TextField label="Model" value={editVeh.model} onChange={e => setEditVeh(f => ({ ...f, model: e.target.value }))} />
-                <TextField label="Year" value={editVeh.year} onChange={e => setEditVeh(f => ({ ...f, year: e.target.value }))} />
-                <div style={{ display: "flex", gap: 8 }}>
-                  <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setEditingId(null)} disabled={savingEdit} />
-                  <Button title={savingEdit ? "SAVING…" : "✓ SAVE"} variant="amber" size="sm" onClick={() => saveEdit(v.id)} disabled={savingEdit || !editVeh.registration.trim()} />
-                </div>
-              </div>
-            ) : (
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontFamily: FONTS.head, fontSize: 15, fontWeight: 800 }}>{v.registration}</div>
-                <div style={{ fontSize: 10, color: COLORS.mist }}>{[v.make, v.model, v.year].filter(Boolean).join(" ") || "—"}</div>
-                <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{v.odometer_km != null ? `${Number(v.odometer_km).toLocaleString()} km` : "Odometer not set"}</div>
-              </div>
-              <div style={{ display: "flex", gap: 4 }}>
-                {confirmingArchiveId === v.id ? (
-                  <>
-                    <Button title="CANCEL" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(null)} />
-                    <Button title={archivingId === v.id ? "…" : "CONFIRM"} variant="ghost" size="sm" onClick={() => archiveVehicle(v.id)} disabled={archivingId === v.id} />
-                  </>
-                ) : (
-                  <>
-                    <Button title="✎ EDIT" variant="ghost" size="sm" onClick={() => startEdit(v)} />
-                    <Button title="🗑 ARCHIVE" variant="ghost" size="sm" onClick={() => setConfirmingArchiveId(v.id)} />
-                  </>
-                )}
-              </div>
-            </div>
-            )}
-
-            <div style={{ marginTop: 8 }}>
-              <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ASSIGNED DRIVER</span>
-              <select value={v.assigned_driver_id || ""} onChange={e => assignDriver(v.id, e.target.value || null)}
-                style={{ width: "100%", background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "6px 8px", fontSize: 11, marginTop: 4 }}>
-                <option value="">— Unassigned —</option>
-                {state.users.filter(u => u.role === ROLE.DRIVER).map(u => (
-                  <option key={u.id} value={u.id}>{u.name}</option>
-                ))}
-              </select>
-              {driverUser && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 2 }}>Currently: {driverUser.name}</div>}
-            </div>
-
-            <div style={{ marginTop: 8 }}>
-              {status === "missing" ? (
-                <span style={{ fontSize: 9, color: COLORS.ghost }}>No service schedule set</span>
-              ) : status === "ok" ? (
-                <span style={{ fontSize: 9, color: COLORS.green, fontWeight: 700 }}>✓ SERVICE UP TO DATE</span>
-              ) : (
-                <span style={{ fontSize: 9, fontWeight: 700, color: status === "expired" ? COLORS.red : COLORS.amber }}>
-                  {status === "expired" ? "✗ OVERDUE" : "⚠ DUE SOON"}
-                  {v.next_service_date ? ` — ${v.next_service_date}` : ""}
-                  {v.next_service_km ? ` (target ${Number(v.next_service_km).toLocaleString()}km${kmLeft != null ? `, ${kmLeft}km left` : ""})` : ""}
-                </span>
-              )}
-            </div>
-
-            <div style={{ marginTop: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
-              <Button title="🔧 LOG SERVICE" variant="ghost" size="sm" onClick={() => setServiceModalFor(v.id)} />
-              {history.length > 0 && (
-                <Button title={expandedHistoryFor === v.id ? "HIDE HISTORY" : `HISTORY (${history.length})`} variant="ghost" size="sm"
-                  onClick={() => setExpandedHistoryFor(expandedHistoryFor === v.id ? null : v.id)} />
-              )}
-            </div>
-
-            {expandedHistoryFor === v.id && (
-              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
-                {history.map(l => (
-                  <div key={l.id} style={{ padding: 8, border: `1px solid ${COLORS.wire}`, borderRadius: 4, fontSize: 10 }}>
-                    <div style={{ fontWeight: 700 }}>{l.service_type || "Service"}{l.service_date ? ` — ${l.service_date}` : ""}</div>
-                    {l.odometer_km != null && <div style={{ color: COLORS.ghost }}>Odometer: {Number(l.odometer_km).toLocaleString()} km</div>}
-                    {l.cost_zar != null && <div style={{ color: COLORS.ghost }}>Cost: R{Number(l.cost_zar).toLocaleString()}</div>}
-                    {l.note && <div style={{ color: COLORS.ghost }}>{l.note}</div>}
-                    <div style={{ color: COLORS.dim, fontSize: 9, marginTop: 2 }}>Logged by {l.logged_by_name}</div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {serviceModalFor === v.id && (
-              <VehicleServiceModal vehicle={v} dispatch={dispatch} onClose={() => setServiceModalFor(null)} />
-            )}
-          </Card>
-        );
-      })}
-    </div>
-  );
-}
-
 function AdminDrivers({ state, user, dispatch }) {
   // Which trip cards are expanded, per driver. Collapsed by default —
   // a driver with several active trips otherwise dumps a wall of detail
@@ -6647,7 +6383,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", VEHICLE_MAINTENANCE_DUE: "🔧" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -6778,7 +6514,7 @@ function AdminAIAssistant({ user }) {
     <div className="pad">
       <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800 }}>AI OPS ASSISTANT</div>
       <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2, marginBottom: 12 }}>
-        Ask about today's active trips, driver status, open tickets, or vehicle maintenance.
+        Ask about today's active trips, driver status, or open tickets.
         Answers are generated from a live snapshot of current data only — not full trip history.
       </div>
       <Card style={{ display: "flex", flexDirection: "column", height: "60vh", minHeight: 360 }}>
@@ -6815,7 +6551,7 @@ function AdminAIAssistant({ user }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["vehicles", "🚐", "Vehicles"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -6836,7 +6572,6 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
-    if (id === "vehicles") return hasAdminPermission(user, "manageAgentsDrivers");
     if (id === "utilization") return hasAdminPermission(user, "manageDispatch");
     // Mirrors the ai-ops-assistant edge function's own server-side gate
     // (Fleet Ops/Standard only) — see that function's header comment.
@@ -6883,12 +6618,14 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // than in every driver's own polling effect.
     dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
     dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
-    dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
+    // Same shape as CHECK_LATE_START — catches a booking that never even
+    // got a driver, not just one whose confirmed driver hasn't started.
+    dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
-      dispatch({ type: "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE" }).catch(() => {});
+      dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
     }, 10 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6999,7 +6736,6 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
-      {tab === "vehicles" && hasAdminPermission(user, "manageAgentsDrivers") && <AdminVehicles state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}

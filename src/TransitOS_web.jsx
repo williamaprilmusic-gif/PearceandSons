@@ -2460,9 +2460,7 @@ export function docExpiryStatus(dateStr) {
   // Found via a dedicated audit, confirmed by hand: at 10:00 SAST on a
   // document's own expiry date, the old logic already reported it
   // expired. Same bug affected the "expiring" (DOC_WARN_DAYS) threshold
-  // boundary by the same margin, and — since vehicleServiceStatus calls
-  // this same function for next_service_date — vehicle maintenance
-  // due-soon alerts too. Fixed by building the expiry moment from the
+  // boundary by the same margin. Fixed by building the expiry moment from the
   // date's own y/m/d components (parsed in the DEVICE'S LOCAL time zone,
   // not UTC) and treating it as valid through 23:59:59.999 of that day.
   const [y, m, d] = dateStr.split("-").map(Number);
@@ -2473,27 +2471,6 @@ export function docExpiryStatus(dateStr) {
   if (daysLeft < 0) return { status: "expired", daysLeft };
   if (daysLeft <= DOC_WARN_DAYS) return { status: "expiring", daysLeft };
   return { status: "ok", daysLeft };
-}
-
-// ── Vehicle service due tracking ─────────────────────────────────────────
-// Reuses docExpiryStatus's exact amber/red date logic for next_service_date,
-// plus an equivalent km-based check for next_service_km (both manually
-// admin-set per DriverDocEditor-style entry, not auto-computed intervals —
-// see project memory for why). Whichever dimension is more urgent wins.
-const MAINTENANCE_WARN_KM = 500;
-
-export function vehicleServiceStatus(v) {
-  const hasDate = !!v.next_service_date;
-  const hasKm = v.next_service_km != null && v.odometer_km != null;
-  if (!hasDate && !hasKm) return { status: "missing", daysLeft: null, kmLeft: null };
-  const dateStatus = hasDate ? docExpiryStatus(v.next_service_date) : null;
-  const kmLeft = hasKm ? v.next_service_km - v.odometer_km : null;
-  const kmStatusVal = hasKm ? (kmLeft < 0 ? "expired" : kmLeft <= MAINTENANCE_WARN_KM ? "expiring" : "ok") : null;
-  const rank = { expired: 2, expiring: 1, ok: 0 };
-  let worst = "ok";
-  if (dateStatus && rank[dateStatus.status] > rank[worst]) worst = dateStatus.status;
-  if (kmStatusVal && rank[kmStatusVal] > rank[worst]) worst = kmStatusVal;
-  return { status: worst, daysLeft: dateStatus?.daysLeft ?? null, kmLeft };
 }
 
 // ── Audit export for compliance ───────────────────────────────────────────
@@ -4968,6 +4945,36 @@ function appReducer(state, action) {
       });
       if (!anyFired) return state; // nothing changed — avoid a pointless re-render/refetch
       return { ...state, trips: newTrips, notifications: [...newNotifs, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/CHECK_UNASSIGNED_APPROACHING": {
+      // Same periodic-sweep shape as CHECK_LATE_START just above, but for
+      // the gap that check doesn't cover: a booking that's still sitting
+      // at UNASSIGNED_BOOKING (never even got a driver) as its scheduled
+      // time approaches. Previously nothing proactively flagged this — an
+      // admin had to happen to notice a driver-less row on the Dispatch
+      // board themselves. Fires once, 2 hours out, same
+      // notified-flag-to-avoid-repeat pattern as every other sweep here.
+      const UNASSIGNED_WARN_MS = 2 * 60 * 60 * 1000;
+      const uaNowTs = now();
+      let uaAnyFired = false;
+      const uaNewNotifs = [];
+      const uaNewTrips = state.trips.map(t => {
+        if (t.state !== TRIP_STATE.UNASSIGNED_BOOKING || t.unassigned_approaching_notified) return t;
+        const scheduledDt = parseScheduledDateTime(t.scheduled_date, t.scheduled_time);
+        if (!scheduledDt) return t; // malformed date/time — skip rather than false-positive
+        const msUntil = scheduledDt.getTime() - Date.now();
+        if (msUntil > UNASSIGNED_WARN_MS || msUntil < 0) return t; // not yet in window, or already passed
+        uaAnyFired = true;
+        uaNewNotifs.push({
+          id: mkId(), type: "TRIP_UNASSIGNED_APPROACHING", for_roles: [ROLE.ADMIN],
+          message: `⚠ Booking ${t.trip_id} still has no driver — scheduled for ${t.scheduled_date} ${t.scheduled_time}, ${Math.round(msUntil / 60000)} min away.`,
+          trip_id: t.trip_id, ts: uaNowTs, read: false,
+        });
+        return { ...t, unassigned_approaching_notified: true };
+      });
+      if (!uaAnyFired) return state; // nothing changed — avoid a pointless re-render/refetch
+      return { ...state, trips: uaNewTrips, notifications: [...uaNewNotifs, ...state.notifications], _error: null };
     }
 
     case "TRIP/RECORD_ROUTE": {
@@ -7449,160 +7456,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
-    case "ADMIN/CREATE_VEHICLE": {
-      const actingAdminVehC = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
-      if (!action.registration?.trim()) throw new Error("A registration number is required.");
-      const { data: vehInserted, error: vehCErr } = await supabase.from("vehicles").insert({
-        registration: action.registration.trim(), make: action.make || null, model: action.model || null,
-        year: action.year || null, odometerkm: action.odometer_km || 0,
-        nextservicedate: action.next_service_date || null, nextservicekm: action.next_service_km || null,
-        assigneddriverid: action.assigned_driver_id || null, active: true, createdat: nowEpoch(),
-      }).select("id").single();
-      if (vehCErr) throw vehCErr;
-      await logAuditAction({
-        actorId: actingAdminVehC.id, actorName: actingAdminVehC.name, actionType: "ADMIN/CREATE_VEHICLE",
-        details: `Added vehicle: ${action.registration.trim()} (id ${vehInserted?.id})`,
-      });
-      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/UPDATE_VEHICLE": {
-      const actingAdminVehU = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
-      const vehUpdate = { updatedat: nowEpoch() };
-      if (action.registration !== undefined) vehUpdate.registration = action.registration.trim();
-      if (action.make !== undefined) vehUpdate.make = action.make;
-      if (action.model !== undefined) vehUpdate.model = action.model;
-      if (action.year !== undefined) vehUpdate.year = action.year;
-      if (action.odometer_km !== undefined) vehUpdate.odometerkm = action.odometer_km;
-      if (action.next_service_date !== undefined) vehUpdate.nextservicedate = action.next_service_date;
-      if (action.next_service_km !== undefined) vehUpdate.nextservicekm = action.next_service_km;
-      const { error: vehUErr } = await supabase.from("vehicles").update(vehUpdate).eq("id", action.vehicle_id);
-      if (vehUErr) throw vehUErr;
-      await logAuditAction({
-        actorId: actingAdminVehU.id, actorName: actingAdminVehU.name, actionType: "ADMIN/UPDATE_VEHICLE",
-        details: `Updated vehicle id ${action.vehicle_id}`,
-      });
-      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/ARCHIVE_VEHICLE": {
-      const actingAdminVehA = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
-      const { data: vehRow } = await supabase.from("vehicles").select("id, registration").eq("id", action.vehicle_id).maybeSingle();
-      if (!vehRow) throw new Error("Vehicle not found");
-      const { error: vehAErr } = await supabase.from("vehicles").update({ active: false, updatedat: nowEpoch() }).eq("id", action.vehicle_id);
-      if (vehAErr) throw vehAErr;
-      await logAuditAction({
-        actorId: actingAdminVehA.id, actorName: actingAdminVehA.name, actionType: "ADMIN/ARCHIVE_VEHICLE",
-        details: `Archived vehicle: ${vehRow.registration} (id ${action.vehicle_id})`,
-      });
-      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/ASSIGN_VEHICLE_TO_DRIVER": {
-      const actingAdminVehAs = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
-      // Guard against double-assignment — found missing via a dedicated
-      // audit: this write had no check at all for whether the target
-      // driver already has a DIFFERENT vehicle assigned. Doesn't fully
-      // close the gap (driver_status.vehicle, a separate free-text field
-      // set independently via EditUserPanel with nothing keeping it in
-      // sync with this relational field, is a distinct design question)
-      // but closes the specific case of two vehicles both pointing at
-      // one driver via THIS action. .maybeSingle() deliberately avoided
-      // here — if a past instance of this exact bug already left more
-      // than one vehicle assigned to this driver, maybeSingle() would
-      // throw on 2+ rows instead of surfacing the real problem.
-      if (action.driver_id) {
-        const { data: existingForDriver } = await supabase.from("vehicles").select("id, registration")
-          .eq("assigneddriverid", action.driver_id).neq("id", action.vehicle_id);
-        if (existingForDriver && existingForDriver.length > 0) {
-          throw new Error(`This driver already has ${existingForDriver.map(v => v.registration).join(", ")} assigned — unassign it first.`);
-        }
-      }
-      const { error: vehAsErr } = await supabase.from("vehicles").update({ assigneddriverid: action.driver_id || null, updatedat: nowEpoch() }).eq("id", action.vehicle_id);
-      if (vehAsErr) throw vehAsErr;
-      await logAuditAction({
-        actorId: actingAdminVehAs.id, actorName: actingAdminVehAs.name, actionType: "ADMIN/ASSIGN_VEHICLE_TO_DRIVER",
-        details: `Assigned vehicle id ${action.vehicle_id} to driver id ${action.driver_id || "(unassigned)"}`,
-      });
-      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/LOG_VEHICLE_MAINTENANCE": {
-      // loggedbyid/loggedbyname always server-derived from the actual
-      // caller, same as every other action in this file — never trust
-      // action.logged_by_* even though the client wouldn't currently send it.
-      const actingAdminVehLog = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
-      if (!action.vehicle_id) throw new Error("A vehicle is required.");
-      const { error: vehLogErr } = await supabase.from("vehicle_maintenance_log").insert({
-        vehicleid: action.vehicle_id, servicedate: action.service_date || null,
-        odometerkm: action.odometer_km || null, servicetype: action.service_type || null,
-        note: action.note || null, cost_zar: action.cost_zar != null ? action.cost_zar : null,
-        loggedbyid: actingAdminVehLog.id, loggedbyname: actingAdminVehLog.name, createdat: nowEpoch(),
-      });
-      if (vehLogErr) throw vehLogErr;
-      // A logged service reading only ever advances the vehicle's own
-      // record forward — a lower/older odometer or service target here
-      // would silently corrupt the vehicle's live state.
-      const vehUpdateFields = { updatedat: nowEpoch() };
-      const { data: vehForLog } = await supabase.from("vehicles").select("odometerkm").eq("id", action.vehicle_id).maybeSingle();
-      if (action.odometer_km != null && (vehForLog?.odometerkm == null || action.odometer_km > vehForLog.odometerkm)) {
-        vehUpdateFields.odometerkm = action.odometer_km;
-      }
-      if (action.next_service_date !== undefined) vehUpdateFields.nextservicedate = action.next_service_date;
-      if (action.next_service_km !== undefined) vehUpdateFields.nextservicekm = action.next_service_km;
-      // Advancing the service target clears any stale "due" notification
-      // flag so the next-check sweep can re-fire once the NEW target
-      // actually approaches, instead of staying silent because the old
-      // target's date/km is still recorded as "already notified."
-      if (action.next_service_date !== undefined || action.next_service_km !== undefined) {
-        vehUpdateFields.maintenancenotifiedfor = null;
-      }
-      await supabase.from("vehicles").update(vehUpdateFields).eq("id", action.vehicle_id);
-      await logAuditAction({
-        actorId: actingAdminVehLog.id, actorName: actingAdminVehLog.name, actionType: "ADMIN/LOG_VEHICLE_MAINTENANCE",
-        details: `Logged service for vehicle id ${action.vehicle_id}: ${action.service_type || "service"}`,
-      });
-      if (extraRefetchers.fetchVehicleMaintenanceLog) await extraRefetchers.fetchVehicleMaintenanceLog();
-      if (extraRefetchers.fetchVehicles) await extraRefetchers.fetchVehicles();
-      if (!extraRefetchers.fetchVehicleMaintenanceLog && !extraRefetchers.fetchVehicles) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/CHECK_VEHICLE_MAINTENANCE_DUE": {
-      // Fleet-ops compliance sweep, same shape as DRIVER/CHECK_DOCUMENT_EXPIRY
-      // above (no assertAdminPermission — it's an internal system check
-      // triggered from AdminApp's own poll effect, not client-supplied
-      // data, same convention as every other periodic sweep in this file).
-      // maintenancenotifiedfor stores {key, notifiedAt} where key is the
-      // exact (date, km) target last notified for, so this re-fires once
-      // per genuinely-still-due target and goes silent once the admin logs
-      // a new service (which clears this field — see ADMIN/LOG_VEHICLE_
-      // MAINTENANCE above) or advances the target past due.
-      const { data: vehicleRows } = await supabase.from("vehicles").select("id, registration, odometerkm, nextservicedate, nextservicekm, maintenancenotifiedfor").eq("active", true);
-      if (!vehicleRows || vehicleRows.length === 0) return;
-      const vehNowTs = nowEpoch();
-      let vehAnyFired = false;
-      for (const v of vehicleRows) {
-        const { status } = vehicleServiceStatus({ next_service_date: v.nextservicedate, next_service_km: v.nextservicekm, odometer_km: v.odometerkm });
-        if (status !== "expiring" && status !== "expired") continue;
-        const notifiedKey = `${v.nextservicedate || ""}|${v.nextservicekm || ""}`;
-        const notified = v.maintenancenotifiedfor || {};
-        if (notified.key === notifiedKey) continue;
-        vehAnyFired = true;
-        const verb = status === "expired" ? "is OVERDUE for service" : "is due for service soon";
-        await insertNotification({
-          type: "VEHICLE_MAINTENANCE_DUE", for_roles: [ROLE.ADMIN],
-          message: `🔧 Vehicle ${v.registration} ${verb}${v.nextservicedate ? ` (${v.nextservicedate})` : ""}${v.nextservicekm ? `, target ${v.nextservicekm}km` : ""}.`,
-          ts: vehNowTs, read: false,
-        });
-        await supabase.from("vehicles").update({ maintenancenotifiedfor: { key: notifiedKey, notifiedAt: vehNowTs } }).eq("id", v.id);
-      }
-      if (vehAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
     case "ADMIN/UPDATE_FEE_RATES": {
       // Fleet Ops + Financial, per explicit decision — setting these rates
       // is Financial's actual job function, not an operational action.
@@ -9884,6 +9737,32 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (anyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
+    case "TRIP/CHECK_UNASSIGNED_APPROACHING": {
+      // See the in-memory reducer's identical case for the full rationale.
+      // Same no-permission-check reasoning as CHECK_LATE_START above.
+      const UNASSIGNED_WARN_MS = 2 * 60 * 60 * 1000;
+      const { data: unassignedTrips } = await supabase.from("trips").select("*")
+        .eq("status", TRIP_STATE.UNASSIGNED_BOOKING)
+        .or("unassignedapproachingnotified.is.null,unassignedapproachingnotified.eq.false");
+      if (!unassignedTrips || unassignedTrips.length === 0) return;
+      const uaNowTsSb = nowEpoch();
+      let uaAnyFiredSb = false;
+      for (const t of unassignedTrips) {
+        const scheduledDt = parseScheduledDateTime(t.scheduleddate, t.scheduledtimestr);
+        if (!scheduledDt) continue; // malformed date/time — skip rather than false-positive
+        const msUntil = scheduledDt.getTime() - Date.now();
+        if (msUntil > UNASSIGNED_WARN_MS || msUntil < 0) continue; // not yet in window, or already passed
+        uaAnyFiredSb = true;
+        await supabase.from("trips").update({ unassignedapproachingnotified: true }).eq("id", t.id);
+        await insertNotification({
+          type: "TRIP_UNASSIGNED_APPROACHING", for_roles: [ROLE.ADMIN],
+          message: `⚠ Booking ${t.id} still has no driver — scheduled for ${t.scheduleddate} ${t.scheduledtimestr}, ${Math.round(msUntil / 60000)} min away.`,
+          trip_id: t.id, ts: uaNowTsSb, read: false,
+        });
+      }
+      if (uaAnyFiredSb) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
     case "TRIP/CHECK_UPCOMING_REMINDERS": {
       // Periodic check — for every trip with reminders enabled
       // (remindersent = true, set by the agent tapping REMIND) that's
@@ -10212,8 +10091,6 @@ function useAppStore() {
   const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
   const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
   const [hazardReports, setHazardReports] = useState([]); // [{ id, driver_id, driver_name, category, lat, lng, note, trip_id, created_at }]
-  const [vehicles, setVehicles] = useState([]); // [{ id, registration, make, model, year, odometer_km, next_service_date, next_service_km, assigned_driver_id, active }]
-  const [vehicleMaintenanceLog, setVehicleMaintenanceLog] = useState([]); // [{ id, vehicle_id, service_date, odometer_km, service_type, note, cost_zar, logged_by_id, logged_by_name, created_at }]
 
   const refetch = useCallback(async () => {
     if (!supabase) return;
@@ -10366,30 +10243,6 @@ function useAppStore() {
     setHighRiskAvoidZones(mapped);
   }, []);
 
-  // Vehicles + their service log — own fetch cycle, same "not part of the
-  // main refetch" reasoning as high_risk_zones/campaigns/companies above.
-  const fetchVehicles = useCallback(async () => {
-    if (!supabase) return;
-    const { data, error } = await supabase.from("vehicles").select("*").order("registration");
-    if (error) return;
-    setVehicles((data || []).map(v => ({
-      id: v.id, registration: v.registration, make: v.make, model: v.model, year: v.year,
-      odometer_km: v.odometerkm, next_service_date: v.nextservicedate, next_service_km: v.nextservicekm,
-      assigned_driver_id: v.assigneddriverid, active: v.active,
-    })));
-  }, []);
-
-  const fetchVehicleMaintenanceLog = useCallback(async () => {
-    if (!supabase) return;
-    const { data, error } = await supabase.from("vehicle_maintenance_log").select("*").order("createdat", { ascending: false });
-    if (error) return;
-    setVehicleMaintenanceLog((data || []).map(l => ({
-      id: l.id, vehicle_id: l.vehicleid, service_date: l.servicedate, odometer_km: l.odometerkm,
-      service_type: l.servicetype, note: l.note, cost_zar: l.cost_zar,
-      logged_by_id: l.loggedbyid, logged_by_name: l.loggedbyname, created_at: l.createdat,
-    })));
-  }, []);
-
   // Trip fee rates — admin-configurable (Fleet Ops only) per-category
   // rates used to compute the trips CSV's Trip Fee column + total,
   // visible only to Fleet Ops/Financial. Same "own fetch cycle" pattern
@@ -10512,9 +10365,9 @@ function useAppStore() {
   // subscribing/polling admin-only or driver+admin-only auxiliary tables
   // for sessions that will never render anything from them (an agent or
   // driver session was previously opening a realtime channel + 5-min poll
-  // for campaigns/vehicles/vehicle_maintenance_log/trip_fee_rates
-  // regardless of role — all four are only ever read from admin-only
-  // components, confirmed by grepping every `state.<table>` reference —
+  // for campaigns/trip_fee_rates regardless of role — both are only ever
+  // read from admin-only components, confirmed by grepping every
+  // `state.<table>` reference —
   // found via a dedicated resource-usage audit). Computed via useMemo
   // (not read inline) so its VALUE stays referentially stable across
   // ordinary refetches — `supaState.users` gets a new array identity on
@@ -10558,8 +10411,8 @@ function useAppStore() {
   // by grepping every `state.driver_positions` read site file-wide, no
   // agent/client-portal consumer exists. Found via a dedicated security
   // sweep: this was the one real-time GPS feed still missing the same
-  // role gate already applied to the 5 auxiliary tables (campaigns/
-  // vehicles/vehicle_maintenance_log/trip_fee_rates/hazard_reports) —
+  // role gate already applied to the auxiliary tables (campaigns/
+  // trip_fee_rates/hazard_reports) —
   // meaning it was previously the ONE table whose "allow all" RLS policy
   // couldn't safely be tightened yet, since anon/agent sessions were
   // still fetching it unconditionally. Gating here first is the
@@ -10667,43 +10520,6 @@ function useAppStore() {
     const pollInterval = setInterval(fetchHighRiskZones, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchHighRiskZones]);
-
-  useEffect(() => {
-    // vehicles/vehicle_maintenance_log only ever render inside Fleet Ops'
-    // admin-only screens (AdminVehicles-style fleet management + service
-    // log panels) — confirmed by grepping every `state.vehicles`/
-    // `state.vehicle_maintenance_log` reference file-wide. Skipped
-    // entirely for agent/driver/client-portal sessions, same reasoning as
-    // the campaigns gate just above.
-    if (!supabase || myRole !== ROLE.ADMIN) return;
-    fetchVehicles();
-    const channel = supabase
-      .channel("transitos-vehicles")
-      .on("postgres_changes", { event: "*", schema: "public", table: "vehicles" }, fetchVehicles)
-      .subscribe();
-    const onVisible = () => { if (document.visibilityState === "visible") fetchVehicles(); };
-    document.addEventListener("visibilitychange", onVisible);
-    // 5-minute poll backstop — see the identical fix/reasoning on the
-    // campaigns fetch cycle above.
-    const pollInterval = setInterval(fetchVehicles, 5 * 60 * 1000);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchVehicles, myRole]);
-
-  useEffect(() => {
-    // See the vehicles gate immediately above — same admin-only reasoning.
-    if (!supabase || myRole !== ROLE.ADMIN) return;
-    fetchVehicleMaintenanceLog();
-    const channel = supabase
-      .channel("transitos-vehicle-maintenance-log")
-      .on("postgres_changes", { event: "*", schema: "public", table: "vehicle_maintenance_log" }, fetchVehicleMaintenanceLog)
-      .subscribe();
-    const onVisible = () => { if (document.visibilityState === "visible") fetchVehicleMaintenanceLog(); };
-    document.addEventListener("visibilitychange", onVisible);
-    // 5-minute poll backstop — see the identical fix/reasoning on the
-    // campaigns fetch cycle above.
-    const pollInterval = setInterval(fetchVehicleMaintenanceLog, 5 * 60 * 1000);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchVehicleMaintenanceLog, myRole]);
 
   useEffect(() => {
     // trip_fee_rates only ever renders inside admin screens gated behind
@@ -10819,7 +10635,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports, fetchVehicles, fetchVehicleMaintenanceLog });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -10835,12 +10651,12 @@ function useAppStore() {
       Sentry.captureException(e, { extra: { action_type: action?.type } });
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports, fetchVehicles, fetchVehicleMaintenanceLog]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], vehicles: localState.vehicles || [], vehicle_maintenance_log: localState.vehicle_maintenance_log || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, vehicles, vehicle_maintenance_log: vehicleMaintenanceLog, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -11947,7 +11763,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", VEHICLE_MAINTENANCE_DUE: "🔧" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -17361,16 +17177,6 @@ function AgentReportDelayModal({ dispatch, onClose }) {
 // try/catch degrades to empty in demo mode" convention as AdminProfileSearch
 // uses for fetchTripHistory.
 
-// Bottom-sheet modal, same shape as DriverDocEditor — logs one service
-// entry and optionally advances the vehicle's next-service target in the
-// same submission (per the plan's "manually admin-set per log entry" scope
-// decision, not an auto-computed interval).
-
-// List+form+delete panel, same shape as HighRiskZonesPanel — vehicle cards
-// with registration/assigned driver/odometer/next-service (due-soon badge
-// reusing vehicleServiceStatus's docExpiryStatus-derived amber/red logic),
-// a LOG SERVICE modal, and a per-vehicle expandable service-history list.
-
 // Read-only detail view — every field the app actually stores about this
 // person, not just the sliver shown in the list row. Trip counts are
 // computed from `state.trips`, which only holds the live ~60-day window
@@ -17726,7 +17532,7 @@ class AppErrorBoundary extends React.Component {
 }
 
 // Admin-only screens (ViewerPortal/FinancialPortal/AdminApp, plus every tab
-// and panel they render — Fleet Ops dispatch/live-map/vehicles/users/CSV
+// and panel they render — Fleet Ops dispatch/live-map/users/CSV
 // exports/AI assistant, ~6,000 lines) are split into their own chunk here so
 // an agent, driver, or client-portal session's bundle never has to include
 // code it will never run. All three lazy-load the SAME chunk file (Vite/

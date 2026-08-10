@@ -2,8 +2,8 @@
 //
 // AI-powered admin operations assistant, per explicit request ("implement
 // AI into this app"). Answers natural-language questions about live
-// operational data (active trips, driver status, open tickets, recent
-// vehicle maintenance) using Google's Gemini API — chosen specifically for
+// operational data (active trips, driver status, open tickets) using
+// Google's Gemini API — chosen specifically for
 // its free tier (no ongoing cost for this feature's usage volume), per
 // explicit user decision after being offered Anthropic/OpenAI/Gemini/Groq.
 //
@@ -160,7 +160,7 @@ Deno.serve(async (req) => {
     // audit): none of these had an explicit timeout, compounding the
     // same "relies entirely on the platform timeout" gap as the Gemini
     // call below if Postgres is ever slow to respond.
-    const [tripsRes, driverStatusRes, ticketsRes, maintRes, usersRes] = await Promise.all([
+    const [tripsRes, driverStatusRes, ticketsRes, usersRes] = await Promise.all([
       supabase.from("trips")
         .select("id, status, scheduleddate, scheduledtimestr, direction, agentid, extraagentids, driverid, latebookingflag, longdistanceflag, driverrouteexceedspolicy, noshows, dispute")
         .not("status", "in", "(ARCHIVED_COMPLETED,ARCHIVED_CANCELLED)")
@@ -169,7 +169,6 @@ Deno.serve(async (req) => {
         .abortSignal(AbortSignal.timeout(10000)),
       supabase.from("driver_status").select("driverid, isonline, isaway, capacity, vehicle").limit(100).abortSignal(AbortSignal.timeout(10000)),
       supabase.from("tickets").select("agentid, category, status, createdat").eq("status", "OPEN").order("createdat", { ascending: false }).limit(50).abortSignal(AbortSignal.timeout(10000)),
-      supabase.from("vehicle_maintenance_log").select("vehicleid, servicedate, servicetype").order("servicedate", { ascending: false }).limit(20).abortSignal(AbortSignal.timeout(10000)),
       supabase.from("users").select("id, fullname").limit(300).abortSignal(AbortSignal.timeout(10000)),
     ]);
     const userName = (id: unknown) => (usersRes.data || []).find((u: { id: unknown }) => String(u.id) === String(id))?.fullname || String(id ?? "");
@@ -191,9 +190,6 @@ Deno.serve(async (req) => {
       open_tickets: (ticketsRes.data || []).map((t: Record<string, unknown>) => ({
         agent: userName(t.agentid), category: t.category, opened: sast(t.createdat as number),
       })),
-      recent_vehicle_maintenance: (maintRes.data || []).map((m: Record<string, unknown>) => ({
-        vehicle_id: m.vehicleid, date: m.servicedate, type: m.servicetype,
-      })),
     };
 
     // Gemini's chat-turn role is "model", not "assistant" — translate our
@@ -206,7 +202,7 @@ Deno.serve(async (req) => {
         systemInstruction: {
           parts: [{ text: `You are the internal operations assistant for Pearce & Sons, a staff transport dispatch company in Cape Town, South Africa. You are answering ${caller.fullname}, a Fleet Ops/Standard admin.
 
-Answer ONLY using the JSON data snapshot in the user's message — never invent trips, drivers, tickets, or numbers that aren't in it. If the snapshot doesn't contain what's needed to answer, say so plainly instead of guessing. Times are SAST (UTC+2). Currency is South African Rand (R) where relevant. Keep answers concise — a sentence or short paragraph, not a report. The snapshot covers only ACTIVE (not yet completed/cancelled) trips, currently OPEN tickets, and current driver/vehicle state — it has no historical/archived data.` }],
+Answer ONLY using the JSON data snapshot in the user's message — never invent trips, drivers, tickets, or numbers that aren't in it. If the snapshot doesn't contain what's needed to answer, say so plainly instead of guessing. Times are SAST (UTC+2). Currency is South African Rand (R) where relevant. Keep answers concise — a sentence or short paragraph, not a report. The snapshot covers only ACTIVE (not yet completed/cancelled) trips, currently OPEN tickets, and current driver state — it has no historical/archived data.` }],
         },
         contents: [
           ...safeHistory.map(m => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),

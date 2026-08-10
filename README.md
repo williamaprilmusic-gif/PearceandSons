@@ -19,7 +19,7 @@ src/TransitOS_web.jsx      Almost the entire client app — shared constants/hel
                             and the Agent/Driver/ClientPortal UI. Large by design;
                             see inline comments before restructuring anything.
 src/admin/AdminSection.jsx Every admin-only screen (dashboard, dispatch, live map,
-                            vehicles, users, tickets, CSV exports, AI assistant,
+                            users, tickets, CSV exports, AI assistant,
                             financial). Dynamically imported (React.lazy) so
                             agent/driver sessions never download this code.
 src/main.jsx                Entry point.
@@ -43,7 +43,7 @@ npm run lint      # ESLint — real bug-catching rules (no-undef, rules-of-hooks
                    # are errors; missing-hook-dependency warnings need individual
                    # judgment, not a blind fix — several are intentional
 npm test          # Vitest — pure business-logic unit tests (fee/pay calculations,
-                   # admin scoping, doc/vehicle expiry, driver-hours math). Imports
+                   # admin scoping, doc expiry, driver-hours math). Imports
                    # straight from TransitOS_web.jsx; no rendered-component tests yet.
 ```
 

@@ -23,7 +23,6 @@ import {
   isCompanyScoped,
   scopeUsersToCompany,
   docExpiryStatus,
-  vehicleServiceStatus,
   computeDriverHoursToday,
   computeDriverHoursThisWeek,
   TRIP_STATE,
@@ -244,7 +243,7 @@ describe("scopeUsersToCompany — Viewer user-list filtering", () => {
   });
 });
 
-describe("docExpiryStatus / vehicleServiceStatus — expiry date math", () => {
+describe("docExpiryStatus — expiry date math", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 0, 15, 10, 0, 0)); // 15 Jan 2026, 10:00 local
@@ -278,17 +277,6 @@ describe("docExpiryStatus / vehicleServiceStatus — expiry date math", () => {
   it("reports \"missing\" for a null/empty date rather than throwing", () => {
     expect(docExpiryStatus(null)).toEqual({ status: "missing", daysLeft: null });
     expect(docExpiryStatus("")).toEqual({ status: "missing", daysLeft: null });
-  });
-
-  it("vehicleServiceStatus picks whichever of date/km is more urgent", () => {
-    const expiredByDate = { next_service_date: "2026-01-01", next_service_km: 50000, odometer_km: 10000 };
-    expect(vehicleServiceStatus(expiredByDate).status).toBe("expired");
-
-    const expiredByKm = { next_service_date: "2027-01-01", next_service_km: 9900, odometer_km: 10000 };
-    expect(vehicleServiceStatus(expiredByKm).status).toBe("expired");
-
-    const fine = { next_service_date: "2027-01-01", next_service_km: 50000, odometer_km: 10000 };
-    expect(vehicleServiceStatus(fine).status).toBe("ok");
   });
 });
 
