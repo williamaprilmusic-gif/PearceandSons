@@ -2662,38 +2662,6 @@ export function computeFleetUtilization(trips, users) {
 const _routeCache = new Map(); // key → { km, ts }
 const ROUTE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 min
 
-// ── High-risk-zone routing avoidance ────────────────────────────────────
-// Module-level cache of TomTom avoidAreas rectangles, refreshed whenever
-// state.high_risk_zones changes (see fetchHighRiskZones) — read directly
-// by tomtomRealRouteKm/tomtomBestOrderOnce rather than threaded as an
-// explicit parameter through every call site (buildPickupSequenceTomTom,
-// useSortedDropoffs, tomtomOptimalStopOrder, etc.), matching the
-// _routeCache/_tomtomSortCache module-level-cache pattern already used in
-// this file. Keeps the change contained to the two functions that actually
-// hit the network, instead of touching every already-fixed call chain.
-let _highRiskAvoidRectangles = null;
-// TomTom's avoidAreas.rectangles accepts a maximum of 10 elements — active
-// zones beyond that are silently dropped (with a console warning) rather
-// than causing the whole request to fail.
-function setHighRiskAvoidZones(zones) {
-  const active = (zones || []).filter(z => z.active && z.lat != null && z.lng != null && z.radius_km > 0);
-  if (!active.length) { _highRiskAvoidRectangles = null; return; }
-  if (active.length > 10) console.warn(`[HighRiskZones] ${active.length} active zones, only the first 10 will be avoided (TomTom's avoidAreas limit).`);
-  _highRiskAvoidRectangles = active.slice(0, 10).map(z => {
-    // Simple lat/lng degree approximation (111km/degree latitude,
-    // adjusted for longitude by cos(latitude)) — plenty precise for a
-    // safety-margin bounding box around a radius-based zone; TomTom only
-    // accepts axis-aligned rectangles, not circles, so this is the
-    // necessary conversion, not a shortcut.
-    const latDelta = z.radius_km / 111;
-    const lngDelta = z.radius_km / (111 * Math.cos(z.lat * Math.PI / 180));
-    return {
-      southWestCorner: { latitude: z.lat - latDelta, longitude: z.lng - lngDelta },
-      northEastCorner: { latitude: z.lat + latDelta, longitude: z.lng + lngDelta },
-    };
-  });
-}
-
 function routeCacheKey(coords, departAtEpoch) {
   const waypts = coords.map(c => `${c.lat.toFixed(4)},${c.lng.toFixed(4)}`).join("|");
   // Round to the nearest hour so trips booked at 14:26 and 14:58 for a
@@ -2877,18 +2845,7 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
     // body without re-validating them.
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
-    // High-risk-zone avoidance requires a POST body — avoidAreas is not a
-    // GET query parameter (confirmed against TomTom's docs) — with every
-    // other parameter still on the query string as normal, since a
-    // parameter can't be supplied in both the query string and POST body
-    // at once.
-    const res = _highRiskAvoidRectangles
-      ? await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
-        })
-      : await fetch(url);
+    const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
     const metres = data.routes?.[0]?.summary?.lengthInMeters;
@@ -2907,9 +2864,6 @@ async function tomtomRealRouteKm(startAnchor, orderedPickups, orderedDropoffs, d
 // embedded nav map (DriverNavMap) — a single from→to leg, unlike
 // tomtomRealRouteKm above (which stitches a driver's WHOLE multi-stop day
 // together for distance/compliance purposes, not for live turn-by-turn).
-// Respects the same high-risk-zone avoidance as every other routing call in
-// this file — a driver actively navigating should never be routed through a
-// flagged area any more than the background distance calculations should.
 // Returns null on any failure; caller falls back to a straight line /
 // haversine estimate rather than breaking navigation entirely.
 async function tomtomNavRoute(fromCoord, toCoord) {
@@ -2927,13 +2881,7 @@ async function tomtomNavRoute(fromCoord, toCoord) {
     const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
       `?key=${TOMTOM_API_KEY}&routeType=fastest&traffic=true&travelMode=car` +
       `&instructionsType=text&language=en-GB&sectionType=speedLimit${TOMTOM_AVOID_PARAM}`;
-    const res = _highRiskAvoidRectangles
-      ? await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
-        })
-      : await fetch(url);
+    const res = await fetch(url);
     if (!res.ok) return null;
     const data = await res.json();
     const route = data.routes?.[0];
@@ -3046,15 +2994,7 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
   // one — see its comment for why that was removed entirely.)
   const url = `https://api.tomtom.com/routing/1/calculateRoute/${locations}/json` +
     `?key=${TOMTOM_API_KEY}&computeBestOrder=true&routeType=fastest&traffic=true&travelMode=car${departAtParam}${TOMTOM_AVOID_PARAM}`;
-  // High-risk-zone avoidance requires a POST body — see the identical
-  // note/reasoning in tomtomRealRouteKm above.
-  const res = _highRiskAvoidRectangles
-    ? await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ avoidAreas: { rectangles: _highRiskAvoidRectangles } }),
-      })
-    : await fetch(url);
+  const res = await fetch(url);
   if (!res.ok) {
     let errBody = "";
     try { errBody = JSON.stringify(await res.json(), null, 2); } catch { errBody = await res.text().catch(() => ""); }
@@ -7511,58 +7451,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
-    case "ADMIN/CREATE_HIGH_RISK_ZONE": {
-      const actingAdminHrzC = await assertAdminPermission(activeUserRef, "manageDispatch");
-      if (!action.label?.trim()) throw new Error("A label/name is required.");
-      if (action.lat == null || action.lng == null) throw new Error("A location is required.");
-      const { data: hrzInserted, error } = await supabase.from("high_risk_zones").insert({
-        label: action.label.trim(), lat: action.lat, lng: action.lng,
-        radiuskm: action.radius_km || 1.0, active: action.active !== false,
-        source: action.source || null, notes: action.notes || null,
-        createdat: nowEpoch(), createdby: actingAdminHrzC.name,
-      }).select("id").single();
-      if (error) throw error;
-      await logAuditAction({
-        actorId: actingAdminHrzC.id, actorName: actingAdminHrzC.name, actionType: "ADMIN/CREATE_HIGH_RISK_ZONE",
-        details: `Created high-risk zone: ${action.label.trim()} (id ${hrzInserted?.id})`,
-      });
-      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/UPDATE_HIGH_RISK_ZONE": {
-      const actingAdminHrzU = await assertAdminPermission(activeUserRef, "manageDispatch");
-      const update = {};
-      if (action.label !== undefined) update.label = action.label.trim();
-      if (action.lat !== undefined) update.lat = action.lat;
-      if (action.lng !== undefined) update.lng = action.lng;
-      if (action.radius_km !== undefined) update.radiuskm = action.radius_km;
-      if (action.active !== undefined) update.active = action.active;
-      if (action.notes !== undefined) update.notes = action.notes;
-      const { error } = await supabase.from("high_risk_zones").update(update).eq("id", action.zone_id);
-      if (error) throw error;
-      await logAuditAction({
-        actorId: actingAdminHrzU.id, actorName: actingAdminHrzU.name, actionType: "ADMIN/UPDATE_HIGH_RISK_ZONE",
-        details: `Updated high-risk zone id ${action.zone_id}${action.active !== undefined ? ` — set active=${action.active}` : ""}`,
-      });
-      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
-    case "ADMIN/DELETE_HIGH_RISK_ZONE": {
-      const actingAdminHrzD = await assertAdminPermission(activeUserRef, "manageDispatch");
-      const { data: hrzRow } = await supabase.from("high_risk_zones").select("id, label").eq("id", action.zone_id).maybeSingle();
-      if (!hrzRow) throw new Error("Zone not found");
-      await logAuditAction({
-        actorId: actingAdminHrzD.id, actorName: actingAdminHrzD.name, actionType: "ADMIN/DELETE_HIGH_RISK_ZONE",
-        details: `Deleted high-risk zone: ${hrzRow.label} (id ${action.zone_id})`,
-      });
-      const { error: delHrzErr } = await supabase.from("high_risk_zones").delete().eq("id", action.zone_id);
-      if (delHrzErr) throw delHrzErr;
-      if (extraRefetchers.fetchHighRiskZones) await extraRefetchers.fetchHighRiskZones();
-      else refetch(); // fire-and-forget — see handleSupabaseAction's header comment
-      return;
-    }
     case "ADMIN/UPDATE_FEE_RATES": {
       // Fleet Ops + Financial, per explicit decision — setting these rates
       // is Financial's actual job function, not an operational action.
@@ -10285,7 +10173,6 @@ function useAppStore() {
   const [campaigns, setCampaigns] = useState([]); // [{ id, name, active }]
   const [companies, setCompanies] = useState([]); // [{ id, name, active, address }]
   const [tickets, setTickets] = useState([]);
-  const [highRiskZones, setHighRiskZones] = useState([]); // [{ id, label, lat, lng, radius_km, active, source, notes }]
   const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
   const [hazardReports, setHazardReports] = useState([]); // [{ id, driver_id, driver_name, category, lat, lng, note, trip_id, created_at }]
 
@@ -10424,26 +10311,10 @@ function useAppStore() {
     })));
   }, []);
 
-  // High-risk zones — admin-editable driver-safety areas, same "own fetch
-  // cycle, not part of the main refetch" reasoning as campaigns/companies/
-  // tickets above. Used both to steer TomTom routing away from these areas
-  // and to alert a driver approaching one in real time.
-  const fetchHighRiskZones = useCallback(async () => {
-    if (!supabase) return;
-    const { data, error } = await supabase.from("high_risk_zones").select("*").order("label");
-    if (error) return;
-    const mapped = (data || []).map(z => ({
-      id: z.id, label: z.label, lat: z.lat, lng: z.lng, radius_km: z.radiuskm,
-      active: z.active, source: z.source, notes: z.notes,
-    }));
-    setHighRiskZones(mapped);
-    setHighRiskAvoidZones(mapped);
-  }, []);
-
   // Trip fee rates — admin-configurable (Fleet Ops only) per-category
   // rates used to compute the trips CSV's Trip Fee column + total,
   // visible only to Fleet Ops/Financial. Same "own fetch cycle" pattern
-  // as high_risk_zones/campaigns/companies/tickets above.
+  // as campaigns/companies/tickets above.
   const fetchFeeRates = useCallback(async () => {
     if (!supabase) return;
     const { data, error } = await supabase.from("trip_fee_rates").select("*").eq("id", 1).maybeSingle();
@@ -10632,8 +10503,8 @@ function useAppStore() {
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); };
   }, [fetchDriverPositions, myRole]);
 
-  // Each of these 5 auxiliary fetch cycles (campaigns/companies/tickets/
-  // high_risk_zones/fee_rates) has ONLY its own realtime subscription —
+  // Each of these 4 auxiliary fetch cycles (campaigns/companies/tickets/
+  // fee_rates) has ONLY its own realtime subscription —
   // unlike the main refetch() cycle above, none of them has a polling
   // backstop or a visibility-triggered refetch. That means a single
   // transient failure on the INITIAL mount-time fetch (the exact same
@@ -10702,21 +10573,6 @@ function useAppStore() {
     const pollInterval = setInterval(fetchTickets, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchTickets]);
-
-  useEffect(() => {
-    if (!supabase) return;
-    fetchHighRiskZones();
-    const channel = supabase
-      .channel("transitos-high-risk-zones")
-      .on("postgres_changes", { event: "*", schema: "public", table: "high_risk_zones" }, fetchHighRiskZones)
-      .subscribe();
-    const onVisible = () => { if (document.visibilityState === "visible") fetchHighRiskZones(); };
-    document.addEventListener("visibilitychange", onVisible);
-    // 5-minute poll backstop — see the identical fix/reasoning on the
-    // campaigns fetch cycle above.
-    const pollInterval = setInterval(fetchHighRiskZones, 5 * 60 * 1000);
-    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
-  }, [fetchHighRiskZones]);
 
   useEffect(() => {
     // trip_fee_rates only ever renders inside admin screens gated behind
@@ -10837,7 +10693,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -10853,12 +10709,12 @@ function useAppStore() {
       Sentry.captureException(e, { extra: { action_type: action?.type } });
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchHighRiskZones, fetchFeeRates, fetchHazardReports]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
-    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], high_risk_zones: localState.high_risk_zones || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, high_risk_zones: highRiskZones, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -11965,7 +11821,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
@@ -12321,7 +12177,7 @@ function useAwayDetection(userId, isLoggedIn) {
   }, [userId, isLoggedIn]);
 }
 
-function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null, highRiskZones = []) {
+function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
   // Raw current position, exposed for the in-app nav map (DriverNavMap) —
@@ -12336,18 +12192,16 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
   // Geofence: track which stops we've already auto-triggered so we
   // don't fire CONFIRM_AGENT_PICKUP/DROPOFF twice for the same stop.
   const geofenceTriggeredRef = useRef(new Set());
-  // activeTrips/dispatch/highRiskZones are read via refs inside the GPS
-  // effect below instead of being closure-captured dependencies — see
-  // that effect's own comment for why. Synced on every render (a plain
-  // assignment during render, not inside an effect — the standard,
-  // side-effect-free pattern for keeping a ref current without
-  // triggering the effect it's read from).
+  // activeTrips/dispatch are read via refs inside the GPS effect below
+  // instead of being closure-captured dependencies — see that effect's
+  // own comment for why. Synced on every render (a plain assignment
+  // during render, not inside an effect — the standard, side-effect-free
+  // pattern for keeping a ref current without triggering the effect it's
+  // read from).
   const activeTripsRef = useRef(activeTrips);
   activeTripsRef.current = activeTrips;
   const dispatchRef = useRef(dispatch);
   dispatchRef.current = dispatch;
-  const highRiskZonesRef = useRef(highRiskZones);
-  highRiskZonesRef.current = highRiskZones;
   // Last time onPosition actually fired — read by the stale-watch
   // watchdog below.
   const lastPositionAtRef = useRef(Date.now());
@@ -12699,78 +12553,6 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           }
         }
       }
-      // Feature: High-risk-zone proximity alert ────────────────────────────
-      // TWO-TIER per explicit request (2026-08-09): previously a single
-      // check (distKm <= zone.radius_km) always said "entering," even for
-      // a driver just driving past on a nearby road within that radius but
-      // never actually crossing into the zone's real danger footprint —
-      // "entering" is an actionable caution, not something to cry wolf on
-      // every drive-by. Now: a wider outer ring (NEARBY_BUFFER_KM beyond
-      // the zone's own configured radius) gets the lighter "nearby"
-      // heads-up, and only actually crossing INTO the zone's real radius
-      // gets the stronger "Caution. Entering" wording. Each tier fires at
-      // most once per zone per trip — same trip-scoped "already fired"
-      // tracking as the stationary/deviation alerts above, now split into
-      // two independent flags so a driver who lingers in the nearby ring
-      // and later actually enters still gets the escalated warning (not
-      // silently swallowed by the nearby alert having already fired).
-      // FIXED (2026-08-09), found via a direct user report: this used to
-      // NOT gate on IN_TRANSIT at all, on the reasoning that "real physical
-      // risk doesn't care about the app's trip state machine." That
-      // reasoning broke in practice because currentTripId itself isn't
-      // always "the trip the driver is currently driving" — it falls back
-      // to the driver's first ASSIGNED-but-not-yet-accepted trip whenever
-      // nothing is IN_TRANSIT (see trackedTripId's own comment, kept that
-      // way deliberately for position-logging purposes). A driver simply
-      // sitting at home with an unaccepted, unstarted trip in their queue
-      // got a "you are entering/near a high-risk area" alert attributed to
-      // that trip — the driver's real (home) location just happened to be
-      // near a flagged zone, with no relationship at all to actually
-      // driving anywhere for this trip. isActiveTrip (same IN_TRANSIT gate
-      // already used by the stationary/deviation checks above) fixes this
-      // the same way: only alert when the driver is actually en route.
-      if (supabase && user?.id && currentTripId && isActiveTrip && highRiskZonesRef.current?.length) {
-        if (!geofenceTriggeredRef.current.highRiskFired) geofenceTriggeredRef.current.highRiskFired = {};
-        const hrFired = geofenceTriggeredRef.current.highRiskFired;
-        const NEARBY_BUFFER_KM = 1; // outer ring beyond the zone's own radius
-        for (const zone of highRiskZonesRef.current) {
-          if (!zone.active || zone.lat == null || zone.lng == null || !zone.radius_km) continue;
-          const enteredKey = `${currentTripId}:${zone.id}:entered`;
-          const nearbyKey = `${currentTripId}:${zone.id}:nearby`;
-          const distKm = haversineKm(latitude, longitude, zone.lat, zone.lng);
-          if (distKm <= zone.radius_km) {
-            // Actually inside the zone's real danger radius.
-            if (!hrFired[enteredKey]) {
-              hrFired[enteredKey] = true;
-              insertNotification({
-                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
-                message: `⚠ Caution. Entering a high-risk area (${zone.label}) — please stay alert and watch your surroundings.`,
-                trip_id: currentTripId, ts: Date.now(), read: false,
-              }).catch(() => {});
-              insertNotification({
-                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
-                message: `⚠ Caution: Driver ${user.name || user.id} is entering a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
-                trip_id: currentTripId, ts: Date.now(), read: false,
-              }).catch(() => {});
-            }
-          } else if (distKm <= zone.radius_km + NEARBY_BUFFER_KM) {
-            // Close by, but hasn't actually crossed into the zone itself.
-            if (!hrFired[nearbyKey]) {
-              hrFired[nearbyKey] = true;
-              insertNotification({
-                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.DRIVER], for_user_ids: [user.id],
-                message: `Nearby high-risk area (${zone.label}).`,
-                trip_id: currentTripId, ts: Date.now(), read: false,
-              }).catch(() => {});
-              insertNotification({
-                type: "HIGH_RISK_AREA_ALERT", for_roles: [ROLE.ADMIN],
-                message: `Driver ${user.name || user.id} is near a flagged high-risk area (${zone.label}) on trip ${currentTripId}.`,
-                trip_id: currentTripId, ts: Date.now(), read: false,
-              }).catch(() => {});
-            }
-          }
-        }
-      }
       // Slow path: persist to the database roughly every 25s — far less
       // frequent than before, since the database write is the expensive
       // part (two REST calls) and live updates no longer depend on it.
@@ -12911,9 +12693,9 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       watchIdRef.current = null;
       if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
     };
-    // Deliberately NOT depending on activeTrips/dispatch/highRiskZones —
-    // all three are read via refs above instead. activeTrips in
-    // particular is rebuilt with a fresh array reference on every render
+    // Deliberately NOT depending on activeTrips/dispatch — both are read
+    // via refs above instead. activeTrips in particular is rebuilt with a
+    // fresh array reference on every render
     // of DriverApp (a plain inline .filter(), never memoized), and
     // DriverApp re-renders on every realtime trips update fleet-wide, not
     // just this driver's own trips. With those in the dependency array,
@@ -15931,8 +15713,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
         {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
       </div>
-      {/* Feature B: Waze nav panel — persistent stop-by-stop guide */}
-      {myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} setNavTarget={setNavTarget} />}
+      {/* Feature B: Waze nav panel — persistent stop-by-stop guide.
+          Only once the trip has actually started — per explicit request,
+          the pre-start NAVIGATE button this panel shows was redundant
+          with (and confusing next to) the START TRIP — NAVIGATE button
+          just below, which already opens navigation to the first pickup
+          the moment it's tapped. */}
+      {tripStarted && myActiveTrips[0] && <WazeNavPanel trip={myActiveTrips[0]} user={user} state={state} setNavTarget={setNavTarget} />}
       {startTripError && (
         <div style={{ background: "rgba(220,53,69,.08)", border: "1px solid rgba(220,53,69,.3)", borderRadius: 4, padding: 10 }}>
           <span style={{ fontSize: 11, color: COLORS.red }}>{startTripError}</span>
@@ -16516,7 +16303,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // position logging context; falls back to the first active trip if
   // none are in transit yet (still assigned/confirmed but not started).
   const trackedTripId = (activeTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT) || activeTrips[0])?.trip_id ?? null;
-  const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch, state.high_risk_zones);
+  const location = useDriverLocationTracking(user, !!user, trackedTripId, activeTrips, dispatch);
   useAwayDetection(user?.id, !!user);
 
   return (
@@ -17262,8 +17049,8 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
 // closure, heavy traffic they heard about on the radio or from a driver's
 // call) straight onto every active driver's nav map — the human-curated
 // stand-in for the (currently account-blocked) TomTom Traffic API, per
-// explicit request. Modeled closely on HighRiskZonesPanel's proven
-// address-search-then-submit-then-list-with-delete shape.
+// explicit request. Modeled closely on the same address-search-then-
+// submit-then-list-with-delete shape used elsewhere in the admin panel.
 // Company-wide memo broadcast to every agent and driver — distinct from
 // RouteAdvisoryPanel below, which posts a location pin on the nav map, not
 // a general notification. Modeled on RouteAdvisoryPanel's own form shape,
@@ -17411,11 +17198,6 @@ function AgentReportDelayModal({ dispatch, onClose }) {
 // time an admin edits them, rather than trusting arbitrary lat/lng values
 // pasted into a spreadsheet, which risks silently misplacing someone's
 // pickup point with no validation at all.
-
-// Driver-safety routing avoidance + proximity alerts. Center-point +
-// radius (not raw polygons) so this form stays a simple "search an
-// address, set a radius" — see setHighRiskAvoidZones for how this gets
-// converted to TomTom's rectangle-based avoidAreas format.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CLIENT PORTAL

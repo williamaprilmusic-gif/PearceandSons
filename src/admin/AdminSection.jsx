@@ -1201,8 +1201,8 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   const wrapRef = useRef(null);
 
   // Resync when the parent externally resets/changes value+preConfirmed —
-  // e.g. a "create new" form (CompanyManagerPanel, HighRiskZonesPanel)
-  // clearing back to an empty form after a successful submit, while this
+  // e.g. a "create new" form (CompanyManagerPanel) clearing back to an
+  // empty form after a successful submit, while this
   // same StreetInput instance stays mounted (unlike the *edit*-row
   // instances, which naturally remount per-row via conditional
   // rendering). query/selected were only ever initialized from
@@ -5437,158 +5437,6 @@ function CompanyManagerPanel({ state, dispatch, onClose }) {
   );
 }
 
-function HighRiskZonesPanel({ state, dispatch, onClose }) {
-  const emptyForm = { label: "", street: "", area: "", coord: null, radiusKm: "1.0" };
-  const [newZone, setNewZone] = useState(emptyForm);
-  const [adding, setAdding] = useState(false);
-  const [editingId, setEditingId] = useState(null);
-  const [editZone, setEditZone] = useState(emptyForm);
-
-  const [zoneError, setZoneError] = useState(null);
-  const [confirmingDeleteId, setConfirmingDeleteId] = useState(null);
-  const [deletingId, setDeletingId] = useState(null);
-
-  const addZone = async () => {
-    if (!newZone.label.trim()) return;
-    if (!newZone.coord) {
-      setZoneError("Pick the location from the search results (not just typed) before adding a zone.");
-      return;
-    }
-    const radiusKm = parseFloat(newZone.radiusKm);
-    if (!(radiusKm > 0)) {
-      setZoneError("Radius must be a positive number of km.");
-      return;
-    }
-    setAdding(true);
-    setZoneError(null);
-    try {
-      await dispatch({
-        type: "ADMIN/CREATE_HIGH_RISK_ZONE", label: newZone.label.trim(),
-        lat: newZone.coord.lat, lng: newZone.coord.lng, radius_km: radiusKm,
-        active: true, source: "Manually added via admin panel",
-      });
-      setNewZone(emptyForm);
-    } catch (e) {
-      setZoneError(e.message || "Couldn't add the zone — please try again.");
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  const startEdit = (z) => {
-    setEditingId(z.id);
-    setEditZone({ label: z.label, street: z.label, area: "", coord: { lat: z.lat, lng: z.lng }, radiusKm: String(z.radius_km) });
-  };
-
-  const saveEdit = async (id) => {
-    if (!editZone.label.trim()) return;
-    const radiusKm = parseFloat(editZone.radiusKm);
-    if (!(radiusKm > 0)) { setZoneError("Radius must be a positive number of km."); return; }
-    setZoneError(null);
-    try {
-      await dispatch({
-        type: "ADMIN/UPDATE_HIGH_RISK_ZONE", zone_id: id, label: editZone.label.trim(),
-        lat: editZone.coord?.lat, lng: editZone.coord?.lng, radius_km: radiusKm,
-      });
-      setEditingId(null);
-    } catch (e) {
-      setZoneError(e.message || "Couldn't update the zone — please try again.");
-    }
-  };
-
-  const toggleActive = async (z) => {
-    setZoneError(null);
-    try {
-      await dispatch({ type: "ADMIN/UPDATE_HIGH_RISK_ZONE", zone_id: z.id, active: !z.active });
-    } catch (e) {
-      setZoneError(e.message || "Couldn't update the zone — please try again.");
-    }
-  };
-
-  const deleteZone = async (z) => {
-    setDeletingId(z.id);
-    setZoneError(null);
-    try {
-      await dispatch({ type: "ADMIN/DELETE_HIGH_RISK_ZONE", zone_id: z.id });
-      setConfirmingDeleteId(null);
-    } catch (e) {
-      setZoneError(e.message || "Couldn't delete the zone — please try again.");
-    } finally {
-      setDeletingId(null);
-    }
-  };
-
-  const LocationField = ({ value, onChange }) => (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>CENTER LOCATION</span>
-      <StreetInput value={value.street} placeholder="Search an address or area…"
-        preConfirmed={value.coord ? { label: value.street, area: value.area, lat: value.coord.lat, lng: value.coord.lng } : null}
-        onChange={({ street, area, coord, confirmed }) => onChange({ ...value, street, area, coord: confirmed ? coord : value.coord })} />
-      <span style={{ fontSize: 8, color: COLORS.dim }}>Pick from the search results so the coordinates are set, not just typed text.</span>
-    </div>
-  );
-
-  return (
-    <Card>
-      <SectionHeader label="High-Risk Zones" />
-      <div style={{ fontSize: 9, color: COLORS.ghost }}>
-        Active zones are avoided when TomTom computes routes, and a driver gets an in-app alert ("watch your surroundings")
-        the moment their live GPS comes within the set radius. Inactive zones have no effect — use that to review a
-        candidate area before it actually changes driver routing/alerts.
-      </div>
-      <TextField label="Zone Name" value={newZone.label} onChange={e => setNewZone(f => ({ ...f, label: e.target.value }))} placeholder="e.g. Area name" />
-      <LocationField value={newZone} onChange={setNewZone} />
-      <TextField label="Radius (km)" value={newZone.radiusKm} onChange={e => setNewZone(f => ({ ...f, radiusKm: e.target.value }))} placeholder="1.0" />
-      <Button title={adding ? "ADDING…" : "+ ADD ZONE"} variant="amber" size="sm" onClick={addZone} disabled={adding || !newZone.label.trim()} />
-      {zoneError && <span style={{ fontSize: 10, color: COLORS.red }}>{zoneError}</span>}
-
-      {(state.high_risk_zones || []).length === 0 ? (
-        <span style={{ fontSize: 10, color: COLORS.ghost }}>No high-risk zones yet — add one above.</span>
-      ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {state.high_risk_zones.map(z => (
-            <div key={z.id} style={{ display: "flex", flexDirection: "column", gap: 8, padding: 10, border: `1px solid ${COLORS.wire}`, borderRadius: 4, opacity: z.active ? 1 : .5 }}>
-              {editingId === z.id ? (
-                <>
-                  <input className="inp" value={editZone.label} onChange={e => setEditZone(f => ({ ...f, label: e.target.value }))} autoFocus />
-                  <LocationField value={editZone} onChange={setEditZone} />
-                  <TextField label="Radius (km)" value={editZone.radiusKm} onChange={e => setEditZone(f => ({ ...f, radiusKm: e.target.value }))} />
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setEditingId(null)} />
-                    <Button title="SAVE" variant="amber" size="sm" style={{ flex: 1 }} onClick={() => saveEdit(z.id)} />
-                  </div>
-                </>
-              ) : confirmingDeleteId === z.id ? (
-                <>
-                  <span style={{ fontSize: 10, color: COLORS.red }}>Delete "{z.label}"?</span>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDeleteId(null)} />
-                    <Button title={deletingId === z.id ? "…" : "CONFIRM"} variant="danger" size="sm" style={{ flex: 1 }} onClick={() => deleteZone(z)} disabled={deletingId === z.id} />
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span style={{ flex: 1, fontSize: 11, fontWeight: 700 }}>{z.label}</span>
-                    {!z.active && <span style={{ fontSize: 8, color: COLORS.ghost, border: `1px solid ${COLORS.wire}`, borderRadius: 2, padding: "2px 5px" }}>INACTIVE</span>}
-                    <Button title="✎" variant="ghost" size="sm" onClick={() => startEdit(z)} />
-                    <Button title={z.active ? "DEACTIVATE" : "ACTIVATE"} variant="ghost" size="sm" onClick={() => toggleActive(z)} />
-                    <Button title="🗑" variant="ghost" size="sm" onClick={() => setConfirmingDeleteId(z.id)} />
-                  </div>
-                  <div style={{ fontSize: 9, color: COLORS.teal }}>{z.radius_km.toFixed(1)} km radius · {z.lat.toFixed(4)}, {z.lng.toFixed(4)}</div>
-                  {z.source && <div style={{ fontSize: 8, color: COLORS.dim }}>Source: {z.source}</div>}
-                  {z.notes && <div style={{ fontSize: 8, color: COLORS.dim }}>{z.notes}</div>}
-                </>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-      <Button title="CLOSE" variant="ghost" onClick={onClose} />
-    </Card>
-  );
-}
-
 function CampaignManagerPanel({ state, dispatch, onClose }) {
   const [newName, setNewName] = useState("");
   const [adding, setAdding] = useState(false);
@@ -5800,8 +5648,7 @@ function AdminUsers({ state, dispatch, user }) {
   const [showBulkImport, setShowBulkImport] = useState(false);
   const [showCampaigns, setShowCampaigns] = useState(false);
   const [showCompanies, setShowCompanies] = useState(false);
-  const [showHighRiskZones, setShowHighRiskZones] = useState(false);
-  const closeAllPanels = () => { setShow(false); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setShowHighRiskZones(false); setEditingId(null); setEditModeId(null); };
+  const closeAllPanels = () => { setShow(false); setShowBulkImport(false); setShowCampaigns(false); setShowCompanies(false); setEditingId(null); setEditModeId(null); };
 
   return (
     <div className="pad">
@@ -5811,7 +5658,6 @@ function AdminUsers({ state, dispatch, user }) {
           {hasAdminPermission(user, "exportCsv") && <Button title="⬇ EXPORT CSV" variant="ghost" size="sm" onClick={() => downloadCsv(usersToCsv(state.users, state.driver_status), `users_${new Date().toISOString().slice(0, 10)}.csv`)} />}
           {canCreateAnything && <Button title="🏢 COMPANIES" variant="ghost" size="sm" onClick={() => { const next = !showCompanies; closeAllPanels(); setShowCompanies(next); }} />}
           {canCreateAnything && <Button title="🏷 CAMPAIGNS" variant="ghost" size="sm" onClick={() => { const next = !showCampaigns; closeAllPanels(); setShowCampaigns(next); }} />}
-          {canCreateAnything && <Button title="⚠ RISK ZONES" variant="ghost" size="sm" onClick={() => { const next = !showHighRiskZones; closeAllPanels(); setShowHighRiskZones(next); }} />}
           {canCreateAnything && <Button title="⬆ BULK IMPORT" variant="ghost" size="sm" onClick={() => { const next = !showBulkImport; closeAllPanels(); setShowBulkImport(next); }} />}
           {canCreateAnything && <Button title="+ CREATE USER" variant="amber" size="sm" onClick={() => { const next = !show; closeAllPanels(); setShow(next); }} />}
           {canCreateAnything && (
@@ -5826,9 +5672,6 @@ function AdminUsers({ state, dispatch, user }) {
       )}
       {showCampaigns && canCreateAnything && (
         <CampaignManagerPanel state={state} dispatch={dispatch} onClose={() => setShowCampaigns(false)} />
-      )}
-      {showHighRiskZones && canCreateAnything && (
-        <HighRiskZonesPanel state={state} dispatch={dispatch} onClose={() => setShowHighRiskZones(false)} />
       )}
       {showBulkImport && canCreateAnything && (
         <BulkUserImportPanel state={state} dispatch={dispatch} onClose={() => setShowBulkImport(false)} onDone={() => setShowBulkImport(false)} />
@@ -6383,7 +6226,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", HIGH_RISK_AREA_ALERT: "⚠", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
