@@ -10451,7 +10451,7 @@ function useAppStore() {
   // fetchTickets already reads it for its own role-based query scoping.
   //
   // MUST be declared before every effect below that reads it (driver
-  // positions + the 5 auxiliary tables) — a real production outage found
+  // positions + the 4 auxiliary tables) — a real production outage found
   // via a security sweep's own follow-up: this declaration briefly sat
   // AFTER the driver_positions effect that references myRole in its
   // dependency array, which is evaluated synchronously at that point in
@@ -10493,7 +10493,7 @@ function useAppStore() {
       .channel("transitos-driver-positions")
       .on("postgres_changes", { event: "*", schema: "public", table: "driver_positions" }, fetchDriverPositions)
       .subscribe();
-    // Same visibility backstop as the 5 auxiliary fetch cycles below — in
+    // Same visibility backstop as the 4 auxiliary fetch cycles below — in
     // practice this table's own realtime traffic (any active driver
     // broadcasts every ~8s) usually self-heals a failed initial load
     // quickly, but an admin loading the Live Map while zero drivers are
