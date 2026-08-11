@@ -7109,7 +7109,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // primary's phone stayed in trips.phone after the promotion,
           // silently attributed to the newly-promoted agent on every
           // future read (CSV export, tripRowToApp's firstPickup).
-          update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label; update.phone = promoted.phone;
+          // `?? null`, NOT plain `promoted.phone` — FOUND VIA A SECOND
+          // /code-review PASS: an agent added via TRIP/ADD_AGENT (the
+          // Add Passenger panel) never gets a phone key on their
+          // extrapickups entry at all, so promoted.phone can genuinely be
+          // undefined here. supabase-js JSON.stringifies the update body,
+          // which DROPS any key whose value is undefined — so
+          // `update.phone = undefined` would silently omit phone from the
+          // PATCH entirely, leaving the OLD (just-removed) agent's stale
+          // number in trips.phone, reproducing the exact bug this promotion
+          // fix was meant to close. An explicit null forces the key to
+          // actually be sent, correctly clearing it.
+          update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label; update.phone = promoted.phone ?? null;
           update.extrapickups = newExtraPickups.slice(1);
           update.extraagentids = newExtraAgentIds.filter(id => id !== promoted.agent_id);
         }
@@ -8242,9 +8253,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const acPromoted = acNewExtraPickups[0];
         acUpdate.agentid = acPromoted?.agent_id ?? acNewExtraAgentIds[0] ?? null;
         if (acPromoted) {
-          // phone promoted alongside lat/lng/label — same fix as
-          // TRIP/REMOVE_AGENT's identical promotion logic above.
-          acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label; acUpdate.phone = acPromoted.phone;
+          // phone promoted alongside lat/lng/label, with the same `?? null`
+          // guard against supabase-js dropping an undefined key from the
+          // PATCH body — same fix as TRIP/REMOVE_AGENT's identical
+          // promotion logic above.
+          acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label; acUpdate.phone = acPromoted.phone ?? null;
           acUpdate.extrapickups = acNewExtraPickups.slice(1);
           acUpdate.extraagentids = acNewExtraAgentIds.filter(id => id !== acPromoted.agent_id);
         }
