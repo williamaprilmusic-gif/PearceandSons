@@ -16827,18 +16827,26 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         // People
         aid != null ? userName(aid) : (t.agent_name || ""),
         aid != null ? userStaffNum(aid) : "",
-        // FOUND VIA DIRECT USER REPORT: was `agentUser?.phone || t.phone`
-        // unconditionally, falling back to t.phone (a single TRIP-level
-        // field, whoever's number was on file at booking time — not this
-        // specific agent's own number) whenever agentUser's OWN phone was
-        // blank. On a merged multi-agent trip, every agent whose own
-        // profile phone was empty ended up showing that same one
-        // trip-level number on their row, looking like every agent shared
-        // one phone number even though they're different people with
-        // different real numbers. Matches the Agent/Staff # columns right
-        // above: t.phone is only a legitimate fallback when there's no
-        // real agent for this row at all (aid == null).
-        aid != null ? (agentUser?.phone || "") : (t.phone || ""),
+        // FOUND VIA DIRECT USER REPORT, THEN CORRECTED VIA CODE REVIEW: was
+        // `agentUser?.phone || t.phone` unconditionally, so a secondary
+        // (merged-in) agent whose own profile phone was blank fell back to
+        // t.phone — the PRIMARY leg's booking-time number, not theirs —
+        // showing one shared number across different people. First fix
+        // (blocking t.phone whenever aid != null) went too far the other
+        // way: t.phone genuinely IS aidIdx===0's own number (form.phone is
+        // required at booking, see "Contact number is required"), and
+        // MERGE_TRIPS keeps primary.phone unchanged onto the merged trip
+        // (see mergedTrip's spread), so blanking it for the primary agent
+        // was a real regression, not a fix. t.phone is only correct for
+        // aidIdx 0 — every secondary trip's own phone is currently
+        // discarded entirely at merge time (not carried per-agent like
+        // pickup_sequence_coords/dropoff_sequence_coords are), so there's
+        // no correct number to recover for aidIdx > 0 when their own
+        // profile phone is blank; showing blank is honest, borrowing the
+        // primary's number is not.
+        aid == null ? (t.phone || "")
+          : aidIdx === 0 ? (agentUser?.phone || t.phone || "")
+          : (agentUser?.phone || ""),
         agentUser?.home_address?.label || "",
         userName(t.driver_id),
         driverVehicle(t.driver_id),
