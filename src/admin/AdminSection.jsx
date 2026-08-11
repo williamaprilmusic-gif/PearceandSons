@@ -4195,16 +4195,18 @@ function AdminLiveMap({ state, user, dispatch }) {
                     at typical zoom) so taps land on mobile even with imprecise fingers */}
                 <circle cx={0} cy={0} r={18} fill="transparent" />
                 {isSelected && <circle cx={0} cy={0} r={16} fill="none" stroke={color} strokeWidth={1.5} opacity={0.4} />}
-                {/* Pin body — a car icon per explicit request, replacing the
-                    plain dot. Rotates to face the driver's actual heading,
-                    which also makes the old separate heading-line indicator
-                    redundant (one rotated icon reads more clearly than a
-                    dot + a separate direction line) — matches how Waze/
-                    Google Maps show a single rotated car glyph. The colored
-                    ring behind it preserves the busy/available/stale status
-                    signal a plain emoji can't otherwise carry (emoji glyphs
-                    aren't tintable via SVG fill). */}
-                <circle cx={0} cy={0} r={11} fill={COLORS.panel} stroke={color} strokeWidth={2.5} opacity={d.stale ? 0.6 : 1} />
+                {/* Pin body — a vector top-down car silhouette per explicit
+                    request to match Bolt/Uber's marker style, replacing the
+                    emoji glyph this used before. Rotates to face the
+                    driver's actual heading, which also makes a separate
+                    heading-line indicator redundant (one rotated icon reads
+                    more clearly than a dot + a separate direction line) —
+                    matches how Waze/Google Maps show a single rotated car
+                    glyph. Unlike the emoji it replaces, an SVG shape IS
+                    tintable, so the body itself now carries the busy/
+                    available/stale status color directly (solid color car,
+                    same as Bolt's own live-map pins) instead of needing a
+                    separate colored ring around a fixed glyph. */}
                 <g
                   // !d.stale check restored — a stale position's heading
                   // could be significantly outdated (the driver may have
@@ -4213,12 +4215,10 @@ function AdminLiveMap({ state, user, dispatch }) {
                   // rather than rotating the icon to a potentially
                   // misleading direction for data that's no longer fresh.
                   transform={d.pos.heading != null && !d.stale ? `rotate(${d.pos.heading})` : undefined}
-                  style={{ transition: "transform .4s ease" }}
+                  style={{ transition: "transform .4s ease", filter: "drop-shadow(0 2px 3px rgba(0,0,0,.55))" }}
                 >
-                  <text x={0} y={0} fontSize={14} textAnchor="middle" dominantBaseline="central"
-                    style={{ pointerEvents: "none", opacity: d.stale ? 0.6 : 1 }}>
-                    🚗
-                  </text>
+                  <rect x={-6.5} y={-11} width={13} height={22} rx={5.5} fill={color} stroke={COLORS.panel} strokeWidth={1.5} opacity={d.stale ? 0.65 : 1} />
+                  <rect x={-4} y={-6.5} width={8} height={6.5} rx={2} fill={COLORS.panel} opacity={d.stale ? 0.55 : 0.9} />
                 </g>
                 {/* Name label above pin */}
                 <text x={0} y={-14} fontSize={9} fontWeight={700} fill={COLORS.chalk}
