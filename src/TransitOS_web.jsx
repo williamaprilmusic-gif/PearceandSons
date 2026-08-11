@@ -16827,7 +16827,18 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         // People
         aid != null ? userName(aid) : (t.agent_name || ""),
         aid != null ? userStaffNum(aid) : "",
-        agentUser?.phone || t.phone || "",
+        // FOUND VIA DIRECT USER REPORT: was `agentUser?.phone || t.phone`
+        // unconditionally, falling back to t.phone (a single TRIP-level
+        // field, whoever's number was on file at booking time — not this
+        // specific agent's own number) whenever agentUser's OWN phone was
+        // blank. On a merged multi-agent trip, every agent whose own
+        // profile phone was empty ended up showing that same one
+        // trip-level number on their row, looking like every agent shared
+        // one phone number even though they're different people with
+        // different real numbers. Matches the Agent/Staff # columns right
+        // above: t.phone is only a legitimate fallback when there's no
+        // real agent for this row at all (aid == null).
+        aid != null ? (agentUser?.phone || "") : (t.phone || ""),
         agentUser?.home_address?.label || "",
         userName(t.driver_id),
         driverVehicle(t.driver_id),
