@@ -3991,7 +3991,16 @@ function appReducer(state, action) {
         // agent_id stamped to match the Supabase shape (tripRowToApp puts
         // row.agentid on the primary coord) — TRIP/REMOVE_AGENT filters
         // and the driver nav's per-passenger stop list both key on it.
-        pickup_sequence_coords: [{ ...pickupCoord, label: action.pickup_label, agent_id: action.agent_id }],
+        // phone stamped here too — FOUND VIA AUDIT: this booking's own
+        // contact number (required at booking, see the "Contact number is
+        // required" validation) previously only lived on the trip-level
+        // `phone` field, which TRIP/DISPATCH_MULTI's merge silently
+        // dropped for every agent except the primary trip's own agent
+        // (whichever trip stayed as "primary" through the merge). Storing
+        // it per-agent alongside lat/lng/agent_id means it survives a
+        // merge automatically, the same way pickup_sequence_coords
+        // already does for location data.
+        pickup_sequence_coords: [{ ...pickupCoord, label: action.pickup_label, agent_id: action.agent_id, phone: action.phone }],
         dropoff_sequence_coords: [{ ...dropCoord, label: action.dropoff_label, agent_id: action.agent_id }],
         completed_pickups: [],
         current_gps_coordinates: pickupCoord,
@@ -5660,7 +5669,11 @@ function driverStatusRowToApp(row) {
   return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_away: row.isaway || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
 }
 function tripRowToApp(row, chatByTrip) {
-  const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid }] : [];
+  // phone included on the primary coord (row.phone IS the primary agent's
+  // own booking-time number — required at booking) so a per-agent phone
+  // lookup can read pickup_sequence_coords uniformly for every agent,
+  // primary or extra, instead of needing a special case for index 0.
+  const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid, phone: row.phone }] : [];
   const extraPickups = Array.isArray(row.extrapickups) ? row.extrapickups : [];
   // Per-agent dropoffs — primary agent uses dropofflat/lng/label; extra agents
   // use extradropoffs (parallel to extrapickups). For INBOUND trips all agents
@@ -8329,7 +8342,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       for (const sec of secondaryRows || []) {
         if (sec.agentid) {
           newExtraAgentIds.push(sec.agentid);
-          newExtraPickups.push({ lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.agentid });
+          // phone included — FOUND VIA AUDIT: without this, sec's own
+          // booking-time contact number (sec.phone, required at booking)
+          // was discarded the moment this secondary row got deleted below,
+          // with no way to recover it — the merged trip only ever kept
+          // the PRIMARY's phone, so every folded-in agent whose profile
+          // phone was blank showed the primary's number as if it were
+          // their own.
+          newExtraPickups.push({ lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.agentid, phone: sec.phone });
           // Store this secondary agent's own dropoff (their home address for OUTBOUND trips).
           newExtraDropoffs.push({ lat: sec.dropofflat, lng: sec.dropofflng, label: sec.dropofflocation, agent_id: sec.agentid });
         }
@@ -8509,7 +8529,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const newExtraDropoffs = [...(mergeTargetTrip.extradropoffs || [])];
           if (tripRow.agentid) {
             newExtraAgentIds.push(tripRow.agentid);
-            newExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid });
+            // phone included — same reasoning as TRIP/DISPATCH_MULTI's
+            // identical fold-in step: tripRow.phone is this agent's own
+            // booking-time number and would otherwise be discarded once
+            // this trip's own row is deleted below.
+            newExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid, phone: tripRow.phone });
             newExtraDropoffs.push({ lat: tripRow.dropofflat, lng: tripRow.dropofflng, label: tripRow.dropofflocation, agent_id: tripRow.agentid });
           }
           for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
@@ -8565,7 +8589,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             const retryExtraDropoffs = [...(freshMergeTarget.extradropoffs || [])];
             if (tripRow.agentid) {
               retryExtraAgentIds.push(tripRow.agentid);
-              retryExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid });
+              // phone included — same reasoning as the non-retry path above.
+              retryExtraPickups.push({ lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: tripRow.agentid, phone: tripRow.phone });
               retryExtraDropoffs.push({ lat: tripRow.dropofflat, lng: tripRow.dropofflng, label: tripRow.dropofflocation, agent_id: tripRow.agentid });
             }
             for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
@@ -16827,26 +16852,26 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         // People
         aid != null ? userName(aid) : (t.agent_name || ""),
         aid != null ? userStaffNum(aid) : "",
-        // FOUND VIA DIRECT USER REPORT, THEN CORRECTED VIA CODE REVIEW: was
-        // `agentUser?.phone || t.phone` unconditionally, so a secondary
-        // (merged-in) agent whose own profile phone was blank fell back to
-        // t.phone — the PRIMARY leg's booking-time number, not theirs —
-        // showing one shared number across different people. First fix
-        // (blocking t.phone whenever aid != null) went too far the other
-        // way: t.phone genuinely IS aidIdx===0's own number (form.phone is
-        // required at booking, see "Contact number is required"), and
-        // MERGE_TRIPS keeps primary.phone unchanged onto the merged trip
-        // (see mergedTrip's spread), so blanking it for the primary agent
-        // was a real regression, not a fix. t.phone is only correct for
-        // aidIdx 0 — every secondary trip's own phone is currently
-        // discarded entirely at merge time (not carried per-agent like
-        // pickup_sequence_coords/dropoff_sequence_coords are), so there's
-        // no correct number to recover for aidIdx > 0 when their own
-        // profile phone is blank; showing blank is honest, borrowing the
-        // primary's number is not.
+        // FOUND VIA DIRECT USER REPORT, THEN CORRECTED VIA CODE REVIEW,
+        // THEN FIXED PROPERLY AT THE ROOT: was `agentUser?.phone ||
+        // t.phone` unconditionally — t.phone is the TRIP-level phone,
+        // which used to mean "whoever's number was on file at booking,"
+        // correct for a single-agent trip but wrong for every merged-in
+        // secondary agent (borrowed the primary's number). An interim fix
+        // special-cased aidIdx===0 vs. >0, but the real gap was one level
+        // deeper: TRIP/DISPATCH_MULTI's merge never carried a secondary
+        // trip's own phone forward at all, only its coords. Now that
+        // booking-time phone is stamped onto each agent's OWN
+        // pickup_sequence_coords entry (see TRIP/BOOK, tripRowToApp, and
+        // both DISPATCH_MULTI/auto-merge fold-in sites) — the same
+        // mechanism pickup/dropoff location already used to survive a
+        // merge — this can look it up uniformly for every agent, primary
+        // or secondary, with no index-based special case. Profile phone
+        // still wins when set (most current), booking-time number is the
+        // fallback (most likely to be correct for a merged-in agent whose
+        // profile was never filled in).
         aid == null ? (t.phone || "")
-          : aidIdx === 0 ? (agentUser?.phone || t.phone || "")
-          : (agentUser?.phone || ""),
+          : (agentUser?.phone || t.pickup_sequence_coords?.find(c => String(c.agent_id) === String(aid))?.phone || ""),
         agentUser?.home_address?.label || "",
         userName(t.driver_id),
         driverVehicle(t.driver_id),
