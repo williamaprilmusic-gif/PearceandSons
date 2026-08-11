@@ -3830,20 +3830,21 @@ function appReducer(state, action) {
       if (!trip.agent_ids.some(id => String(id) === String(action.agent_id))) return { ...state, _error: "Agent is not on this trip" };
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state)) return { ...state, _error: "Cannot relocate a passenger on a completed or cancelled trip" };
 
-      const newCoord = { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id };
       // Untagged-coord fallback matched by POSITION in agent_ids, not just
       // index 0 — see TRIP/REMOVE_AGENT's identical fix above for why an
       // index-0-only fallback silently no-ops for any non-primary agent on
       // an untagged trip.
       const newPickupCoords = trip.pickup_sequence_coords.map((c, i) => {
         const belongsToThisAgent = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
-        // newCoord already carries agent_id: action.agent_id — spreading it
-        // and then re-overwriting agent_id with the OLD c.agent_id was a
-        // no-op when c was already tagged (same value), but silently
-        // dropped the tag back to undefined whenever c was untagged and
-        // matched via the positional fallback above, undoing the very fix
-        // that fallback exists for.
-        return belongsToThisAgent ? newCoord : c;
+        if (!belongsToThisAgent) return c;
+        // Spread the OLD entry `c` first, THEN override with the new
+        // pickup coord — FOUND VIA /code-review on the phone-survives-
+        // merge fix: building newCoord from scratch as
+        // {...action.pickup_coord, label, agent_id} discarded every other
+        // field the old entry carried, including `phone`, on every
+        // relocate. Relocating a pin has nothing to do with this agent's
+        // stored contact number.
+        return { ...c, ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id };
       });
 
       let newTripsRelocate;
@@ -7103,7 +7104,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const promoted = newExtraPickups[0];
         update.agentid = promoted?.agent_id ?? newExtraAgentIds[0] ?? null;
         if (promoted) {
-          update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label;
+          // phone promoted alongside lat/lng/label — FOUND VIA /code-review
+          // on the phone-survives-merge fix: without this, the OLD
+          // primary's phone stayed in trips.phone after the promotion,
+          // silently attributed to the newly-promoted agent on every
+          // future read (CSV export, tripRowToApp's firstPickup).
+          update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label; update.phone = promoted.phone;
           update.extrapickups = newExtraPickups.slice(1);
           update.extraagentids = newExtraAgentIds.filter(id => id !== promoted.agent_id);
         }
@@ -7230,8 +7236,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (isPrimary) {
         update.pickuplat = action.pickup_coord.lat; update.pickuplng = action.pickup_coord.lng; update.pickuplabel = action.pickup_label;
       } else {
+        // Spread the existing entry first, THEN override lat/lng/label —
+        // FOUND VIA /code-review on the phone-survives-merge fix: this
+        // used to replace the whole entry with a bare
+        // {lat,lng,label,agent_id} object, silently dropping `phone`
+        // (and any other field this entry might carry) just from moving
+        // a pin. Relocating a pickup point has nothing to do with this
+        // agent's stored contact number.
         update.extrapickups = (tripRow.extrapickups || []).map(p =>
-          String(p.agent_id) === String(action.agent_id) ? { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id } : p
+          String(p.agent_id) === String(action.agent_id) ? { ...p, lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id } : p
         );
       }
 
@@ -8229,7 +8242,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const acPromoted = acNewExtraPickups[0];
         acUpdate.agentid = acPromoted?.agent_id ?? acNewExtraAgentIds[0] ?? null;
         if (acPromoted) {
-          acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label;
+          // phone promoted alongside lat/lng/label — same fix as
+          // TRIP/REMOVE_AGENT's identical promotion logic above.
+          acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label; acUpdate.phone = acPromoted.phone;
           acUpdate.extrapickups = acNewExtraPickups.slice(1);
           acUpdate.extraagentids = acNewExtraAgentIds.filter(id => id !== acPromoted.agent_id);
         }
