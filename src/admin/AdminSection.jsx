@@ -4195,6 +4195,19 @@ function AdminLiveMap({ state, user, dispatch }) {
                     at typical zoom) so taps land on mobile even with imprecise fingers */}
                 <circle cx={0} cy={0} r={18} fill="transparent" />
                 {isSelected && <circle cx={0} cy={0} r={16} fill="none" stroke={color} strokeWidth={1.5} opacity={0.4} />}
+                {/* Flat-fill "shadow" ellipse instead of a CSS drop-shadow
+                    filter — FOUND VIA AUDIT: this map re-renders every
+                    driver marker on every ~8s position broadcast (see
+                    livePositions above), and an SVG filter forces the
+                    browser to rasterize+blur each marker to an offscreen
+                    buffer every time, compounded by the transform
+                    transition on the car <g> below re-triggering it on
+                    every heading change too. A plain semi-transparent
+                    shape is a flat fill, not a blur — same visual "lifted
+                    off the map" depth cue at a fraction of the paint cost.
+                    Lives in the non-rotating outer <g> (unlike the car
+                    body) since a shadow shouldn't spin with heading. */}
+                <ellipse cx={0} cy={3} rx={7} ry={2.5} fill="rgba(0,0,0,.4)" opacity={d.stale ? 0.5 : 1} />
                 {/* Pin body — a vector top-down car silhouette per explicit
                     request to match Bolt/Uber's marker style, replacing the
                     emoji glyph this used before. Rotates to face the
@@ -4215,10 +4228,16 @@ function AdminLiveMap({ state, user, dispatch }) {
                   // rather than rotating the icon to a potentially
                   // misleading direction for data that's no longer fresh.
                   transform={d.pos.heading != null && !d.stale ? `rotate(${d.pos.heading})` : undefined}
-                  style={{ transition: "transform .4s ease", filter: "drop-shadow(0 2px 3px rgba(0,0,0,.55))" }}
+                  style={{ transition: "transform .4s ease" }}
                 >
-                  <rect x={-6.5} y={-11} width={13} height={22} rx={5.5} fill={color} stroke={COLORS.panel} strokeWidth={1.5} opacity={d.stale ? 0.65 : 1} />
-                  <rect x={-4} y={-6.5} width={8} height={6.5} rx={2} fill={COLORS.panel} opacity={d.stale ? 0.55 : 0.9} />
+                  {/* Single shared opacity for the whole car — FOUND VIA
+                      AUDIT: body/windshield previously carried two
+                      independently-chosen stale ratios (0.65/1 vs 0.55/0.9)
+                      for what's meant to be the same "dim when stale"
+                      signal, risking drift if one is ever tweaked without
+                      the other. */}
+                  <rect x={-6.5} y={-11} width={13} height={22} rx={5.5} fill={color} stroke={COLORS.panel} strokeWidth={1.5} opacity={d.stale ? 0.6 : 1} />
+                  <rect x={-4} y={-6.5} width={8} height={6.5} rx={2} fill={COLORS.panel} opacity={d.stale ? 0.6 : 1} />
                 </g>
                 {/* Name label above pin */}
                 <text x={0} y={-14} fontSize={9} fontWeight={700} fill={COLORS.chalk}
