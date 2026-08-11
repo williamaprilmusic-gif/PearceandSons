@@ -143,9 +143,7 @@ Deno.serve(async (req) => {
       for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
     }
 
-    let flaggedCount = 0;
     for (const { driverid, hoursToday, hoursWeek, overDay, overWeek } of flagged) {
-      flaggedCount++;
       const driverName = driverNameById[String(driverid)] || String(driverid);
       const reason = overDay && overWeek
         ? `${hoursToday.toFixed(1)}h today and ${hoursWeek.toFixed(1)}h this week`
@@ -166,7 +164,7 @@ Deno.serve(async (req) => {
       await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: nowMs } }).eq("driverid", driverid);
     }
 
-    return new Response(JSON.stringify({ ok: true, checked: driverStatusRows.length, flagged: flaggedCount }), {
+    return new Response(JSON.stringify({ ok: true, checked: driverStatusRows.length, flagged: flagged.length }), {
       headers: { "Content-Type": "application/json" },
     });
   } catch (e) {

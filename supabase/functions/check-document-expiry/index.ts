@@ -62,45 +62,46 @@ Deno.serve(async (req) => {
       .select("driverid, documents, docexpirynotified");
     if (error) throw error;
 
-    // Driver names, batched into ONE query up front — FOUND VIA AUDIT:
-    // this used to run one `users` lookup per flagged driver INSIDE the
-    // loop below, the exact N+1 pattern check-trip-timing's own header
-    // comment already calls out and fixes for its own sweeps.
-    const needsNotifying = (ds: Record<string, unknown>) => {
+    // First pass: figure out which drivers actually need notifying, and
+    // for which doc types (pure in-memory math against driverStatusRows,
+    // no DB calls) — same two-pass shape as check-hours-compliance, so
+    // docExpiryStatus is computed exactly once per doc per driver instead
+    // of once in a pre-filter and again in the notify loop.
+    type DocFlag = { docType: typeof DOC_TYPES[number]; dateVal: string; status: string };
+    type FlaggedDriver = { driverid: unknown; notified: Record<string, string>; flags: DocFlag[] };
+    const flagged: FlaggedDriver[] = [];
+    for (const ds of driverStatusRows || []) {
       const docs = (ds.documents as Record<string, string>) || {};
       const notified = (ds.docexpirynotified as Record<string, string>) || {};
-      return DOC_TYPES.some(docType => {
-        const dateVal = docs[docType.key];
-        if (!dateVal) return false;
-        const { status } = docExpiryStatus(dateVal);
-        if (status !== "expiring" && status !== "expired") return false;
-        return notified[docType.key] !== dateVal;
-      });
-    };
-    const driverIdsNeedingName = (driverStatusRows || []).filter(needsNotifying).map(ds => ds.driverid);
-    const driverNameById: Record<string, string> = {};
-    if (driverIdsNeedingName.length > 0) {
-      const { data: driverRows } = await supabase.from("users").select("id, fullname").in("id", driverIdsNeedingName);
-      for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
-    }
-
-    let flaggedCount = 0;
-    for (const ds of driverStatusRows || []) {
-      const docs = ds.documents || {};
-      const notified = ds.docexpirynotified || {};
-      const newNotified = { ...notified };
-      let rowChanged = false;
-      const driverName = driverNameById[String(ds.driverid)] || String(ds.driverid);
-
+      const flags: DocFlag[] = [];
       for (const docType of DOC_TYPES) {
         const dateVal = docs[docType.key];
         if (!dateVal) continue;
         const { status } = docExpiryStatus(dateVal);
         if (status !== "expiring" && status !== "expired") continue;
         if (notified[docType.key] === dateVal) continue; // already notified for this exact date
+        flags.push({ docType, dateVal, status });
+      }
+      if (flags.length > 0) flagged.push({ driverid: ds.driverid, notified, flags });
+    }
 
+    // Driver names, batched into ONE query up front — FOUND VIA AUDIT:
+    // this used to run one `users` lookup per flagged driver INSIDE the
+    // loop below, the exact N+1 pattern check-trip-timing's own header
+    // comment already calls out and fixes for its own sweeps.
+    const driverNameById: Record<string, string> = {};
+    if (flagged.length > 0) {
+      const { data: driverRows } = await supabase.from("users").select("id, fullname").in("id", flagged.map(f => f.driverid));
+      for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
+    }
+
+    let flaggedCount = 0;
+    for (const { driverid, notified, flags } of flagged) {
+      const driverName = driverNameById[String(driverid)] || String(driverid);
+      const newNotified = { ...notified };
+
+      for (const { docType, dateVal, status } of flags) {
         newNotified[docType.key] = dateVal;
-        rowChanged = true;
         flaggedCount++;
 
         const verb = status === "expired" ? "has EXPIRED" : "is expiring soon";
@@ -112,16 +113,14 @@ Deno.serve(async (req) => {
             timestamp: nowTs, isread: false,
           },
           {
-            title: "DRIVER DOCUMENT EXPIRY", type: "DRIVER_DOCUMENT_EXPIRY", forroles: ["DRIVER"], userid: ds.driverid,
+            title: "DRIVER DOCUMENT EXPIRY", type: "DRIVER_DOCUMENT_EXPIRY", forroles: ["DRIVER"], userid: driverid,
             message: `⚠ Your ${docType.label} ${verb} (${dateVal}) — please renew and update it as soon as possible.`,
             timestamp: nowTs, isread: false,
           },
         ]);
       }
 
-      if (rowChanged) {
-        await supabase.from("driver_status").update({ docexpirynotified: newNotified }).eq("driverid", ds.driverid);
-      }
+      await supabase.from("driver_status").update({ docexpirynotified: newNotified }).eq("driverid", driverid);
     }
 
     return new Response(JSON.stringify({ ok: true, checked: (driverStatusRows || []).length, flagged: flaggedCount }), {
