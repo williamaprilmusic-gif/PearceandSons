@@ -62,13 +62,35 @@ Deno.serve(async (req) => {
       .select("driverid, documents, docexpirynotified");
     if (error) throw error;
 
+    // Driver names, batched into ONE query up front — FOUND VIA AUDIT:
+    // this used to run one `users` lookup per flagged driver INSIDE the
+    // loop below, the exact N+1 pattern check-trip-timing's own header
+    // comment already calls out and fixes for its own sweeps.
+    const needsNotifying = (ds: Record<string, unknown>) => {
+      const docs = (ds.documents as Record<string, string>) || {};
+      const notified = (ds.docexpirynotified as Record<string, string>) || {};
+      return DOC_TYPES.some(docType => {
+        const dateVal = docs[docType.key];
+        if (!dateVal) return false;
+        const { status } = docExpiryStatus(dateVal);
+        if (status !== "expiring" && status !== "expired") return false;
+        return notified[docType.key] !== dateVal;
+      });
+    };
+    const driverIdsNeedingName = (driverStatusRows || []).filter(needsNotifying).map(ds => ds.driverid);
+    const driverNameById: Record<string, string> = {};
+    if (driverIdsNeedingName.length > 0) {
+      const { data: driverRows } = await supabase.from("users").select("id, fullname").in("id", driverIdsNeedingName);
+      for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
+    }
+
     let flaggedCount = 0;
     for (const ds of driverStatusRows || []) {
       const docs = ds.documents || {};
       const notified = ds.docexpirynotified || {};
       const newNotified = { ...notified };
       let rowChanged = false;
-      let driverName: string | null = null;
+      const driverName = driverNameById[String(ds.driverid)] || String(ds.driverid);
 
       for (const docType of DOC_TYPES) {
         const dateVal = docs[docType.key];
@@ -81,10 +103,6 @@ Deno.serve(async (req) => {
         rowChanged = true;
         flaggedCount++;
 
-        if (driverName === null) {
-          const { data: driverUserRow } = await supabase.from("users").select("fullname").eq("id", ds.driverid).maybeSingle();
-          driverName = driverUserRow?.fullname || String(ds.driverid);
-        }
         const verb = status === "expired" ? "has EXPIRED" : "is expiring soon";
         const nowTs = Date.now();
         await supabase.from("notifications").insert([

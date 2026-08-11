@@ -63,25 +63,33 @@ Deno.serve(async (req) => {
   const monthEndMs = Date.UTC(sY, sM, 1, 0, 0, 0, 0) - 2 * 3600000;
   const monthLabel = new Date(Date.UTC(sY, sM - 1, 1)).toLocaleDateString("en-ZA", { month: "long", year: "numeric", timeZone: "UTC" });
 
-  const { data: feeRatesRow, error: feeErr } = await sb.from("trip_fee_rates").select("*").eq("id", 1).maybeSingle();
+  // Three independent reads — FOUND VIA AUDIT: these were awaited one
+  // after another; Promise.all cuts this run's DB-wait time to roughly
+  // the slowest single query instead of the sum of all three, same
+  // pattern as weekly-ops-digest's own fix.
+  const [
+    { data: feeRatesRow, error: feeErr },
+    { data: trips, error: tripErr },
+    { data: users },
+  ] = await Promise.all([
+    sb.from("trip_fee_rates").select("*").eq("id", 1).maybeSingle(),
+    sb.from("trips")
+      .select("id, status, scheduleddate, driverid, agentid, extraagentids, latebookingflag, noshows, completeddropoffs, actualdistancekm, estdistancekm")
+      .in("status", ["ARCHIVED_COMPLETED", "ARCHIVED_CANCELLED"])
+      .gte("scheduledtime", monthStartMs)
+      .lt("scheduledtime", monthEndMs),
+    sb.from("users").select("id, fullname"),
+  ]);
   if (feeErr || !feeRatesRow) {
     console.error("DB error (trip_fee_rates):", feeErr?.message ?? "no row");
     return json({ error: "Internal error — please try again." }, 500);
   }
   const feeRates = feeRatesRow as FeeRates;
-
-  const { data: trips, error: tripErr } = await sb
-    .from("trips")
-    .select("id, status, scheduleddate, driverid, agentid, extraagentids, latebookingflag, noshows, completeddropoffs, actualdistancekm, estdistancekm")
-    .in("status", ["ARCHIVED_COMPLETED", "ARCHIVED_CANCELLED"])
-    .gte("scheduledtime", monthStartMs)
-    .lt("scheduledtime", monthEndMs);
   if (tripErr) {
     console.error("DB error (trips):", tripErr.message);
     return json({ error: "Internal error — please try again." }, 500);
   }
 
-  const { data: users } = await sb.from("users").select("id, fullname");
   const userName = (id: unknown) => (users ?? []).find((u: { id: unknown }) => String(u.id) === String(id))?.fullname || String(id ?? "");
 
   // ── Per-agent billing model — mirrors agentFeeCategory/agentFeeAmount/

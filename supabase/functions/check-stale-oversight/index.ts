@@ -37,9 +37,23 @@ Deno.serve(async (req) => {
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
     const nowMs = Date.now();
 
-    // ── Stale tickets ──────────────────────────────────────────────────
-    const { data: openTickets, error: ticketErr } = await supabase.from("tickets").select("*").eq("status", "OPEN");
+    // Tickets and disputed trips are independent reads — FOUND VIA AUDIT:
+    // these were awaited one after another; Promise.all cuts this run's
+    // DB-wait time to roughly the slowest single query instead of the sum
+    // of both, same pattern as weekly-ops-digest's own fix.
+    const [
+      { data: openTickets, error: ticketErr },
+      { data: disputedTrips, error: disputeErr },
+    ] = await Promise.all([
+      supabase.from("tickets").select("*").eq("status", "OPEN"),
+      supabase.from("trips").select("id, dispute")
+        .not("dispute", "is", null)
+        .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED"),
+    ]);
     if (ticketErr) throw ticketErr;
+    if (disputeErr) throw disputeErr;
+
+    // ── Stale tickets ──────────────────────────────────────────────────
     let ticketsFlagged = 0;
     for (const t of openTickets || []) {
       const age = nowMs - t.createdat;
@@ -56,10 +70,6 @@ Deno.serve(async (req) => {
     }
 
     // ── Stale disputes ────────────────────────────────────────────────
-    const { data: disputedTrips, error: disputeErr } = await supabase.from("trips").select("id, dispute")
-      .not("dispute", "is", null)
-      .or("dispute->>state.eq.OPEN,dispute->>state.eq.DRIVER_RESPONDED");
-    if (disputeErr) throw disputeErr;
     let disputesFlagged = 0;
     for (const t of disputedTrips || []) {
       const age = nowMs - t.dispute.filed_at;

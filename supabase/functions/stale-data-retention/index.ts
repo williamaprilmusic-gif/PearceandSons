@@ -45,16 +45,18 @@ Deno.serve(async (req) => {
     twoMonthsAgo.setUTCMonth(twoMonthsAgo.getUTCMonth() - 2);
     const ninetyDaysAgo = nowMs - 90 * 24 * 60 * 60 * 1000;
 
-    const { error: posErr, count: posCount } = await supabase
-      .from("driver_position_log")
-      .delete({ count: "exact" })
-      .lt("recordedat", twoMonthsAgo.getTime());
+    // Two independent deletes against unrelated tables — FOUND VIA AUDIT:
+    // these were awaited one after another; Promise.all cuts this run's
+    // DB-wait time to roughly the slowest single delete instead of the sum
+    // of both, same pattern as weekly-ops-digest's own fix.
+    const [
+      { error: posErr, count: posCount },
+      { error: notifErr, count: notifCount },
+    ] = await Promise.all([
+      supabase.from("driver_position_log").delete({ count: "exact" }).lt("recordedat", twoMonthsAgo.getTime()),
+      supabase.from("notifications").delete({ count: "exact" }).lt("timestamp", ninetyDaysAgo),
+    ]);
     if (posErr) throw posErr;
-
-    const { error: notifErr, count: notifCount } = await supabase
-      .from("notifications")
-      .delete({ count: "exact" })
-      .lt("timestamp", ninetyDaysAgo);
     if (notifErr) throw notifErr;
 
     return new Response(JSON.stringify({ ok: true, purgedPositionLog: posCount ?? 0, purgedNotifications: notifCount ?? 0 }), {

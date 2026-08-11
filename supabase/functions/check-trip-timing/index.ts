@@ -13,10 +13,12 @@
 // "every non-terminal trip" as their base set anyway.
 //
 // Each of the 4 checks below is a straight port of its own now-retired
-// function's logic — see check-late-start/check-upcoming-reminders/
-// check-unassigned-approaching's own (still-deployed but no longer
-// scheduled) source for the original per-check header comments this
-// summarizes. Nothing about any individual check's threshold/notified-
+// function's logic — see check-late-start/check-upcoming-reminders's own
+// (still-deployed but no longer scheduled) source for the original
+// per-check header comments this summarizes (check-unassigned-
+// approaching's local source was deleted as dead code once its logic
+// was fully absorbed here; its deployment was already unscheduled).
+// Nothing about any individual check's threshold/notified-
 // flag/re-fire behavior changed in the merge, only that they now share
 // one query instead of four, plus a post-merge fix batching the driver-
 // name lookups checks #1/#4 need into one query up front instead of one

@@ -73,26 +73,31 @@ Deno.serve(async (req) => {
     }
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
 
-    const { data: driverStatusRows, error: dsError } = await supabase
-      .from("driver_status")
-      .select("driverid, hourscompliancenotifiedfor");
+    // driver_status and trips are independent reads — FOUND VIA AUDIT:
+    // these were awaited one after another; Promise.all cuts this run's
+    // DB-wait time to roughly the slowest single query instead of the
+    // sum of both.
+    const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const [
+      { data: driverStatusRows, error: dsError },
+      { data: recentTripRows, error: tripError },
+    ] = await Promise.all([
+      supabase.from("driver_status").select("driverid, hourscompliancenotifiedfor"),
+      // Filtered on scheduledtime, NOT bookedat — see the app's own
+      // identical comment: a WEEK-type trip (booked up to 14 days in
+      // advance, all days sharing nearly the same bookedat) can have its
+      // actual driving day fall outside an 8-day bookedat window even
+      // though scheduledtime always stays close to when it's actually
+      // driven.
+      supabase.from("trips")
+        .select("driverid, status, bookedat, confirmedat, acceptedat, completedat")
+        .gte("scheduledtime", eightDaysAgo),
+    ]);
     if (dsError) throw dsError;
+    if (tripError) throw tripError;
     if (!driverStatusRows || driverStatusRows.length === 0) {
       return new Response(JSON.stringify({ ok: true, checked: 0, flagged: 0 }), { headers: { "Content-Type": "application/json" } });
     }
-
-    // Filtered on scheduledtime, NOT bookedat — see the app's own
-    // identical comment: a WEEK-type trip (booked up to 14 days in
-    // advance, all days sharing nearly the same bookedat) can have its
-    // actual driving day fall outside an 8-day bookedat window even
-    // though scheduledtime always stays close to when it's actually
-    // driven.
-    const eightDaysAgo = Date.now() - 8 * 24 * 60 * 60 * 1000;
-    const { data: recentTripRows, error: tripError } = await supabase
-      .from("trips")
-      .select("driverid, status, bookedat, confirmedat, acceptedat, completedat")
-      .gte("scheduledtime", eightDaysAgo);
-    if (tripError) throw tripError;
     const trips: TripRow[] = recentTripRows || [];
 
     // SAST (UTC+2) calendar date/week boundaries, NOT this runtime's own
@@ -111,7 +116,11 @@ Deno.serve(async (req) => {
     const diffToMonday = sDow === 0 ? 6 : sDow - 1;
     const startOfWeekMs = Date.UTC(sY, sM, sD - diffToMonday, 0, 0, 0, 0) - 2 * 3600000;
 
-    let flaggedCount = 0;
+    // First pass: figure out which drivers are actually over-limit (pure
+    // in-memory math against `trips`, no DB calls) before touching the
+    // network again.
+    type FlaggedDriver = { driverid: string | number; hoursToday: number; hoursWeek: number; overDay: boolean; overWeek: boolean };
+    const flagged: FlaggedDriver[] = [];
     for (const ds of driverStatusRows) {
       const notified = ds.hourscompliancenotifiedfor || {};
       if (notified.date === todayDateStr) continue;
@@ -121,10 +130,23 @@ Deno.serve(async (req) => {
       const overDay = hoursToday >= MAX_DRIVER_HOURS_PER_DAY;
       const overWeek = hoursWeek >= MAX_DRIVER_HOURS_PER_WEEK;
       if (!overDay && !overWeek) continue;
+      flagged.push({ driverid: ds.driverid, hoursToday, hoursWeek, overDay, overWeek });
+    }
 
+    // Driver names, batched into ONE query up front — FOUND VIA AUDIT:
+    // this used to run one `users` lookup per flagged driver INSIDE the
+    // loop below, the exact N+1 pattern check-trip-timing's own header
+    // comment already calls out and fixes for its own sweeps.
+    const driverNameById: Record<string, string> = {};
+    if (flagged.length > 0) {
+      const { data: driverRows } = await supabase.from("users").select("id, fullname").in("id", flagged.map(f => f.driverid));
+      for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
+    }
+
+    let flaggedCount = 0;
+    for (const { driverid, hoursToday, hoursWeek, overDay, overWeek } of flagged) {
       flaggedCount++;
-      const { data: driverUserRow } = await supabase.from("users").select("fullname").eq("id", ds.driverid).maybeSingle();
-      const driverName = driverUserRow?.fullname || String(ds.driverid);
+      const driverName = driverNameById[String(driverid)] || String(driverid);
       const reason = overDay && overWeek
         ? `${hoursToday.toFixed(1)}h today and ${hoursWeek.toFixed(1)}h this week`
         : overDay ? `${hoursToday.toFixed(1)}h today` : `${hoursWeek.toFixed(1)}h this week`;
@@ -136,12 +158,12 @@ Deno.serve(async (req) => {
           timestamp: nowMs, isread: false,
         },
         {
-          title: "DRIVER HOURS WARNING", type: "DRIVER_HOURS_WARNING", forroles: ["DRIVER"], userid: ds.driverid,
+          title: "DRIVER HOURS WARNING", type: "DRIVER_HOURS_WARNING", forroles: ["DRIVER"], userid: driverid,
           message: `⚠ You've logged ${reason} — please plan for adequate rest.`,
           timestamp: nowMs, isread: false,
         },
       ]);
-      await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: nowMs } }).eq("driverid", ds.driverid);
+      await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: nowMs } }).eq("driverid", driverid);
     }
 
     return new Response(JSON.stringify({ ok: true, checked: driverStatusRows.length, flagged: flaggedCount }), {
