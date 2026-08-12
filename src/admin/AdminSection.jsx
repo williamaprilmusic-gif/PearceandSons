@@ -4431,7 +4431,12 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
     <Card>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{driverUser?.name || "Driver"}</span>
-        <StateBadge state={TRIP_STATE.IN_TRANSIT} />
+        {/* Real trip state, not a hardcoded IN_TRANSIT — this card now
+            also shows a DRIVER_CONFIRMED driver who's started navigating
+            to their first pickup but hasn't picked everyone up yet (see
+            the widened filter above); showing "IN TRANSIT" for that case
+            would misleadingly imply pickups are already done. */}
+        <StateBadge state={driverTrips[0]?.state || TRIP_STATE.DRIVER_CONFIRMED} />
       </div>
       <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
         {allPickedUp ? "Drop-offs" : "Pickups"}
@@ -4478,7 +4483,22 @@ function AdminActiveTrips({ state }) {
   // O(drivers×trips) work tied to the SAME state actually changing size
   // (driver_status/trips), not to unrelated parent re-renders.
   const { activeDrivers, driverTripsById } = React.useMemo(() => {
-    const inTransitTrips = state.trips.filter(t => t.state === TRIP_STATE.IN_TRANSIT);
+    // FOUND VIA DIRECT USER REPORT ("driver already started the trip but i
+    // cant see active trips in admin"): this only ever matched IN_TRANSIT,
+    // which a trip doesn't reach until EVERY passenger has been picked up
+    // — a driver who tapped Start Trip and is actively navigating to their
+    // FIRST pickup stays DRIVER_CONFIRMED the whole way there, and was
+    // invisible here despite genuinely being "out on the road," which is
+    // exactly what this tab's own description claims to show ("once a
+    // driver has actually started driving"). There's no dedicated
+    // trip-started flag/timestamp, but route_total_km is a reliable
+    // existing stand-in: it's null until TRIP/RECORD_ROUTE runs, and
+    // that's the ONE thing Start Trip actually does server-side (see
+    // handleStartTrip) — a DRIVER_CONFIRMED trip with a real
+    // route_total_km has definitely been started, not merely accepted.
+    const inTransitTrips = state.trips.filter(t =>
+      t.state === TRIP_STATE.IN_TRANSIT || (t.state === TRIP_STATE.DRIVER_CONFIRMED && t.route_total_km != null)
+    );
     const byId = new Map();
     for (const t of inTransitTrips) {
       const key = String(t.driver_id);
@@ -4499,7 +4519,7 @@ function AdminActiveTrips({ state }) {
         actually started driving.
       </div>
       {activeDrivers.length === 0 ? (
-        <Empty icon="🚦" text="No drivers currently in transit" />
+        <Empty icon="🚦" text="No drivers currently on a live route" />
       ) : activeDrivers.map(ds => (
         <ActiveDriverCard key={ds.driver_id} ds={ds} driverTrips={driverTripsById.get(String(ds.driver_id)) || []} state={state} />
       ))}

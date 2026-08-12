@@ -9684,9 +9684,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // before calling, but this guards against a request reaching the
       // backend directly or a stale client. Checked against the EARLIEST
       // scheduled trip in this batch, matching the client-side check —
-      // and that trip's own passenger count decides the early-start
-      // window (see tripStartWindowOpensAt): >6 passengers gets 2h early,
-      // otherwise 1h.
+      // see tripStartWindowOpensAt for the flat 2h early-start window.
       const { trips: routeTrips, driver_coord } = action;
       // Ownership check — every other action that writes to a trip row
       // checks driverid against the caller; this one previously didn't, so
