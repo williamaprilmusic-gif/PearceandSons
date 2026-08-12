@@ -14416,14 +14416,23 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
   const myStatus = state.driver_status.find(d => String(d.driver_id) === String(user.id));
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const active = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
-  // Seats used = sum of PASSENGERS across active trips, not trip-record count.
-  // A merged trip (several agents combined into one trip via DISPATCH_MULTI
-  // or the auto-merge in TRIP/ASSIGN_DRIVER) is still exactly one trip
-  // record but occupies as many seats as it has agent_ids — using
-  // active.length here undercounts every merged trip down to "1 seat"
-  // regardless of how many actual passengers are aboard. Matches
-  // getDriverLoad's seat-counting logic used everywhere else in the app.
-  const load = active.reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
+  // "FULLY BOOKED" badge scoped to TODAY only, via getDriverLoad — FOUND
+  // VIA DIRECT USER REPORT (same bug as the home-screen header badge):
+  // this used to sum agent_ids across every active trip regardless of
+  // date, so 2 seats from a DIFFERENT day's trip counted toward TODAY's
+  // capacity — the comment here claimed to "match getDriverLoad's
+  // seat-counting logic," which was true of the per-seat FORMULA but not
+  // of getDriverLoad's (required, not optional) date scoping. Calling the
+  // real helper instead of reimplementing an unscoped copy keeps this
+  // badge consistent with the header's.
+  const todayStrTrips = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const load = getDriverLoad(state, user.id, todayStrTrips);
+  // totalPassengers stays an all-dates figure deliberately — it's shown
+  // as "X trips this period" summary context, not a capacity/seat check,
+  // so it isn't subject to the same one-day constraint as `load`/`full`.
   const totalPassengers = active.reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
   const full = load >= myCapacity;
   const [chatWith, setChatWith] = useState(null); // { trip, otherUser } | null
@@ -16391,10 +16400,20 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     return priorDay ? [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state) : false;
   });
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
-  // Seats used = sum of passengers across active trips, not trip-record
-  // count — a merged trip is one record but can hold several agents.
-  // See DriverTripsTab's identical fix for the full rationale.
-  const load = activeTrips.reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
+  // Seats used, scoped to TODAY only — FOUND VIA DIRECT USER REPORT: this
+  // used to sum agent_ids across EVERY active trip regardless of date
+  // (e.g. showing "5/4 FULLY BOOKED" when 2 of those 5 seats belonged to
+  // a DIFFERENT day's trip), the exact all-dates bug getDriverLoad's own
+  // header comment already documents and exists specifically to avoid —
+  // "a driver already assigned to 4 different days of one agent's week
+  // booking is NOT full for a 5th, unrelated day." Reuses that same
+  // helper (already correctly used on the admin/dispatch side for this
+  // exact reason) instead of a second, differently-scoped seat count.
+  const todayStrHome = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const load = getDriverLoad(state, user.id, todayStrHome);
   const myAppCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const full = load >= myAppCapacity;
   const call = useWebRTCCall(user);
