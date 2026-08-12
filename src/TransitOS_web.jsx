@@ -1030,12 +1030,11 @@ function formatTripDateForDriver(dateStr) {
 export const ROAD_FACTOR = 1.35; // same straight-line-to-road approximation used elsewhere in the app
 
 // Early-start window for the "start trip" restriction below — per explicit
-// requirement: a driver may start up to 2h early if the EARLIEST-scheduled
-// trip in the batch has more than 6 passengers, otherwise only 1h early.
-// Passenger count is agent_ids.length, matching how passenger counts are
-// computed everywhere else in this file (e.g. the PASSENGERS summary card).
-const TRIP_EARLY_START_LARGE_MS = 2 * 60 * 60 * 1000;
-const TRIP_EARLY_START_SMALL_MS = 60 * 60 * 1000;
+// request, a flat 2h early-start window for every trip regardless of
+// passenger count. Supersedes an earlier requirement that split this into
+// 2h (>6 passengers) vs. 1h (6 or fewer) — the passenger-count distinction
+// is gone, not just widened for the small case.
+const TRIP_EARLY_START_MS = 2 * 60 * 60 * 1000;
 function earliestScheduledTrip(trips) {
   return (trips || [])
     .filter(t => t.scheduled_time_epoch != null)
@@ -1043,9 +1042,7 @@ function earliestScheduledTrip(trips) {
 }
 function tripStartWindowOpensAt(trip) {
   if (!trip || trip.scheduled_time_epoch == null) return null;
-  const paxCount = trip.agent_ids?.length || 1;
-  const windowMs = paxCount > 6 ? TRIP_EARLY_START_LARGE_MS : TRIP_EARLY_START_SMALL_MS;
-  return trip.scheduled_time_epoch - windowMs;
+  return trip.scheduled_time_epoch - TRIP_EARLY_START_MS;
 }
 
 function computeOptimalRoute(trips, driverCurrentCoord) {
@@ -15550,15 +15547,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const [startTripError, setStartTripError] = useState(null);
   const handleStartTrip = async () => {
     setStartTripError(null);
-    // A driver may not start a trip before its scheduled time, except for
-    // a passenger-count-dependent early-start window — see
-    // tripStartWindowOpensAt. Checked against the EARLIEST scheduled trip
-    // in this batch (a driver's several active trips for the day are
-    // started together as one route), so the restriction — and the window
-    // size, based on that trip's own passenger count — is based on
-    // whichever pickup comes first. Trips already IN_TRANSIT or
-    // DRIVER_CONFIRMED with a route already recorded are unaffected —
-    // this only gates the initial "start trip" action itself.
+    // A driver may not start a trip more than TRIP_EARLY_START_MS before
+    // its scheduled time — see tripStartWindowOpensAt. Checked against the
+    // EARLIEST scheduled trip in this batch (a driver's several active
+    // trips for the day are started together as one route), so the
+    // restriction is based on whichever pickup comes first. Trips already
+    // IN_TRANSIT or DRIVER_CONFIRMED with a route already recorded are
+    // unaffected — this only gates the initial "start trip" action itself.
     const windowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(myActiveTrips));
     if (windowOpensAt != null) {
       const now = Date.now();
