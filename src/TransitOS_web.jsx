@@ -1477,7 +1477,13 @@ function resolveDriverActiveTripDate(driverTrips) {
   const confirmedDue = (driverTrips || []).filter(t => [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) && isDue(t));
   if (confirmedDue.length > 0) {
     const inTransitTrip = confirmedDue.find(t => t.state === TRIP_STATE.IN_TRANSIT);
-    return { targetDate: inTransitTrip?.scheduled_date ?? earliestDate(confirmedDue) };
+    // `?? todayStr` — FOUND VIA /code-review: without this, a due but
+    // undated confirmedDue trip (scheduled_date null/missing) would leave
+    // targetDate as null instead of falling back to today, which then
+    // excludes every REAL dated trip downstream (null !== any real date
+    // string) — silently breaking nav display and geofence auto-confirm
+    // for exactly the trips this whole fix exists to correctly show.
+    return { targetDate: inTransitTrip?.scheduled_date ?? earliestDate(confirmedDue) ?? todayStr };
   }
   const assignedDue = (driverTrips || []).filter(t => t.state === TRIP_STATE.ASSIGNED && isDue(t));
   return { targetDate: earliestDate(assignedDue) ?? todayStr };
