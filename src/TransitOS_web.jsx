@@ -15319,7 +15319,23 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   // in TODAY's navigation route at once. Falls back to state.trips only
   // if the prop is missing (defensive, e.g. older call sites).
   const navSourceTrips = myTrips ?? state.trips.filter(t => String(t.driver_id) === String(user.id));
-  const myActiveTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id) && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state))
+  // Today-or-earlier only — FOUND VIA DIRECT USER REPORT: 3 independently-
+  // booked DAY trips (no week_group_id, so the progressive-reveal filter
+  // above never touches them) for the same agent/driver on 3 CONSECUTIVE
+  // days all got confirmed together, and with nothing here comparing
+  // scheduled_date, all 3 showed up in myActiveTrips at once — meaning
+  // pickupStops' flatMap below combined tomorrow's and the day after's
+  // pickup into TODAY's route alongside today's own stop. `<=` (not
+  // strict `===`) deliberately still surfaces a genuinely overdue trip
+  // left over from a prior day (driver forgot to start/complete it) —
+  // that's an anomaly the driver still needs to see and act on, not one
+  // to silently hide; only trips whose day hasn't arrived yet get held
+  // back, same intent as the week-series reveal just above.
+  const todayStrNav = (() => {
+    const d = new Date();
+    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  })();
+  const myActiveTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id) && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) && (!t.scheduled_date || t.scheduled_date <= todayStrNav))
     .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
 
   // One stop per PASSENGER, not per trip — a multi-passenger trip
