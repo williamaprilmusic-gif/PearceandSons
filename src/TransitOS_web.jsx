@@ -15343,7 +15343,19 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
   })();
   const dueTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id) && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) && (!t.scheduled_date || t.scheduled_date <= todayStrNav));
-  const navTargetDate = dueTrips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null) ?? todayStrNav;
+  // An IN_TRANSIT trip's own date wins outright, regardless of how it
+  // compares to any other due trip's date — FOUND VIA /code-review: the
+  // plain earliest-date reduce below picks whichever day is OLDEST, which
+  // could be a forgotten, never-started ASSIGNED trip from days ago — if
+  // one of those exists alongside a trip the driver has ALREADY STARTED
+  // today, the earliest-date rule would silently swap the actively-
+  // navigated trip out from under the driver mid-route. A trip actually
+  // in progress must never lose the nav screen to an older but unstarted
+  // one; only when nothing is in progress does "oldest due date" apply.
+  const inTransitTrip = dueTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT);
+  const navTargetDate = inTransitTrip?.scheduled_date
+    ?? dueTrips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null)
+    ?? todayStrNav;
   const myActiveTrips = dueTrips.filter(t => !t.scheduled_date || t.scheduled_date === navTargetDate)
     .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
 
