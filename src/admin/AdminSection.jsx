@@ -51,10 +51,12 @@ import {
   driverPositionChannelName,
   epochToDisplay,
   exceptionLabel,
+  exportGpsTrailToCsv,
   exportTripsToCsv,
   fetchDelaysForTrips,
   fetchDirectMessages,
   fetchDriverSafetyHistory,
+  fetchGpsTrailForTrip,
   fetchMyConversations,
   fetchTripDelays,
   fetchTripHistory,
@@ -1934,6 +1936,20 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
   const [relocatingId, setRelocatingId] = useState(null);
   const [removingId, setRemovingId] = useState(null);
   const [delays, setDelays] = useState(null); // null = not loaded yet
+  const [gpsTrail, setGpsTrail] = useState(null); // null = not loaded yet, [] = loaded, empty
+  const [gpsTrailLoading, setGpsTrailLoading] = useState(false);
+  const [gpsTrailError, setGpsTrailError] = useState(null);
+  const loadGpsTrail = async () => {
+    setGpsTrailLoading(true);
+    setGpsTrailError(null);
+    try {
+      setGpsTrail(await fetchGpsTrailForTrip(trip.trip_id));
+    } catch (e) {
+      setGpsTrailError(e.message || "Couldn't load the GPS trail — please try again.");
+    } finally {
+      setGpsTrailLoading(false);
+    }
+  };
   const driver = state.users.find(u => String(u.id) === String(trip.driver_id));
   const passengers = trip.agent_ids.map(id => state.users.find(u => String(u.id) === String(id))).filter(Boolean);
   const canEdit = ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state) && dispatch != null;
@@ -2044,6 +2060,27 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
             {trip.est_distance_km && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>EST DIST: </span>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span>}
             {(trip.route_total_km ?? trip.driver_route_km) != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER'S FULL ROUTE: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km</span></span>}
           </div>
+
+          {/* GPS trail — only shown once this trip has actually been
+              started (route_total_km only ever gets set by TRIP/RECORD_ROUTE,
+              the same "has Start Trip actually been tapped" signal used
+              elsewhere). driver_position_log already gets a row every ~25s
+              while a trip is active, but nothing ever read it back out
+              until now — lazy-loaded on click, same pattern as delays
+              above, since a long trip's breadcrumb trail can be hundreds
+              of rows and most admins won't need it on every expand. */}
+          {trip.route_total_km != null && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {gpsTrail === null ? (
+                <Button title={gpsTrailLoading ? "LOADING…" : "📍 LOAD GPS TRAIL"} variant="ghost" size="sm" onClick={loadGpsTrail} disabled={gpsTrailLoading} />
+              ) : gpsTrail.length === 0 ? (
+                <span style={{ fontSize: 10, color: COLORS.ghost }}>📍 No GPS points recorded for this trip.</span>
+              ) : (
+                <Button title={`⬇ DOWNLOAD GPS TRAIL CSV (${gpsTrail.length} points)`} variant="ghost" size="sm" onClick={() => exportGpsTrailToCsv(gpsTrail, trip.trip_id)} />
+              )}
+              {gpsTrailError && <span style={{ fontSize: 10, color: COLORS.red }}>{gpsTrailError}</span>}
+            </div>
+          )}
 
           <SectionHeader label={`Passengers (${passengers.length})`} />
           {passengers.map((p, i) => {

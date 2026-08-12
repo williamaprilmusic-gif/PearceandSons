@@ -1424,19 +1424,23 @@ function parseScheduledDateTime(dateStr, timeStr) {
 // format) — runs client-side, so the browser's own local time IS SAST
 // already, no UTC-offset correction needed (unlike the edge functions,
 // which run server-side in UTC and must shift explicitly). Cached against
-// the day-of-month so repeated calls within the same day (e.g. a GPS
+// the day's own midnight timestamp (NOT day-of-month alone — FOUND VIA
+// /code-review: a day-of-month-only cache key can collide across
+// different months, e.g. a long-lived idle tab that goes 31+ days
+// between calls could see 2026/08/15 read back a stale cached
+// "2026/07/15") so repeated calls within the same day (e.g. a GPS
 // watchPosition callback firing every few seconds) don't reformat a new
 // Date on every call — FOUND VIA /simplify: this exact 3-line IIFE had
 // been independently copy-pasted at 4 separate call sites (DriverNavTab,
 // DriverApp, DriverTripsTab, the geofence auto-confirm loop).
 let _todayDateStrCache = null;
-let _todayDateStrCacheDay = -1;
+let _todayDateStrCacheMidnightMs = -1;
 function todayDateStr() {
   const d = new Date();
-  const day = d.getDate();
-  if (day !== _todayDateStrCacheDay) {
-    _todayDateStrCacheDay = day;
-    _todayDateStrCache = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(day).padStart(2, "0")}`;
+  const midnightMs = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  if (midnightMs !== _todayDateStrCacheMidnightMs) {
+    _todayDateStrCacheMidnightMs = midnightMs;
+    _todayDateStrCache = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
   }
   return _todayDateStrCache;
 }
@@ -1450,22 +1454,33 @@ function todayDateStr() {
 // RANGE check — meaning a driver with both an overdue trip AND today's
 // trip could still have the geofence loop cross-confirm between the two
 // different days, the same bug class DriverNavTab's own fix closed for
-// the nav screen. An IN_TRANSIT trip's own date wins outright (a trip
-// already in progress must never lose scope to an older, unstarted one);
-// otherwise the earliest due (today-or-overdue) date. `driverTrips` is
-// expected to already be scoped to one driver — this only filters by
-// state/date, not driver_id.
+// the nav screen.
+//
+// Two-tier resolution — FOUND VIA /code-review: an earlier version of
+// this function let ASSIGNED trips (accepted by nobody yet) participate
+// in the SAME date pool as DRIVER_CONFIRMED/IN_TRANSIT ones, so an old
+// forgotten ASSIGNED trip from days ago could hijack the target date
+// away from a driver's real, currently-confirmed/in-progress trip today.
+// Tier 1: if ANY DRIVER_CONFIRMED/IN_TRANSIT trip is due, it alone
+// decides the day (IN_TRANSIT wins outright over DRIVER_CONFIRMED, since
+// a trip already in progress must never lose scope to an unstarted one).
+// Tier 2: only when NOTHING is confirmed/in-transit does an ASSIGNED
+// trip's date get to decide — still surfacing a genuinely-forgotten
+// unaccepted trip rather than silently hiding it, just never at the
+// expense of real, already-confirmed work. `driverTrips` is expected to
+// already be scoped to one driver — this only filters by state/date.
 function resolveDriverActiveTripDate(driverTrips) {
   const todayStr = todayDateStr();
-  const dueTrips = (driverTrips || []).filter(t =>
-    [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) &&
-    (!t.scheduled_date || t.scheduled_date <= todayStr)
-  );
-  const inTransitTrip = dueTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT);
-  const targetDate = inTransitTrip?.scheduled_date
-    ?? dueTrips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null)
-    ?? todayStr;
-  return { targetDate, dueTrips };
+  const isDue = t => !t.scheduled_date || t.scheduled_date <= todayStr;
+  const earliestDate = (trips) => trips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null);
+
+  const confirmedDue = (driverTrips || []).filter(t => [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) && isDue(t));
+  if (confirmedDue.length > 0) {
+    const inTransitTrip = confirmedDue.find(t => t.state === TRIP_STATE.IN_TRANSIT);
+    return { targetDate: inTransitTrip?.scheduled_date ?? earliestDate(confirmedDue) };
+  }
+  const assignedDue = (driverTrips || []).filter(t => t.state === TRIP_STATE.ASSIGNED && isDue(t));
+  return { targetDate: earliestDate(assignedDue) ?? todayStr };
 }
 
 export function getDriverLoad(state, driver_id, scheduledDate) {
@@ -5900,6 +5915,20 @@ export async function fetchTripDelays(tripId) {
   const { data, error } = await supabase.from("trip_delays").select("*").eq("tripid", tripId).order("reportedat", { ascending: true });
   if (error) throw error;
   return (data || []).map(d => ({ id: d.id, trip_id: d.tripid, driver_id: d.driverid, reason: d.reason, note: d.note, reported_at: d.reportedat }));
+}
+
+// On-demand fetch of a trip's raw GPS breadcrumb trail — driver_position_log
+// already gets a row inserted roughly every DB_PERSIST_INTERVAL_MS (25s)
+// while a driver has this trip active (see useDriverLocationTracking's
+// "LIVE GPS TRACKING" block), but until now nothing ever read that data
+// back out; it just accumulated for the 2-month retention window
+// (stale-data-retention) and got purged unread. Same on-demand pattern as
+// fetchTripDelays — only fetched when an admin actually opens this trip's
+// GPS trail, not part of the general refetch cycle.
+export async function fetchGpsTrailForTrip(tripId) {
+  const { data, error } = await supabase.from("driver_position_log").select("*").eq("tripid", tripId).order("recordedat", { ascending: true });
+  if (error) throw error;
+  return (data || []).map(r => ({ lat: r.lat, lng: r.lng, heading: r.heading, speed_kmh: r.speed_kmh, recorded_at: r.recordedat }));
 }
 
 export async function fetchDirectMessages(userIdA, userIdB) {
@@ -15400,16 +15429,26 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   // date) now lives in the shared resolveDriverActiveTripDate — also used
   // by the geofence auto-confirm loop, so nav display and GPS auto-
   // confirm can never pick a different target day from each other.
-  // useMemo — FOUND VIA /simplify (efficiency pass): driverPosition
-  // changes on every GPS tick (several times a minute while driving),
-  // which re-renders this component; without memoization the full
-  // filter/find/reduce/sort chain below re-ran on every single tick even
-  // though its inputs (navSourceTrips, user.id) rarely change.
+  // useMemo — FOUND VIA /simplify (efficiency pass), MADE ACTUALLY
+  // EFFECTIVE VIA /code-review: driverPosition changes on every GPS tick
+  // (several times a minute while driving), which re-renders this
+  // component; without memoization the full filter/find/reduce/sort
+  // chain below re-ran on every single tick even though its real inputs
+  // rarely change. The memo only pays off because DriverApp's own
+  // allMyTrips/myTrips are now ALSO memoized on state.trips — otherwise
+  // navSourceTrips would be a new array reference every tick regardless,
+  // "changing" this memo's dependency every time and recomputing anyway.
+  // ASSIGNED trips are included in the final list (Start Trip auto-
+  // accepts an ASSIGNED trip as part of starting it — see handleStartTrip
+  // below) even though resolveDriverActiveTripDate deliberately excludes
+  // them from DECIDING the target date (see that function's own comment).
   const myActiveTrips = React.useMemo(() => {
     const ownTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id));
-    const { targetDate, dueTrips } = resolveDriverActiveTripDate(ownTrips);
-    return dueTrips.filter(t => !t.scheduled_date || t.scheduled_date === targetDate)
-      .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+    const { targetDate } = resolveDriverActiveTripDate(ownTrips);
+    return ownTrips.filter(t =>
+      [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) &&
+      (!t.scheduled_date || t.scheduled_date === targetDate)
+    ).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
   }, [navSourceTrips, user.id]);
 
   // One stop per PASSENGER, not per trip — a multi-passenger trip
@@ -16397,7 +16436,18 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   }, [notifClickHandlerRef]);
   const myStatus = state.driver_status.find(d => String(d.driver_id) === String(user.id));
   const myUnreadNotifs = state.notifications.filter(n => isNotificationForUser(n, user) && !n.read).length;
-  const allMyTrips = state.trips.filter(t => String(t.driver_id) === String(user.id));
+  // Memoized on state.trips itself, not recomputed every render — FOUND
+  // VIA /code-review: DriverApp re-renders on every GPS position tick
+  // (useDriverLocationTracking's setPosition lives here), which used to
+  // rebuild allMyTrips/myTrips as brand-new array references each time
+  // even though the underlying trips data hadn't changed — silently
+  // defeating DriverNavTab's own useMemo downstream (a new navSourceTrips
+  // reference every tick meant its memo dependency "changed" every tick
+  // too, recomputing exactly as often as if it were never memoized at
+  // all). state.trips only changes on a genuine dispatch/refetch, never
+  // on a GPS-only re-render, so keying on it here is what actually makes
+  // the whole downstream memo chain effective.
+  const allMyTrips = React.useMemo(() => state.trips.filter(t => String(t.driver_id) === String(user.id)), [state.trips, user.id]);
 
   // Client-side half of the late-start warning — see AdminApp's
   // identical effect for the full rationale. A driver having the app
@@ -16425,7 +16475,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // once today's is done" actually work — without this, all of a week
   // booking's daily trips would be visible (and bookable for navigation)
   // at once, which isn't how a driver should plan a multi-day series.
-  const myTrips = allMyTrips.filter(t => {
+  const myTrips = React.useMemo(() => allMyTrips.filter(t => {
     if (!t.week_group_id || !t.week_day_num || t.week_day_num <= 1) return true;
     const priorDay = allMyTrips.find(other => String(other.week_group_id) === String(t.week_group_id) && other.week_day_num === t.week_day_num - 1);
     // If the prior day's trip isn't even in this driver's list yet (e.g.
@@ -16440,7 +16490,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     // — a cancelled trip never transitions to ARCHIVED_COMPLETED, so the
     // gate could never open.
     return priorDay ? [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state) : false;
-  });
+  }), [allMyTrips]);
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   // Seats used, scoped to TODAY only — FOUND VIA DIRECT USER REPORT: this
   // used to sum agent_ids across EVERY active trip regardless of date
@@ -17140,6 +17190,38 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
   const dateStr = new Date().toISOString().slice(0, 10);
   a.href = url;
   a.download = `${filenamePrefix}_${dateStr}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Downloads one trip's raw driver_position_log breadcrumb trail as a CSV —
+// same Blob + temporary-anchor-click download pattern as exportTripsToCsv,
+// same BOM prefix / CSV-formula-injection guard, but deliberately its own
+// small self-contained function (not a mode of exportTripsToCsv) since a
+// GPS trail is a completely different shape of data — one row per GPS
+// sample, not one row per passenger.
+export function exportGpsTrailToCsv(rows, tripId) {
+  const headers = ["Timestamp", "Latitude", "Longitude", "Speed (km/h)", "Heading (°)"];
+  const escapeCsv = (val) => {
+    let s = val == null ? "" : String(val);
+    if (/^[=+\-@]/.test(s)) s = "'" + s;
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
+  const csvRows = rows.map(r => [
+    fmtTs(r.recorded_at), r.lat, r.lng,
+    r.speed_kmh != null ? r.speed_kmh.toFixed(1) : "",
+    r.heading != null ? r.heading.toFixed(0) : "",
+  ]);
+  const csv = [headers, ...csvRows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
+  const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const dateStr = new Date().toISOString().slice(0, 10);
+  a.href = url;
+  a.download = `gps_trail_trip_${tripId}_${dateStr}.csv`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
