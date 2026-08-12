@@ -4436,7 +4436,7 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
             to their first pickup but hasn't picked everyone up yet (see
             the widened filter above); showing "IN TRANSIT" for that case
             would misleadingly imply pickups are already done. */}
-        <StateBadge state={driverTrips[0]?.state || TRIP_STATE.DRIVER_CONFIRMED} />
+        <StateBadge state={driverTrips[0].state} />
       </div>
       <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
         {allPickedUp ? "Drop-offs" : "Pickups"}

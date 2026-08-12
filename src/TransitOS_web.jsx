@@ -1420,6 +1420,54 @@ function parseScheduledDateTime(dateStr, timeStr) {
   return Number.isNaN(fallback.getTime()) ? null : fallback;
 }
 
+// Local calendar date as "YYYY/MM/DD" (matches trips.scheduled_date's own
+// format) — runs client-side, so the browser's own local time IS SAST
+// already, no UTC-offset correction needed (unlike the edge functions,
+// which run server-side in UTC and must shift explicitly). Cached against
+// the day-of-month so repeated calls within the same day (e.g. a GPS
+// watchPosition callback firing every few seconds) don't reformat a new
+// Date on every call — FOUND VIA /simplify: this exact 3-line IIFE had
+// been independently copy-pasted at 4 separate call sites (DriverNavTab,
+// DriverApp, DriverTripsTab, the geofence auto-confirm loop).
+let _todayDateStrCache = null;
+let _todayDateStrCacheDay = -1;
+function todayDateStr() {
+  const d = new Date();
+  const day = d.getDate();
+  if (day !== _todayDateStrCacheDay) {
+    _todayDateStrCacheDay = day;
+    _todayDateStrCache = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(day).padStart(2, "0")}`;
+  }
+  return _todayDateStrCache;
+}
+
+// Resolves the ONE calendar day a driver's live systems should treat as
+// "the active route" — shared by DriverNavTab (what the driver SEES) and
+// the geofence auto-confirm loop (what GPS proximity is allowed to ACT
+// on), so the two can never diverge. FOUND VIA /simplify (altitude pass):
+// an earlier fix gave DriverNavTab this exact single-target-day logic,
+// but the geofence loop was patched separately with a looser `<= today`
+// RANGE check — meaning a driver with both an overdue trip AND today's
+// trip could still have the geofence loop cross-confirm between the two
+// different days, the same bug class DriverNavTab's own fix closed for
+// the nav screen. An IN_TRANSIT trip's own date wins outright (a trip
+// already in progress must never lose scope to an older, unstarted one);
+// otherwise the earliest due (today-or-overdue) date. `driverTrips` is
+// expected to already be scoped to one driver — this only filters by
+// state/date, not driver_id.
+function resolveDriverActiveTripDate(driverTrips) {
+  const todayStr = todayDateStr();
+  const dueTrips = (driverTrips || []).filter(t =>
+    [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) &&
+    (!t.scheduled_date || t.scheduled_date <= todayStr)
+  );
+  const inTransitTrip = dueTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT);
+  const targetDate = inTransitTrip?.scheduled_date
+    ?? dueTrips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null)
+    ?? todayStr;
+  return { targetDate, dueTrips };
+}
+
 export function getDriverLoad(state, driver_id, scheduledDate) {
   // Counts PASSENGERS (summed across the driver's active trips ON THE
   // GIVEN DATE), not trips, and not across all dates. A driver's trips
@@ -12371,16 +12419,20 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // identical coordinate on tomorrow's and the day-after's trips —
       // silently auto-confirming pickup (and cascading to IN_TRANSIT) on
       // trips that hadn't happened yet, corrupting future-day trip data.
-      // A future-dated trip is never geofence-eligible; only today's due
-      // work (or something genuinely overdue) can be.
-      const todayStrGeo = (() => {
-        const d = new Date();
-        return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-      })();
+      // Uses the SAME resolveDriverActiveTripDate DriverNavTab's own nav
+      // screen is built from — FOUND VIA /simplify (altitude pass): a
+      // first version of this fix used a looser `<= today` RANGE check
+      // here instead of the single-target-day logic, which still let a
+      // driver with both an overdue trip AND today's trip cross-confirm
+      // between the two different days — the exact same bug class this
+      // fix exists to close, just reintroduced via a second, divergent
+      // rule. One shared resolver means nav display and GPS auto-confirm
+      // can never disagree on which day is "active" again.
+      const { targetDate: geoTargetDate } = resolveDriverActiveTripDate(activeTripsRef.current);
       if (dispatchRef.current && activeTripsRef.current?.length) {
         for (const trip of activeTripsRef.current) {
           if (!["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(trip.state)) continue;
-          if (trip.scheduled_date && trip.scheduled_date > todayStrGeo) continue;
+          if (trip.scheduled_date && trip.scheduled_date !== geoTargetDate) continue;
           const completedPickups = trip.completed_pickups || [];
           const completedDropoffs = trip.completed_dropoffs || [];
           const agentIds = trip.agent_ids || [];
@@ -14437,11 +14489,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
   // of getDriverLoad's (required, not optional) date scoping. Calling the
   // real helper instead of reimplementing an unscoped copy keeps this
   // badge consistent with the header's.
-  const todayStrTrips = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  const load = getDriverLoad(state, user.id, todayStrTrips);
+  const load = getDriverLoad(state, user.id, todayDateStr());
   // totalPassengers stays an all-dates figure deliberately — it's shown
   // as "X trips this period" summary context, not a capacity/seat check,
   // so it isn't subject to the same one-day constraint as `load`/`full`.
@@ -15347,38 +15395,22 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   // days all got confirmed together, and with nothing here comparing
   // scheduled_date, all 3 showed up in myActiveTrips at once — meaning
   // pickupStops' flatMap below combined tomorrow's and the day after's
-  // pickup into TODAY's route alongside today's own stop. A first pass
-  // fixed this with `scheduled_date <= today`, but that has the SAME bug
-  // in miniature: two different overdue trips from two different past
-  // days (driver forgot to start/complete either) would still both
-  // pass the `<=` check and get combined into one route between them —
-  // reproducing the exact reported symptom via backlog instead of the
-  // future. The nav screen should only ever represent ONE calendar day's
-  // route at a time, so pick that one target day explicitly — the
-  // EARLIEST due date among this driver's active trips (oldest overdue
-  // trip first if one exists, else today) — then match on that day only,
-  // not a range. An overdue trip still surfaces (nothing here silently
-  // hides it), it just doesn't get merged with a DIFFERENT overdue day.
-  const todayStrNav = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  const dueTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id) && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) && (!t.scheduled_date || t.scheduled_date <= todayStrNav));
-  // An IN_TRANSIT trip's own date wins outright, regardless of how it
-  // compares to any other due trip's date — FOUND VIA /code-review: the
-  // plain earliest-date reduce below picks whichever day is OLDEST, which
-  // could be a forgotten, never-started ASSIGNED trip from days ago — if
-  // one of those exists alongside a trip the driver has ALREADY STARTED
-  // today, the earliest-date rule would silently swap the actively-
-  // navigated trip out from under the driver mid-route. A trip actually
-  // in progress must never lose the nav screen to an older but unstarted
-  // one; only when nothing is in progress does "oldest due date" apply.
-  const inTransitTrip = dueTrips.find(t => t.state === TRIP_STATE.IN_TRANSIT);
-  const navTargetDate = inTransitTrip?.scheduled_date
-    ?? dueTrips.reduce((earliest, t) => (!t.scheduled_date || (earliest && earliest <= t.scheduled_date)) ? earliest : t.scheduled_date, null)
-    ?? todayStrNav;
-  const myActiveTrips = dueTrips.filter(t => !t.scheduled_date || t.scheduled_date === navTargetDate)
-    .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+  // pickup into TODAY's route alongside today's own stop. The single-
+  // target-day resolution (IN_TRANSIT wins outright, else earliest due
+  // date) now lives in the shared resolveDriverActiveTripDate — also used
+  // by the geofence auto-confirm loop, so nav display and GPS auto-
+  // confirm can never pick a different target day from each other.
+  // useMemo — FOUND VIA /simplify (efficiency pass): driverPosition
+  // changes on every GPS tick (several times a minute while driving),
+  // which re-renders this component; without memoization the full
+  // filter/find/reduce/sort chain below re-ran on every single tick even
+  // though its inputs (navSourceTrips, user.id) rarely change.
+  const myActiveTrips = React.useMemo(() => {
+    const ownTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id));
+    const { targetDate, dueTrips } = resolveDriverActiveTripDate(ownTrips);
+    return dueTrips.filter(t => !t.scheduled_date || t.scheduled_date === targetDate)
+      .sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+  }, [navSourceTrips, user.id]);
 
   // One stop per PASSENGER, not per trip — a multi-passenger trip
   // contributes one entry per agent in pickup_sequence_coords. The old
@@ -16419,11 +16451,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // booking is NOT full for a 5th, unrelated day." Reuses that same
   // helper (already correctly used on the admin/dispatch side for this
   // exact reason) instead of a second, differently-scoped seat count.
-  const todayStrHome = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-  })();
-  const load = getDriverLoad(state, user.id, todayStrHome);
+  const load = getDriverLoad(state, user.id, todayDateStr());
   const myAppCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const full = load >= myAppCapacity;
   const call = useWebRTCCall(user);
