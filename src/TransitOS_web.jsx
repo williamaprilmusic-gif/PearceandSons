@@ -12361,9 +12361,26 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // loose enough to handle GPS drift in dense urban areas. Uber uses ~50m
       // with their more accurate native-app GPS; 80m is appropriate for a PWA.
       const GEOFENCE_RADIUS_KM = 0.08; // 80 metres
+      // FOUND VIA DIRECT USER REPORT: activeTripsRef.current (from
+      // DriverApp's own `activeTrips`) is every DRIVER_CONFIRMED/IN_TRANSIT
+      // trip for this driver with NO date scoping at all — unlike
+      // DriverNavTab's myActiveTrips, which was already fixed to a single
+      // target day. A recurring booking (same agent, same daily pickup
+      // point, several consecutive DAY trips) meant the driver's real GPS
+      // proximity to TODAY's actual pickup ALSO matched that same agent's
+      // identical coordinate on tomorrow's and the day-after's trips —
+      // silently auto-confirming pickup (and cascading to IN_TRANSIT) on
+      // trips that hadn't happened yet, corrupting future-day trip data.
+      // A future-dated trip is never geofence-eligible; only today's due
+      // work (or something genuinely overdue) can be.
+      const todayStrGeo = (() => {
+        const d = new Date();
+        return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+      })();
       if (dispatchRef.current && activeTripsRef.current?.length) {
         for (const trip of activeTripsRef.current) {
           if (!["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(trip.state)) continue;
+          if (trip.scheduled_date && trip.scheduled_date > todayStrGeo) continue;
           const completedPickups = trip.completed_pickups || [];
           const completedDropoffs = trip.completed_dropoffs || [];
           const agentIds = trip.agent_ids || [];
