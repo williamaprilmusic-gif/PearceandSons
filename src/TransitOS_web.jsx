@@ -197,11 +197,14 @@ export const ADMIN_PERMISSIONS = {
     // includes the computed Trip Fee column + total — per explicit
     // decision, restricted to Fleet Ops and Financial only.
     manageFeeRates: true, viewTripFees: true,
+    // viewGpsTrail: deliberately its own permission, NOT folded into
+    // viewDriverProfiles — see VIEWER's entry below for why.
+    viewGpsTrail: true,
   },
   [ADMIN_LEVEL.STANDARD]: {
     viewUsers: true, manageAgentsDrivers: true, manageAdmins: false,
     manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
-    manageFeeRates: false, viewTripFees: false,
+    manageFeeRates: false, viewTripFees: false, viewGpsTrail: true,
   },
   [ADMIN_LEVEL.FINANCIAL]: {
     // Read-only reporting/finance role otherwise — can search and view
@@ -214,7 +217,7 @@ export const ADMIN_PERMISSIONS = {
     // Fleet Ops keeps the same ability too (not exclusive to Financial).
     viewUsers: true, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: true,
-    manageFeeRates: true, viewTripFees: true,
+    manageFeeRates: true, viewTripFees: true, viewGpsTrail: true,
   },
   [ADMIN_LEVEL.VIEWER]: {
     // Viewer can see that a driver was ASSIGNED to a trip (name only,
@@ -229,6 +232,21 @@ export const ADMIN_PERMISSIONS = {
     viewUsers: false, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: false,
     manageFeeRates: false, viewTripFees: false,
+    // viewGpsTrail: TRUE for Viewer, per explicit request ("i also want
+    // the viewer accounts to be able to see it if it is linked to their
+    // company") — deliberately separate from viewDriverProfiles (which
+    // stays false) so this doesn't also unlock the rest of the full
+    // profile view (phone, home address, live status, route detail).
+    // Safe to grant broadly here because Viewer never reaches a trip
+    // outside their own company in the first place — ViewerPortal's
+    // scopedState (see its own header comment on the fail-closed
+    // getAdminCompanyIds fix) already filters trips/users/etc. to only
+    // the Viewer's own scoped companies BEFORE AdminProfileSearch (the
+    // one place TripDetailRow — and this GPS trail button — is reachable
+    // from for this tier) ever renders anything; a trip belonging to a
+    // different company is never in `state.trips` for this render at
+    // all, so there's nothing for this permission to leak.
+    viewGpsTrail: true,
   },
 };
 

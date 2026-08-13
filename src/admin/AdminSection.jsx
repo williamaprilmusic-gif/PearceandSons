@@ -2071,18 +2071,26 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
               until now — lazy-loaded on click, same pattern as delays
               above, since a long trip's breadcrumb trail can be hundreds
               of rows and most admins won't need it on every expand.
-              Gated on viewDriverProfiles — FOUND VIA /security-review:
-              continuous GPS location history is the same class of
-              sensitive driver-personal data (phone, home address, live
-              status, active route detail) that permission already
-              restricts from Viewer-tier admins; this control had no
-              permission gate at all when first added. The real boundary
-              is now the driver_position_log RLS policy (admin-role-only
-              reads), not this check — but hiding the control for a tier
-              that can't use it anyway matches this file's own established
-              convention (see viewTripFees/exportCsv gates nearby) and
-              avoids a dead button that would just come back empty. */}
-          {trip.route_total_km != null && hasAdminPermission(user, "viewDriverProfiles") && (
+              Gated on viewGpsTrail (not viewDriverProfiles) — FOUND VIA
+              /security-review, then per explicit follow-up request:
+              this control had no permission gate at all when first
+              added, so it was initially gated on viewDriverProfiles
+              (same restriction as full driver profile detail). Then
+              split into its own dedicated permission so Viewer-tier
+              admins could be granted GPS trail access WITHOUT also
+              unlocking the rest of what viewDriverProfiles gates (phone,
+              home address, live status, route detail) — safe to grant
+              broadly since Viewer never reaches a trip outside their own
+              company here in the first place (ViewerPortal's scopedState
+              already filters trips before AdminProfileSearch, the one
+              place this component is reachable from for that tier, ever
+              renders). The real boundary is still the driver_position_log
+              RLS policy (admin-role-only reads), not this check — but
+              hiding the control for a tier that can't use it anyway
+              matches this file's own established convention (see
+              viewTripFees/exportCsv gates nearby) and avoids a dead
+              button that would just come back empty. */}
+          {trip.route_total_km != null && hasAdminPermission(user, "viewGpsTrail") && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {gpsTrail === null ? (
                 <Button title={gpsTrailLoading ? "LOADING…" : "📍 LOAD GPS TRAIL"} variant="ghost" size="sm" onClick={loadGpsTrail} disabled={gpsTrailLoading} />
