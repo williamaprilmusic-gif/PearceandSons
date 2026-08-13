@@ -13769,14 +13769,32 @@ const RING_TONES = [
 ];
 const ALERT_TONE_PREF_KEY = "transitos_alert_tone";
 const RING_TONE_PREF_KEY = "transitos_ring_tone";
+// Namespaced per logged-in user, not per device — FOUND VIA DIRECT USER
+// REPORT: this app is used on shared devices (a dispatch-desk computer,
+// a driver's tablet handed between shifts), and the old fixed key meant
+// whichever tone the LAST person on that device picked silently applied
+// to the NEXT person who logged in there too, since localStorage
+// persists across logins/logouts on the same browser. readStoredActiveUserId
+// (already maintained on every login/logout for session persistence) is
+// reused here rather than threading a `user` prop through TonePicker,
+// AlertSoundToggle, and every bare playAlertSound()/startRingtone() call
+// site scattered through the app — this stays correct automatically
+// whenever the active user changes, with no call-site changes needed.
+// Falls back to the old unscoped key only if somehow called before any
+// login has ever persisted an id (shouldn't happen in practice, since
+// these are only ever reached from within a logged-in app shell).
+function tonePrefStorageKey(baseKey) {
+  const uid = readStoredActiveUserId();
+  return uid != null ? `${baseKey}_${uid}` : baseKey;
+}
 function getTonePref(key, tones) {
   try {
-    const saved = localStorage.getItem(key);
+    const saved = localStorage.getItem(tonePrefStorageKey(key));
     return tones.find(t => t.id === saved) || tones[0];
   } catch (e) { return tones[0]; }
 }
 function setTonePref(key, toneId) {
-  try { localStorage.setItem(key, toneId); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
+  try { localStorage.setItem(tonePrefStorageKey(key), toneId); } catch (e) { /* ignore — worst case, preference doesn't persist */ }
 }
 
 function playAlertSound() {
