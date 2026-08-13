@@ -15274,14 +15274,45 @@ function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onRe
     const latlng = [driverPosition.lat, driverPosition.lng];
     const heading = driverPosition.heading || 0;
     if (!driverMarkerRef.current) {
+      // 3D-look nav puck (per explicit request, replacing the old flat
+      // amber dot) — a static ground-shadow ellipse plus a gradient-shaded
+      // car body for a glossy/raised look. The shadow is a SEPARATE layer
+      // from the rotating car body: rotating a drop shadow along with
+      // heading would swing it out to the side whenever the driver isn't
+      // facing due north, which reads as broken rather than "3D." Only
+      // the .car-rotate layer gets the heading transform — same glide
+      // ("glide-marker" className, untouched) for position, just a
+      // different inner structure than the old single-div marker, so the
+      // rotate-on-tick code below now targets .car-rotate specifically
+      // instead of the marker's firstElementChild.
       const icon = L.divIcon({
-        className: "glide-marker", iconSize: [22, 22],
-        html: `<div style="width:22px;height:22px;border-radius:50%;background:${COLORS.amber};border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.6);transform:rotate(${heading}deg);transition:transform .4s ease"></div>`,
+        className: "glide-marker", iconSize: [32, 32],
+        html: `<div style="position:relative;width:32px;height:32px;">
+          <div style="position:absolute;left:50%;top:22px;width:14px;height:5px;transform:translateX(-50%);border-radius:50%;background:radial-gradient(ellipse at center, rgba(0,0,0,.55) 0%, rgba(0,0,0,0) 75%);"></div>
+          <div class="car-rotate" style="position:absolute;inset:0;transform:rotate(${heading}deg);transition:transform .4s ease;">
+            <svg width="32" height="32" viewBox="0 0 32 32">
+              <defs>
+                <linearGradient id="navCarBody" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="#FFD98A"/>
+                  <stop offset="0.55" stop-color="${COLORS.amber}"/>
+                  <stop offset="1" stop-color="${COLORS.amber2}"/>
+                </linearGradient>
+              </defs>
+              <g transform="translate(16,16)">
+                <path d="M0,-12 C3.5,-12 6.2,-9.7 6.5,-6.2 L7,3 C7,7.2 4.8,9.6 0,10 C-4.8,9.6 -7,7.2 -7,3 L-6.5,-6.2 C-6.2,-9.7 -3.5,-12 0,-12 Z" fill="url(#navCarBody)" stroke="#fff" stroke-width="1.5"/>
+                <ellipse cx="-2" cy="-8" rx="2.4" ry="1.4" fill="#fff" opacity=".35"/>
+                <path d="M-4.3,-6.3 C-4.3,-8.4 -2.4,-9.5 0,-9.5 C2.4,-9.5 4.3,-8.4 4.3,-6.3 L4,-1.8 L-4,-1.8 Z" fill="${COLORS.panel}" opacity=".88"/>
+                <circle cx="-4.8" cy="-8.8" r="1" fill="#fff" opacity=".9"/>
+                <circle cx="4.8" cy="-8.8" r="1" fill="#fff" opacity=".9"/>
+              </g>
+            </svg>
+          </div>
+        </div>`,
       });
       driverMarkerRef.current = L.marker(latlng, { icon }).addTo(map);
     } else {
       driverMarkerRef.current.setLatLng(latlng);
-      const inner = driverMarkerRef.current.getElement()?.firstElementChild;
+      const inner = driverMarkerRef.current.getElement()?.querySelector(".car-rotate");
       if (inner) inner.style.transform = `rotate(${heading}deg)`;
     }
     if (followMode) map.panTo(latlng, { animate: true });
