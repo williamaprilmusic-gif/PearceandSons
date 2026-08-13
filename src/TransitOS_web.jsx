@@ -198,13 +198,19 @@ export const ADMIN_PERMISSIONS = {
     // decision, restricted to Fleet Ops and Financial only.
     manageFeeRates: true, viewTripFees: true,
     // viewGpsTrail: deliberately its own permission, NOT folded into
-    // viewDriverProfiles — see VIEWER's entry below for why.
-    viewGpsTrail: true,
+    // viewDriverProfiles — see VIEWER's entry below for why. Same for
+    // exportGpsTrail vs. the generic exportCsv — FINANCIAL has
+    // exportCsv:false (it uses its own viewTripFees-gated CSV instead)
+    // but should still be able to export this unrelated telemetry data,
+    // since it can already view everything on-screen; inferring that
+    // from exportCsv||viewTripFees would be fragile if either changes
+    // independently later, so this gets its own explicit flag instead.
+    viewGpsTrail: true, exportGpsTrail: true,
   },
   [ADMIN_LEVEL.STANDARD]: {
     viewUsers: true, manageAgentsDrivers: true, manageAdmins: false,
     manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
-    manageFeeRates: false, viewTripFees: false, viewGpsTrail: true,
+    manageFeeRates: false, viewTripFees: false, viewGpsTrail: true, exportGpsTrail: true,
   },
   [ADMIN_LEVEL.FINANCIAL]: {
     // Read-only reporting/finance role otherwise — can search and view
@@ -217,7 +223,7 @@ export const ADMIN_PERMISSIONS = {
     // Fleet Ops keeps the same ability too (not exclusive to Financial).
     viewUsers: true, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: true,
-    manageFeeRates: true, viewTripFees: true, viewGpsTrail: true,
+    manageFeeRates: true, viewTripFees: true, viewGpsTrail: true, exportGpsTrail: true,
   },
   [ADMIN_LEVEL.VIEWER]: {
     // Viewer can see that a driver was ASSIGNED to a trip (name only,

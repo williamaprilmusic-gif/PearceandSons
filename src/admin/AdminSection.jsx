@@ -2099,7 +2099,17 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
               ) : (
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <Button title="🗺️ VIEW ON MAP" variant="ghost" size="sm" onClick={() => setShowGpsTrailMap(true)} />
-                  <Button title={`⬇ DOWNLOAD GPS TRAIL CSV (${gpsTrail.length} points)`} variant="ghost" size="sm" onClick={() => exportGpsTrailToCsv(gpsTrail, trip.trip_id)} />
+                  {/* Separate exportGpsTrail check — FOUND VIA /code-review:
+                      viewGpsTrail alone let Viewer download the raw CSV
+                      too, contradicting Viewer's own documented "can
+                      never export data in any form" invariant. Its own
+                      permission (not exportCsv) because FINANCIAL has
+                      exportCsv:false but should still be able to export
+                      this non-billing telemetry data. Viewing the trail
+                      on-screen isn't exporting; downloading a file is. */}
+                  {hasAdminPermission(user, "exportGpsTrail") && (
+                    <Button title={`⬇ DOWNLOAD GPS TRAIL CSV (${gpsTrail.length} points)`} variant="ghost" size="sm" onClick={() => exportGpsTrailToCsv(gpsTrail, trip.trip_id)} />
+                  )}
                 </div>
               )}
               {gpsTrailError && <span style={{ fontSize: 10, color: COLORS.red }}>{gpsTrailError}</span>}
@@ -2570,7 +2580,15 @@ function AdminProfileSearch({ state, user, dispatch }) {
     setLoadingHistory(true);
     try {
       const hits = await fetchTripHistory(u.role === ROLE.AGENT ? { agentId: u.id } : { driverId: u.id });
-      setHistoryTrips(hits);
+      // Same scoping principle as the trip-search tab's runSearch/
+      // runSearchWithRange — FOUND VIA /code-review: fetchTripHistory
+      // queries by agent/driver id only, with no company filter, so
+      // without this a Viewer could reassign-then-search their way into
+      // an agent's out-of-scope-company trip history (and from there, GPS
+      // trail data) just by the agent's CURRENT branch_id matching. No
+      // manual company picker exists on this tab (unlike the search tab),
+      // so this is a straight scope-or-don't, no user-selected override.
+      setHistoryTrips(isCompanyScoped(user, state.companies) ? scopeTripsToCompany(hits, state.users, getAdminCompanyIds(user, state.companies)) : hits);
     } catch (e) {
       setHistoryTrips([]);
     } finally {
