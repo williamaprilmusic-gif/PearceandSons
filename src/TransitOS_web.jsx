@@ -1376,6 +1376,15 @@ function tripArchiveBucket(trip) {
 // instead of a raw number like 1752262440000.
 export const epochToDisplay = (ms) => (ms == null ? null : new Date(ms).toLocaleString("en-ZA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }));
 
+// Same idea as epochToDisplay, but pins the timezone explicitly to SAST
+// (Africa/Johannesburg) instead of following the viewing device's own
+// local clock — for data (like GPS trail timestamps) that must read the
+// same way regardless of which admin's device/timezone is looking at it.
+// Shared by exportTripsToCsv, exportGpsTrailToCsv, and GpsTrailModal —
+// FOUND VIA /code-review: this exact formatter had been independently
+// copy-pasted at all three.
+export const fmtSastDateTime = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
+
 // Parses the app's booking-form date/time strings into a real Date object.
 // scheduled_date is typically "DD/MM/YYYY" (en-ZA locale, what the booking
 // form's date default produces) but the field is free-text — admins/agents
@@ -16950,7 +16959,7 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
   // follows the exporting device's own OS clock rather than Cape Town's.
   // Africa/Johannesburg = SAST (UTC+2, no DST), matching Cape Town
   // year-round, so exports stay deterministic regardless of the device.
-  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
+  const fmtTs = fmtSastDateTime;
   const fmtCoord = (loc) => loc ? `${loc.lat.toFixed(5)},${loc.lng.toFixed(5)}` : "";
 
   // Multiple delay reports joined into one cell — one row per PASSENGER
@@ -17252,9 +17261,8 @@ export function exportGpsTrailToCsv(rows, tripId) {
     if (/^[=+\-@]/.test(s)) s = "'" + s;
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
-  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
   const csvRows = rows.map(r => [
-    fmtTs(r.recorded_at), r.lat, r.lng,
+    fmtSastDateTime(r.recorded_at), r.lat, r.lng,
     r.speed_kmh != null ? r.speed_kmh.toFixed(1) : "",
     r.heading != null ? r.heading.toFixed(0) : "",
   ]);

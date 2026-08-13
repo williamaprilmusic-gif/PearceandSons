@@ -60,6 +60,7 @@ import {
   fetchMyConversations,
   fetchTripDelays,
   fetchTripHistory,
+  fmtSastDateTime,
   getAdminCompanyIds,
   getDriverLoad,
   haversineKm,
@@ -3685,25 +3686,44 @@ function tomtomTileUrl(x, y, zoom) {
 let tomtomTileErrorLoggedOnce = { current: false };
 
 const LiveMapTiles = React.memo(function LiveMapTiles({ width, height, viewport }) {
+  // tileZoom picks which discrete tile IMAGE to fetch (tile servers only
+  // have whole-number zoom levels) — but FOUND VIA DIRECT USER REPORT
+  // ("trail alignment is out"): every tile's ON-SCREEN POSITION used to
+  // ALSO be forced through this same rounded zoom (passing
+  // `{...viewport, zoom: tileZoom}` into projectToSvg for each tile
+  // corner), while everything else drawn on top of the map — driver
+  // markers, the GPS trail's polyline — projects through the viewport's
+  // REAL, continuous zoom instead. World-pixel scale is 2**zoom, so tiles
+  // and overlay content were being computed in two DIFFERENT pixel
+  // spaces sharing one <svg> — they only lined up by coincidence when
+  // zoom happened to already be a whole number (e.g. right after "fit to
+  // bounds"), and drifted further apart the more a wheel-zoom tick or
+  // pinch pushed the real zoom away from its rounded value, worse the
+  // farther a point sits from the viewport center. Real slippy maps
+  // handle non-integer zoom by scaling each fetched tile image to its
+  // TRUE position instead of snapping everything to the nearest whole
+  // level — every coordinate below (including each tile's own corners)
+  // now projects through the SAME real `viewport` used everywhere else,
+  // so nothing drawn on this map can ever disagree with it again.
+  const tileZoom = Math.round(viewport.zoom);
   if (!TOMTOM_API_KEY) {
     // No TomTom key — render OSM tiles as fallback using the same SVG approach
-    const zoom = Math.round(viewport.zoom);
-    const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
-    const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
-    const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
-    const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+    const topLeftLonLat = unprojectFromSvg(0, 0, width, height, viewport);
+    const bottomRightLonLat = unprojectFromSvg(width, height, width, height, viewport);
+    const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, tileZoom);
+    const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, tileZoom);
     const osmTiles = [];
     for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
       for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
-        const nw = tileToLonLat(tx, ty, zoom);
-        const se = tileToLonLat(tx + 1, ty + 1, zoom);
-        const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
-        const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+        const nw = tileToLonLat(tx, ty, tileZoom);
+        const se = tileToLonLat(tx + 1, ty + 1, tileZoom);
+        const p1 = projectToSvg(nw.lat, nw.lon, width, height, viewport);
+        const p2 = projectToSvg(se.lat, se.lon, width, height, viewport);
         const sub = ["a","b","c"][((tx + ty) % 3 + 3) % 3]; // rotate OSM subdomains
         osmTiles.push(
           <image
-            key={`osm-${zoom}-${tx}-${ty}`}
-            href={`https://${sub}.tile.openstreetmap.org/${zoom}/${tx}/${ty}.png`}
+            key={`osm-${tileZoom}-${tx}-${ty}`}
+            href={`https://${sub}.tile.openstreetmap.org/${tileZoom}/${tx}/${ty}.png`}
             x={p1.x} y={p1.y}
             width={Math.max(1, p2.x - p1.x)}
             height={Math.max(1, p2.y - p1.y)}
@@ -3716,28 +3736,27 @@ const LiveMapTiles = React.memo(function LiveMapTiles({ width, height, viewport 
     }
     return <>{osmTiles}</>;
   }
-  const zoom = Math.round(viewport.zoom);
   // Corners of the visible canvas, converted to lon/lat, then to which
   // tile range covers them — same idea as the old bounds-based version,
   // just driven by the current viewport's visible area instead of a
   // fixed Cape Town box.
-  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
-  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
-  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
-  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, viewport);
+  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, viewport);
+  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, tileZoom);
+  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, tileZoom);
   const tiles = [];
   // +/-1 tile of padding so panning doesn't show a visible gap at the
   // edge for a frame while new tiles load in.
   for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
     for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
-      const nw = tileToLonLat(tx, ty, zoom);
-      const se = tileToLonLat(tx + 1, ty + 1, zoom);
-      const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
-      const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+      const nw = tileToLonLat(tx, ty, tileZoom);
+      const se = tileToLonLat(tx + 1, ty + 1, tileZoom);
+      const p1 = projectToSvg(nw.lat, nw.lon, width, height, viewport);
+      const p2 = projectToSvg(se.lat, se.lon, width, height, viewport);
       tiles.push(
         <image
-          key={`${zoom}-${tx}-${ty}`}
-          href={tomtomTileUrl(tx, ty, zoom)}
+          key={`${tileZoom}-${tx}-${ty}`}
+          href={tomtomTileUrl(tx, ty, tileZoom)}
           x={p1.x} y={p1.y}
           width={Math.max(1, p2.x - p1.x)}
           height={Math.max(1, p2.y - p1.y)}
@@ -3762,22 +3781,26 @@ const LiveMapTiles = React.memo(function LiveMapTiles({ width, height, viewport 
 
 const LiveMapTrafficTiles = React.memo(function LiveMapTrafficTiles({ width, height, viewport }) {
   if (!TOMTOM_API_KEY) return null;
-  const zoom = Math.round(viewport.zoom);
-  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, { ...viewport, zoom });
-  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, { ...viewport, zoom });
-  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, zoom);
-  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, zoom);
+  // Same tile-position/overlay misalignment fix as LiveMapTiles just
+  // above — tileZoom picks which discrete tile image to fetch, every
+  // on-screen coordinate (including this tile's own corners) projects
+  // through the real, continuous viewport.
+  const tileZoom = Math.round(viewport.zoom);
+  const topLeftLonLat = unprojectFromSvg(0, 0, width, height, viewport);
+  const bottomRightLonLat = unprojectFromSvg(width, height, width, height, viewport);
+  const topLeft = lonLatToTile(topLeftLonLat.lon, topLeftLonLat.lat, tileZoom);
+  const bottomRight = lonLatToTile(bottomRightLonLat.lon, bottomRightLonLat.lat, tileZoom);
   const tiles = [];
   for (let tx = topLeft.x - 1; tx <= bottomRight.x + 1; tx++) {
     for (let ty = topLeft.y - 1; ty <= bottomRight.y + 1; ty++) {
-      const nw = tileToLonLat(tx, ty, zoom);
-      const se = tileToLonLat(tx + 1, ty + 1, zoom);
-      const p1 = projectToSvg(nw.lat, nw.lon, width, height, { ...viewport, zoom });
-      const p2 = projectToSvg(se.lat, se.lon, width, height, { ...viewport, zoom });
+      const nw = tileToLonLat(tx, ty, tileZoom);
+      const se = tileToLonLat(tx + 1, ty + 1, tileZoom);
+      const p1 = projectToSvg(nw.lat, nw.lon, width, height, viewport);
+      const p2 = projectToSvg(se.lat, se.lon, width, height, viewport);
       tiles.push(
         <image
-          key={`flow-${zoom}-${tx}-${ty}`}
-          href={`https://api.tomtom.com/traffic/map/4/tile/flow/relative0/${zoom}/${tx}/${ty}.png?key=${TOMTOM_API_KEY}`}
+          key={`flow-${tileZoom}-${tx}-${ty}`}
+          href={`https://api.tomtom.com/traffic/map/4/tile/flow/relative0/${tileZoom}/${tx}/${ty}.png?key=${TOMTOM_API_KEY}`}
           x={p1.x} y={p1.y}
           width={Math.max(1, p2.x - p1.x)}
           height={Math.max(1, p2.y - p1.y)}
@@ -4555,15 +4578,26 @@ function GpsTrailModal({ trail, tripId, onClose }) {
   const W = 900, H = 600;
   const svgRef = useRef(null);
   const dragRef = useRef(null);
+  const pinchRef = useRef(null); // tracks 2-finger pinch state, same as AdminLiveMap
 
   // Fit the viewport to the trail's own bounds on open — same
-  // min/max-then-pick-a-zoom-that-fits approach as AdminLiveMap's
-  // fitAllDrivers, just centered on this one trip's points instead of
-  // every currently-reporting driver.
+  // pick-a-zoom-that-fits approach as AdminLiveMap's fitAllDrivers, just
+  // centered on this one trip's points instead of every currently-
+  // reporting driver. Manual min/max loop, NOT Math.min(...lats) — FOUND
+  // VIA /code-review: spreading a long trail (driver_position_log rows
+  // persist for a 2-month retention window; a trip that never gets
+  // marked complete keeps logging for days/weeks, easily tens of
+  // thousands of rows) as call arguments risks "Maximum call stack size
+  // exceeded" in V8 — the exact same fix already applied elsewhere in
+  // this codebase for a dense TomTom polyline, for the identical reason.
   const initialViewport = React.useMemo(() => {
-    const lats = trail.map(p => p.lat), lngs = trail.map(p => p.lng);
-    const minLat = Math.min(...lats), maxLat = Math.max(...lats);
-    const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+    let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+    for (const p of trail) {
+      if (p.lat < minLat) minLat = p.lat;
+      if (p.lat > maxLat) maxLat = p.lat;
+      if (p.lng < minLng) minLng = p.lng;
+      if (p.lng > maxLng) maxLng = p.lng;
+    }
     const centerLat = (minLat + maxLat) / 2, centerLng = (minLng + maxLng) / 2;
     let zoom = 16;
     for (; zoom > 3; zoom--) {
@@ -4580,14 +4614,34 @@ function GpsTrailModal({ trail, tripId, onClose }) {
   const zoomIn = () => setViewport(v => ({ ...v, zoom: Math.min(18, v.zoom + 1) }));
   const zoomOut = () => setViewport(v => ({ ...v, zoom: Math.max(3, v.zoom - 1) }));
 
-  // Drag-to-pan — same math as AdminLiveMap's identical handlers, scoped
-  // to this component's own viewport state instead of shared with it.
+  // Drag-to-pan + 2-finger pinch-to-zoom — same math as AdminLiveMap's
+  // identical handlers, scoped to this component's own viewport state
+  // rather than shared with it. FOUND VIA /code-review: an earlier
+  // version of this component dropped pinch-zoom despite claiming "same
+  // math ... identical handlers" — a real touch-UX gap versus the live
+  // map for a feature meant to be reviewed in the field.
   const handlePointerDown = (e) => {
+    if (e.touches && e.touches.length === 2) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      pinchRef.current = { startDist: dist, startZoom: viewport.zoom };
+      dragRef.current = null;
+      return;
+    }
+    pinchRef.current = null;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
     dragRef.current = { startScreenX: clientX, startScreenY: clientY, startCenterLat: viewport.centerLat, startCenterLng: viewport.centerLng };
   };
   const handlePointerMove = (e) => {
+    if (e.touches && e.touches.length === 2 && pinchRef.current) {
+      const t0 = e.touches[0], t1 = e.touches[1];
+      const dist = Math.hypot(t1.clientX - t0.clientX, t1.clientY - t0.clientY);
+      const ratio = dist / pinchRef.current.startDist;
+      const newZoom = Math.max(3, Math.min(18, pinchRef.current.startZoom + Math.log2(ratio)));
+      setViewport(v => ({ ...v, zoom: newZoom }));
+      return;
+    }
     if (!dragRef.current) return;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
@@ -4601,7 +4655,7 @@ function GpsTrailModal({ trail, tripId, onClose }) {
     const newCenterLonLat = worldPixelToLonLat(newCenterPx.x, newCenterPx.y, viewport.zoom);
     setViewport(v => ({ ...v, centerLat: newCenterLonLat.lat, centerLng: newCenterLonLat.lon }));
   };
-  const handlePointerUp = () => { dragRef.current = null; };
+  const handlePointerUp = () => { dragRef.current = null; pinchRef.current = null; };
 
   // Wheel-zoom needs a native, non-passive listener — same reasoning as
   // AdminLiveMap's identical effect (React's onWheel is passive by
@@ -4632,18 +4686,38 @@ function GpsTrailModal({ trail, tripId, onClose }) {
     const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 150);
     return () => clearTimeout(t);
   }, [playing, currentIndex, trail.length]);
+  // Rewind/forward — jump by ~5% of the trail per tap (minimum 1 point),
+  // per explicit request for video-style transport controls alongside
+  // play/pause and the scrub slider. Scales with trail length rather
+  // than a fixed point count, since trails range from a handful of
+  // points to several thousand.
+  const skipAmount = Math.max(1, Math.round(trail.length * 0.05));
+  const skipBack = () => { setPlaying(false); setCurrentIndex(i => Math.max(0, i - skipAmount)); };
+  const skipForward = () => { setPlaying(false); setCurrentIndex(i => Math.min(trail.length - 1, i + skipAmount)); };
 
   const current = trail[currentIndex];
+  // Memoized on [trail, viewport] — FOUND VIA /code-review (both this
+  // session's manual pass and an independent /code-review run flagged
+  // the same thing): re-projecting every trail point on every render
+  // was real, measurable waste on two hot paths — every 150ms playback
+  // tick, and every pointermove event while drag-panning — both firing
+  // far more often than [trail, viewport] actually changes.
+  const { polylinePoints, startPt, endPt } = React.useMemo(() => {
+    const pts = trail.map(p => projectToSvg(p.lat, p.lng, W, H, viewport));
+    return {
+      polylinePoints: pts.map(pt => `${pt.x},${pt.y}`).join(" "),
+      startPt: pts[0] || null,
+      endPt: pts.length > 0 ? pts[pts.length - 1] : null,
+    };
+  }, [trail, viewport]);
   const currentPos = current ? projectToSvg(current.lat, current.lng, W, H, viewport) : null;
-  const polylinePoints = trail.map(p => { const pt = projectToSvg(p.lat, p.lng, W, H, viewport); return `${pt.x},${pt.y}`; }).join(" ");
-  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "—";
 
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 300, background: COLORS.bg, display: "flex", flexDirection: "column", paddingTop: "env(safe-area-inset-top, 0px)", paddingBottom: "env(safe-area-inset-bottom, 0px)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, flexShrink: 0 }}>
         <div>
           <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>GPS TRAIL — TRIP {tripId}</div>
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>{trail.length} points · drag to pan, scroll or +/− to zoom</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{trail.length} points · drag or pinch to pan/zoom, scroll or +/− also works</div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
           <Button title="🎯" variant="ghost" size="sm" onClick={fitToTrail} style={{ width: 36 }} />
@@ -4665,15 +4739,19 @@ function GpsTrailModal({ trail, tripId, onClose }) {
           <polyline points={polylinePoints} fill="none" stroke={COLORS.blue} strokeWidth={3} strokeOpacity={0.75} strokeLinecap="round" strokeLinejoin="round" />
           {/* Start/end markers so the trail's direction is obvious even
               before pressing play. */}
-          {trail.length > 0 && (() => { const p = projectToSvg(trail[0].lat, trail[0].lng, W, H, viewport); return <circle cx={p.x} cy={p.y} r={5} fill={COLORS.green} stroke={COLORS.panel} strokeWidth={1.5} />; })()}
-          {trail.length > 0 && (() => { const p = projectToSvg(trail[trail.length - 1].lat, trail[trail.length - 1].lng, W, H, viewport); return <circle cx={p.x} cy={p.y} r={5} fill={COLORS.red} stroke={COLORS.panel} strokeWidth={1.5} />; })()}
+          {startPt && <circle cx={startPt.x} cy={startPt.y} r={5} fill={COLORS.green} stroke={COLORS.panel} strokeWidth={1.5} />}
+          {endPt && <circle cx={endPt.x} cy={endPt.y} r={5} fill={COLORS.red} stroke={COLORS.panel} strokeWidth={1.5} />}
           {/* Current scrub position — the "replay" half of the request. */}
           {currentPos && <GpsTrailCarMarker x={currentPos.x} y={currentPos.y} heading={current.heading} color={COLORS.amber} />}
         </svg>
       </div>
       <div style={{ padding: "10px 14px", background: COLORS.panel, borderTop: `1px solid ${COLORS.wire}`, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Button title="⏮" variant="ghost" size="sm" onClick={() => { setPlaying(false); setCurrentIndex(0); }} style={{ width: 36 }} disabled={trail.length <= 1} />
+          <Button title="◀◀" variant="ghost" size="sm" onClick={skipBack} style={{ width: 40 }} disabled={trail.length <= 1} />
           <Button title={playing ? "⏸" : "▶"} variant="amber" size="sm" onClick={() => setPlaying(p => !p)} style={{ width: 44 }} disabled={trail.length <= 1} />
+          <Button title="▶▶" variant="ghost" size="sm" onClick={skipForward} style={{ width: 40 }} disabled={trail.length <= 1} />
+          <Button title="⏭" variant="ghost" size="sm" onClick={() => { setPlaying(false); setCurrentIndex(trail.length - 1); }} style={{ width: 36 }} disabled={trail.length <= 1} />
           <input
             type="range" min={0} max={Math.max(0, trail.length - 1)} value={currentIndex}
             onChange={e => { setPlaying(false); setCurrentIndex(Number(e.target.value)); }}
@@ -4682,7 +4760,7 @@ function GpsTrailModal({ trail, tripId, onClose }) {
           <span style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap" }}>{currentIndex + 1} / {trail.length}</span>
         </div>
         <div style={{ display: "flex", gap: 14, fontSize: 10, color: COLORS.chalk }}>
-          <span><span style={{ color: COLORS.ghost }}>TIME: </span>{fmtTs(current?.recorded_at)}</span>
+          <span><span style={{ color: COLORS.ghost }}>TIME: </span>{fmtSastDateTime(current?.recorded_at) || "—"}</span>
           {current?.speed_kmh != null && <span><span style={{ color: COLORS.ghost }}>SPEED: </span>{Math.round(current.speed_kmh)} km/h</span>}
         </div>
       </div>
