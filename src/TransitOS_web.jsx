@@ -13789,7 +13789,26 @@ function tonePrefStorageKey(baseKey) {
 }
 function getTonePref(key, tones) {
   try {
-    const saved = localStorage.getItem(tonePrefStorageKey(key));
+    const scopedKey = tonePrefStorageKey(key);
+    let saved = localStorage.getItem(scopedKey);
+    if (saved == null) {
+      // One-time migration from the old un-namespaced key — FOUND VIA
+      // /code-review: without this, every existing user's already-chosen
+      // tone silently reverted to default the moment per-user scoping
+      // shipped, even on a device that was NEVER shared (the common
+      // case, where there's nothing actually wrong with the old value).
+      // Whoever reads first after this deploy "claims" the legacy value
+      // into their own new per-user key. On a genuinely shared device
+      // that's a one-time, one-person quirk (immediately fixable by
+      // re-picking) — not the permanent cross-user leakage this whole
+      // fix exists to close, since every read AFTER this one is already
+      // correctly scoped per-user again.
+      const legacy = localStorage.getItem(key);
+      if (legacy != null) {
+        localStorage.setItem(scopedKey, legacy);
+        saved = legacy;
+      }
+    }
     return tones.find(t => t.id === saved) || tones[0];
   } catch (e) { return tones[0]; }
 }
