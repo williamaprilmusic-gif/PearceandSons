@@ -1919,7 +1919,7 @@ function DropoffSequenceDisplay({ coords, trip, state, anchor }) {
   );
 }
 
-function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
+function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
   const [open, setOpen] = useState(!!initiallyOpen);
   const [addingAgent, setAddingAgent] = useState(false);
   const [confirmingCancel, setConfirmingCancel] = useState(false);
@@ -2068,8 +2068,19 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen }) {
               while a trip is active, but nothing ever read it back out
               until now — lazy-loaded on click, same pattern as delays
               above, since a long trip's breadcrumb trail can be hundreds
-              of rows and most admins won't need it on every expand. */}
-          {trip.route_total_km != null && (
+              of rows and most admins won't need it on every expand.
+              Gated on viewDriverProfiles — FOUND VIA /security-review:
+              continuous GPS location history is the same class of
+              sensitive driver-personal data (phone, home address, live
+              status, active route detail) that permission already
+              restricts from Viewer-tier admins; this control had no
+              permission gate at all when first added. The real boundary
+              is now the driver_position_log RLS policy (admin-role-only
+              reads), not this check — but hiding the control for a tier
+              that can't use it anyway matches this file's own established
+              convention (see viewTripFees/exportCsv gates nearby) and
+              avoids a dead button that would just come back empty. */}
+          {trip.route_total_km != null && hasAdminPermission(user, "viewDriverProfiles") && (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               {gpsTrail === null ? (
                 <Button title={gpsTrailLoading ? "LOADING…" : "📍 LOAD GPS TRAIL"} variant="ghost" size="sm" onClick={loadGpsTrail} disabled={gpsTrailLoading} />
@@ -2465,7 +2476,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
               {groupTrips.map(t => {
                 const isSelectable = canEditTrips && (t.state === TRIP_STATE.UNASSIGNED_BOOKING || t.state === TRIP_STATE.ARCHIVED_COMPLETED);
                 if (!isSelectable) {
-                  return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} initiallyOpen={String(t.trip_id) === String(jumpTripId)} />;
+                  return <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={canEditTrips ? dispatch : null} initiallyOpen={String(t.trip_id) === String(jumpTripId)} user={user} />;
                 }
                 const checked = selectedTripIds.has(t.trip_id);
                 return (
@@ -2474,7 +2485,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                       <span style={{ width: 15, height: 15, borderRadius: 3, border: `1px solid ${checked ? COLORS.amber : COLORS.wire}`, background: checked ? COLORS.amber : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: COLORS.ink }}>{checked && "✓"}</span>
                     </div>
                     <div style={{ flex: 1, minWidth: 0 }}>
-                      <TripDetailRow trip={t} state={state} dispatch={dispatch} initiallyOpen={String(t.trip_id) === String(jumpTripId)} />
+                      <TripDetailRow trip={t} state={state} dispatch={dispatch} initiallyOpen={String(t.trip_id) === String(jumpTripId)} user={user} />
                     </div>
                   </div>
                 );
@@ -2665,7 +2676,7 @@ function AdminProfileSearch({ state, user, dispatch }) {
           {!loadingHistory && allTrips.length === 0 && <Empty icon="⊟" text="No trips found for this person" />}
           {!loadingHistory && allTrips.length > 0 && (
             <Card body={false}>
-              {allTrips.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} />)}
+              {allTrips.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} user={user} />)}
             </Card>
           )}
         </>
@@ -3029,7 +3040,7 @@ function AdminHistory({ state, user, dispatch }) {
           <Card body={false}>
             {filteredResults.length === 0
               ? <Empty icon="⊟" text={results.length === 0 ? "No completed trips in this range" : "No trips match the current Normal/Exception filter"} />
-              : filteredResults.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} />)}
+              : filteredResults.map(t => <TripDetailRow key={t.trip_id} trip={t} state={state} dispatch={null} user={user} />)}
           </Card>
         </>
         );
