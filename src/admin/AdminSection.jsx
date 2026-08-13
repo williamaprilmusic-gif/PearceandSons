@@ -2114,7 +2114,19 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
               )}
               {gpsTrailError && <span style={{ fontSize: 10, color: COLORS.red }}>{gpsTrailError}</span>}
               {showGpsTrailMap && gpsTrail && gpsTrail.length > 0 && (
-                <GpsTrailModal trail={gpsTrail} tripId={trip.trip_id} onClose={() => setShowGpsTrailMap(false)} />
+                <GpsTrailModal
+                  trail={gpsTrail}
+                  tripId={trip.trip_id}
+                  direction={trip.direction}
+                  // OUTBOUND (work→home) drops each agent at their own
+                  // home, so the drop-offs are the interesting per-agent
+                  // stops; INBOUND (home→work) picks each agent up at
+                  // their own home and drops everyone at the same shared
+                  // work location, so the pickups are the interesting
+                  // ones — per explicit request.
+                  stops={(trip.direction === "OUTBOUND" ? trip.dropoff_sequence_coords : trip.pickup_sequence_coords) || []}
+                  onClose={() => setShowGpsTrailMap(false)}
+                />
               )}
             </div>
           )}
@@ -4600,7 +4612,7 @@ function GpsTrailCarMarker({ x, y, heading, color }) {
 // tile primitives (projectToSvg, LiveMapTiles, lonLatToWorldPixel) so the
 // two maps look and feel consistent, but keeps its own viewport/pan/zoom
 // state rather than sharing AdminLiveMap's component-internal handlers.
-function GpsTrailModal({ trail, tripId, onClose }) {
+function GpsTrailModal({ trail, tripId, direction, stops = [], onClose }) {
   const W = 900, H = 600;
   const svgRef = useRef(null);
   const dragRef = useRef(null);
@@ -4623,6 +4635,17 @@ function GpsTrailModal({ trail, tripId, onClose }) {
       if (p.lat > maxLat) maxLat = p.lat;
       if (p.lng < minLng) minLng = p.lng;
       if (p.lng > maxLng) maxLng = p.lng;
+    }
+    // Stop markers (drop-offs for OUTBOUND, pickups for INBOUND) also count
+    // toward the fit — a stop a little off the recorded trail (GPS drift,
+    // or the driver's last few points before stopping never got logged)
+    // would otherwise land outside the initial view.
+    for (const s of stops) {
+      if (s.lat == null || s.lng == null) continue;
+      if (s.lat < minLat) minLat = s.lat;
+      if (s.lat > maxLat) maxLat = s.lat;
+      if (s.lng < minLng) minLng = s.lng;
+      if (s.lng > maxLng) maxLng = s.lng;
     }
     const centerLat = (minLat + maxLat) / 2, centerLng = (minLng + maxLng) / 2;
     let zoom = 16;
@@ -4706,12 +4729,16 @@ function GpsTrailModal({ trail, tripId, onClose }) {
   // "play" naturally ends rather than restarting on its own.
   const [currentIndex, setCurrentIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
+  // Speed toggle (1x/2x) — per explicit request. Just halves the per-point
+  // delay rather than skipping points, so 2x still visits every recorded
+  // point, just twice as fast.
+  const [speed, setSpeed] = useState(1);
   useEffect(() => {
     if (!playing) return;
     if (currentIndex >= trail.length - 1) { setPlaying(false); return; }
-    const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 150);
+    const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 150 / speed);
     return () => clearTimeout(t);
-  }, [playing, currentIndex, trail.length]);
+  }, [playing, currentIndex, trail.length, speed]);
   // Rewind/forward — jump by ~5% of the trail per tap (minimum 1 point),
   // per explicit request for video-style transport controls alongside
   // play/pause and the scrub slider. Scales with trail length rather
@@ -4728,14 +4755,20 @@ function GpsTrailModal({ trail, tripId, onClose }) {
   // was real, measurable waste on two hot paths — every 150ms playback
   // tick, and every pointermove event while drag-panning — both firing
   // far more often than [trail, viewport] actually changes.
-  const { polylinePoints, startPt, endPt } = React.useMemo(() => {
+  const { polylinePoints, startPt, endPt, stopPts } = React.useMemo(() => {
     const pts = trail.map(p => projectToSvg(p.lat, p.lng, W, H, viewport));
     return {
       polylinePoints: pts.map(pt => `${pt.x},${pt.y}`).join(" "),
       startPt: pts[0] || null,
       endPt: pts.length > 0 ? pts[pts.length - 1] : null,
+      // Drop-off stops for OUTBOUND, pickup stops for INBOUND — per
+      // explicit request ("the outbound trip all the drop offs must be
+      // included ... inbound trip all the pickups must be included").
+      // Projected here alongside the trail itself so they pan/zoom in
+      // lockstep and don't get recomputed on every playback tick.
+      stopPts: stops.filter(s => s.lat != null && s.lng != null).map((s, i) => ({ ...projectToSvg(s.lat, s.lng, W, H, viewport), label: s.label, index: i })),
     };
-  }, [trail, viewport]);
+  }, [trail, viewport, stops]);
   const currentPos = current ? projectToSvg(current.lat, current.lng, W, H, viewport) : null;
 
   return (
@@ -4743,7 +4776,9 @@ function GpsTrailModal({ trail, tripId, onClose }) {
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, flexShrink: 0 }}>
         <div>
           <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>GPS TRAIL — TRIP {tripId}</div>
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>{trail.length} points · drag or pinch to pan/zoom, scroll or +/− also works</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>
+            {trail.length} points{stopPts.length > 0 ? ` · ${stopPts.length} ${direction === "OUTBOUND" ? "drop-off" : "pickup"}${stopPts.length === 1 ? "" : "s"}` : ""} · drag or pinch to pan/zoom, scroll or +/− also works
+          </div>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
           <Button title="🎯" variant="ghost" size="sm" onClick={fitToTrail} style={{ width: 36 }} />
@@ -4763,6 +4798,18 @@ function GpsTrailModal({ trail, tripId, onClose }) {
           {/* Full trail — the "static overlay" half of the request, always
               visible regardless of playback position. */}
           <polyline points={polylinePoints} fill="none" stroke={COLORS.blue} strokeWidth={3} strokeOpacity={0.75} strokeLinecap="round" strokeLinejoin="round" />
+          {/* Stop markers — drop-offs for OUTBOUND, pickups for INBOUND
+              (per explicit request), numbered in sequence order. Distinct
+              purple so they read separately from the green/red start/end
+              trail endpoints, which mark the GPS log itself rather than a
+              scheduled stop. */}
+          {stopPts.map(pt => (
+            <g key={pt.index}>
+              <circle cx={pt.x} cy={pt.y} r={7} fill={COLORS.purple} stroke={COLORS.panel} strokeWidth={1.5} />
+              <text x={pt.x} y={pt.y} textAnchor="middle" dominantBaseline="central" fontSize={8} fontWeight={800} fill={COLORS.white} style={{ pointerEvents: "none" }}>{pt.index + 1}</text>
+              {pt.label && <title>{pt.label}</title>}
+            </g>
+          ))}
           {/* Start/end markers so the trail's direction is obvious even
               before pressing play. */}
           {startPt && <circle cx={startPt.x} cy={startPt.y} r={5} fill={COLORS.green} stroke={COLORS.panel} strokeWidth={1.5} />}
@@ -4778,6 +4825,7 @@ function GpsTrailModal({ trail, tripId, onClose }) {
           <Button title={playing ? "⏸" : "▶"} variant="amber" size="sm" onClick={() => setPlaying(p => !p)} style={{ width: 44 }} disabled={trail.length <= 1} />
           <Button title="▶▶" variant="ghost" size="sm" onClick={skipForward} style={{ width: 40 }} disabled={trail.length <= 1} />
           <Button title="⏭" variant="ghost" size="sm" onClick={() => { setPlaying(false); setCurrentIndex(trail.length - 1); }} style={{ width: 36 }} disabled={trail.length <= 1} />
+          <Button title={`${speed}x`} variant="ghost" size="sm" onClick={() => setSpeed(s => (s === 1 ? 2 : 1))} style={{ width: 36 }} disabled={trail.length <= 1} />
           <input
             type="range" min={0} max={Math.max(0, trail.length - 1)} value={currentIndex}
             onChange={e => { setPlaying(false); setCurrentIndex(Number(e.target.value)); }}
