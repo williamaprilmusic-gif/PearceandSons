@@ -2118,6 +2118,8 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
                   trail={gpsTrail}
                   tripId={trip.trip_id}
                   direction={trip.direction}
+                  pickupTimestamps={trip.pickup_timestamps}
+                  dropoffTimestamps={trip.dropoff_timestamps}
                   // OUTBOUND (work→home) drops each agent at their own
                   // home, so the drop-offs are the interesting per-agent
                   // stops; INBOUND (home→work) picks each agent up at
@@ -4586,16 +4588,23 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
   );
 }
 
-// Vector top-down car marker, rotated to heading — same geometry as
-// AdminLiveMap's own driver markers (rounded-rect body + windshield
-// cutout), reused here for visual consistency between the live map and
-// this historical replay.
+// Vector top-down car marker, rotated to heading — per explicit request,
+// styled after the ride-hailing-app "car pin" look (Uber/Bolt-style live
+// map marker): a tapered-nose car silhouette rather than a plain rounded
+// rect, with a windshield band and a pair of headlight dots up front.
+// Deliberately NOT shared with AdminLiveMap's own inline driver marker
+// (same reasoning as this file's other AdminLiveMap-vs-GpsTrailModal
+// duplication: touching AdminLiveMap's live, already-tested marker code
+// carries more risk than the value of DRY-ing up a small shape) — this
+// replay-only redesign intentionally diverges from it now.
 function GpsTrailCarMarker({ x, y, heading, color }) {
   return (
-    <g transform={`translate(${x},${y})`} style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,.5))" }}>
+    <g transform={`translate(${x},${y})`} style={{ filter: "drop-shadow(0 2px 3px rgba(0,0,0,.55))" }}>
       <g transform={heading != null ? `rotate(${heading})` : undefined} style={{ transition: "transform .15s linear" }}>
-        <rect x={-6.5} y={-11} width={13} height={22} rx={5.5} fill={color} stroke={COLORS.panel} strokeWidth={1.5} />
-        <rect x={-4} y={-6.5} width={8} height={6.5} rx={2} fill={COLORS.panel} opacity={0.9} />
+        <path d="M0,-12 C3.5,-12 6.2,-9.7 6.5,-6.2 L7,3 C7,7.2 4.8,9.6 0,10 C-4.8,9.6 -7,7.2 -7,3 L-6.5,-6.2 C-6.2,-9.7 -3.5,-12 0,-12 Z" fill={color} stroke={COLORS.panel} strokeWidth={1.3} />
+        <path d="M-4.3,-6.3 C-4.3,-8.4 -2.4,-9.5 0,-9.5 C2.4,-9.5 4.3,-8.4 4.3,-6.3 L4,-1.8 L-4,-1.8 Z" fill={COLORS.panel} opacity={0.85} />
+        <circle cx={-4.8} cy={-8.8} r={1} fill={COLORS.white} opacity={0.9} />
+        <circle cx={4.8} cy={-8.8} r={1} fill={COLORS.white} opacity={0.9} />
       </g>
     </g>
   );
@@ -4612,11 +4621,41 @@ function GpsTrailCarMarker({ x, y, heading, color }) {
 // tile primitives (projectToSvg, LiveMapTiles, lonLatToWorldPixel) so the
 // two maps look and feel consistent, but keeps its own viewport/pan/zoom
 // state rather than sharing AdminLiveMap's component-internal handlers.
-function GpsTrailModal({ trail, tripId, direction, stops = [], onClose }) {
+function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupTimestamps, dropoffTimestamps, onClose }) {
   const W = 900, H = 600;
   const svgRef = useRef(null);
   const dragRef = useRef(null);
   const pinchRef = useRef(null); // tracks 2-finger pinch state, same as AdminLiveMap
+
+  // Crop the raw driver_position_log trail down to the pickup→last-dropoff
+  // window — per explicit request ("gps trail should show from the pickup
+  // to the last drop off"). driver_position_log logs for the whole time a
+  // trip is active, which can include driving TO the first pickup and
+  // idle time after the last dropoff before the trip gets marked
+  // complete; this trims both. pickup_timestamps/dropoff_timestamps are
+  // keyed by agent id (see tripRowToApp), so the earliest pickup and
+  // latest dropoff cover both directions with the same logic: OUTBOUND
+  // has one shared pickup (so "the pickup" IS the earliest/only one) and
+  // several per-agent dropoffs; INBOUND has several per-agent pickups (so
+  // "the first pickup" is the earliest) and one shared dropoff. Falls
+  // back to the untrimmed side, or the full trail, when a timestamp isn't
+  // available yet (e.g. an in-progress trip before any dropoff has been
+  // confirmed) or when the crop would leave nothing (GPS samples land
+  // every ~25s, so the nearest logged point can fall just outside the
+  // exact confirm timestamp).
+  // startTs/endTs are primitives (not the pickupTimestamps/dropoffTimestamps
+  // object refs, which get rebuilt on every state refetch) so this memo
+  // only recomputes when the actual confirm times change, not on every
+  // unrelated poll — same reasoning as the trail-projection memo below.
+  const pickupTsValues = Object.values(pickupTimestamps || {}).filter(v => typeof v === "number");
+  const dropoffTsValues = Object.values(dropoffTimestamps || {}).filter(v => typeof v === "number");
+  const startTs = pickupTsValues.length ? Math.min(...pickupTsValues) : null;
+  const endTs = dropoffTsValues.length ? Math.max(...dropoffTsValues) : null;
+  const trail = React.useMemo(() => {
+    if (startTs == null && endTs == null) return rawTrail;
+    const cropped = rawTrail.filter(p => (startTs == null || p.recorded_at >= startTs) && (endTs == null || p.recorded_at <= endTs));
+    return cropped.length > 0 ? cropped : rawTrail;
+  }, [rawTrail, startTs, endTs]);
 
   // Fit the viewport to the trail's own bounds on open — same
   // pick-a-zoom-that-fits approach as AdminLiveMap's fitAllDrivers, just
@@ -4721,12 +4760,13 @@ function GpsTrailModal({ trail, tripId, direction, stops = [], onClose }) {
     return () => el.removeEventListener("wheel", handleWheel);
   }, []);
 
-  // Playback — fixed animation speed (one recorded point every 150ms),
-  // NOT scaled to the real ~25s gap between samples: at real elapsed
-  // time a full trip's replay would take as long as the trip itself,
-  // which defeats the point of a scrubbable replay. Stops automatically
-  // at the last point rather than looping, matching how a video's
-  // "play" naturally ends rather than restarting on its own.
+  // Playback — fixed animation speed (one recorded point every 300ms at
+  // 1x, per explicit request to slow the default down from an earlier
+  // 150ms), NOT scaled to the real ~25s gap between samples: at real
+  // elapsed time a full trip's replay would take as long as the trip
+  // itself, which defeats the point of a scrubbable replay. Stops
+  // automatically at the last point rather than looping, matching how a
+  // video's "play" naturally ends rather than restarting on its own.
   const [currentIndex, setCurrentIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   // Speed toggle (1x/2x) — per explicit request. Just halves the per-point
@@ -4736,7 +4776,7 @@ function GpsTrailModal({ trail, tripId, direction, stops = [], onClose }) {
   useEffect(() => {
     if (!playing) return;
     if (currentIndex >= trail.length - 1) { setPlaying(false); return; }
-    const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 150 / speed);
+    const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 300 / speed);
     return () => clearTimeout(t);
   }, [playing, currentIndex, trail.length, speed]);
   // Rewind/forward — jump by ~5% of the trail per tap (minimum 1 point),
