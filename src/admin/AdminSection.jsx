@@ -1939,6 +1939,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
   const [gpsTrail, setGpsTrail] = useState(null); // null = not loaded yet, [] = loaded, empty
   const [gpsTrailLoading, setGpsTrailLoading] = useState(false);
   const [gpsTrailError, setGpsTrailError] = useState(null);
+  const [showGpsTrailMap, setShowGpsTrailMap] = useState(false);
   const loadGpsTrail = async () => {
     setGpsTrailLoading(true);
     setGpsTrailError(null);
@@ -2087,9 +2088,15 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
               ) : gpsTrail.length === 0 ? (
                 <span style={{ fontSize: 10, color: COLORS.ghost }}>📍 No GPS points recorded for this trip.</span>
               ) : (
-                <Button title={`⬇ DOWNLOAD GPS TRAIL CSV (${gpsTrail.length} points)`} variant="ghost" size="sm" onClick={() => exportGpsTrailToCsv(gpsTrail, trip.trip_id)} />
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  <Button title="🗺️ VIEW ON MAP" variant="ghost" size="sm" onClick={() => setShowGpsTrailMap(true)} />
+                  <Button title={`⬇ DOWNLOAD GPS TRAIL CSV (${gpsTrail.length} points)`} variant="ghost" size="sm" onClick={() => exportGpsTrailToCsv(gpsTrail, trip.trip_id)} />
+                </div>
               )}
               {gpsTrailError && <span style={{ fontSize: 10, color: COLORS.red }}>{gpsTrailError}</span>}
+              {showGpsTrailMap && gpsTrail && gpsTrail.length > 0 && (
+                <GpsTrailModal trail={gpsTrail} tripId={trip.trip_id} onClose={() => setShowGpsTrailMap(false)} />
+              )}
             </div>
           )}
 
@@ -4515,6 +4522,171 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
         ))
       )}
     </Card>
+  );
+}
+
+// Vector top-down car marker, rotated to heading — same geometry as
+// AdminLiveMap's own driver markers (rounded-rect body + windshield
+// cutout), reused here for visual consistency between the live map and
+// this historical replay.
+function GpsTrailCarMarker({ x, y, heading, color }) {
+  return (
+    <g transform={`translate(${x},${y})`} style={{ filter: "drop-shadow(0 1px 2px rgba(0,0,0,.5))" }}>
+      <g transform={heading != null ? `rotate(${heading})` : undefined} style={{ transition: "transform .15s linear" }}>
+        <rect x={-6.5} y={-11} width={13} height={22} rx={5.5} fill={color} stroke={COLORS.panel} strokeWidth={1.5} />
+        <rect x={-4} y={-6.5} width={8} height={6.5} rx={2} fill={COLORS.panel} opacity={0.9} />
+      </g>
+    </g>
+  );
+}
+
+// Full-screen GPS trail map + playback — per explicit request ("all of
+// it": both a static polyline overlay AND a scrubbable replay), opened
+// from TripDetailRow once a trail has been fetched. Self-contained,
+// hand-rolled SVG map matching AdminLiveMap's own approach (this
+// codebase's established pattern — "a separate hand-rolled SVG map, not
+// Leaflet" — rather than sharing one map implementation across very
+// different use cases: a live, auto-refreshing fleet view vs. a static,
+// scrubbable historical replay). Reuses the same low-level projection/
+// tile primitives (projectToSvg, LiveMapTiles, lonLatToWorldPixel) so the
+// two maps look and feel consistent, but keeps its own viewport/pan/zoom
+// state rather than sharing AdminLiveMap's component-internal handlers.
+function GpsTrailModal({ trail, tripId, onClose }) {
+  const W = 900, H = 600;
+  const svgRef = useRef(null);
+  const dragRef = useRef(null);
+
+  // Fit the viewport to the trail's own bounds on open — same
+  // min/max-then-pick-a-zoom-that-fits approach as AdminLiveMap's
+  // fitAllDrivers, just centered on this one trip's points instead of
+  // every currently-reporting driver.
+  const initialViewport = React.useMemo(() => {
+    const lats = trail.map(p => p.lat), lngs = trail.map(p => p.lng);
+    const minLat = Math.min(...lats), maxLat = Math.max(...lats);
+    const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
+    const centerLat = (minLat + maxLat) / 2, centerLng = (minLng + maxLng) / 2;
+    let zoom = 16;
+    for (; zoom > 3; zoom--) {
+      const p1 = lonLatToWorldPixel(minLng, maxLat, zoom);
+      const p2 = lonLatToWorldPixel(maxLng, minLat, zoom);
+      const spanX = Math.abs(p2.x - p1.x), spanY = Math.abs(p2.y - p1.y);
+      if (spanX < W * 0.75 && spanY < H * 0.75) break;
+    }
+    return { centerLat, centerLng, zoom };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const [viewport, setViewport] = useState(initialViewport);
+  const fitToTrail = () => setViewport(initialViewport);
+  const zoomIn = () => setViewport(v => ({ ...v, zoom: Math.min(18, v.zoom + 1) }));
+  const zoomOut = () => setViewport(v => ({ ...v, zoom: Math.max(3, v.zoom - 1) }));
+
+  // Drag-to-pan — same math as AdminLiveMap's identical handlers, scoped
+  // to this component's own viewport state instead of shared with it.
+  const handlePointerDown = (e) => {
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    dragRef.current = { startScreenX: clientX, startScreenY: clientY, startCenterLat: viewport.centerLat, startCenterLng: viewport.centerLng };
+  };
+  const handlePointerMove = (e) => {
+    if (!dragRef.current) return;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    const rect = svgRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const scaleX = W / rect.width, scaleY = H / rect.height;
+    const dxScreen = clientX - dragRef.current.startScreenX;
+    const dyScreen = clientY - dragRef.current.startScreenY;
+    const startCenterPx = lonLatToWorldPixel(dragRef.current.startCenterLng, dragRef.current.startCenterLat, viewport.zoom);
+    const newCenterPx = { x: startCenterPx.x - dxScreen * scaleX, y: startCenterPx.y - dyScreen * scaleY };
+    const newCenterLonLat = worldPixelToLonLat(newCenterPx.x, newCenterPx.y, viewport.zoom);
+    setViewport(v => ({ ...v, centerLat: newCenterLonLat.lat, centerLng: newCenterLonLat.lon }));
+  };
+  const handlePointerUp = () => { dragRef.current = null; };
+
+  // Wheel-zoom needs a native, non-passive listener — same reasoning as
+  // AdminLiveMap's identical effect (React's onWheel is passive by
+  // default since React 17, so e.preventDefault() inside it silently
+  // fails to stop the page underneath from scrolling too).
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+    const handleWheel = (e) => {
+      e.preventDefault();
+      setViewport(v => ({ ...v, zoom: Math.max(3, Math.min(18, v.zoom + (e.deltaY < 0 ? 0.5 : -0.5))) }));
+    };
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  // Playback — fixed animation speed (one recorded point every 150ms),
+  // NOT scaled to the real ~25s gap between samples: at real elapsed
+  // time a full trip's replay would take as long as the trip itself,
+  // which defeats the point of a scrubbable replay. Stops automatically
+  // at the last point rather than looping, matching how a video's
+  // "play" naturally ends rather than restarting on its own.
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  useEffect(() => {
+    if (!playing) return;
+    if (currentIndex >= trail.length - 1) { setPlaying(false); return; }
+    const t = setTimeout(() => setCurrentIndex(i => Math.min(i + 1, trail.length - 1)), 150);
+    return () => clearTimeout(t);
+  }, [playing, currentIndex, trail.length]);
+
+  const current = trail[currentIndex];
+  const currentPos = current ? projectToSvg(current.lat, current.lng, W, H, viewport) : null;
+  const polylinePoints = trail.map(p => { const pt = projectToSvg(p.lat, p.lng, W, H, viewport); return `${pt.x},${pt.y}`; }).join(" ");
+  const fmtTs = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "—";
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 300, background: COLORS.bg, display: "flex", flexDirection: "column", paddingTop: "env(safe-area-inset-top, 0px)", paddingBottom: "env(safe-area-inset-bottom, 0px)" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", background: COLORS.panel, borderBottom: `1px solid ${COLORS.wire}`, flexShrink: 0 }}>
+        <div>
+          <div style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>GPS TRAIL — TRIP {tripId}</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{trail.length} points · drag to pan, scroll or +/− to zoom</div>
+        </div>
+        <div style={{ display: "flex", gap: 6 }}>
+          <Button title="🎯" variant="ghost" size="sm" onClick={fitToTrail} style={{ width: 36 }} />
+          <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 36 }} />
+          <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 36 }} />
+          <Button title="✕ CLOSE" variant="ghost" size="sm" onClick={onClose} />
+        </div>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+        <svg
+          ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", touchAction: "none", cursor: "grab" }}
+          onMouseDown={handlePointerDown} onMouseMove={handlePointerMove} onMouseUp={handlePointerUp} onMouseLeave={handlePointerUp}
+          onTouchStart={handlePointerDown} onTouchMove={handlePointerMove} onTouchEnd={handlePointerUp}
+        >
+          <rect x={0} y={0} width={W} height={H} fill={COLORS.surface} />
+          <LiveMapTiles width={W} height={H} viewport={viewport} />
+          {/* Full trail — the "static overlay" half of the request, always
+              visible regardless of playback position. */}
+          <polyline points={polylinePoints} fill="none" stroke={COLORS.blue} strokeWidth={3} strokeOpacity={0.75} strokeLinecap="round" strokeLinejoin="round" />
+          {/* Start/end markers so the trail's direction is obvious even
+              before pressing play. */}
+          {trail.length > 0 && (() => { const p = projectToSvg(trail[0].lat, trail[0].lng, W, H, viewport); return <circle cx={p.x} cy={p.y} r={5} fill={COLORS.green} stroke={COLORS.panel} strokeWidth={1.5} />; })()}
+          {trail.length > 0 && (() => { const p = projectToSvg(trail[trail.length - 1].lat, trail[trail.length - 1].lng, W, H, viewport); return <circle cx={p.x} cy={p.y} r={5} fill={COLORS.red} stroke={COLORS.panel} strokeWidth={1.5} />; })()}
+          {/* Current scrub position — the "replay" half of the request. */}
+          {currentPos && <GpsTrailCarMarker x={currentPos.x} y={currentPos.y} heading={current.heading} color={COLORS.amber} />}
+        </svg>
+      </div>
+      <div style={{ padding: "10px 14px", background: COLORS.panel, borderTop: `1px solid ${COLORS.wire}`, flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <Button title={playing ? "⏸" : "▶"} variant="amber" size="sm" onClick={() => setPlaying(p => !p)} style={{ width: 44 }} disabled={trail.length <= 1} />
+          <input
+            type="range" min={0} max={Math.max(0, trail.length - 1)} value={currentIndex}
+            onChange={e => { setPlaying(false); setCurrentIndex(Number(e.target.value)); }}
+            style={{ flex: 1 }}
+          />
+          <span style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap" }}>{currentIndex + 1} / {trail.length}</span>
+        </div>
+        <div style={{ display: "flex", gap: 14, fontSize: 10, color: COLORS.chalk }}>
+          <span><span style={{ color: COLORS.ghost }}>TIME: </span>{fmtTs(current?.recorded_at)}</span>
+          {current?.speed_kmh != null && <span><span style={{ color: COLORS.ghost }}>SPEED: </span>{Math.round(current.speed_kmh)} km/h</span>}
+        </div>
+      </div>
+    </div>
   );
 }
 
