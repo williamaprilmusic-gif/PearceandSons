@@ -930,37 +930,124 @@ function WeeklyOpsSummaryPanel({ state }) {
   );
 }
 
-function computeGroupSuggestions(unassigned) {
+// Time: candidate bookings' scheduled_time must be within this many
+// minutes of the anchor booking's scheduled_time. A booking missing
+// scheduled_time is treated as compatible (mirrors isDriverOnShift's
+// "no trip time = always available" tolerance, AdminSection.jsx:288).
+const GROUP_SUGGESTION_TIME_WINDOW_MIN = 25;
+
+function scheduledTimeToMinutes(timeStr) {
+  if (!timeStr) return null;
+  const [h, m] = timeStr.split(":").map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  return h * 60 + m;
+}
+
+// Resolves the ONE company a booking belongs to via its first agent's
+// branch_id — same field scopeTripsToCompany (AdminSection.jsx:95-100)
+// reads. Bookings pre-dispatch normally carry exactly one agent, so
+// agent_ids[0] is a safe anchor.
+function bookingCompanyId(usersById, trip) {
+  const agentId = trip.agent_ids?.[0];
+  if (agentId == null) return null;
+  return usersById.get(String(agentId))?.branch_id ?? null;
+}
+
+// Resolves the agent's home AREA — direction-agnostic, since home is the
+// pickup point for INBOUND and the drop-off point for OUTBOUND, so "same
+// home area" is the right grouping signal either way without branching
+// on trip.direction here. FOUND VIA explicit correction: raw distance
+// (the old `haversineKm(...) <= 8` gate) was replaced with this — same
+// field the existing manual area filter already relies on.
+function bookingHomeArea(usersById, trip) {
+  const agentId = trip.agent_ids?.[0];
+  if (agentId == null) return null;
+  return usersById.get(String(agentId))?.home_address?.area || null;
+}
+
+// Distance used only as a secondary ranking signal (not a gate) among
+// candidates that already passed the area/company/time checks — pickup
+// coord for INBOUND, drop-off coord for OUTBOUND, matching whichever leg
+// actually varies per agent in that direction.
+function bookingRankCoord(trip) {
+  return trip.direction === "OUTBOUND" ? trip.dropoff_sequence_coords?.[0] : trip.pickup_sequence_coords?.[0];
+}
+
+export function computeGroupSuggestions(unassigned, users = [], driverStatus = []) {
+  const usersById = new Map(users.map(u => [String(u.id), u]));
   const suggestions = [];
   const used = new Set();
+
   for (let i = 0; i < unassigned.length; i++) {
     if (used.has(i)) continue;
     const a = unassigned[i];
-    const aCoord = a.pickup_sequence_coords?.[0];
-    if (!aCoord?.lat) continue;
-    const group = [a];
-    const groupIdxs = [i];
+    const aArea = bookingHomeArea(usersById, a);
+    if (!aArea) continue; // can't safely group without a resolved home area
+    const aCompanyId = bookingCompanyId(usersById, a);
+    if (aCompanyId == null) continue;
+    const aTimeMin = scheduledTimeToMinutes(a.scheduled_time);
+    const aRankCoord = bookingRankCoord(a);
+
+    // Dynamic capacity cap — replaces the old hard-coded 4. Prefers the
+    // largest vehicle among drivers on shift for THIS booking's
+    // date/time (isDriverOnShift, AdminSection.jsx:285), falls back to
+    // the largest vehicle in the whole fleet, falls back to
+    // DRIVER_CAPACITY if driver_status is empty.
+    const onShiftCaps = driverStatus
+      .filter(ds => isDriverOnShift(ds, a.scheduled_date, a.scheduled_time))
+      .map(ds => ds.capacity || DRIVER_CAPACITY);
+    const fleetCaps = driverStatus.map(ds => ds.capacity || DRIVER_CAPACITY);
+    const groupCap = onShiftCaps.length ? Math.max(...onShiftCaps)
+      : (fleetCaps.length ? Math.max(...fleetCaps) : DRIVER_CAPACITY);
+
+    // Collect every valid candidate, then sort by distance — the old
+    // version grabbed whichever match appeared first in raw array
+    // order, which could skip a genuinely closer booking sitting a few
+    // slots further down the unassigned list.
+    const candidates = [];
     for (let j = i + 1; j < unassigned.length; j++) {
       if (used.has(j)) continue;
       const b = unassigned[j];
       if (b.scheduled_date !== a.scheduled_date) continue;
       if (b.direction !== a.direction) continue;
-      const bCoord = b.pickup_sequence_coords?.[0];
-      if (!bCoord?.lat) continue;
-      const distKm = haversineKm(aCoord.lat, aCoord.lng, bCoord.lat, bCoord.lng);
-      if (distKm > 8) continue;
-      // No agent overlap
-      const aAgents = new Set(a.agent_ids || []);
-      const hasOverlap = (b.agent_ids || []).some(id => aAgents.has(id));
-      if (hasOverlap) continue;
-      group.push(b);
-      groupIdxs.push(j);
-      if (group.length >= 4) break; // cap at 4 per suggestion
+      const bTimeMin = scheduledTimeToMinutes(b.scheduled_time);
+      if (aTimeMin != null && bTimeMin != null && Math.abs(aTimeMin - bTimeMin) > GROUP_SUGGESTION_TIME_WINDOW_MIN) continue;
+      const bCompanyId = bookingCompanyId(usersById, b);
+      if (bCompanyId == null || bCompanyId !== aCompanyId) continue;
+      const bArea = bookingHomeArea(usersById, b);
+      if (!bArea || bArea !== aArea) continue;
+      const bRankCoord = bookingRankCoord(b);
+      const distKm = (aRankCoord?.lat != null && bRankCoord?.lat != null)
+        ? haversineKm(aRankCoord.lat, aRankCoord.lng, bRankCoord.lat, bRankCoord.lng)
+        : Infinity; // no coord = ranked last, but still eligible on area/company/time
+      candidates.push({ idx: j, trip: b, distKm });
     }
+    candidates.sort((x, y) => x.distKm - y.distKm);
+
+    const group = [a];
+    const groupIdxs = [i];
+    const groupAgentIds = new Set(a.agent_ids || []);
+    for (const c of candidates) {
+      if (group.length >= groupCap) break;
+      // Tracked cumulatively against every agent already in the group,
+      // not just the anchor's agents, so a booking sharing an agent
+      // with an already-added 2nd/3rd member can't slip in either.
+      const hasOverlap = (c.trip.agent_ids || []).some(id => groupAgentIds.has(id));
+      if (hasOverlap) continue;
+      group.push(c.trip);
+      groupIdxs.push(c.idx);
+      (c.trip.agent_ids || []).forEach(id => groupAgentIds.add(id));
+    }
+
     if (group.length >= 2) {
       groupIdxs.forEach(idx => used.add(idx));
       const totalPax = group.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-      suggestions.push({ trips: group, totalPax, date: a.scheduled_date, direction: a.direction });
+      const timeLabels = group.map(t => t.scheduled_time).filter(Boolean).sort();
+      suggestions.push({
+        trips: group, totalPax, date: a.scheduled_date, direction: a.direction,
+        companyId: aCompanyId, area: aArea,
+        earliestTime: timeLabels[0] || null, latestTime: timeLabels[timeLabels.length - 1] || null,
+      });
     }
   }
   return suggestions;
@@ -3455,19 +3542,25 @@ function AdminDispatch({ state, dispatch }) {
         </div>
       )}
       {(() => {
-        const suggestions = computeGroupSuggestions(unassignedAllDates.filter(t => !selectedTripIds.has(t.trip_id)));
+        const suggestions = computeGroupSuggestions(unassignedAllDates.filter(t => !selectedTripIds.has(t.trip_id)), state.users, state.driver_status);
         if (!suggestions.length) return null;
         return (
           <div style={{ marginBottom: 10 }}>
             <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.green, letterSpacing: 1, marginBottom: 6 }}>💡 COMBINE SUGGESTED</div>
-            {suggestions.map((sg, i) => (
-              <div key={i} style={{ background: "rgba(29,185,84,0.06)", border: "1px solid rgba(29,185,84,0.25)", borderRadius: 4, padding: "8px 10px", marginBottom: 6 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.green }}>{sg.trips.length} bookings · {sg.date} · {sg.direction} · {sg.totalPax} passengers</div>
-                <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{sg.trips.map(t => t.agent_name || t.trip_id).join(", ")} — pickups within 8 km of each other</div>
-                <Button title="SELECT ALL FOR COMBINING" variant="ghost" size="sm" style={{ marginTop: 6, borderColor: COLORS.green, color: COLORS.green }}
-                  onClick={() => { setSelectedTripIds(new Set(sg.trips.map(t => t.trip_id))); setSelectedDriverId(null); }} />
-              </div>
-            ))}
+            {suggestions.map((sg, i) => {
+              const companyLabel = companyById(state, sg.companyId)?.label || "Unknown company";
+              const timeSpread = sg.earliestTime && sg.latestTime && sg.earliestTime !== sg.latestTime
+                ? `${sg.earliestTime}–${sg.latestTime}` : (sg.earliestTime || "");
+              return (
+                <div key={i} style={{ background: "rgba(29,185,84,0.06)", border: "1px solid rgba(29,185,84,0.25)", borderRadius: 4, padding: "8px 10px", marginBottom: 6 }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.green }}>{sg.trips.length} bookings · {sg.date} · {sg.direction} · {sg.totalPax} passengers</div>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{companyLabel} · {sg.area}{timeSpread ? ` · ${timeSpread}` : ""}</div>
+                  <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>{sg.trips.map(t => t.agent_name || t.trip_id).join(", ")}</div>
+                  <Button title="SELECT ALL FOR COMBINING" variant="ghost" size="sm" style={{ marginTop: 6, borderColor: COLORS.green, color: COLORS.green }}
+                    onClick={() => { setSelectedTripIds(new Set(sg.trips.map(t => t.trip_id))); setSelectedDriverId(null); }} />
+                </div>
+              );
+            })}
           </div>
         );
       })()}

@@ -28,7 +28,9 @@ import {
   TRIP_STATE,
   ROLE,
   ADMIN_LEVEL,
+  DRIVER_CAPACITY,
 } from "../TransitOS_web.jsx";
+import { computeGroupSuggestions } from "../admin/AdminSection.jsx";
 
 const feeRates = {
   normal_zar: 100,
@@ -341,5 +343,98 @@ describe("computeDriverHoursToday / computeDriverHoursThisWeek — worked-time f
       state: TRIP_STATE.ARCHIVED_COMPLETED,
     }];
     expect(computeDriverHoursThisWeek(7, trips)).toBeCloseTo(3, 5);
+  });
+});
+
+describe("computeGroupSuggestions — dispatch pooling suggestions", () => {
+  const mkUser = (id, branch_id, area) => ({
+    id, role: ROLE.AGENT, branch_id, home_address: { area, lat: -33.93, lng: 18.45 },
+  });
+  const mkTrip = (trip_id, agent_ids, overrides = {}) => ({
+    trip_id, agent_ids, direction: "INBOUND", scheduled_date: "2026/08/17", scheduled_time: "06:00",
+    pickup_sequence_coords: [{ lat: -33.93, lng: 18.45 }],
+    dropoff_sequence_coords: [{ lat: -33.92, lng: 18.42 }],
+    ...overrides,
+  });
+
+  it("groups two same-date/direction/company/area bookings within the time window", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock")];
+    const trips = [mkTrip("T1", [1]), mkTrip("T2", [2], { scheduled_time: "06:15" })];
+    const suggestions = computeGroupSuggestions(trips, users, []);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].trips.map(t => t.trip_id).sort()).toEqual(["T1", "T2"]);
+    expect(suggestions[0].area).toBe("Woodstock");
+  });
+
+  it("does not group bookings more than the time window apart", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock")];
+    const trips = [mkTrip("T1", [1], { scheduled_time: "06:00" }), mkTrip("T2", [2], { scheduled_time: "07:00" })];
+    expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
+  });
+
+  it("does not group bookings from different companies, even with matching area/date/direction/time", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 2, "Woodstock")];
+    const trips = [mkTrip("T1", [1]), mkTrip("T2", [2])];
+    expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
+  });
+
+  it("does not group bookings from different home areas, even with matching company/date/direction/time", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Observatory")];
+    const trips = [mkTrip("T1", [1]), mkTrip("T2", [2])];
+    expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
+  });
+
+  it("reads area from the agent's home for OUTBOUND trips too, not the shared office pickup", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock")];
+    const trips = [mkTrip("T1", [1], { direction: "OUTBOUND" }), mkTrip("T2", [2], { direction: "OUTBOUND" })];
+    const suggestions = computeGroupSuggestions(trips, users, []);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].area).toBe("Woodstock");
+  });
+
+  it("caps a group at the max on-shift driver capacity when it exceeds the default of 4", () => {
+    const users = [1, 2, 3, 4, 5].map(id => mkUser(id, 1, "Woodstock"));
+    const trips = [1, 2, 3, 4, 5].map(id => mkTrip(`T${id}`, [id]));
+    const driverStatus = [{ driver_id: "D1", capacity: 6 }];
+    const suggestions = computeGroupSuggestions(trips, users, driverStatus);
+    expect(suggestions).toHaveLength(1);
+    expect(suggestions[0].trips).toHaveLength(5); // all 5 fit under a cap of 6
+  });
+
+  it("falls back to DRIVER_CAPACITY when driverStatus is empty", () => {
+    const users = [1, 2, 3, 4, 5].map(id => mkUser(id, 1, "Woodstock"));
+    const trips = [1, 2, 3, 4, 5].map(id => mkTrip(`T${id}`, [id]));
+    const suggestions = computeGroupSuggestions(trips, users, []);
+    expect(suggestions[0].trips).toHaveLength(DRIVER_CAPACITY);
+  });
+
+  it("prefers the nearer of two eligible candidates over raw array order", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock"), mkUser(3, 1, "Woodstock")];
+    const trips = [
+      mkTrip("Anchor", [1], { pickup_sequence_coords: [{ lat: -33.930, lng: 18.450 }] }),
+      mkTrip("Farther", [2], { pickup_sequence_coords: [{ lat: -33.960, lng: 18.500 }] }),
+      mkTrip("Nearer", [3], { pickup_sequence_coords: [{ lat: -33.931, lng: 18.451 }] }),
+    ];
+    const driverStatus = [{ driver_id: "D1", capacity: 2 }]; // room for only 1 more
+    const suggestions = computeGroupSuggestions(trips, users, driverStatus);
+    expect(suggestions[0].trips.map(t => t.trip_id)).toEqual(["Anchor", "Nearer"]);
+  });
+
+  it("does not let a candidate overlap an already-added group member's agent (not just the anchor's)", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock"), mkUser(3, 1, "Woodstock")];
+    const trips = [
+      mkTrip("A", [1]),
+      mkTrip("B", [2]),
+      mkTrip("C", [3, 2]), // shares agent 2 with B, not with A directly
+    ];
+    const driverStatus = [{ driver_id: "D1", capacity: 10 }];
+    const suggestions = computeGroupSuggestions(trips, users, driverStatus);
+    expect(suggestions[0].trips.map(t => t.trip_id)).toEqual(["A", "B"]);
+  });
+
+  it("never groups a booking whose agent can't be resolved (missing company/area)", () => {
+    const users = [mkUser(1, 1, "Woodstock")]; // agent 2 deliberately absent
+    const trips = [mkTrip("A", [1]), mkTrip("B", [2])];
+    expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
   });
 });
