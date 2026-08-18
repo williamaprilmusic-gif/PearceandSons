@@ -3423,23 +3423,34 @@ function AdminDispatch({ state, dispatch }) {
     setSelectedTripIds(prev => {
       const next = new Set(prev);
       if (next.has(tripId)) { next.delete(tripId); return next; }
-      // Block adding a trip whose agent is already in the current
-      // selection — UNLESS this is a week-booking series (same agent,
-      // several days), where repeating the agent across selected trips
-      // is expected and correct, not a mistake. Checked fresh here
-      // rather than reusing the component-level isMultiDaySelection,
-      // since that reflects the CURRENT selection, not the prospective
-      // one after this trip is added.
+      // Block adding a trip whose agent already appears on another
+      // SELECTED TRIP FOR THE SAME DATE — that's a genuine duplicate (the
+      // same person can't ride on two bookings being combined for one
+      // day). The same agent appearing on a DIFFERENT date is expected
+      // and fine (a week series), since different dates never merge into
+      // one trip record anyway (see isMultiDaySelection/
+      // TRIP/BULK_ASSIGN_DRIVER, which assigns each date independently).
+      //
+      // FOUND VIA DIRECT USER REPORT ("it doesn't allow me to select all
+      // the outbound to one driver" — 3 agents, each with their own
+      // 6-day week series): the old check required EVERY currently-
+      // selected trip to share ONE week_group_id before allowing a
+      // repeat agent through at all. The moment a second agent's booking
+      // was also selected (a totally normal "these people ride
+      // together" case), that global check failed, and adding the FIRST
+      // agent's next day got wrongly flagged as a duplicate — the same
+      // root cause as the capacity bug just fixed, just in the
+      // selection guard instead of the seat math.
       const tripBeingAdded = unassigned.find(t => String(t.trip_id) === String(tripId));
-      const currentlySelected = unassigned.filter(t => next.has(t.trip_id));
-      const isSameWeekSeries = tripBeingAdded?.week_group_id && currentlySelected.every(t => String(t.week_group_id) === String(tripBeingAdded.week_group_id));
-      if (!isSameWeekSeries && tripBeingAdded) {
+      if (tripBeingAdded) {
+        const currentlySelected = unassigned.filter(t => next.has(t.trip_id));
+        const sameDateSelected = currentlySelected.filter(t => t.scheduled_date === tripBeingAdded.scheduled_date);
         const incomingAgentIds = new Set(tripBeingAdded.agent_ids || []);
-        const alreadySelectedAgentIds = new Set(currentlySelected.flatMap(t => t.agent_ids || []));
-        const overlap = [...incomingAgentIds].find(id => alreadySelectedAgentIds.has(id));
+        const alreadySelectedAgentIdsSameDate = new Set(sameDateSelected.flatMap(t => t.agent_ids || []));
+        const overlap = [...incomingAgentIds].find(id => alreadySelectedAgentIdsSameDate.has(id));
         if (overlap) {
           const overlapName = state.users.find(u => String(u.id) === String(overlap))?.name || "This agent";
-          setMsg(`✗ ${overlapName} is already on another selected booking — combining two of the same agent's bookings isn't a valid merge.`);
+          setMsg(`✗ ${overlapName} is already on another selected booking for this date — combining two of the same agent's bookings on the same day isn't a valid merge.`);
           setTimeout(() => setMsg(null), 4000);
           return next; // unchanged — the tap is rejected
         }
