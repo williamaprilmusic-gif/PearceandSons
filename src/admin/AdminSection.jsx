@@ -3353,17 +3353,31 @@ function AdminDispatch({ state, dispatch }) {
   // audit trail and for which agent's name the merge notification uses,
   // so this is insertion order, not sorted order.
   const primaryTrip = selectedTrips[0] || null;
-  // A week booking creates one SEPARATE trip per day (each needs its own
-  // route) — if every selected trip shares the same week_group_id, this
-  // is one agent's week, not several different agents to merge together
-  // for a shared ride. Summing seats across days would be meaningless
-  // (day 1's passenger and day 3's passenger are the same person on
-  // different days, not two people sharing one vehicle at once), so
-  // capacity is checked PER TRIP instead, and the whole selection routes
-  // to TRIP/BULK_ASSIGN_DRIVER (each day assigned independently) rather
-  // than the merge-into-one-trip path DISPATCH_MULTI uses.
-  const isWeekBookingSelection = selectedTrips.length > 1 && selectedTrips.every(t => t.week_group_id && String(t.week_group_id) === String(primaryTrip?.week_group_id));
-  const totalSeats = isWeekBookingSelection ? Math.max(...selectedTrips.map(t => t.agent_ids.length), 0) : selectedTrips.reduce((n, t) => n + t.agent_ids.length, 0);
+  // A selection spanning more than one calendar date needs capacity
+  // checked PER DAY, not summed across the whole selection — day 1's
+  // passengers and day 3's passengers never share a vehicle at the same
+  // time, so summing them is meaningless. The whole selection routes to
+  // TRIP/BULK_ASSIGN_DRIVER (each trip assigned independently — its
+  // handler auto-merges same-day trips server-side) rather than the
+  // merge-into-one-trip path DISPATCH_MULTI uses for a single day.
+  //
+  // FOUND VIA DIRECT USER REPORT (3 agents each with their own separate
+  // week-long return-trip series, assigned to one driver together, got
+  // "13/4 seats — exceeds vehicle capacity"): this used to require every
+  // selected trip to share ONE week_group_id, which only ever holds for
+  // a SINGLE agent's own recurring series. The moment several different
+  // agents' week series are selected together — a totally normal
+  // "these 3 people ride together every day" case — each agent has their
+  // own week_group_id, the check failed, and totalSeats fell through to
+  // the flat sum-everything branch: 3 agents × 6 days summed as if all
+  // 18 bookings needed one vehicle simultaneously. The real constraint is
+  // just "how many agents does this driver carry on this vehicle's
+  // busiest single day" — computed below per calendar date, regardless
+  // of whether one agent or several own the trips on that date.
+  const seatsByDate = new Map();
+  for (const t of selectedTrips) seatsByDate.set(t.scheduled_date, (seatsByDate.get(t.scheduled_date) || 0) + t.agent_ids.length);
+  const isMultiDaySelection = seatsByDate.size > 1;
+  const totalSeats = isMultiDaySelection ? Math.max(...seatsByDate.values(), 0) : selectedTrips.reduce((n, t) => n + t.agent_ids.length, 0);
   const overCapacity = totalSeats > DRIVER_CAPACITY;
   // A vehicle trip should combine enough agent bookings to fill it at
   // least 75% (3 of 4 seats) before dispatching a driver — a single
@@ -3375,7 +3389,7 @@ function AdminDispatch({ state, dispatch }) {
   // repeated across several days is not "several agents sharing a ride"
   // and was never the kind of under-filled trip this rule targets.
   const MIN_FULL_PCT = 0.75;
-  const underCapacityWarning = !isWeekBookingSelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
+  const underCapacityWarning = !isMultiDaySelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
   const availableDriversRaw = state.driver_status.filter(ds => {
     // Feature 7: shift filtering — exclude drivers not rostered for this time slot.
     // isDriverOnShift returns true when no schedule is set (backward compat).
@@ -3390,10 +3404,15 @@ function AdminDispatch({ state, dispatch }) {
     // (e.g. a 2-seat sedan) showed as available for a booking their real
     // car can't fit.
     const driverCapacity = ds.capacity || DRIVER_CAPACITY;
-    if (isWeekBookingSelection) {
-      return selectedTrips.every(t => {
-        if (!isDriverOnShift(ds, t.scheduled_date, tripTimeStr)) return false;
-        return getDriverLoad(state, ds.driver_id, t.scheduled_date) + Math.max(1, t.agent_ids.length) <= driverCapacity;
+    if (isMultiDaySelection) {
+      // Check each distinct date against its FULL batch total (every
+      // selected trip's agents landing on that date, from seatsByDate
+      // above) — not just one trip's own agent count. A driver who
+      // already has room for agent A alone on day 1 isn't necessarily
+      // able to also take agent B's day-1 booking from this same batch.
+      return [...seatsByDate.entries()].every(([date, seats]) => {
+        if (!isDriverOnShift(ds, date, tripTimeStr)) return false;
+        return getDriverLoad(state, ds.driver_id, date) + Math.max(1, seats) <= driverCapacity;
       });
     }
     const checkDate = primaryTrip?.scheduled_date;
@@ -3408,7 +3427,7 @@ function AdminDispatch({ state, dispatch }) {
       // selection — UNLESS this is a week-booking series (same agent,
       // several days), where repeating the agent across selected trips
       // is expected and correct, not a mistake. Checked fresh here
-      // rather than reusing the component-level isWeekBookingSelection,
+      // rather than reusing the component-level isMultiDaySelection,
       // since that reflects the CURRENT selection, not the prospective
       // one after this trip is added.
       const tripBeingAdded = unassigned.find(t => String(t.trip_id) === String(tripId));
@@ -3488,7 +3507,7 @@ function AdminDispatch({ state, dispatch }) {
     if (!primaryTrip || !selectedDriverId) return;
     const driverName = state.users.find(u => String(u.id) === String(selectedDriverId))?.name;
     try {
-      if (isWeekBookingSelection) {
+      if (isMultiDaySelection) {
         const results = await dispatch({
           type: "TRIP/BULK_ASSIGN_DRIVER",
           trip_ids: selectedTrips.map(t => t.trip_id),
@@ -3658,12 +3677,12 @@ function AdminDispatch({ state, dispatch }) {
             <span style={{ fontSize: 10, color: COLORS.mist }}>
               {selectedTrips.length === 1
                 ? <>Assigning: <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> — {primaryTrip.custom_pickup}</>
-                : isWeekBookingSelection
-                ? <>Assigning <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
+                : isMultiDaySelection
+                ? <>Assigning <span style={{ color: COLORS.amber }}>{new Set(selectedTrips.flatMap(t => t.agent_ids || [])).size} agent{new Set(selectedTrips.flatMap(t => t.agent_ids || [])).size !== 1 ? "s" : ""}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
                 : <>Combining <span style={{ color: COLORS.amber }}>{selectedTrips.length} bookings</span> ({selectedTrips.reduce((n, t) => n + (t.agent_ids?.length || 1), 0)} passengers total) onto {primaryTrip.trip_id}</>}
             </span>
             <span style={{ fontSize: 9, color: overCapacity ? COLORS.red : COLORS.ghost }}>
-              {isWeekBookingSelection
+              {isMultiDaySelection
                 ? `${totalSeats}/${DRIVER_CAPACITY} seats on the busiest day${overCapacity ? " — exceeds vehicle capacity" : ""}`
                 : `${totalSeats}/${DRIVER_CAPACITY} seats${overCapacity ? " — exceeds vehicle capacity, remove a trip" : ""}`}
             </span>
@@ -3753,7 +3772,7 @@ function AdminDispatch({ state, dispatch }) {
                 <CapacityBar load={load} capacity={driverCapacityDispatch} />
                 {sel && (
                   <Button
-                    title={isWeekBookingSelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"}
+                    title={isMultiDaySelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"}
                     variant="amber" full onClick={(e) => { e.stopPropagation(); handleDispatch(); }}
                   />
                 )}
