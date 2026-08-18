@@ -7040,15 +7040,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // this one).
         if (action.capacity !== undefined) {
           const { data: activeTripsForCap } = await supabase.from("trips")
-            .select("id, agentid, extraagentids, driverroutekm")
+            .select("id, agentid, extraagentids, driverroutekm, scheduleddate")
             .eq("driverid", action.user_id)
             .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
           if (activeTripsForCap && activeTripsForCap.length > 0) {
-            const totalPassengersForCap = activeTripsForCap.reduce((n, t) => n + 1 + (t.extraagentids || []).length, 0);
-            // All of a driver's active trips share the same computed
-            // whole-day route distance (stamped identically by
-            // TRIP/ASSIGN_DRIVER) — max() is just a defensive read in case
-            // any one row is out of sync, not an aggregation.
+            // Per-day max, not a flat sum across every date — FOUND VIA
+            // DIRECT USER REPORT ("COMPLIANCE: ... vehicle overloaded",
+            // fixed together with TRIP/ASSIGN_DRIVER and siblings): a
+            // driver with several different future-dated trips isn't
+            // carrying all of them at once, so summing every row's
+            // passenger count regardless of date produced a false
+            // overload warning on a routine capacity edit.
+            const seatsByDateForCap = new Map();
+            for (const t of activeTripsForCap) seatsByDateForCap.set(t.scheduleddate, (seatsByDateForCap.get(t.scheduleddate) || 0) + 1 + (t.extraagentids || []).length);
+            const totalPassengersForCap = Math.max(...seatsByDateForCap.values(), 0);
+            // All of a driver's active trips ON THE SAME DAY share the
+            // same computed whole-day route distance (stamped identically
+            // by TRIP/ASSIGN_DRIVER) — max() across every date instead
+            // finds the worst single day's route, now that different
+            // dates legitimately carry different values post-fix.
             const routeKmForCap = Math.max(0, ...activeTripsForCap.map(t => t.driverroutekm || 0));
             const capComplianceIssues = checkComplianceTriggers(
               { name: target.fullname }, { capacity: action.capacity }, routeKmForCap, totalPassengersForCap
@@ -7124,7 +7134,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // sequencing continues from, re-sequence drop-offs too rather than
       // leaving dropsequencenum stale after a mid-route passenger add.
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+        // Scoped to the SAME DATE as the trip being modified — FOUND VIA
+        // DIRECT USER REPORT ("COMPLIANCE: Driver 1's vehicle capacity is
+        // 4 but 12 passengers are assigned"): this used to fetch the
+        // driver's ENTIRE active-trip backlog across every date, then
+        // route-sequenced and summed passengers across ALL of it as if a
+        // driver's whole week were one simultaneous vehicle load. Same
+        // root cause as getDriverLoad's own documented reasoning (a
+        // driver's trips on the SAME day all run on one vehicle at once;
+        // different days never do) — just not yet applied here.
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED).eq("scheduleddate", tripRow.scheduleddate);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
           const extra = (String(r.id) === String(action.trip_id) ? newExtraPickups : (r.extrapickups || [])).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
@@ -7262,7 +7281,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
 
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+        // Scoped to the SAME DATE as the trip being modified — same fix
+        // as TRIP/ADD_AGENT, TRIP/RELOCATE_AGENT, TRIP/ADMIN_CANCEL, and
+        // TRIP/ASSIGN_DRIVER (all found and fixed together): the
+        // driver's route/compliance numbers must never be computed
+        // across their whole multi-day backlog at once.
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED).eq("scheduleddate", tripRow.scheduleddate);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const isThisTrip = String(r.id) === String(action.trip_id);
           const first = (isThisTrip ? update.pickuplat ?? r.pickuplat : r.pickuplat) != null
@@ -7386,7 +7410,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
 
       if (tripRow.driverid) {
-        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+        // Scoped to the SAME DATE as the trip being modified — same fix
+        // as TRIP/ADD_AGENT, TRIP/REMOVE_AGENT, TRIP/ADMIN_CANCEL, and
+        // TRIP/ASSIGN_DRIVER (all found and fixed together): the
+        // driver's route/compliance numbers must never be computed
+        // across their whole multi-day backlog at once.
+        const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED).eq("scheduleddate", tripRow.scheduleddate);
         const allForDriver = (driverTripsRaw || []).map(r => {
           const isThisTrip = String(r.id) === String(action.trip_id);
           const lat = isThisTrip ? (update.pickuplat ?? r.pickuplat) : r.pickuplat;
@@ -8187,8 +8216,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // re-check firing either way (a route that's now genuinely fine
         // could keep showing as exceeding policy, or vice versa).
         if (remaining && remaining.length > 0) {
+          // Scoped to the SAME DATE as the cancelled trip — same fix as
+          // TRIP/ADD_AGENT, TRIP/REMOVE_AGENT, TRIP/RELOCATE_AGENT, and
+          // TRIP/ASSIGN_DRIVER (all found and fixed together): the
+          // driver's route/compliance numbers must never be computed
+          // across their whole multi-day backlog at once.
           const { data: driverTripsRawCancel } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid)
-            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+            .eq("scheduleddate", tripRow.scheduleddate);
           const allForDriverCancel = (driverTripsRawCancel || []).map(r => {
             const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
             const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
@@ -8824,7 +8859,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const assignDriverCapacitySupa = driverRow.capacity || DRIVER_CAPACITY;
       if (currentLoad + incomingSeats > assignDriverCapacitySupa) throw new Error(`Driver doesn't have room — ${currentLoad}/${assignDriverCapacitySupa} seats taken, this trip needs ${incomingSeats}.`);
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
-      const existingAssigned = (driverTripsRaw || []).filter(t => String(t.id) !== String(action.trip_id));
+      // FOUND VIA DIRECT USER REPORT ("COMPLIANCE: Driver 1's vehicle
+      // capacity is 4 but 12 passengers are assigned"): this used the
+      // UNSCOPED driverTripsRaw (every active trip across every date)
+      // instead of the already-correctly-date-scoped
+      // driverTripsRawSameDay computed two lines above for the real
+      // capacity gate — so while the capacity CHECK above was correctly
+      // per-day, the route sequencing and totalAgentCountAssign fed into
+      // the compliance check below still summed the driver's entire
+      // multi-day backlog as one vehicle load. Same root cause fixed
+      // together with TRIP/ADD_AGENT, TRIP/REMOVE_AGENT,
+      // TRIP/RELOCATE_AGENT, and TRIP/ADMIN_CANCEL.
+      const existingAssigned = driverTripsRawSameDay.filter(t => String(t.id) !== String(action.trip_id));
       const allForDriver = [...existingAssigned, { ...tripRow, driverid: action.driver_id }].map(r => {
         const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
         const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
