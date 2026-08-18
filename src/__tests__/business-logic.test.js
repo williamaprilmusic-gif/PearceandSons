@@ -25,6 +25,7 @@ import {
   docExpiryStatus,
   computeDriverHoursToday,
   computeDriverHoursThisWeek,
+  cropTrailToPickupWindow,
   TRIP_STATE,
   ROLE,
   ADMIN_LEVEL,
@@ -436,5 +437,59 @@ describe("computeGroupSuggestions — dispatch pooling suggestions", () => {
     const users = [mkUser(1, 1, "Woodstock")]; // agent 2 deliberately absent
     const trips = [mkTrip("A", [1]), mkTrip("B", [2])];
     expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
+  });
+});
+
+describe("cropTrailToPickupWindow — GPS trail crop (temporal + spatial)", () => {
+  const PICKUP = { lat: -33.891199, lng: 18.484883 };
+
+  it("returns the trail unchanged when no timestamps exist yet, even if a point happens to sit near pickup", () => {
+    // Regression test for a real bug: the spatial snap used to run even
+    // with no pickup confirmed yet, risking discarding legitimate
+    // in-progress-trip trail data on a coincidental near-pickup point.
+    const trail = [
+      { lat: -33.9, lng: 18.4, recorded_at: 1000 },
+      { lat: PICKUP.lat, lng: PICKUP.lng, recorded_at: 2000 },
+      { lat: -34.0, lng: 18.6, recorded_at: 3000 },
+    ];
+    expect(cropTrailToPickupWindow(trail, {}, {}, PICKUP)).toEqual(trail);
+  });
+
+  it("crops the trail to the pickup->dropoff time window", () => {
+    const trail = [100, 200, 300, 400].map(recorded_at => ({ lat: 0, lng: 0, recorded_at }));
+    const result = cropTrailToPickupWindow(trail, { a: 200 }, { a: 300 }, null);
+    expect(result.map(p => p.recorded_at)).toEqual([200, 300]);
+  });
+
+  it("falls back to the full trail (lenient) or null (strict) when the time window catches zero points", () => {
+    const trail = [{ lat: 0, lng: 0, recorded_at: 100 }];
+    expect(cropTrailToPickupWindow(trail, { a: 500 }, { a: 600 }, null)).toEqual(trail);
+    expect(cropTrailToPickupWindow(trail, { a: 500 }, { a: 600 }, null, { strict: true })).toBeNull();
+  });
+
+  it("snaps the crop start to the first point near ANY of several pickup coordinates", () => {
+    // A multi-agent INBOUND trip has one pickup per agent, and the
+    // driver doesn't necessarily visit the primary agent's first.
+    const trail = [
+      { lat: -30, lng: 20, recorded_at: 100 }, // far from every pickup
+      { lat: PICKUP.lat, lng: PICKUP.lng, recorded_at: 200 }, // near the 2nd coord
+      { lat: -34, lng: 18.5, recorded_at: 300 },
+    ];
+    const result = cropTrailToPickupWindow(trail, { a: 100 }, {}, [{ lat: -20, lng: 10 }, PICKUP]);
+    expect(result.map(p => p.recorded_at)).toEqual([200, 300]);
+  });
+
+  it("leaves the trail unchanged (lenient) or returns null (strict) when no point is ever near the pickup", () => {
+    const trail = [
+      { lat: -30, lng: 20, recorded_at: 100 },
+      { lat: -31, lng: 21, recorded_at: 200 },
+    ];
+    expect(cropTrailToPickupWindow(trail, { a: 100 }, {}, PICKUP)).toEqual(trail);
+    expect(cropTrailToPickupWindow(trail, { a: 100 }, {}, PICKUP, { strict: true })).toBeNull();
+  });
+
+  it("returns null (strict) or an empty trail (lenient) when the raw trail itself is empty", () => {
+    expect(cropTrailToPickupWindow([], {}, {}, null, { strict: true })).toBeNull();
+    expect(cropTrailToPickupWindow([], {}, {}, null)).toEqual([]);
   });
 });

@@ -64,6 +64,7 @@ import {
   getAdminCompanyIds,
   getDriverLoad,
   haversineKm,
+  cropTrailToPickupWindow,
   isCompanyScoped,
   isMasterAdmin,
   notifySessionExpired,
@@ -799,7 +800,13 @@ function computeWeeklySummary(trips, users, driverStatus) {
   const rejections = lastWeek.filter(t => t.rejection_reason);
   const noShows = lastWeek.filter(t => (t.no_shows || []).length > 0);
   const totalPax = completed.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-  const totalKm = completed.reduce((n, t) => n + (t.actual_distance_km || t.est_distance_km || 0), 0);
+  // actual_distance_km (real GPS-trail distance) is already road-
+  // following and must not be multiplied by ROAD_FACTOR again — only
+  // the est_distance_km fallback (no usable trail for that trip) still
+  // needs it. `!= null` rather than `||`, so a genuine 0 doesn't
+  // wrongly fall through to the estimate. FOUND VIA /code-review.
+  const routeKmFor = (t) => t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0);
+  const totalKm = completed.reduce((n, t) => n + routeKmFor(t), 0);
 
   // Per-driver stats for the week
   const driverStats = {};
@@ -811,7 +818,7 @@ function computeWeeklySummary(trips, users, driverStatus) {
     }
     driverStats[t.driver_id].trips++;
     driverStats[t.driver_id].pax += (t.agent_ids?.length || 1);
-    driverStats[t.driver_id].km += (t.actual_distance_km || t.est_distance_km || 0);
+    driverStats[t.driver_id].km += routeKmFor(t);
   }
   for (const t of rejections) {
     if (!t.rejection_driver_id) continue;
@@ -2207,6 +2214,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
                   direction={trip.direction}
                   pickupTimestamps={trip.pickup_timestamps}
                   dropoffTimestamps={trip.dropoff_timestamps}
+                  pickupCoords={trip.pickup_sequence_coords}
                   // OUTBOUND (work→home) drops each agent at their own
                   // home, so the drop-offs are the interesting per-agent
                   // stops; INBOUND (home→work) picks each agent up at
@@ -4744,7 +4752,7 @@ function GpsTrailCarMarker({ x, y, heading, color }) {
 // tile primitives (projectToSvg, LiveMapTiles, lonLatToWorldPixel) so the
 // two maps look and feel consistent, but keeps its own viewport/pan/zoom
 // state rather than sharing AdminLiveMap's component-internal handlers.
-function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupTimestamps, dropoffTimestamps, onClose }) {
+function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupTimestamps, dropoffTimestamps, pickupCoords, onClose }) {
   const W = 900, H = 600;
   const svgRef = useRef(null);
   const dragRef = useRef(null);
@@ -4752,20 +4760,14 @@ function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupT
 
   // Crop the raw driver_position_log trail down to the pickup→last-dropoff
   // window — per explicit request ("gps trail should show from the pickup
-  // to the last drop off"). driver_position_log logs for the whole time a
-  // trip is active, which can include driving TO the first pickup and
-  // idle time after the last dropoff before the trip gets marked
-  // complete; this trims both. pickup_timestamps/dropoff_timestamps are
-  // keyed by agent id (see tripRowToApp), so the earliest pickup and
-  // latest dropoff cover both directions with the same logic: OUTBOUND
-  // has one shared pickup (so "the pickup" IS the earliest/only one) and
-  // several per-agent dropoffs; INBOUND has several per-agent pickups (so
-  // "the first pickup" is the earliest) and one shared dropoff. Falls
-  // back to the untrimmed side, or the full trail, when a timestamp isn't
-  // available yet (e.g. an in-progress trip before any dropoff has been
-  // confirmed) or when the crop would leave nothing (GPS samples land
-  // every ~25s, so the nearest logged point can fall just outside the
-  // exact confirm timestamp).
+  // to the last drop off"), via the shared cropTrailToPickupWindow
+  // (TransitOS_web.jsx) — also used by computeActualRouteKm for the real
+  // driven-distance calculation. Lenient mode here (the default): falls
+  // back to showing more of the trail rather than less when the data
+  // itself doesn't cooperate, since an admin looking at a map benefits
+  // from seeing what's recorded even if the crop couldn't be fully
+  // trusted — unlike computeActualRouteKm's strict mode, this is just a
+  // display, not a figure driver pay depends on.
   // startTs/endTs are primitives (not the pickupTimestamps/dropoffTimestamps
   // object refs, which get rebuilt on every state refetch) so this memo
   // only recomputes when the actual confirm times change, not on every
@@ -4774,11 +4776,21 @@ function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupT
   const dropoffTsValues = Object.values(dropoffTimestamps || {}).filter(v => typeof v === "number");
   const startTs = pickupTsValues.length ? Math.min(...pickupTsValues) : null;
   const endTs = dropoffTsValues.length ? Math.max(...dropoffTsValues) : null;
-  const trail = React.useMemo(() => {
-    if (startTs == null && endTs == null) return rawTrail;
-    const cropped = rawTrail.filter(p => (startTs == null || p.recorded_at >= startTs) && (endTs == null || p.recorded_at <= endTs));
-    return cropped.length > 0 ? cropped : rawTrail;
-  }, [rawTrail, startTs, endTs]);
+  // tripId, not pickupCoords, gates this memo — FOUND VIA /code-review:
+  // pickup_sequence_coords is rebuilt with a new array reference by
+  // tripRowToApp on every state refetch/poll, same problem the
+  // startTs/endTs-as-primitives trick already exists to avoid for
+  // pickupTimestamps/dropoffTimestamps. A trip's pickup coordinates
+  // never change once booked, and this modal is remounted fresh per
+  // trip (tripId is constant for its whole lifetime), so tripId is a
+  // stable, correct proxy — using the array reference directly would
+  // have silently re-run the full crop (including the per-point haversine
+  // spatial scan) on every background poll while the modal stayed open.
+  const trail = React.useMemo(
+    () => cropTrailToPickupWindow(rawTrail, pickupTimestamps, dropoffTimestamps, pickupCoords),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rawTrail, startTs, endTs, tripId]
+  );
 
   // Fit the viewport to the trail's own bounds on open — same
   // pick-a-zoom-that-fits approach as AdminLiveMap's fitAllDrivers, just

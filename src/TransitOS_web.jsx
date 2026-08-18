@@ -4730,7 +4730,16 @@ function appReducer(state, action) {
         const completeNowTs = Date.now();
         const newTrips = state.trips.map(t =>
           String(t.trip_id) === String(action.trip_id)
-            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km,
+            // Offline/fallback store has no async Supabase/GPS-trail access
+            // (this reducer is synchronous), so it can't compute a real
+            // driven distance the way the Supabase-backed handlers now do
+            // — pre-multiplying by ROAD_FACTOR here instead keeps
+            // actual_distance_km's contract ("already road-following, do
+            // not multiply again") true regardless of which path set it.
+            // FOUND VIA /code-review: leaving this as a raw copy would
+            // have silently underpaid a driver's extra-km bonus by ~26%
+            // whenever a trip completed via this fallback path.
+            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : null,
                 completed_dropoffs: newCompletedDropoffs, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations }
             : t
         );
@@ -4889,7 +4898,10 @@ function appReducer(state, action) {
       const newTrips = state.trips.map(t =>
         String(t.trip_id) === String(action.trip_id)
           ? {
-              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km,
+              // Pre-multiplied by ROAD_FACTOR — see the identical fix/
+              // comment on this same field a few cases above (TRIP/
+              // CONFIRM_AGENT_DROPOFF's completion branch).
+              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : null,
               completed_dropoffs: [...t.agent_ids], dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations,
             }
           : t
@@ -5768,13 +5780,24 @@ function userRowToApp(row) {
 function driverStatusRowToApp(row) {
   return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_away: row.isaway || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
 }
-function tripRowToApp(row, chatByTrip) {
+// Every pickup coordinate on a raw trip row (primary + extras), in the
+// same shape tripRowToApp exposes as pickup_sequence_coords — shared so
+// computeActualRouteKm's spatial snap (called directly with this row
+// below) can't silently drift out of sync with what a trip's own pickup
+// list actually is. FOUND VIA /code-review: these used to be two
+// independent copies of the same assembly logic.
+function pickupSequenceCoordsFromRow(row) {
   // phone included on the primary coord (row.phone IS the primary agent's
   // own booking-time number — required at booking) so a per-agent phone
   // lookup can read pickup_sequence_coords uniformly for every agent,
   // primary or extra, instead of needing a special case for index 0.
   const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid, phone: row.phone }] : [];
   const extraPickups = Array.isArray(row.extrapickups) ? row.extrapickups : [];
+  return [...firstPickup, ...extraPickups];
+}
+
+function tripRowToApp(row, chatByTrip) {
+  const pickupSequenceCoords = pickupSequenceCoordsFromRow(row);
   // Per-agent dropoffs — primary agent uses dropofflat/lng/label; extra agents
   // use extradropoffs (parallel to extrapickups). For INBOUND trips all agents
   // drop at the same company location, so extradropoffs is typically empty and
@@ -5784,7 +5807,7 @@ function tripRowToApp(row, chatByTrip) {
   const extraDropoffs = Array.isArray(row.extradropoffs) ? row.extradropoffs : [];
   return {
     trip_id: row.id, agent_ids: [row.agentid, ...(row.extraagentids || [])].filter(Boolean), driver_id: row.driverid, state: row.status,
-    pickup_sequence_coords: [...firstPickup, ...extraPickups],
+    pickup_sequence_coords: pickupSequenceCoords,
     dropoff_sequence_coords: extraDropoffs.length > 0 ? [...firstDropoff, ...extraDropoffs] : firstDropoff,
     completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
     no_shows: row.noshows || [],
@@ -5968,6 +5991,106 @@ export async function fetchGpsTrailForTrip(tripId) {
   const { data, error } = await supabase.from("driver_position_log").select("*").eq("tripid", tripId).order("recordedat", { ascending: true });
   if (error) throw error;
   return (data || []).map(r => ({ lat: r.lat, lng: r.lng, heading: r.heading, speed_kmh: r.speed_kmh, recorded_at: r.recordedat }));
+}
+
+// A rough GPS fix taken before the driver was really at the pickup point
+// (stale/delayed location lock) puts the trail's first recorded point
+// implausibly far from the pickup address — same issue GpsTrailModal's
+// spatial sanity check guards against on the admin map. 1.5km tolerates
+// normal GPS drift around a real address without accepting a point the
+// driver clearly hadn't reached yet.
+export const PICKUP_SNAP_RADIUS_KM = 1.5;
+
+// Crops a raw GPS trail down to the pickup->last-dropoff window, checked
+// both temporally (recorded_at within [min(pickupTimestamps),
+// max(dropoffTimestamps)]) and spatially (snaps the crop's start forward
+// to the first point actually near ANY of the trip's pickup coordinates
+// — pickupCoords accepts one coord or an array, since a multi-agent
+// INBOUND trip has one pickup per agent and pickup_sequence_coords is in
+// insertion order, not necessarily the order the driver actually visits
+// them in, so only checking the primary agent's own coordinate could
+// wrongly reject a trail that legitimately starts at a DIFFERENT agent's
+// pickup first). Shared by the admin GPS trail viewer and
+// computeActualRouteKm below — FOUND VIA /code-review: these used to be
+// two independent copies that had already started disagreeing on
+// fallback behavior.
+//
+// `strict` controls what happens when the data itself doesn't cooperate
+// (no point in the window, or no point ever near any pickup coord):
+// lenient (default, GpsTrailModal's use) falls back to showing more of
+// the trail rather than less, since an admin looking at a map benefits
+// from seeing what's recorded even if the crop couldn't be trusted;
+// strict (computeActualRouteKm's use) returns null instead, since that
+// feeds a financial figure (driver pay) where an untrustworthy distance
+// is worse than falling back to the pre-trip estimate.
+export function cropTrailToPickupWindow(trail, pickupTimestamps, dropoffTimestamps, pickupCoords, { strict = false } = {}) {
+  if (!trail.length) return strict ? null : trail;
+  const pickupTsValues = Object.values(pickupTimestamps || {}).filter(v => typeof v === "number");
+  const dropoffTsValues = Object.values(dropoffTimestamps || {}).filter(v => typeof v === "number");
+  const startTs = pickupTsValues.length ? Math.min(...pickupTsValues) : null;
+  const endTs = dropoffTsValues.length ? Math.max(...dropoffTsValues) : null;
+  let cropped = trail;
+  if (startTs != null || endTs != null) {
+    const windowed = trail.filter(p => (startTs == null || p.recorded_at >= startTs) && (endTs == null || p.recorded_at <= endTs));
+    if (windowed.length > 0) cropped = windowed;
+    else if (strict) return null;
+  }
+  // Only run the spatial snap once a real pickup has actually been
+  // confirmed (startTs exists) — FOUND VIA /code-review: without this
+  // guard, viewing an in-progress trip's live trail BEFORE any pickup is
+  // confirmed (both timestamp maps still empty, so the temporal crop
+  // above is a no-op) let the snap fire against the WHOLE unfiltered
+  // trail, including points from before this trip genuinely started
+  // (e.g. the tail of a driver's previous trip). If any of those happen
+  // to sit within range of this trip's pickup coordinate, that's a
+  // coincidence, not evidence the driver has arrived — and slicing the
+  // trail there would silently discard real, legitimate early tracking
+  // data for a trip that hasn't even reached its pickup yet.
+  const coords = startTs != null ? (Array.isArray(pickupCoords) ? pickupCoords : [pickupCoords]).filter(c => c?.lat != null) : [];
+  if (coords.length > 0) {
+    const firstIdx = cropped.findIndex(p => coords.some(c => haversineKm(p.lat, p.lng, c.lat, c.lng) <= PICKUP_SNAP_RADIUS_KM));
+    if (firstIdx === -1) { if (strict) return null; }
+    else if (firstIdx > 0) cropped = cropped.slice(firstIdx);
+  }
+  return cropped;
+}
+
+// Real distance actually driven for this trip, computed from the
+// recorded GPS trail rather than the pre-trip route estimate — per
+// explicit request ("use the exact kms used from first pickup to last
+// drop off and not an estimated kms"). Sums consecutive real-road-
+// following point-to-point distances across the cropped trail. Unlike
+// est_distance_km/driver_route_km (both pre-trip estimates that need
+// the synthetic ROAD_FACTOR multiplier to approximate road distance
+// from a straight line), this sum is already threaded through real
+// recorded road positions — callers must NOT re-apply ROAD_FACTOR to
+// it. Returns null (caller should fall back to the estimate) when
+// there's no usable trail.
+async function computeActualRouteKm(tripId, pickupTimestamps, dropoffTimestamps, pickupCoords) {
+  try {
+    const trail = await fetchGpsTrailForTrip(tripId);
+    const cropped = cropTrailToPickupWindow(trail, pickupTimestamps, dropoffTimestamps, pickupCoords, { strict: true });
+    if (!cropped || cropped.length < 2) return null;
+    let total = 0;
+    for (let i = 1; i < cropped.length; i++) {
+      total += haversineKm(cropped[i - 1].lat, cropped[i - 1].lng, cropped[i].lat, cropped[i].lng);
+    }
+    return total;
+  } catch (e) {
+    console.warn("[computeActualRouteKm] failed:", e.message);
+    return null;
+  }
+}
+
+// The pre-trip estimate, road-adjusted — for use as the actualdistancekm
+// fallback when computeActualRouteKm returns null (no usable GPS trail).
+// FOUND VIA /code-review: the two real Supabase completion handlers were
+// writing tripRow.estdistancekm RAW here, un-multiplied — the exact
+// underpayment bug this whole change was fixing, just left in place on
+// this specific fallback branch (the offline/fallback reducer's
+// equivalent branch got this right).
+function estimatedRouteKm(tripRow) {
+  return tripRow.estdistancekm != null ? tripRow.estdistancekm * ROAD_FACTOR : null;
 }
 
 export async function fetchDirectMessages(userIdA, userIdB) {
@@ -9606,25 +9729,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!dropoffCompletedPickups.some(c => String(c) === String(action.agent_id))) {
         throw new Error("This agent hasn't been confirmed picked up yet.");
       }
-      const nowTs = nowEpoch();
-      // Reverse-geocode the driver's GPS to get a readable street address
-      const dropoffLabel = action.driver_coord
-        ? (action.dropoff_label || await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
-        : null;
-      // Prefer action.confirmed_at over nowTs — see the identical
-      // fix/reasoning on CONFIRM_AGENT_PICKUP above.
-      const confirmTs = action.confirmed_at ?? nowTs;
-      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
-      const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
-      if (action.driver_coord) {
-        newDropoffLocations[action.agent_id] = {
-          lat: action.driver_coord.lat,
-          lng: action.driver_coord.lng,
-          label: dropoffLabel || null,
-        };
-      }
-      const newCompletedDropoffs = [...new Set([...(tripRow.completeddropoffs || []), action.agent_id])];
-      const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) {
         // Already completed — a replayed/duplicate confirmation (e.g. the
         // offline-sync queue retrying this exact action after its success
@@ -9637,9 +9741,42 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // reconnect, forever, even though the trip completed successfully
         // the first time. Treat a replay against an already-completed trip
         // as a no-op success instead. Matches CONFIRM_AGENT_PICKUP's
-        // equivalent status guard just above.
+        // equivalent status guard just above. Checked BEFORE any
+        // reverse-geocode/GPS-trail work below, so a replay doesn't pay
+        // for network calls it's about to discard anyway.
         refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
+      }
+      const nowTs = nowEpoch();
+      // Prefer action.confirmed_at over nowTs — see the identical
+      // fix/reasoning on CONFIRM_AGENT_PICKUP above.
+      const confirmTs = action.confirmed_at ?? nowTs;
+      const newCompletedDropoffs = [...new Set([...(tripRow.completeddropoffs || []), action.agent_id])];
+      const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
+      // reverseGeocode (this agent's own dropoff address) and, only when
+      // this confirmation completes the trip, computeActualRouteKm (the
+      // trip's own recorded GPS trail) are independent — run them
+      // concurrently rather than sequentially, since this sits on the
+      // driver-facing "confirm dropoff" button's critical path.
+      // FOUND VIA /code-review (raised on both review passes — the
+      // first fix only parallelized the equivalent pair in the sibling
+      // TRIP/COMPLETE handler, not here).
+      const [dropoffLabel, actualRouteKmDrop] = await Promise.all([
+        action.driver_coord
+          ? (action.dropoff_label ? Promise.resolve(action.dropoff_label) : reverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
+          : Promise.resolve(null),
+        allDroppedOff
+          ? computeActualRouteKm(action.trip_id, tripRow.pickuptimestamps, newDropoffTimestamps, pickupSequenceCoordsFromRow(tripRow))
+          : Promise.resolve(null),
+      ]);
+      const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
+      if (action.driver_coord) {
+        newDropoffLocations[action.agent_id] = {
+          lat: action.driver_coord.lat,
+          lng: action.driver_coord.lng,
+          label: dropoffLabel || null,
+        };
       }
       if (allDroppedOff) {
         // All agents dropped off — complete the trip
@@ -9653,7 +9790,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const completeRes = must(await supabase.from("trips").update({
           status: TRIP_STATE.ARCHIVED_COMPLETED,
           completedat: nowTs,
-          actualdistancekm: tripRow.estdistancekm,
+          actualdistancekm: actualRouteKmDrop ?? estimatedRouteKm(tripRow),
           completeddropoffs: newCompletedDropoffs,
           dropofftimestamps: newDropoffTimestamps,
           dropofflocations: newDropoffLocations,
@@ -9790,14 +9927,23 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // and this confirms the drop event happened, not just the booking.
       const tripAgentIdsForDrop = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}) };
+      tripAgentIdsForDrop.forEach(id => { newDropoffTimestamps[id] = nowTs; });
+      // reverseGeocode (the driver's current position) and
+      // computeActualRouteKm (the trip's own recorded GPS trail) are
+      // independent — run them concurrently rather than sequentially,
+      // since this sits on the driver-facing "complete trip" button's
+      // critical path and neither depends on the other's result.
+      // FOUND VIA /code-review.
+      const [dropoffLabel, actualRouteKmComplete] = await Promise.all([
+        action.driver_coord ? reverseGeocode(action.driver_coord.lat, action.driver_coord.lng) : Promise.resolve(null),
+        computeActualRouteKm(
+          action.trip_id, tripRow.pickuptimestamps, newDropoffTimestamps, pickupSequenceCoordsFromRow(tripRow)
+        ),
+      ]);
+      // Stamp the resolved dropoff label for every agent on the trip
+      // (they all exit at the same spot).
       const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
-      // Reverse-geocode the driver's GPS position at drop-off time once,
-      // then stamp it for every agent on the trip (they all exit at the same spot).
-      const dropoffLabel = action.driver_coord
-        ? await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng)
-        : null;
       tripAgentIdsForDrop.forEach(id => {
-        newDropoffTimestamps[id] = nowTs;
         if (action.driver_coord) newDropoffLocations[id] = {
           lat: action.driver_coord.lat,
           lng: action.driver_coord.lng,
@@ -9812,7 +9958,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // UI has already moved on, and a silently-blocked driver_status
       // write leaves them stuck BUSY/unavailable for new dispatch.
       const completeRes = must(await supabase.from("trips").update({
-        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: tripRow.estdistancekm,
+        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: actualRouteKmComplete ?? estimatedRouteKm(tripRow),
         completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, dropofflocations: newDropoffLocations, updatedat: nowTs,
       }).eq("id", action.trip_id).select("id"));
       if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
@@ -14630,7 +14776,20 @@ function DriverDeclineModal({ trip, user, dispatch, onClose }) {
 function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTarget }) {
   const myStatus = state.driver_status.find(d => String(d.driver_id) === String(user.id));
   const myCapacity = myStatus?.capacity || DRIVER_CAPACITY;
-  const active = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+  // Chronological by date+time first, THEN pickup_order_num — FOUND VIA
+  // DIRECT USER REPORT: sorting purely by pickup_order_num (a PER-DAY
+  // sequence number) put a driver's trips in an effectively random order
+  // the moment their assignments spanned more than one date, since day
+  // 6's "pickup #1" isn't comparable to day 1's "pickup #2" at all.
+  // Same-date trips still fall back to pickup_order_num for correct
+  // within-day ordering.
+  const active = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)).sort((a, b) => {
+    const dateCmp = (a.scheduled_date || "").localeCompare(b.scheduled_date || "");
+    if (dateCmp !== 0) return dateCmp;
+    const timeCmp = (a.scheduled_time || "").localeCompare(b.scheduled_time || "");
+    if (timeCmp !== 0) return timeCmp;
+    return (a.pickup_order_num || 99) - (b.pickup_order_num || 99);
+  });
   // "FULLY BOOKED" badge scoped to TODAY only, via getDriverLoad — FOUND
   // VIA DIRECT USER REPORT (same bug as the home-screen header badge):
   // this used to sum agent_ids across every active trip regardless of
@@ -14707,7 +14866,15 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
       </Card>
 
       <SectionHeader label={`Assigned Passengers (${totalPassengers})`} />
-      {active.length === 0 ? <Empty icon="⊟" text="No assigned trips" /> : active.map(trip => {
+      {active.length === 0 ? <Empty icon="⊟" text="No assigned trips" /> : (() => {
+        // Date-group headers — per explicit request: once a driver's
+        // assignments span more than one day (now sorted chronologically
+        // above), a flat list gives no visual cue where one day ends and
+        // the next begins. Tracked via a plain closure variable across
+        // the map rather than a separate grouping pass, since `active`
+        // is already in the right order for a single linear scan.
+        let lastGroupDate = null;
+        return active.map(trip => {
         const pickupCoord = trip.pickup_sequence_coords?.[0];
         // A trip can carry multiple agents (extraagentids) — resolve every
         // one of them to a real user record and their own pickup point,
@@ -14725,8 +14892,16 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
           };
         });
         const isExpanded = expandedTripIds.has(trip.trip_id);
+        const showDateHeader = trip.scheduled_date !== lastGroupDate;
+        lastGroupDate = trip.scheduled_date;
         return (
-          <Card key={trip.trip_id}>
+          <React.Fragment key={trip.trip_id}>
+          {showDateHeader && (
+            <div style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 800, color: COLORS.chalk, letterSpacing: 1, textTransform: "uppercase", marginTop: 14, marginBottom: 2 }}>
+              {formatTripDateForDriver(trip.scheduled_date)}
+            </div>
+          )}
+          <Card>
             <div onClick={() => toggleTripExpanded(trip.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 {/* Direction indicator — green up-triangle for INBOUND
@@ -14869,8 +15044,10 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
             </div>
           )}
           </Card>
+          </React.Fragment>
         );
-      })}
+        });
+      })()}
 
       {chatWith && (
         <TripChatModal
@@ -16351,12 +16528,15 @@ function DriverHistoryTab({ myTrips, state }) {
         || t.custom_dropoff || "—";
       return { name: agentUser?.name || t.agent_name || "Agent", pickupLabel, dropLabel };
     });
-    // Full multi-stop route total — route_total_km/driver_route_km is the
-    // driver's ENTIRE run (first pickup through last drop-off across every
-    // passenger on this trip), which is what "kms driven" should mean here.
-    // actual_distance_km is a single-leg figure and understates a merged
-    // trip's real distance.
-    const fullRouteKm = t.route_total_km ?? t.driver_route_km ?? t.actual_distance_km;
+    // Full multi-stop route total — "kms driven" should mean the driver's
+    // ENTIRE run (first pickup through last drop-off across every
+    // passenger on this trip), not any one passenger's own leg.
+    // actual_distance_km is now the REAL post-trip distance (computed
+    // from the recorded GPS trail once the trip completes), which is
+    // more authoritative than the pre-trip route_total_km/driver_route_km
+    // estimates when available — null for any trip not yet completed, so
+    // this still falls through to the estimates correctly for those.
+    const fullRouteKm = t.actual_distance_km ?? t.route_total_km ?? t.driver_route_km;
     return (
       <Card key={t.trip_id}>
         <div onClick={() => toggleExpanded(t.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -16378,7 +16558,18 @@ function DriverHistoryTab({ myTrips, state }) {
                 {p.pickupLabel} → {p.dropLabel}
               </div>
             ))}
-            {fullRouteKm != null && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 4 }}>Full route: {(fullRouteKm * (t.route_total_km != null || t.driver_route_km != null ? 1 : ROAD_FACTOR)).toFixed(1)} km</div>}
+            {/* No ROAD_FACTOR here — actual_distance_km (real GPS trail),
+                route_total_km, and driver_route_km are ALL already
+                road-following distances (the latter two computed via
+                TomTom, or via computeDriverRouteDistanceKm's own
+                internal ROAD_FACTOR multiplication as its fallback), so
+                none of fullRouteKm's possible sources need it applied
+                again here. FOUND VIA /code-review: the old conditional
+                (factor 1 if route_total_km/driver_route_km were set,
+                else ROAD_FACTOR) assumed actual_distance_km was always
+                the LAST fallback and always raw — both no longer true
+                now that actual_distance_km is real and checked first. */}
+            {fullRouteKm != null && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 4 }}>Full route: {fullRouteKm.toFixed(1)} km</div>}
             <div style={{ fontSize: 9, color: COLORS.dim, marginTop: 4 }}>{t.completed_at}</div>
           </>
         )}
@@ -16520,7 +16711,14 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
         const done = myTrips.filter(t => t.state === "ARCHIVED_COMPLETED" && tripArchiveBucket(t) === "CURRENT");
         if (done.length === 0) return null;
         const passengers = done.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-        const km = done.reduce((n, t) => n + (Number(t.actual_distance_km ?? t.est_distance_km) || 0), 0);
+        // actual_distance_km (real GPS-trail distance) is already road-
+        // following and must not be multiplied by ROAD_FACTOR again —
+        // only the est_distance_km fallback (no usable trail for that
+        // trip) still needs it. FOUND VIA /code-review: this used to sum
+        // the raw values then apply ROAD_FACTOR once to the whole total,
+        // which silently inflated real per-trip distances by 35% the
+        // moment actual_distance_km became a real (not estimated) figure.
+        const km = done.reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0)), 0);
         return (
           <Card>
             <SectionHeader label="Performance — this month" />
@@ -16528,7 +16726,7 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
               {[
                 ["TRIPS COMPLETED", String(done.length)],
                 ["PASSENGERS", String(passengers)],
-                ["DISTANCE", `${(km * ROAD_FACTOR).toFixed(0)} km`],
+                ["DISTANCE", `${km.toFixed(0)} km`],
               ].map(([l, v]) => (
                 <div key={l} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: 10 }}>
                   <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 1 }}>{l}</div>
@@ -16536,7 +16734,7 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
                 </div>
               ))}
             </div>
-            <span style={{ fontSize: 8, color: COLORS.ghost }}>Distance uses the same 1.35× road-distance estimate as trip records.</span>
+            <span style={{ fontSize: 8, color: COLORS.ghost }}>Distance is each trip's actual recorded GPS route where available, otherwise a road-distance estimate.</span>
           </Card>
         );
       })()}
@@ -16968,7 +17166,14 @@ export function tripDriverPayment(t, feeRates) {
   // never populated, and correctly yields 0 for a genuine empty array.
   const successfulAgentCount = t.completed_dropoffs != null
     ? t.completed_dropoffs.length : (t.agent_ids || []).length;
-  const roadKm = t.actual_distance_km != null ? t.actual_distance_km * ROAD_FACTOR
+  // actual_distance_km is the REAL distance driven, computed from the
+  // trip's own recorded GPS trail (pickup to last drop-off) — already
+  // real-road-following, so it must NOT be multiplied by ROAD_FACTOR
+  // again (that synthetic multiplier only approximates road distance
+  // from a straight line, which is all est_distance_km ever was). Only
+  // the est_distance_km fallback (no usable GPS trail for this trip)
+  // still needs it.
+  const roadKm = t.actual_distance_km != null ? t.actual_distance_km
     : t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0;
   const extraKm = Math.max(0, roadKm - 40);
   const perAgent = successfulAgentCount * feeRates.driver_pay_per_agent_zar;
@@ -17224,7 +17429,9 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         actualDropOrderFor(t, aid) || "",
         // Financials
         t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
-        t.actual_distance_km != null ? (t.actual_distance_km * ROAD_FACTOR).toFixed(1) : "",
+        // actual_distance_km is already a real road-following distance —
+        // see tripDriverPayment's identical fix/comment.
+        t.actual_distance_km != null ? t.actual_distance_km.toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
         // Driver route
         (t.route_total_km ?? t.driver_route_km) != null ? (t.route_total_km ?? t.driver_route_km).toFixed(1) : "",
@@ -17620,8 +17827,14 @@ function ClientPortalSummaryCard({ trips, label }) {
   const exceptions = trips.filter(t => t.is_exception).length;
   const pax = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
     .reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
+  // actual_distance_km (real GPS-trail distance) is already road-
+  // following and must not be multiplied by ROAD_FACTOR again — only
+  // the est_distance_km fallback (no usable trail for that trip) still
+  // needs it. FOUND VIA /code-review: same class of bug as
+  // DriverProfileTab's "Performance — this month" card and
+  // tripDriverPayment.
   const km = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
-    .reduce((n, t) => n + (Number(t.actual_distance_km ?? t.est_distance_km) || 0), 0);
+    .reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0)), 0);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {label && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, letterSpacing: 0.5 }}>{label}</div>}
@@ -17666,7 +17879,9 @@ function ClientPortalTripRow({ trip, users }) {
       <div style={{ textAlign: "right", flexShrink: 0 }}>
         <div style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>{trip.state.replace(/_/g, " ")}</div>
         {(trip.est_distance_km || trip.actual_distance_km) && (
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>{(trip.actual_distance_km ?? trip.est_distance_km).toFixed(1)} km</div>
+          // actual_distance_km is already road-following — see the
+          // identical fix/comment on the summary card above.
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{(trip.actual_distance_km ?? (trip.est_distance_km * ROAD_FACTOR)).toFixed(1)} km</div>
         )}
       </div>
     </div>
