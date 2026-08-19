@@ -45,6 +45,7 @@ import {
   computeDriverStats,
   computeFleetUtilization,
   copyShareLink,
+  csvEscapeCell,
   defaultCompanyAnchor,
   docExpiryStatus,
   driverAvgRating,
@@ -537,19 +538,6 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
     "No-Show Count","Delay Reports","Actual Distance (km)","Audit Actions",
   ];
 
-  // Safely wrap a value for CSV — escape quotes and wrap in quotes if needed
-  const csvCell = (v) => {
-    if (v == null || v === "") return "";
-    let s = String(v);
-    // CSV/formula-injection guard — see the identical fix/comment on the
-    // escapeCsv definitions elsewhere in this file for the full rationale.
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    if (s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")) {
-      return `"${s.replace(/"/g, '""')}"`;
-    }
-    return s;
-  };
-
   // Type-safe ID comparison — bigint vs string vs number all normalised to string
   const idEq = (a, b) => String(a) === String(b);
 
@@ -635,15 +623,15 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
       // TomTom-computed one) shown in this column anymore.
       t.actual_distance_km ?? "",
       auditSummary,
-    ].map(csvCell);
+    ].map(csvEscapeCell);
   });
 
   // Pinned to SAST — see fmtEpoch above for why this document's timestamps
   // can't be allowed to silently follow the exporting device's own clock.
   const now = new Date().toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" });
   const csvLines = [
-    csvCell(`# Pearce & Sons Compliance Audit Export — Generated: ${now}`),
-    csvCell(`# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`),
+    csvEscapeCell(`# Pearce & Sons Compliance Audit Export — Generated: ${now}`),
+    csvEscapeCell(`# Period: ${fromDateStr} to ${toDateStr} — Trips: ${inRange.length}`),
     "# This document constitutes a complete operational audit trail.",
     "",
     headers.join(","),
@@ -3215,16 +3203,9 @@ function AdminHistory({ state, user, dispatch }) {
 
 function fleetUtilizationToCsv(rows) {
   const headers = ["Driver", "Trips", "Driving (hrs)", "Loading/Dispatch Lag (hrs)", "Gap Between Trips (hrs)"];
-  const escapeCsv = (val) => {
-    let s = val == null ? "" : String(val);
-    // CSV/formula-injection guard — see the identical fix/comment on the
-    // other escapeCsv definitions in this file for the full rationale.
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const toHrs = (ms) => (ms / (1000 * 60 * 60)).toFixed(2);
   const dataRows = rows.map(r => [r.driver_name, r.trips, toHrs(r.driving_ms), toHrs(r.loading_ms), toHrs(r.gap_ms)]);
-  const csv = [headers, ...dataRows].map(r => r.map(escapeCsv).join(",")).join("\r\n");
+  const csv = [headers, ...dataRows].map(r => r.map(csvEscapeCell).join(",")).join("\r\n");
   return "﻿" + csv;
 }
 
@@ -5694,20 +5675,6 @@ function usersToCsv(users, driverStatusList) {
     "Admin Level", "Home Address", "Home Area", "Home Lat", "Home Lng", "Company",
     "Vehicle", "Phone",
   ];
-  const escapeCsv = (val) => {
-    let s = val == null ? "" : String(val);
-    // CSV/formula-injection guard — see the identical fix/comment on the
-    // other escapeCsv definitions in this file for the full rationale.
-    // Especially relevant here: this export includes Login/Password
-    // fields, a more sensitive target than most.
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    // Must also catch a lone \r (not just \r\n) — matches the other CSV
-    // escaper in this file (csvCell, compliance audit export) which
-    // already checks for it; this one didn't, so a field containing a
-    // bare carriage return could slip through unquoted and corrupt row
-    // boundaries for CSV parsers that treat lone \r as a line break.
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const rows = users.map(u => {
     const ds = u.role === ROLE.DRIVER ? driverStatusList.find(d => String(d.driver_id) === String(u.id)) : null;
     return [
@@ -5723,7 +5690,7 @@ function usersToCsv(users, driverStatusList) {
       ds?.vehicle || "", ds?.phone || "",
     ];
   });
-  const csv = [headers, ...rows].map(r => r.map(escapeCsv).join(",")).join("\r\n");
+  const csv = [headers, ...rows].map(r => r.map(csvEscapeCell).join(",")).join("\r\n");
   return "\uFEFF" + csv;
 }
 

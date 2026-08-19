@@ -1347,6 +1347,50 @@ function companyPolicyDistanceCapKm(totalAgentCount) {
   return 40 * Math.max(1, totalAgentCount);
 }
 
+// Shared route/compliance recompute — every dispatch handler that changes a
+// driver's stop list (TRIP/ADD_AGENT, TRIP/REMOVE_AGENT, TRIP/RELOCATE_AGENT,
+// TRIP/ADMIN_CANCEL, TRIP/ASSIGN_DRIVER, and TRIP/ASSIGN_DRIVER's own
+// merge-target branch) needs this exact same sequencing + distance +
+// policy-cap computation given the driver's active-trip row skeletons
+// (each { trip_id, pickup_sequence_coords, dropoff_sequence_coords,
+// direction }) for one date. This was hand-duplicated 6 times — found via
+// a redundancy audit — and it's the reason the date-scoping bug (driver
+// route/compliance math summing a driver's whole multi-day backlog
+// instead of one date) needed 5 separate edits to fix, and why the
+// merge-target branch below still had that exact same unscoped-backlog
+// bug even after that round of fixes, having been missed entirely.
+//
+// 4 of the 6 duplicated copies also independently derived departEpoch via
+// `rows.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0]` —
+// these row skeletons never actually carry a scheduled_time_epoch field,
+// so that expression always evaluated to an empty array and departEpoch
+// was silently always null, discarding TomTom's traffic-aware,
+// time-of-day-dependent routing every time. Callers now compute
+// departEpoch themselves from the real scheduledtime column on their
+// fetched rows and pass it in explicitly (matching what the other 2
+// correct copies already did, generalized to the earliest departure
+// across the whole group rather than just one trip).
+async function recomputeDriverRouteAndCompliance(driverTripRows, companyAnchor, departEpoch) {
+  const ordered = await buildPickupSequenceTomTom(driverTripRows, companyAnchor, departEpoch);
+  const dropOrdered = buildDropoffSequence(driverTripRows, dropoffAnchor(driverTripRows, ordered, companyAnchor));
+  const seqMap = {}, dropMap = {};
+  ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+  dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+  const totalAgentCount = driverTripRows.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
+  const tomtomKm = await tomtomRealRouteKm(companyAnchor, ordered, dropOrdered, departEpoch);
+  const routeDistanceKm = tomtomKm ?? computeDriverRouteDistanceKm(companyAnchor, ordered, dropOrdered);
+  const policyCapKm = companyPolicyDistanceCapKm(totalAgentCount);
+  const exceedsPolicy = routeDistanceKm > policyCapKm;
+  return { seqMap, dropMap, totalAgentCount, routeDistanceKm, policyCapKm, exceedsPolicy, tomtomKm };
+}
+
+// Earliest scheduledtime among a set of raw (DB-shaped) trip rows — used
+// to derive recomputeDriverRouteAndCompliance's departEpoch consistently.
+function earliestScheduledTime(rawRows) {
+  const times = rawRows.map(r => r.scheduledtime).filter(t => t != null).sort((a, b) => a - b);
+  return times[0] ?? null;
+}
+
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
 export const now = () => new Date().toLocaleString("en-ZA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
 // now() returns a formatted display string, which is what the in-memory
@@ -7312,17 +7356,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const departEpochAdd = allForDriver.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochAdd);
-        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
-        const seqMap = {}, dropMap = {};
-        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
-        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
-        const totalAgentCountAdd = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmAdd = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochAdd);
-        const routeDistanceKmAdd = tomtomKmAdd ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
-        const policyCapKmAdd = companyPolicyDistanceCapKm(totalAgentCountAdd);
-        const exceedsPolicyAdd = routeDistanceKmAdd > policyCapKmAdd;
+        const departEpochAdd = earliestScheduledTime(driverTripsRaw || []);
+        const {
+          seqMap, dropMap, totalAgentCount: totalAgentCountAdd, routeDistanceKm: routeDistanceKmAdd,
+          policyCapKm: policyCapKmAdd, exceedsPolicy: exceedsPolicyAdd,
+        } = await recomputeDriverRouteAndCompliance(allForDriver, supaCo, departEpochAdd);
         for (const t of driverTripsRaw || []) {
           const patch = {};
           if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
@@ -7449,17 +7487,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const departEpochRem = tripRow.scheduledtime ?? null;
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochRem);
-        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
-        const seqMap = {}, dropMap = {};
-        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
-        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
-        const totalAgentCountRem = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmRem = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochRem);
-        const routeDistanceKmRem = tomtomKmRem ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
-        const policyCapKmRem = companyPolicyDistanceCapKm(totalAgentCountRem);
-        const exceedsPolicyRem = routeDistanceKmRem > policyCapKmRem;
+        const departEpochRem = earliestScheduledTime(driverTripsRaw || []);
+        const {
+          seqMap, dropMap, totalAgentCount: totalAgentCountRem, routeDistanceKm: routeDistanceKmRem,
+          policyCapKm: policyCapKmRem, exceedsPolicy: exceedsPolicyRem,
+        } = await recomputeDriverRouteAndCompliance(allForDriver, supaCo, departEpochRem);
         for (const t of driverTripsRaw || []) {
           const patch = {};
           if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
@@ -7578,17 +7610,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const supaCo = await fetchCompanyAnchor();
-        const departEpochReloc = tripRow.scheduledtime ?? null;
-        const ordered = await buildPickupSequenceTomTom(allForDriver, supaCo, departEpochReloc);
-        const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, supaCo));
-        const seqMap = {}, dropMap = {};
-        ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
-        dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
-        const totalAgentCountReloc = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const tomtomKmReloc = await tomtomRealRouteKm(supaCo, ordered, dropOrdered, departEpochReloc);
-        const routeDistanceKmReloc = tomtomKmReloc ?? computeDriverRouteDistanceKm(supaCo, ordered, dropOrdered);
-        const policyCapKmReloc = companyPolicyDistanceCapKm(totalAgentCountReloc);
-        const exceedsPolicyReloc = routeDistanceKmReloc > policyCapKmReloc;
+        const departEpochReloc = earliestScheduledTime(driverTripsRaw || []);
+        const {
+          seqMap, dropMap, totalAgentCount: totalAgentCountReloc, routeDistanceKm: routeDistanceKmReloc,
+          policyCapKm: policyCapKmReloc, exceedsPolicy: exceedsPolicyReloc,
+        } = await recomputeDriverRouteAndCompliance(allForDriver, supaCo, departEpochReloc);
         for (const t of driverTripsRaw || []) {
           const patch = {};
           if (seqMap[t.id] != null && seqMap[t.id] !== t.pickupordernum) patch.pickupordernum = seqMap[t.id];
@@ -8387,17 +8413,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
           });
           const supaCoCancel = await fetchCompanyAnchor();
-          const departEpochCancel = allForDriverCancel.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
-          const orderedCancel = await buildPickupSequenceTomTom(allForDriverCancel, supaCoCancel, departEpochCancel);
-          const dropOrderedCancel = buildDropoffSequence(allForDriverCancel, dropoffAnchor(allForDriverCancel, orderedCancel, supaCoCancel));
-          const seqMapCancel = {}, dropMapCancel = {};
-          orderedCancel.forEach((o, i) => { seqMapCancel[o.trip.trip_id] = i + 1; });
-          dropOrderedCancel.forEach((t, i) => { dropMapCancel[t.trip_id] = i + 1; });
-          const totalAgentCountCancel = allForDriverCancel.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-          const tomtomKmCancel = await tomtomRealRouteKm(supaCoCancel, orderedCancel, dropOrderedCancel, departEpochCancel);
-          const routeDistanceKmCancel = tomtomKmCancel ?? computeDriverRouteDistanceKm(supaCoCancel, orderedCancel, dropOrderedCancel);
-          const policyCapKmCancel = companyPolicyDistanceCapKm(totalAgentCountCancel);
-          const exceedsPolicyCancel = routeDistanceKmCancel > policyCapKmCancel;
+          const departEpochCancel = earliestScheduledTime(driverTripsRawCancel || []);
+          const {
+            seqMap: seqMapCancel, dropMap: dropMapCancel, totalAgentCount: totalAgentCountCancel,
+            routeDistanceKm: routeDistanceKmCancel, policyCapKm: policyCapKmCancel, exceedsPolicy: exceedsPolicyCancel,
+          } = await recomputeDriverRouteAndCompliance(allForDriverCancel, supaCoCancel, departEpochCancel);
           for (const t of driverTripsRawCancel || []) {
             const patch = {};
             if (seqMapCancel[t.id] != null && seqMapCancel[t.id] !== t.pickupordernum) patch.pickupordernum = seqMapCancel[t.id];
@@ -8574,7 +8594,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (acErr) throw acErr;
 
       if (acTripRow.driverid) {
-        const { data: acDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", acTripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+        // Scoped to the SAME DATE as the trip being modified — a 7th copy
+        // of the same recompute this file's other 6 dispatch handlers
+        // already share via recomputeDriverRouteAndCompliance, found via
+        // /code-review to have been missed by that consolidation (and by
+        // the original date-scoping fix it carried forward): this used to
+        // fetch the driver's ENTIRE active-trip backlog across every
+        // date, summing it as one vehicle load.
+        const { data: acDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", acTripRow.driverid).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED).eq("scheduleddate", acTripRow.scheduleddate);
         const acAllForDriver = (acDriverTripsRaw || []).map(r => {
           const isThisTrip = String(r.id) === String(action.trip_id);
           const first = (isThisTrip ? acUpdate.pickuplat ?? r.pickuplat : r.pickuplat) != null
@@ -8588,17 +8615,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           };
         });
         const acCompanyAnchor = await fetchCompanyAnchor();
-        const departEpochAc = acTripRow.scheduledtime ?? null;
-        const acOrdered = await buildPickupSequenceTomTom(acAllForDriver, acCompanyAnchor, departEpochAc);
-        const acDropOrdered = buildDropoffSequence(acAllForDriver, dropoffAnchor(acAllForDriver, acOrdered, acCompanyAnchor));
-        const acSeqMap = {}, acDropMap = {};
-        acOrdered.forEach((o, i) => { acSeqMap[o.trip.trip_id] = i + 1; });
-        acDropOrdered.forEach((t, i) => { acDropMap[t.trip_id] = i + 1; });
-        const acTotalAgentCount = acAllForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-        const acTomtomKm = await tomtomRealRouteKm(acCompanyAnchor, acOrdered, acDropOrdered, departEpochAc);
-        const acRouteDistanceKm = acTomtomKm ?? computeDriverRouteDistanceKm(acCompanyAnchor, acOrdered, acDropOrdered);
-        const acPolicyCapKm = companyPolicyDistanceCapKm(acTotalAgentCount);
-        const acExceedsPolicy = acRouteDistanceKm > acPolicyCapKm;
+        const departEpochAc = earliestScheduledTime(acDriverTripsRaw || []);
+        const {
+          seqMap: acSeqMap, dropMap: acDropMap, routeDistanceKm: acRouteDistanceKm,
+          policyCapKm: acPolicyCapKm, exceedsPolicy: acExceedsPolicy,
+        } = await recomputeDriverRouteAndCompliance(acAllForDriver, acCompanyAnchor, departEpochAc);
         for (const t of acDriverTripsRaw || []) {
           const patch = {};
           if (acSeqMap[t.id] != null && acSeqMap[t.id] !== t.pickupordernum) patch.pickupordernum = acSeqMap[t.id];
@@ -8962,7 +8983,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // DRIVER_CONFIRMED (or further along), and assertTripTransition
           // would reject a DRIVER_CONFIRMED → DRIVER_CONFIRMED self-transition
           // as illegal. Instead, inline just the sequencing recompute here.
-          const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+          // Scoped to the SAME DATE as mergeTargetTrip — this merge branch
+          // is a 6th, separately-maintained variant of the same
+          // route/compliance recompute every other dispatch handler in
+          // this file needed the same date-scoping fix for, but it was
+          // missed when that round of fixes went in everywhere else
+          // (found via the redundancy audit that finally unified all 6
+          // copies into recomputeDriverRouteAndCompliance) — this driver's
+          // ENTIRE multi-day backlog was still being summed as one vehicle
+          // load every time a merge happened.
+          const { data: driverTripsAfterMerge } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED).eq("scheduleddate", mergeTargetTrip.scheduleddate);
           const allForDriverMerge = (driverTripsAfterMerge || []).map(r => {
             const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
             const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
@@ -8974,22 +9004,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
           });
           const mergeAnchor = await fetchCompanyAnchor();
-          const departEpochMerge = allForDriverMerge.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
-          const mergeOrdered = await buildPickupSequenceTomTom(allForDriverMerge, mergeAnchor, departEpochMerge);
-          const mergeDropOrdered = buildDropoffSequence(allForDriverMerge, dropoffAnchor(allForDriverMerge, mergeOrdered, mergeAnchor));
-          const mergeSeqMap = {}, mergeDropMap = {};
-          mergeOrdered.forEach((o, i) => { mergeSeqMap[o.trip.trip_id] = i + 1; });
-          mergeDropOrdered.forEach((t, i) => { mergeDropMap[t.trip_id] = i + 1; });
-          const mergeTomtomKm = await tomtomRealRouteKm(mergeAnchor, mergeOrdered, mergeDropOrdered, departEpochMerge);
-          const mergeRouteKm = mergeTomtomKm ?? computeDriverRouteDistanceKm(mergeAnchor, mergeOrdered, mergeDropOrdered);
-          const mergeTotalSeats = allForDriverMerge.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-          const mergePolicyCap = companyPolicyDistanceCapKm(mergeTotalSeats);
+          const departEpochMerge = earliestScheduledTime(driverTripsAfterMerge || []);
+          const {
+            seqMap: mergeSeqMap, dropMap: mergeDropMap, routeDistanceKm: mergeRouteKm,
+            policyCapKm: mergePolicyCap, exceedsPolicy: mergeExceedsPolicy,
+          } = await recomputeDriverRouteAndCompliance(allForDriverMerge, mergeAnchor, departEpochMerge);
           for (const r of (driverTripsAfterMerge || [])) {
             await supabase.from("trips").update({
               pickupordernum: mergeSeqMap[r.id] ?? null,
               dropsequencenum: mergeDropMap[r.id] ?? null,
               driverroutekm: mergeRouteKm, driverroutecapkm: mergePolicyCap,
-              driverrouteexceedspolicy: mergeRouteKm > mergePolicyCap,
+              driverrouteexceedspolicy: mergeExceedsPolicy,
             }).eq("id", r.id);
           }
           refetch(); // fire-and-forget — see handleSupabaseAction's header comment
@@ -9039,20 +9064,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         };
       });
       const startAnchor = await fetchCompanyAnchor();
-      const departEpochAssign = allForDriver.map(t => t.scheduled_time_epoch).filter(Boolean).sort()[0] ?? null;
-      const ordered = await buildPickupSequenceTomTom(allForDriver, startAnchor, departEpochAssign);
-      const dropOrdered = buildDropoffSequence(allForDriver, dropoffAnchor(allForDriver, ordered, startAnchor));
-      const seqMap = {}, dropMap = {};
-      ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
-      dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
-      // Total route distance — try TomTom for real road distance first,
-      // fall back to haversine × 1.35 if TomTom is unavailable.
-      const totalAgentCountAssign = allForDriver.reduce((n, t) => n + (t.pickup_sequence_coords?.length || 0), 0);
-      const tomtomKm = await tomtomRealRouteKm(startAnchor, ordered, dropOrdered, departEpochAssign);
-      const routeDistanceKm = tomtomKm ?? computeDriverRouteDistanceKm(startAnchor, ordered, dropOrdered);
+      const departEpochAssign = earliestScheduledTime([...existingAssigned, tripRow]);
+      const {
+        seqMap, dropMap, totalAgentCount: totalAgentCountAssign, routeDistanceKm, policyCapKm, exceedsPolicy, tomtomKm,
+      } = await recomputeDriverRouteAndCompliance(allForDriver, startAnchor, departEpochAssign);
       console.log(`[ASSIGN_DRIVER] route: TomTom=${tomtomKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${routeDistanceKm.toFixed(1)} km`);
-      const policyCapKm = companyPolicyDistanceCapKm(totalAgentCountAssign);
-      const exceedsPolicy = routeDistanceKm > policyCapKm;
       const nowTs = nowEpoch();
       // Set ASSIGNED — driver must explicitly accept before DRIVER_CONFIRMED.
       // driveraccepted stays false; acceptedat/confirmedat stay null until TRIP/ACCEPT.
@@ -17255,6 +17271,23 @@ export function tripDriverPayment(t, feeRates) {
   return { perAgent, perExtraKm, total: perAgent + perExtraKm };
 }
 
+// Shared CSV cell escaper — every CSV export in this app (exportTripsToCsv,
+// exportGpsTrailToCsv here, plus AdminSection.jsx's exportComplianceAudit/
+// fleetUtilizationToCsv/usersToCsv) used to hand-duplicate this same logic.
+// CSV/formula-injection guard: a field starting with =, +, -, or @ can be
+// interpreted as a formula by Excel/Sheets when the file is opened,
+// potentially executing attacker-controlled content from a user-editable
+// field (agent/driver name, pickup label, etc.) — prefixing with a single
+// quote neutralizes it while keeping the value readable. Also catches a
+// lone \r (not just \r\n), so a field containing a bare carriage return
+// can't slip through unquoted and corrupt row boundaries for CSV parsers
+// that treat lone \r as a line break.
+export function csvEscapeCell(val) {
+  let s = val == null ? "" : String(val);
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 // feeRates ({ normal_zar, late_booking_zar, late_cancellation_zar,
 // no_show_zar, driver_pay_per_agent_zar, driver_pay_per_extra_km_zar }) is
 // optional — only Fleet Ops/Financial admins ever pass it (gated by the
@@ -17316,24 +17349,6 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
     ] : []),
   ];
 
-  const escapeCsv = (val) => {
-    let s = val == null ? "" : String(val);
-    // CSV/formula-injection guard — a field starting with =, +, -, or @
-    // can be interpreted as a formula by Excel/Sheets when this file is
-    // opened, potentially executing attacker-controlled content from a
-    // user-editable field (agent/driver name, pickup label, etc.).
-    // Prefixing with a single quote neutralizes it as a formula trigger
-    // while keeping the value readable. Found missing here (and in every
-    // other CSV export in this file, and the daily-trip-sheet edge
-    // function's mirror of this exact function) via a dedicated audit.
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    // Must also catch a lone \r (not just \r\n) — matches the other CSV
-    // escaper in this file (csvCell, compliance audit export) which
-    // already checks for it; this one didn't, so a field containing a
-    // bare carriage return could slip through unquoted and corrupt row
-    // boundaries for CSV parsers that treat lone \r as a line break.
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const userName = (id) => users?.find(u => String(u.id) === String(id))?.name || (id ?? "");
   const userStaffNum = (id) => users?.find(u => String(u.id) === String(id))?.staff_number || "";
   const driverVehicle = (id) => (driverStatusList || []).find(d => String(d.driver_id) === String(id))?.vehicle || "";
@@ -17621,7 +17636,7 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
   }
 
   // BOM prefix so Excel opens UTF-8 CSVs correctly.
-  const csv = [headers, ...rows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
+  const csv = [headers, ...rows].map(row => row.map(csvEscapeCell).join(",")).join("\r\n");
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -17642,17 +17657,12 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
 // sample, not one row per passenger.
 export function exportGpsTrailToCsv(rows, tripId) {
   const headers = ["Timestamp", "Latitude", "Longitude", "Speed (km/h)", "Heading (°)"];
-  const escapeCsv = (val) => {
-    let s = val == null ? "" : String(val);
-    if (/^[=+\-@]/.test(s)) s = "'" + s;
-    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
   const csvRows = rows.map(r => [
     fmtSastDateTime(r.recorded_at), r.lat, r.lng,
     r.speed_kmh != null ? r.speed_kmh.toFixed(1) : "",
     r.heading != null ? r.heading.toFixed(0) : "",
   ]);
-  const csv = [headers, ...csvRows].map(row => row.map(escapeCsv).join(",")).join("\r\n");
+  const csv = [headers, ...csvRows].map(row => row.map(csvEscapeCell).join(",")).join("\r\n");
   const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
