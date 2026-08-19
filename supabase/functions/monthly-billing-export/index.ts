@@ -123,7 +123,15 @@ Deno.serve(async (req) => {
     if (t.status !== "ARCHIVED_COMPLETED") return 0;
     const actualKm = t.actualdistancekm as number | null;
     const estKm = t.estdistancekm as number | null;
-    const roadKm = actualKm != null ? actualKm * ROAD_FACTOR : estKm != null ? estKm * ROAD_FACTOR : 0;
+    // actualdistancekm is the REAL GPS-trail distance (already road-
+    // following) — must NOT be multiplied by ROAD_FACTOR again. Only the
+    // estdistancekm fallback (no usable GPS trail for that trip) still
+    // needs it. FOUND VIA /code-review: this edge function independently
+    // reimplements tripDriverPayment's math (src/TransitOS_web.jsx) and
+    // was missed when that function was fixed for the same bug — every
+    // completed trip with a real actualdistancekm was overpaying the
+    // driver's extra-km bonus by 35% on this monthly billing export.
+    const roadKm = actualKm != null ? actualKm : estKm != null ? estKm * ROAD_FACTOR : 0;
     const extraKm = Math.max(0, roadKm - 40);
     return extraKm * feeRates.driverpayperextrakmzar;
   }

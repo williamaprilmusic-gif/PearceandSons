@@ -1409,6 +1409,32 @@ export const epochToDisplay = (ms) => (ms == null ? null : new Date(ms).toLocale
 // copy-pasted at all three.
 export const fmtSastDateTime = (epochMs) => epochMs ? new Date(epochMs).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" }) : "";
 
+// hourCycle explicitly "h23" (not just hour12:false) — hour12:false
+// alone can resolve to hourCycle "h24" on some ICU/V8 builds, which
+// formats midnight as hour "24" instead of "00", which would make a
+// booking made just after midnight misread as hour>15. Module-scope,
+// not rebuilt per call, since this can run once per row in a CSV
+// export or more than once per trip in a single render.
+const SAST_DATE_HOUR_FORMAT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Africa/Johannesburg", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, hourCycle: "h23",
+});
+// The shared core of the "same-day-after-15:00 SAST" booking-exception
+// rule — used BOTH when SETTING is_exception at booking time (the demo
+// reducer's and the real Supabase handler's TRIP/BOOK cases) and later
+// when EXPLAINING it (exceptionLabel, via wasBookedSameDayAfter15h
+// below). FOUND VIA /code-review: this was hand-duplicated 3 times
+// across those sites — the exact bug class this whole SAST-pinning fix
+// was about (two independently-computed copies of the same rule
+// silently disagreeing). A future change to the cutoff hour or
+// timezone only has to touch this one function.
+function sastSameDayAfter15h(epochMs, scheduledDateStr) {
+  if (epochMs == null || !scheduledDateStr) return false;
+  const parts = Object.fromEntries(SAST_DATE_HOUR_FORMAT.formatToParts(new Date(epochMs)).map(p => [p.type, p.value]));
+  if (`${parts.year}/${parts.month}/${parts.day}` !== scheduledDateStr) return false;
+  const hour = Number(parts.hour), minute = Number(parts.minute);
+  return hour > 15 || (hour === 15 && minute > 0);
+}
+
 // Parses the app's booking-form date/time strings into a real Date object.
 // scheduled_date is typically "DD/MM/YYYY" (en-ZA locale, what the booking
 // form's date default produces) but the field is free-text — admins/agents
@@ -4067,21 +4093,20 @@ function appReducer(state, action) {
       // wouldn't exist in React's authoritative state.
       const tripId = action._client_trip_id || ("TRP_" + mkId());
       const nowTs = now();
+      const nowEpochForBooking = Date.now();
 
       // Exception flag: booked on the SAME calendar day as the trip,
-      // after 15:00 local time — a fixed clock-time cutoff, not a rolling
+      // after 15:00 SAST — a fixed clock-time cutoff, not a rolling
       // "hours before departure" window. A trip booked today for tomorrow
       // at any time is never an exception under this rule, even if it's
       // booked at 11pm tonight; only same-day-after-3pm counts. Mirrors
       // the Supabase handler's isException exactly — this was previously
       // ONLY computed there, so the "E" badge / CSV column / Search
       // Profiles exception count never worked in demo/fallback mode.
-      // nowTs (above) is a formatted display string, not an epoch — this
-      // needs a real Date object to read the current hour/minute/date.
-      const nowDateForException = new Date();
-      const bookingDateStr = `${nowDateForException.getFullYear()}/${String(nowDateForException.getMonth() + 1).padStart(2, "0")}/${String(nowDateForException.getDate()).padStart(2, "0")}`;
-      const isSameDay = action.scheduled_date === bookingDateStr;
-      const isException = isSameDay && (nowDateForException.getHours() > 15 || (nowDateForException.getHours() === 15 && nowDateForException.getMinutes() > 0));
+      // Shares sastSameDayAfter15h (near fmtSastDateTime) with the
+      // Supabase handler's equivalent check and exceptionLabel's later
+      // recomputation of the exact same rule.
+      const isException = sastSameDayAfter15h(nowEpochForBooking, action.scheduled_date);
 
       const trip = {
         trip_id: tripId,
@@ -4121,6 +4146,13 @@ function appReducer(state, action) {
         week_day_num: action.week_day_num || null,
         direction: action.direction || null,
         booked_at: nowTs,
+        // FOUND VIA /code-review: was missing entirely from this demo/
+        // offline reducer branch (Supabase's tripRowToApp has always set
+        // it) — without it, wasBookedSameDayAfter15h (exceptionLabel's
+        // helper) could never label a same-day-after-15:00 exception
+        // booked in demo mode, silently falling back to the generic
+        // "Exception" tag despite is_exception being set correctly.
+        booked_at_epoch: nowEpochForBooking,
         confirmed_at: null,
         tripStartedAt: null,
         in_transit_at: null,
@@ -4732,14 +4764,12 @@ function appReducer(state, action) {
           String(t.trip_id) === String(action.trip_id)
             // Offline/fallback store has no async Supabase/GPS-trail access
             // (this reducer is synchronous), so it can't compute a real
-            // driven distance the way the Supabase-backed handlers now do
-            // — pre-multiplying by ROAD_FACTOR here instead keeps
-            // actual_distance_km's contract ("already road-following, do
-            // not multiply again") true regardless of which path set it.
-            // FOUND VIA /code-review: leaving this as a raw copy would
-            // have silently underpaid a driver's extra-km bonus by ~26%
-            // whenever a trip completed via this fallback path.
-            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : null,
+            // driven distance the way the Supabase-backed handlers now
+            // do — left null, matching the real handlers, rather than
+            // baking in an estimate that every display site now treats
+            // as always-exact. tripDriverPayment still protects driver
+            // pay via its own independent fallback to est_distance_km.
+            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: null,
                 completed_dropoffs: newCompletedDropoffs, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations }
             : t
         );
@@ -4898,10 +4928,10 @@ function appReducer(state, action) {
       const newTrips = state.trips.map(t =>
         String(t.trip_id) === String(action.trip_id)
           ? {
-              // Pre-multiplied by ROAD_FACTOR — see the identical fix/
-              // comment on this same field a few cases above (TRIP/
-              // CONFIRM_AGENT_DROPOFF's completion branch).
-              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : null,
+              // Left null — see the identical fix/comment on this same
+              // field a few cases above (TRIP/CONFIRM_AGENT_DROPOFF's
+              // completion branch).
+              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: null,
               completed_dropoffs: [...t.agent_ids], dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations,
             }
           : t
@@ -5637,8 +5667,12 @@ function appReducer(state, action) {
     }
 
     case "TRIP/FILE_DISPUTE": {
+      // is_exception: true — matches the real Supabase handler (FOUND
+      // VIA /code-review: this demo/offline reducer case was missing it,
+      // undercounting disputed trips in every is_exception-gated
+      // aggregate — exception counts, weekly summary — in demo mode).
       return { ...state, trips: state.trips.map(t =>
-        String(t.trip_id) === String(action.trip_id) ? { ...t, dispute: {
+        String(t.trip_id) === String(action.trip_id) ? { ...t, is_exception: true, dispute: {
           agent_id: action.agent_id, category: action.category,
           description: action.description, filed_at: action.filed_at,
           state: DISPUTE_STATE.OPEN, resolution_note: null,
@@ -6064,8 +6098,11 @@ export function cropTrailToPickupWindow(trail, pickupTimestamps, dropoffTimestam
 // the synthetic ROAD_FACTOR multiplier to approximate road distance
 // from a straight line), this sum is already threaded through real
 // recorded road positions — callers must NOT re-apply ROAD_FACTOR to
-// it. Returns null (caller should fall back to the estimate) when
-// there's no usable trail.
+// it. Returns null when there's no usable trail — callers store that
+// null as-is (not a baked-in estimate) per explicit request ("only show
+// the exact kms"); tripDriverPayment separately, independently falls
+// back to est_distance_km for pay purposes when actual_distance_km is
+// null, so this null doesn't leave driver pay unprotected.
 async function computeActualRouteKm(tripId, pickupTimestamps, dropoffTimestamps, pickupCoords) {
   try {
     const trail = await fetchGpsTrailForTrip(tripId);
@@ -6080,17 +6117,6 @@ async function computeActualRouteKm(tripId, pickupTimestamps, dropoffTimestamps,
     console.warn("[computeActualRouteKm] failed:", e.message);
     return null;
   }
-}
-
-// The pre-trip estimate, road-adjusted — for use as the actualdistancekm
-// fallback when computeActualRouteKm returns null (no usable GPS trail).
-// FOUND VIA /code-review: the two real Supabase completion handlers were
-// writing tripRow.estdistancekm RAW here, un-multiplied — the exact
-// underpayment bug this whole change was fixing, just left in place on
-// this specific fallback branch (the offline/fallback reducer's
-// equivalent branch got this right).
-function estimatedRouteKm(tripRow) {
-  return tripRow.estdistancekm != null ? tripRow.estdistancekm * ROAD_FACTOR : null;
 }
 
 export async function fetchDirectMessages(userIdA, userIdB) {
@@ -8105,13 +8131,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
 
       // Exception flag: booked on the SAME calendar day as the trip,
-      // after 15:00 local time — a fixed clock-time cutoff, not a rolling
+      // after 15:00 SAST — a fixed clock-time cutoff, not a rolling
       // "hours before departure" window. A trip booked today for tomorrow
       // at any time is never an exception under this rule, even if it's
-      // booked at 11pm tonight; only same-day-after-3pm counts.
-      // (nowDate/bookingDateStr are now computed earlier above, reused here.)
-      const isSameDay = action.scheduled_date === bookingDateStr;
-      const isException = isSameDay && (nowDate.getHours() > 15 || (nowDate.getHours() === 15 && nowDate.getMinutes() > 0));
+      // booked at 11pm tonight; only same-day-after-3pm counts. Shares
+      // sastSameDayAfter15h (near fmtSastDateTime) with the demo
+      // reducer's equivalent check and exceptionLabel's later
+      // recomputation of the exact same rule — pinned to
+      // Africa/Johannesburg rather than the executing device's own local
+      // time, so all three can never disagree with each other.
+      const isException = sastSameDayAfter15h(nowTs, action.scheduled_date);
 
       // Real trips.id is a DB-generated bigint — insert and read it back
       // before building notifications that reference trip_id.
@@ -9790,7 +9819,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const completeRes = must(await supabase.from("trips").update({
           status: TRIP_STATE.ARCHIVED_COMPLETED,
           completedat: nowTs,
-          actualdistancekm: actualRouteKmDrop ?? estimatedRouteKm(tripRow),
+          // Real GPS-measured distance only, or null — no estimate
+          // fallback baked into this column anymore, per explicit
+          // request ("only show the exact kms"). tripDriverPayment
+          // still protects driver pay via its OWN independent fallback
+          // to est_distance_km when actual_distance_km is null, so
+          // nothing about pay changes — this just stops an estimate
+          // from silently hiding inside a field every display site now
+          // treats as always-exact.
+          actualdistancekm: actualRouteKmDrop,
           completeddropoffs: newCompletedDropoffs,
           dropofftimestamps: newDropoffTimestamps,
           dropofflocations: newDropoffLocations,
@@ -9958,7 +9995,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // UI has already moved on, and a silently-blocked driver_status
       // write leaves them stuck BUSY/unavailable for new dispatch.
       const completeRes = must(await supabase.from("trips").update({
-        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: actualRouteKmComplete ?? estimatedRouteKm(tripRow),
+        // Real GPS-measured distance only, or null — see the identical
+        // fix/comment on CONFIRM_AGENT_DROPOFF's completion branch above.
+        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: actualRouteKmComplete,
         completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, dropofflocations: newDropoffLocations, updatedat: nowTs,
       }).eq("id", action.trip_id).select("id"));
       if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
@@ -14976,21 +15015,19 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
             ))}
             {/* Drop-off: per-agent for OUTBOUND — uses TomTom road-optimal ordering */}
             <DriverTripDropoffs trip={trip} state={state} />
-            {trip.est_distance_km && <div style={{ fontSize: 9, color: COLORS.ghost }}>Est. <span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span></div>}
-            {(trip.route_total_km ?? trip.driver_route_km) != null && (
+            {/* Only the real, post-trip GPS-measured distance — per
+                explicit request, no pre-trip route figure shown here
+                anymore either (a trip in progress just shows nothing
+                until it completes). The policy-exceeded warning is
+                shown independently below so it doesn't disappear along
+                with the pre-trip km number that used to carry it. */}
+            {trip.actual_distance_km != null && (
               <div style={{ fontSize: 9, color: COLORS.ghost }}>
-                {/* Prefer route_total_km — recomputed from the driver's ACTUAL
-                    position when they tapped Start Trip, so it reflects the
-                    real route rather than the dispatch-time estimate (which
-                    can go stale, e.g. if it was computed before a routing fix
-                    shipped, or before the driver's day changed). Same
-                    fallback pattern used everywhere else this pair is shown —
-                    this was the one place that only ever read driver_route_km
-                    directly. */}
-                Driver's total route: <span style={{ color: trip.driver_route_exceeds_policy ? COLORS.red : COLORS.teal, fontWeight: 700 }}>
-                  {(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km{trip.driver_route_exceeds_policy ? " ⚠" : ""}
-                </span>
+                Driver's total route: <span style={{ color: COLORS.teal, fontWeight: 700 }}>{trip.actual_distance_km.toFixed(1)} km</span>
               </div>
+            )}
+            {trip.driver_route_exceeds_policy && (
+              <div style={{ fontSize: 9, color: COLORS.red, fontWeight: 700 }}>⚠ Route exceeds policy</div>
             )}
             {pickupCoord && <GpsBlock coord={pickupCoord} />}
             {trip.state === TRIP_STATE.ASSIGNED && !trip.driverAccepted && (
@@ -16219,8 +16256,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     <div className="pad">
       <div style={{ fontFamily: FONTS.head, fontSize: 22, fontWeight: 800 }}>NAVIGATION</div>
       <div style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 1.5, textTransform: "uppercase", marginTop: -8 }}>
+        {/* No pre-trip route-km figure here anymore, per explicit request
+            (only exact kms on the driver's side too) — FOUND VIA
+            /code-review: this was missed when every other pre-trip
+            route-km display was removed elsewhere. */}
         {donePickups}/{pickupStops.length} PICKUPS · {doneDrops}/{dropStops.length} DROP-OFFS
-        {(myActiveTrips[0]?.route_total_km ?? myActiveTrips[0]?.driver_route_km) != null && ` · ${(myActiveTrips[0].route_total_km ?? myActiveTrips[0].driver_route_km).toFixed(1)} km TOTAL ROUTE`}
       </div>
       {/* Feature B: Waze nav panel — persistent stop-by-stop guide.
           Only once the trip has actually started — per explicit request,
@@ -16530,13 +16570,10 @@ function DriverHistoryTab({ myTrips, state }) {
     });
     // Full multi-stop route total — "kms driven" should mean the driver's
     // ENTIRE run (first pickup through last drop-off across every
-    // passenger on this trip), not any one passenger's own leg.
-    // actual_distance_km is now the REAL post-trip distance (computed
-    // from the recorded GPS trail once the trip completes), which is
-    // more authoritative than the pre-trip route_total_km/driver_route_km
-    // estimates when available — null for any trip not yet completed, so
-    // this still falls through to the estimates correctly for those.
-    const fullRouteKm = t.actual_distance_km ?? t.route_total_km ?? t.driver_route_km;
+    // passenger on this trip), not any one passenger's own leg. Only the
+    // real GPS-measured figure, per explicit request — no pre-trip
+    // route fallback.
+    const fullRouteKm = t.actual_distance_km;
     return (
       <Card key={t.trip_id}>
         <div onClick={() => toggleExpanded(t.trip_id)} style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -16558,17 +16595,8 @@ function DriverHistoryTab({ myTrips, state }) {
                 {p.pickupLabel} → {p.dropLabel}
               </div>
             ))}
-            {/* No ROAD_FACTOR here — actual_distance_km (real GPS trail),
-                route_total_km, and driver_route_km are ALL already
-                road-following distances (the latter two computed via
-                TomTom, or via computeDriverRouteDistanceKm's own
-                internal ROAD_FACTOR multiplication as its fallback), so
-                none of fullRouteKm's possible sources need it applied
-                again here. FOUND VIA /code-review: the old conditional
-                (factor 1 if route_total_km/driver_route_km were set,
-                else ROAD_FACTOR) assumed actual_distance_km was always
-                the LAST fallback and always raw — both no longer true
-                now that actual_distance_km is real and checked first. */}
+            {/* No ROAD_FACTOR here — actual_distance_km is already a
+                real, road-following distance. */}
             {fullRouteKm != null && <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 4 }}>Full route: {fullRouteKm.toFixed(1)} km</div>}
             <div style={{ fontSize: 9, color: COLORS.dim, marginTop: 4 }}>{t.completed_at}</div>
           </>
@@ -16711,14 +16739,14 @@ function DriverProfileTab({ user, myStatus, myTrips, dispatch, load }) {
         const done = myTrips.filter(t => t.state === "ARCHIVED_COMPLETED" && tripArchiveBucket(t) === "CURRENT");
         if (done.length === 0) return null;
         const passengers = done.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-        // actual_distance_km (real GPS-trail distance) is already road-
-        // following and must not be multiplied by ROAD_FACTOR again —
-        // only the est_distance_km fallback (no usable trail for that
-        // trip) still needs it. FOUND VIA /code-review: this used to sum
-        // the raw values then apply ROAD_FACTOR once to the whole total,
-        // which silently inflated real per-trip distances by 35% the
-        // moment actual_distance_km became a real (not estimated) figure.
-        const km = done.reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0)), 0);
+        // Real distance only, per explicit request — no estimate
+        // fallback in this DISPLAY total (unlike driver pay, which
+        // deliberately keeps an internal estimate fallback so a trip
+        // with no usable GPS trail still earns a reasonable extra-km
+        // bonus). A trip with no real actual_distance_km yet just
+        // doesn't contribute to this total, rather than contributing an
+        // estimate.
+        const km = done.reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : 0), 0);
         return (
           <Card>
             <SectionHeader label="Performance — this month" />
@@ -17067,16 +17095,62 @@ export function actualDropoffCoordOrder(coords, trip) {
 // which kind. A trip can technically have more than one at once (e.g.
 // booked late, then later had a no-show) — all that genuinely apply are
 // joined together rather than picking just one and hiding the rest.
+// FOUND VIA DIRECT USER REPORT (trips flagged as an "Exception" whose
+// late_booking_flag was false, read as a contradiction): is_exception is
+// a single shared flag set true by SEVERAL unrelated conditions — this
+// function is supposed to name which one, but two of them had no label
+// at all and silently fell through to the generic "Exception" fallback,
+// leaving an admin no way to tell why. Every current is_exception=true
+// site, so this stays complete if a new one is ever added:
+//   - TRIP/AGENT_CANCEL (late only — an on-time cancel deletes the row
+//     instead of archiving it) -> ARCHIVED_CANCELLED, labeled below.
+//   - TRIP/MARK_NO_SHOW -> no_shows, labeled below.
+//   - TRIP/BOOK's <2h-before-departure check -> late_booking_flag,
+//     labeled below.
+//   - TRIP/DECLINE -> rejection_reason/rejection_driver_id, labeled
+//     below.
+//   - TRIP/FILE_DISPUTE -> dispute (was MISSING a label — the trip stays
+//     flagged even after the dispute is resolved, same as the others).
+//   - TRIP/BOOK's OWN separate same-day-after-15:00-cutoff check (a
+//     fixed clock-time cutoff, NOT the same rule as the <2h
+//     late_booking_flag check just above it — a trip booked same-day at
+//     16:00 for a 21:00 departure trips THIS rule but not that one) —
+//     was MISSING a label, the actual gap the user hit. Has no dedicated
+//     column of its own — recomputed deterministically below from
+//     booked_at_epoch + scheduled_date/time instead of inferred by
+//     elimination from is_exception. FOUND VIA /code-review: the first
+//     version of this fix DID infer by elimination (only showed this
+//     label when it was the trip's SOLE exception reason), which broke
+//     the moment a trip genuinely had two reasons at once (e.g. booked
+//     same-day at 19:30 for a 21:00 departure trips BOTH this rule and
+//     the separate <2h late_booking_flag rule) — the elimination gate
+//     silently swallowed this label whenever another one was present,
+//     contradicting this function's own composability.
+//
+// Thin wrapper over the shared sastSameDayAfter15h (near fmtSastDateTime)
+// for exceptionLabel's own trip-object shape.
+function wasBookedSameDayAfter15h(t) {
+  return sastSameDayAfter15h(t.booked_at_epoch, t.scheduled_date);
+}
+
 export function exceptionLabel(t) {
   const labels = [];
   if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) labels.push("Late Cancellation");
   if (t.no_shows && t.no_shows.length > 0) labels.push("No Show");
-  if (t.late_booking_flag) labels.push("Late Booking");
+  if (t.late_booking_flag) labels.push("Late Booking (<2h before departure)");
   // Driver rejection — a driver explicitly declining an assigned trip is
   // tracked as an exception so it surfaces in the CSV and admin dashboard.
   if (t.rejection_reason || t.rejection_driver_id) {
     labels.push(`Driver Rejection${t.rejection_reason ? ` (${t.rejection_reason})` : ""}`);
   }
+  if (t.dispute) labels.push("Disputed");
+  if (wasBookedSameDayAfter15h(t)) labels.push("Same-Day Booking (after 15:00 cutoff)");
+  // Only now, with every NAMED reason checked independently (not by
+  // elimination), does a bare is_exception with nothing else explaining
+  // it fall back to the generic label — should be rare/never in
+  // practice, since every current is_exception=true site is covered
+  // above, but safer than showing nothing if a future site is added
+  // here without a matching label.
   if (labels.length === 0 && t.is_exception) labels.push("Exception");
   return labels.join(" + ");
 }
@@ -17215,10 +17289,14 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
     "Pickup Order #", "Drop Sequence #",
     // Actual sequencing (REAL order the driver visited them in, from timestamps)
     "Actual Pickup Order #", "Actual Drop Order #",
-    // Financials
-    "Est. Distance (km)", "Actual Distance (km)", "Long Distance",
-    // Driver route
-    "Driver Full Route (km)", "Driver Route Cap (km)", "Exceeds Policy",
+    // Financials — per explicit request, only the real GPS-derived
+    // distance is shown; no separate pre-trip estimate column.
+    "Actual Distance (km)", "Long Distance",
+    // Driver route — no separate route-km column anymore (it would just
+    // duplicate Actual Distance once no pre-trip figure is shown, per
+    // explicit request); the policy cap/exceeded flags stay, since
+    // they're compliance data, not a distance figure.
+    "Driver Route Cap (km)", "Exceeds Policy",
     // Status
     "Status", "Driver Accepted", "Driver Accepted At", "Driver Rejection Reason", "Driver Rejection Note", "Reminder Sent",
     // Timestamps (epoch → readable)
@@ -17427,14 +17505,14 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
         // Sequencing — actual (real order the driver visited them, from timestamps)
         actualPickupOrderFor(t, aid) || "",
         actualDropOrderFor(t, aid) || "",
-        // Financials
-        t.est_distance_km != null ? (t.est_distance_km * ROAD_FACTOR).toFixed(1) : "",
-        // actual_distance_km is already a real road-following distance —
-        // see tripDriverPayment's identical fix/comment.
+        // Financials — no Est. Distance column anymore, per explicit
+        // request; actual_distance_km is already a real road-following
+        // distance (see tripDriverPayment's identical fix/comment), left
+        // blank rather than estimate-filled for a trip with no usable
+        // GPS trail.
         t.actual_distance_km != null ? t.actual_distance_km.toFixed(1) : "",
         t.long_distance_flag ? "YES" : "NO",
-        // Driver route
-        (t.route_total_km ?? t.driver_route_km) != null ? (t.route_total_km ?? t.driver_route_km).toFixed(1) : "",
+        // Driver route — no separate km column, see header comment.
         t.driver_route_cap_km != null ? t.driver_route_cap_km.toFixed(1) : "",
         t.driver_route_exceeds_policy ? "YES" : "NO",
         // Status
@@ -17827,14 +17905,10 @@ function ClientPortalSummaryCard({ trips, label }) {
   const exceptions = trips.filter(t => t.is_exception).length;
   const pax = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
     .reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-  // actual_distance_km (real GPS-trail distance) is already road-
-  // following and must not be multiplied by ROAD_FACTOR again — only
-  // the est_distance_km fallback (no usable trail for that trip) still
-  // needs it. FOUND VIA /code-review: same class of bug as
-  // DriverProfileTab's "Performance — this month" card and
-  // tripDriverPayment.
+  // Real distance only, per explicit request — see DriverProfileTab's
+  // identical "Performance — this month" card for the same fix.
   const km = trips.filter(t => t.state === TRIP_STATE.ARCHIVED_COMPLETED)
-    .reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0)), 0);
+    .reduce((n, t) => n + (t.actual_distance_km != null ? t.actual_distance_km : 0), 0);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {label && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.amber, letterSpacing: 0.5 }}>{label}</div>}
@@ -17878,10 +17952,10 @@ function ClientPortalTripRow({ trip, users }) {
       </div>
       <div style={{ textAlign: "right", flexShrink: 0 }}>
         <div style={{ fontSize: 10, fontWeight: 700, color: statusColor }}>{trip.state.replace(/_/g, " ")}</div>
-        {(trip.est_distance_km || trip.actual_distance_km) && (
-          // actual_distance_km is already road-following — see the
-          // identical fix/comment on the summary card above.
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>{(trip.actual_distance_km ?? (trip.est_distance_km * ROAD_FACTOR)).toFixed(1)} km</div>
+        {/* Real distance only, per explicit request — no estimate
+            shown/fallen-back-to for a trip that hasn't completed yet. */}
+        {trip.actual_distance_km != null && (
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>{trip.actual_distance_km.toFixed(1)} km</div>
         )}
       </div>
     </div>

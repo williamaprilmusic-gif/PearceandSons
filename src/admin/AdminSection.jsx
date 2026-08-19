@@ -528,7 +528,13 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
     "Trip ID","Date","Time","Direction","Driver","Agent(s)","Status",
     "Exception","Booked At","Driver Assigned At","Driver Accepted At",
     "Trip Started At","Completed At","Rejection Reason","Rejection Note",
-    "No-Show Count","Delay Reports","Route km","Audit Actions",
+    // "Actual Distance", not "Route km" — FOUND VIA /code-review: this
+    // column used to show the planned/estimated route (available before
+    // completion), now shows only the real post-trip GPS distance (blank
+    // for anything not yet completed), so the old header name was left
+    // describing the wrong thing on a document used for regulatory
+    // submissions.
+    "No-Show Count","Delay Reports","Actual Distance (km)","Audit Actions",
   ];
 
   // Safely wrap a value for CSV — escape quotes and wrap in quotes if needed
@@ -624,7 +630,10 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
       t.rejection_note || "",
       (t.no_shows || []).length,
       delaySummary,
-      t.driver_route_km ?? t.est_distance_km ?? "",
+      // Only the real, post-trip GPS-measured distance — per explicit
+      // request, no pre-trip route figure at all (not even the real
+      // TomTom-computed one) shown in this column anymore.
+      t.actual_distance_km ?? "",
       auditSummary,
     ].map(csvCell);
   });
@@ -800,12 +809,11 @@ function computeWeeklySummary(trips, users, driverStatus) {
   const rejections = lastWeek.filter(t => t.rejection_reason);
   const noShows = lastWeek.filter(t => (t.no_shows || []).length > 0);
   const totalPax = completed.reduce((n, t) => n + (t.agent_ids?.length || 1), 0);
-  // actual_distance_km (real GPS-trail distance) is already road-
-  // following and must not be multiplied by ROAD_FACTOR again — only
-  // the est_distance_km fallback (no usable trail for that trip) still
-  // needs it. `!= null` rather than `||`, so a genuine 0 doesn't
-  // wrongly fall through to the estimate. FOUND VIA /code-review.
-  const routeKmFor = (t) => t.actual_distance_km != null ? t.actual_distance_km : (t.est_distance_km != null ? t.est_distance_km * ROAD_FACTOR : 0);
+  // Real distance only, per explicit request — no estimate fallback in
+  // this DISPLAY total (unlike driver pay, which deliberately keeps one
+  // internally). `!= null` rather than `||`, so a genuine 0 doesn't get
+  // treated as missing.
+  const routeKmFor = (t) => t.actual_distance_km != null ? t.actual_distance_km : 0;
   const totalKm = completed.reduce((n, t) => n + routeKmFor(t), 0);
 
   // Per-driver stats for the week
@@ -2153,8 +2161,20 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
             {driver && canEdit && (
               <Button title="✕ REMOVE DRIVER" variant="danger" size="sm" onClick={() => dispatch({ type: "TRIP/REMOVE_DRIVER", trip_id: trip.trip_id }).catch(() => {}) /* failure already toasted by the wrapper */} />
             )}
-            {trip.est_distance_km && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>EST DIST: </span>{(trip.est_distance_km * ROAD_FACTOR).toFixed(1)} km</span>}
-            {(trip.route_total_km ?? trip.driver_route_km) != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER'S FULL ROUTE: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{(trip.route_total_km ?? trip.driver_route_km).toFixed(1)} km</span></span>}
+            {/* Only the real, post-trip GPS-measured distance — per
+                explicit request, no pre-trip route figure (DRIVER'S
+                FULL ROUTE) shown here anymore either. */}
+            {trip.actual_distance_km != null && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>ACTUAL DIST: </span><span style={{ color: COLORS.teal, fontWeight: 700 }}>{trip.actual_distance_km.toFixed(1)} km</span></span>}
+            {/* Independent of the km figure above — FOUND VIA /code-review:
+                removing the pre-trip route-km display also silently
+                removed its red exceeds-policy color coding, with nothing
+                replacing it, so a live policy breach on an in-progress
+                trip became invisible to admins in-app (still exported in
+                the CSV, just never shown here). Matches DriverTripsTab's
+                identical fix in TransitOS_web.jsx. */}
+            {trip.driver_route_exceeds_policy && (
+              <span style={{ fontSize: 10, width: "100%", color: COLORS.red, fontWeight: 700 }}>⚠ Route exceeds policy</span>
+            )}
           </div>
 
           {/* GPS trail — only shown once this trip has actually been
@@ -2602,9 +2622,10 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                 {isUnassigned ? "UNASSIGNED" : (driverUser?.name || `Driver ${key}`)}
               </span>
               <span style={{ fontSize: 10, color: COLORS.ghost }}>({groupTrips.length} {isUnassigned ? "booking" : "trip"}{groupTrips.length !== 1 ? "s" : ""})</span>
-              {!isUnassigned && (groupTrips[0]?.route_total_km ?? groupTrips[0]?.driver_route_km) != null && (
-                <span style={{ fontSize: 10, color: COLORS.teal, marginLeft: "auto" }}>{(groupTrips[0].route_total_km ?? groupTrips[0].driver_route_km).toFixed(1)} km route</span>
-              )}
+              {/* No pre-trip route-km summary here anymore, per explicit
+                  request (only exact kms on the admin side) — these are
+                  active, not-yet-completed trips, so there's no exact
+                  figure to show for them yet. */}
             </div>
             {!isCollapsed && (
             <Card body={false}>
