@@ -121,6 +121,12 @@ input, select, textarea { font-family: inherit; }
 .empty-ico { font-size: 28px; opacity: .2; }
 .empty-txt { font-size: 11px; color: ${COLORS.ghost}; letter-spacing: 1px; }
 
+/* Custom-styled <summary> disclosure marker — list-style:none alone
+   doesn't suppress it in WebKit/Safari, which uses its own
+   ::-webkit-details-marker pseudo-element instead. */
+.no-marker summary { list-style: none; }
+.no-marker summary::-webkit-details-marker { display: none; }
+
 .gps-block { background: ${COLORS.surface}; border: 1px solid ${COLORS.wire}; border-radius: 3px; padding: 10px; display: flex; flex-direction: column; gap: 5px; }
 .gps-row { display: flex; gap: 8px; font-size: 10px; }
 .gps-key { color: ${COLORS.ghost}; width: 28px; }
@@ -206,11 +212,21 @@ export const ADMIN_PERMISSIONS = {
     // from exportCsv||viewTripFees would be fragile if either changes
     // independently later, so this gets its own explicit flag instead.
     viewGpsTrail: true, exportGpsTrail: true,
+    // viewAuditLog: the admin activity log (every logAuditAction entry,
+    // not just trip-linked ones — user/company/fee-rate management, DMs,
+    // announcements, driver docs/shifts, etc.) per explicit request
+    // ("the fleet admin is able to see all the work done by admins").
+    // Restricted to the two fleet-wide unrestricted tiers (FLEET_OPS,
+    // STANDARD) — both are the only ones that ever reach AdminApp, where
+    // this tab lives; FINANCIAL/VIEWER are routed to their own portals
+    // and never see this permission checked at all.
+    viewAuditLog: true,
   },
   [ADMIN_LEVEL.STANDARD]: {
     viewUsers: true, manageAgentsDrivers: true, manageAdmins: false,
     manageTrips: true, manageDispatch: true, exportCsv: true, viewDriverProfiles: true,
     manageFeeRates: false, viewTripFees: false, viewGpsTrail: true, exportGpsTrail: true,
+    viewAuditLog: true,
   },
   [ADMIN_LEVEL.FINANCIAL]: {
     // Read-only reporting/finance role otherwise — can search and view
@@ -224,6 +240,7 @@ export const ADMIN_PERMISSIONS = {
     viewUsers: true, manageAgentsDrivers: false, manageAdmins: false,
     manageTrips: false, manageDispatch: false, exportCsv: false, viewDriverProfiles: true,
     manageFeeRates: true, viewTripFees: true, viewGpsTrail: true, exportGpsTrail: true,
+    viewAuditLog: false,
   },
   [ADMIN_LEVEL.VIEWER]: {
     // Viewer can see that a driver was ASSIGNED to a trip (name only,
@@ -252,7 +269,7 @@ export const ADMIN_PERMISSIONS = {
     // from for this tier) ever renders anything; a trip belonging to a
     // different company is never in `state.trips` for this render at
     // all, so there's nothing for this permission to leak.
-    viewGpsTrail: true,
+    viewGpsTrail: true, viewAuditLog: false,
   },
 };
 
@@ -14942,7 +14959,16 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
           const coord = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(aid)) || pickupCoord;
           const pickedUp = trip.completed_pickups?.some(c => String(c) === String(aid));
           return {
-            id: aid, name: u?.name || trip.agent_name || "Unknown Agent", phone: u?.phone || trip.phone,
+            // Profile phone wins when set (most current); coord?.phone —
+            // this agent's OWN booking-time number, via
+            // pickupSequenceCoordsFromRow — is the fallback. Same priority
+            // exportTripsToCsv already established for this exact problem
+            // (see its own comment). Previously this was `u?.phone ||
+            // trip.phone`, which for every EXTRA agent on a merged trip
+            // never consulted their own coord at all — falling back
+            // straight to trip.phone (the PRIMARY agent's number) whenever
+            // their profile phone was unset.
+            id: aid, name: u?.name || trip.agent_name || "Unknown Agent", phone: u?.phone || coord?.phone || trip.phone,
             pickupLabel: coord?.label || trip.custom_pickup, coord, pickedUp,
           };
         });
@@ -15849,7 +15875,16 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         lat: p.lat, lng: p.lng,
         label: p.label || trip.custom_pickup,
         trip_id: trip.trip_id, agent_id: agentId,
-        agent_name: agentUser?.name || trip.agent_name, phone: trip.phone,
+        // Profile phone wins when set (most current); p.phone — this
+        // stop's own agent's booking-time number, via
+        // pickupSequenceCoordsFromRow — is the fallback. Same priority
+        // exportTripsToCsv already established for this exact problem.
+        // Was `trip.phone` unconditionally, always the PRIMARY agent's
+        // number regardless of which passenger's stop this is — the
+        // in-app CALL button on this screen keys off agent_id (already
+        // correct, unaffected either way), but this field is still the
+        // per-stop contact number the data model is meant to carry.
+        agent_name: agentUser?.name || trip.agent_name, phone: agentUser?.phone || p.phone || trip.phone,
         done: !!(agentId != null && trip.completed_pickups?.some(c => String(c) === String(agentId))),
         isManual: trip.pickup_is_manual || false,
         // Booked pickup time — previously absent from this list entirely,

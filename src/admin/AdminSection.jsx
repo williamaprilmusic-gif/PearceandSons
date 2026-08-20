@@ -1135,6 +1135,129 @@ async function fetchAuditLogsForTrips(tripIds) {
   return byTrip;
 }
 
+// Fetches EVERY audit_logs entry in a date range, not just trip-linked
+// ones — powers AdminActivityLog. Distinct from fetchAuditLogsForTrips
+// above (which only ever surfaces entries with a tripid via `.in("tripid",
+// ...)`), so the 17+ non-trip action types this app already logs — user
+// CRUD, company/fee-rate edits, DMs, announcements, driver docs/shifts —
+// were being recorded but were permanently unreachable in the app; the
+// only UI surface that ever read audit_logs was the trip-scoped one.
+// Capped at 1000 rows, same resource-conscious pattern as
+// fetchTripHistory's 500-row cap — this is an on-demand, admin-triggered
+// query (Run Search button), never polled.
+async function fetchAuditLogsRange({ fromMs, toMs, limit = 1000 } = {}) {
+  let q = supabase.from("audit_logs").select("*").order("timestamp", { ascending: false }).limit(limit);
+  if (fromMs != null) q = q.gte("timestamp", fromMs);
+  if (toMs != null) q = q.lte("timestamp", toMs);
+  const { data, error } = await q;
+  if (error) throw error;
+  // issuccess isn't included — every logAuditAction call site (src/
+  // TransitOS_web.jsx) unconditionally writes true, so it can never
+  // actually be false today; surfacing it here would imply failure
+  // detection this app doesn't have yet.
+  return (data || []).map(a => ({
+    id: a.id, actionType: a.actiontype || "UNKNOWN", username: a.username, actorId: a.actordetails,
+    details: a.details, timestamp: a.timestamp, tripId: a.tripid, targetUserId: a.targetuserid,
+  }));
+}
+
+// The part before "/" in actionType (e.g. "TRIP", "ADMIN", "DM") — used to
+// group/filter the activity log by category without a hardcoded list of
+// every action type, so a newly-added logAuditAction call site is
+// automatically grouped correctly with no changes needed here.
+function auditLogCategory(actionType) {
+  return (actionType || "").split("/")[0] || "OTHER";
+}
+
+// SAST midnight (00:00) of a "YYYY-MM-DD" date string, as a UTC epoch ms —
+// same fixed +2h SAST offset every edge function in this project already
+// applies (see e.g. monthly-billing-export's identical -2*3600000
+// correction). Used by AdminActivityLog's date-range search so the fetch
+// window agrees with auditLogPeriodKey's own SAST-pinned bucketing below.
+function sastMidnightMs(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return Date.UTC(y, m - 1, d, 0, 0, 0, 0) - 2 * 3600000;
+}
+
+// Today's date in SAST, as "YYYY-MM-DD" — used for AdminActivityLog's
+// default range and quick-range buttons so they agree with sastMidnightMs/
+// auditLogPeriodKey's own SAST-pinned day boundary, instead of
+// `new Date().toISOString()`'s UTC calendar day (which is a different,
+// wrong day for up to 2 hours after SAST midnight).
+// Reused across sastTodayStr and auditLogPeriodKey instead of
+// constructing a new Intl.DateTimeFormat per call — auditLogPeriodKey
+// runs once per log entry (up to the 1000-row fetch cap) on every
+// grouping recompute, and Intl.DateTimeFormat construction isn't free.
+const SAST_YMD_FORMAT = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Johannesburg", year: "numeric", month: "2-digit", day: "2-digit" });
+
+function sastTodayStr() {
+  const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date()).map(x => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+// Shifts a "YYYY-MM-DD" date string by N days and/or N calendar months —
+// treats the string as a plain calendar date (UTC midnight, no further
+// timezone conversion needed since it's already the target SAST date).
+function shiftDateStr(dateStr, { days = 0, months = 0 } = {}) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  if (days) dt.setUTCDate(dt.getUTCDate() + days);
+  if (months) {
+    // setUTCMonth on a day that doesn't exist in the target month rolls
+    // FORWARD into the following month instead of clamping (e.g. Oct 31
+    // minus 1 month lands on "Sep 31", which JS normalizes to Oct 1) —
+    // shift against day 1 first, then clamp back to the target month's
+    // real last day.
+    const day = dt.getUTCDate();
+    dt.setUTCDate(1);
+    dt.setUTCMonth(dt.getUTCMonth() + months);
+    const lastDayOfTargetMonth = new Date(Date.UTC(dt.getUTCFullYear(), dt.getUTCMonth() + 1, 0)).getUTCDate();
+    dt.setUTCDate(Math.min(day, lastDayOfTargetMonth));
+  }
+  return dt.toISOString().slice(0, 10);
+}
+
+// Calendar bucket key for a timestamp, pinned to SAST (not the viewing
+// device's local time) — same reasoning as sastSameDayAfter15h elsewhere
+// in this app: an admin reviewing "today's" activity from a non-SAST
+// device must see the same boundary everyone else does. Week buckets are
+// Monday-start (ISO), keyed by that Monday's date.
+function auditLogPeriodKey(timestamp, granularity) {
+  const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date(timestamp)).map(x => [x.type, x.value]));
+  if (granularity === "month") return `${p.year}-${p.month}`;
+  if (granularity === "week") {
+    const monday = new Date(`${p.year}-${p.month}-${p.day}T00:00:00Z`);
+    const dow = monday.getUTCDay(); // 0=Sun..6=Sat
+    monday.setUTCDate(monday.getUTCDate() - ((dow + 6) % 7));
+    return monday.toISOString().slice(0, 10);
+  }
+  return `${p.year}-${p.month}-${p.day}`;
+}
+
+function groupAuditLogsByPeriod(logs, granularity) {
+  const buckets = new Map();
+  for (const log of logs) {
+    const key = auditLogPeriodKey(log.timestamp, granularity);
+    if (!buckets.has(key)) buckets.set(key, { key, count: 0, byCategory: {}, entries: [] });
+    const bucket = buckets.get(key);
+    bucket.count++;
+    const cat = auditLogCategory(log.actionType);
+    bucket.byCategory[cat] = (bucket.byCategory[cat] || 0) + 1;
+    bucket.entries.push(log);
+  }
+  return [...buckets.values()].sort((a, b) => b.key.localeCompare(a.key));
+}
+
+function auditLogsToCsv(logs) {
+  const headers = ["Timestamp", "Category", "Action Type", "Actor", "Details", "Trip ID", "Target User ID"];
+  const rows = logs.map(l => [
+    fmtSastDateTime(l.timestamp), auditLogCategory(l.actionType), l.actionType, l.username || "",
+    l.details || "", l.tripId ?? "", l.targetUserId ?? "",
+  ]);
+  const csv = [headers, ...rows].map(r => r.map(csvEscapeCell).join(",")).join("\r\n");
+  return "﻿" + csv;
+}
+
 function computeDriverSafetyScorecard(trips, notifications) {
   const tripsInWindow = trips.length;
   const noShows = trips.reduce((n, t) => n + (t.no_shows?.length || 0), 0);
@@ -2271,6 +2394,18 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
                     {pickedUp && <span style={{ fontSize: 9, color: COLORS.green, marginLeft: 6 }}>✓ picked up</span>}
                     {droppedOff && driverName && <span style={{ fontSize: 9, color: COLORS.teal, marginLeft: 6 }}>✓ dropped by {driverName}</span>}
                     <div style={{ fontSize: 9, color: COLORS.ghost }}>{pickup?.label || "—"}</div>
+                    {/* Profile phone (p.phone, from state.users) wins when
+                        set (most current); pickup?.phone — this agent's own
+                        booking-time number, via pickup_sequence_coords — is
+                        the fallback. Same priority exportTripsToCsv already
+                        established for this exact problem. The trip-level
+                        "PHONE:" field above only ever shows the primary
+                        agent's, so a merged multi-passenger trip had no way
+                        to see any other agent's number at all. FOUND VIA
+                        direct user report. */}
+                    {(p.phone || pickup?.phone) && (
+                      <div style={{ fontSize: 9, color: COLORS.ghost }}>☎ {p.phone || pickup?.phone}</div>
+                    )}
                     {agentDropoff && agentDropoff.label && agentDropoff.label !== (pickup?.label) && (
                       <div style={{ fontSize: 9, color: COLORS.red }}>◎ {agentDropoff.label}</div>
                     )}
@@ -3010,17 +3145,21 @@ function AdminHistory({ state, user, dispatch }) {
   // search immediately, rather than making someone manually calculate
   // and type a date range for the common cases.
   const applyQuickRange = (unit) => {
-    const end = new Date();
-    const start = new Date();
-    if (unit === "day") start.setDate(start.getDate() - 1);
-    else if (unit === "week") start.setDate(start.getDate() - 7);
-    else if (unit === "month") start.setMonth(start.getMonth() - 1);
-    const clampedStart = isViewer && start < earliestAllowed ? earliestAllowed : start;
-    const startStr = clampedStart.toISOString().slice(0, 10);
-    const endStr = end.toISOString().slice(0, 10);
-    setFromDate(startStr);
+    // SAST-pinned + calendar-month-safe via shiftDateStr — the previous
+    // `start.setMonth(start.getMonth() - 1)` overflowed into the wrong
+    // month on any day-29/30/31 date shorter months don't have (e.g. Oct
+    // 31 minus 1 month lands on Oct 1, not Sep 30), silently collapsing
+    // "PAST MONTH" to a 1-day range. Found and fixed via the same bug in
+    // AdminActivityLog's own quick-range helper.
+    const endStr = sastTodayStr();
+    const startStr = unit === "day" ? shiftDateStr(endStr, { days: -1 })
+      : unit === "week" ? shiftDateStr(endStr, { days: -7 })
+      : shiftDateStr(endStr, { months: -1 });
+    const earliestAllowedStr = earliestAllowed.toISOString().slice(0, 10);
+    const clampedStartStr = isViewer && startStr < earliestAllowedStr ? earliestAllowedStr : startStr;
+    setFromDate(clampedStartStr);
     setToDate(endStr);
-    setTimeout(() => runSearchWithRange(startStr, endStr), 0);
+    setTimeout(() => runSearchWithRange(clampedStartStr, endStr), 0);
   };
 
   // Same as runSearch but takes explicit dates — needed because
@@ -3301,6 +3440,215 @@ function AdminFleetUtilization({ state, user, dispatch }) {
           );
         })
       )}
+    </div>
+  );
+}
+
+// Surfaces the admin activity log (audit_logs table) with real daily/
+// weekly/monthly grouping — closes a real gap: logAuditAction already
+// records EVERY admin action (trip changes, user CRUD, company/fee-rate
+// edits, DMs, announcements, driver docs/shifts, etc.) but the only other
+// UI surface that ever reads audit_logs (AuditExportPanel, in Search
+// Profiles) only ever fetches entries linked to a trip, so every non-trip
+// action type — "everything from deleted users to adding drivers and
+// everything in between," per the explicit request this was built for —
+// was logged but permanently unreachable in the app. Only reachable from
+// AdminApp (FLEET_OPS/STANDARD — see the viewAuditLog permission gate at
+// its call site), which are both fleet-wide unrestricted tiers
+// (getAdminCompanyIds returns [] for both), so this deliberately has no
+// company-scoping logic — VIEWER/FINANCIAL never reach this tab at all.
+function AdminActivityLog() {
+  const [fromDate, setFromDate] = useState(() => shiftDateStr(sastTodayStr(), { days: -7 }));
+  const [toDate, setToDate] = useState(sastTodayStr);
+  const [granularity, setGranularity] = useState("day"); // "day" | "week" | "month" | "raw"
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [textFilter, setTextFilter] = useState("");
+  const [logs, setLogs] = useState(null);
+  // The range actually behind `logs` — CSV filename uses this, not the
+  // live fromDate/toDate inputs, which can be edited after a search
+  // without re-running it (the inputs would otherwise mislabel an export
+  // with a range it doesn't actually contain).
+  const [searchedRange, setSearchedRange] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  // Guards against RUN SEARCH and a quick-range button (or two quick-range
+  // clicks) firing overlapping requests — without this, a slow first
+  // request resolving AFTER a faster second one would silently overwrite
+  // logs/searchedRange with stale data and no indication anything raced.
+  const searchSeqRef = React.useRef(0);
+
+  const runSearch = async (fromStr = fromDate, toStr = toDate) => {
+    const seq = ++searchSeqRef.current;
+    setLoading(true); setErr(null);
+    // A category picked for the previous result set can silently zero
+    // out an unrelated new one (it's no longer in the new category list
+    // but the <select> still shows it selected) — clear it on every new
+    // search rather than leave an invisible stale filter behind.
+    setCategoryFilter("");
+    try {
+      // Pinned to SAST calendar-day boundaries (not the viewing device's
+      // local time) — must agree with auditLogPeriodKey's own SAST
+      // bucketing below, or a "TODAY" search from outside SAST would
+      // fetch the wrong 24h window and disagree with the day/week/month
+      // buckets it's then grouped into.
+      const fromMs = fromStr ? sastMidnightMs(fromStr) : undefined;
+      const toMs = toStr ? sastMidnightMs(toStr) + 24 * 3600000 - 1 : undefined;
+      const result = await fetchAuditLogsRange({ fromMs, toMs });
+      if (seq !== searchSeqRef.current) return; // superseded by a newer search
+      setLogs(result);
+      setSearchedRange({ from: fromStr, to: toStr });
+    } catch (e) {
+      if (seq !== searchSeqRef.current) return;
+      setErr(e.message || "Search failed");
+      setLogs(null);
+    } finally {
+      if (seq === searchSeqRef.current) setLoading(false);
+    }
+  };
+
+  // Same quick-range convenience as AdminProfileSearch/AdminFleetUtilization,
+  // SAST-pinned like runSearch above (not UTC via toISOString()).
+  const applyQuickRange = (unit) => {
+    const endStr = sastTodayStr();
+    const startStr = unit === "day" ? shiftDateStr(endStr, { days: -1 })
+      : unit === "week" ? shiftDateStr(endStr, { days: -7 })
+      : shiftDateStr(endStr, { months: -1 });
+    setFromDate(startStr); setToDate(endStr);
+    runSearch(startStr, endStr);
+  };
+
+  const categories = React.useMemo(() => {
+    const set = new Set((logs || []).map(l => auditLogCategory(l.actionType)));
+    return [...set].sort();
+  }, [logs]);
+
+  const filteredLogs = React.useMemo(() => {
+    if (!logs) return [];
+    const needle = textFilter.trim().toLowerCase();
+    return logs.filter(l => {
+      if (categoryFilter && auditLogCategory(l.actionType) !== categoryFilter) return false;
+      if (!needle) return true;
+      return [l.actionType, l.username, l.details].some(v => (v || "").toLowerCase().includes(needle));
+    });
+  }, [logs, categoryFilter, textFilter]);
+
+  const grouped = React.useMemo(
+    () => (granularity === "raw" ? [] : groupAuditLogsByPeriod(filteredLogs, granularity)),
+    [filteredLogs, granularity]
+  );
+
+  const exportCsv = () => {
+    if (!filteredLogs.length || !searchedRange) return;
+    downloadCsv(auditLogsToCsv(filteredLogs), `activity_log_${searchedRange.from}_to_${searchedRange.to}.csv`);
+  };
+
+  const periodLabel = (key) => {
+    if (granularity === "month") {
+      const [y, m] = key.split("-");
+      return new Date(Number(y), Number(m) - 1, 1).toLocaleDateString("en-ZA", { month: "long", year: "numeric" });
+    }
+    if (granularity === "week") return `Week of ${key}`;
+    return key;
+  };
+
+  return (
+    <div className="pad">
+      <SectionHeader label="Admin Activity Log" />
+      <div style={{ fontSize: 9, color: COLORS.ghost }}>
+        Every admin/agent-triggered action recorded by the app — trip changes, user and company management, fee
+        rate edits, dispatch, messages, announcements, driver document/shift updates, and more. Capped at the most
+        recent 1000 entries in the selected range — narrow the date range if you hit that cap.
+      </div>
+      <Card>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>FROM</span>
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12 }} />
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>TO</span>
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "7px 10px", fontSize: 12 }} />
+          </div>
+          <Button title={loading ? "SEARCHING…" : "RUN SEARCH"} variant="amber" size="sm" onClick={() => runSearch()} disabled={loading} />
+          {filteredLogs.length > 0 && <Button title="⬇ EXPORT CSV" variant="ghost" size="sm" onClick={exportCsv} />}
+        </div>
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <Button title="TODAY" size="sm" variant="ghost" onClick={() => applyQuickRange("day")} disabled={loading} style={{ flex: 1 }} />
+          <Button title="WEEK" size="sm" variant="ghost" onClick={() => applyQuickRange("week")} disabled={loading} style={{ flex: 1 }} />
+          <Button title="MONTH" size="sm" variant="ghost" onClick={() => applyQuickRange("month")} disabled={loading} style={{ flex: 1 }} />
+        </div>
+        {err && <span style={{ fontSize: 10, color: COLORS.red }}>{err}</span>}
+      </Card>
+
+      {logs && (
+        <Card>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>GROUP BY</span>
+            {[["day", "DAILY"], ["week", "WEEKLY"], ["month", "MONTHLY"], ["raw", "RAW LIST"]].map(([g, label]) => (
+              <Button key={g} title={label} size="sm" variant={granularity === g ? "amber" : "ghost"} onClick={() => setGranularity(g)} />
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            <select value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}
+              style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "6px 8px", fontSize: 11 }}>
+              <option value="">All categories</option>
+              {categories.map(c => <option key={c} value={c}>{c}</option>)}
+            </select>
+            <input value={textFilter} onChange={e => setTextFilter(e.target.value)} placeholder="Search actor / action / details…"
+              style={{ flex: 1, minWidth: 180, background: COLORS.card, border: `1px solid ${COLORS.wire}`, color: COLORS.chalk, borderRadius: 4, padding: "6px 8px", fontSize: 11 }} />
+          </div>
+          <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 6 }}>
+            {filteredLogs.length} of {logs.length} entries
+            {logs.length === 1000 ? " (capped at 1000 — narrow the date range for a complete list)" : ""}
+          </div>
+        </Card>
+      )}
+
+      {logs && filteredLogs.length === 0 && <Empty icon="📜" text="No activity matches this range/filter" />}
+
+      {granularity === "raw" ? (
+        filteredLogs.map(l => <AuditLogEntryRow key={l.id} log={l} />)
+      ) : (
+        grouped.map(bucket => (
+          <Card key={bucket.key}>
+            <details className="no-marker">
+              <summary style={{ cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 800 }}>{periodLabel(bucket.key)}</span>
+                <span style={{ fontSize: 10, color: COLORS.ghost }}>{bucket.count} action{bucket.count !== 1 ? "s" : ""}</span>
+              </summary>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
+                {Object.entries(bucket.byCategory).sort((a, b) => b[1] - a[1]).map(([cat, count]) => (
+                  <div key={cat} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: "3px 8px", fontSize: 9, color: COLORS.ghost }}>
+                    {cat} · {count}
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 4 }}>
+                {bucket.entries.map(l => <AuditLogEntryRow key={l.id} log={l} compact />)}
+              </div>
+            </details>
+          </Card>
+        ))
+      )}
+    </div>
+  );
+}
+
+function AuditLogEntryRow({ log, compact }) {
+  return (
+    <div style={{
+      display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8,
+      padding: compact ? "4px 0" : "8px 0", borderBottom: `1px solid ${COLORS.wire}`,
+    }}>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        <div style={{ fontSize: compact ? 10 : 11, fontWeight: 700 }}>
+          {log.actionType}{log.tripId != null && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> · trip {log.tripId}</span>}
+        </div>
+        <div style={{ fontSize: 9, color: COLORS.ghost }}>{log.username || "System"}{log.details ? ` — ${log.details}` : ""}</div>
+      </div>
+      <span style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap" }}>{fmtSastDateTime(log.timestamp)}</span>
     </div>
   );
 }
@@ -6968,7 +7316,7 @@ function AdminAIAssistant({ user }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -6990,6 +7338,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
     if (id === "utilization") return hasAdminPermission(user, "manageDispatch");
+    if (id === "activity") return hasAdminPermission(user, "viewAuditLog");
     // Mirrors the ai-ops-assistant edge function's own server-side gate
     // (Fleet Ops/Standard only) — see that function's header comment.
     if (id === "ai") return hasAdminPermission(user, "manageDispatch");
@@ -7167,6 +7516,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "profiles" && <AdminProfileSearch state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "activity" && hasAdminPermission(user, "viewAuditLog") && <AdminActivityLog />}
       {tab === "ai" && hasAdminPermission(user, "manageDispatch") && <AdminAIAssistant user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
