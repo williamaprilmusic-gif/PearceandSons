@@ -651,11 +651,8 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
 }
 
 function AuditExportPanel({ state }) {
-  const [from, setFrom] = React.useState(() => {
-    const d = new Date(); d.setDate(d.getDate() - 30);
-    return d.toISOString().slice(0,10);
-  });
-  const [to, setTo] = React.useState(new Date().toISOString().slice(0,10));
+  const [from, setFrom] = React.useState(() => shiftDateStr(sastTodayStr(), { days: -30 }));
+  const [to, setTo] = React.useState(sastTodayStr);
   const [exporting, setExporting] = React.useState(false);
 
   const doExport = async () => {
@@ -1193,6 +1190,18 @@ const SAST_YMD_FORMAT = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Joh
 function sastTodayStr() {
   const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date()).map(x => [x.type, x.value]));
   return `${p.year}-${p.month}-${p.day}`;
+}
+
+// Same as sastTodayStr but slash-separated ("YYYY/MM/DD"), matching
+// trip.scheduled_date's own format — used to compare "today" against
+// scheduled_date. Previously two separate call sites each computed this
+// from `new Date().getFullYear()/getMonth()/getDate()` (local device
+// time, not SAST), which could misjudge "is this driver full TODAY" for
+// an admin browsing from outside SAST — a real capacity-decision bug at
+// one of the two sites, not just a display mismatch.
+function sastTodaySlashStr() {
+  const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date()).map(x => [x.type, x.value]));
+  return `${p.year}/${p.month}/${p.day}`;
 }
 
 // Shifts a "YYYY-MM-DD" date string by N days and/or N calendar months —
@@ -1761,10 +1770,7 @@ function AdminDashboard({ state, user, dispatch }) {
   // cap already) — this is specifically about the Dashboard's daily
   // snapshot being genuinely daily for that tier.
   const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER;
-  const todayStr = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-  })();
+  const todayStr = sastTodaySlashStr();
   const trips = isViewer ? state.trips.filter(t => t.scheduled_date === todayStr) : state.trips;
   const counts = {
     total: trips.length,
@@ -5521,10 +5527,7 @@ function AdminDrivers({ state, user, dispatch }) {
   // capacity RIGHT NOW (today), not across every date they happen to
   // have any assignment on (a driver booked solid on 4 different future
   // days of one agent's week isn't "full" today).
-  const todayStr = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
-  })();
+  const todayStr = sastTodaySlashStr();
   // Viewer sees driver name + vehicle registration only — no phone, no
   // home address, no live status, no active-route detail. Full tier
   // (Fleet Ops / Standard) still sees everything, same as before.
