@@ -3880,7 +3880,9 @@ function appReducer(state, action) {
       }
 
       const newAgentIds = [...trip.agent_ids, action.agent_id];
-      const newPickupCoords = [...trip.pickup_sequence_coords, { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id }];
+      // phone included — see the real Supabase handler's identical
+      // comment on this same fix.
+      const newPickupCoords = [...trip.pickup_sequence_coords, { ...action.pickup_coord, label: action.pickup_label, agent_id: action.agent_id, phone: action.phone ?? null }];
       // Per-agent dropoff — for OUTBOUND trips each agent drops at their own
       // home address, not the primary's. Store alongside extrapickups so the
       // driver nav and CSV export can show the correct address per passenger.
@@ -7325,7 +7327,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
 
       const newExtraAgentIds = [...(tripRow.extraagentids || []), action.agent_id];
-      const newExtraPickups = [...(tripRow.extrapickups || []), { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id }];
+      // phone included — FOUND VIA /code-review (deep pass): this used to
+      // omit it entirely, so every display site that prefers a per-agent
+      // coord/pickup phone over the trip-level primary-agent phone
+      // (DriverTripsTab, DriverNavTab, admin TripDetailRow) had nothing
+      // to find for anyone added through this path, silently falling
+      // through to the PRIMARY agent's number instead.
+      const newExtraPickups = [...(tripRow.extrapickups || []), { lat: action.pickup_coord.lat, lng: action.pickup_coord.lng, label: action.pickup_label, agent_id: action.agent_id, phone: action.phone ?? null }];
       // Per-agent dropoff — OUTBOUND trips drop each agent at their own home.
       const newExtraDropoffs = action.dropoff_coord
         ? [...(tripRow.extradropoffs || []), { lat: action.dropoff_coord.lat, lng: action.dropoff_coord.lng, label: action.dropoff_label, agent_id: action.agent_id }]
@@ -8730,7 +8738,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
         for (let i = 0; i < (sec.extraagentids || []).length; i++) {
           newExtraAgentIds.push(sec.extraagentids[i]);
-          newExtraPickups.push(sec.extrapickups?.[i] || { lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.extraagentids[i] });
+          // phone fallback — matches the primary agent's identical fallback
+          // 2 lines up (FOUND VIA /code-review, deep pass): without this,
+          // an extra agent missing their own extrapickups entry fell back
+          // to a bare {lat,lng,label,agent_id} with no phone at all.
+          newExtraPickups.push(sec.extrapickups?.[i] || { lat: sec.pickuplat, lng: sec.pickuplng, label: sec.pickuplocation, agent_id: sec.extraagentids[i], phone: sec.phone });
           // Extra agents from the secondary also get their own dropoff entry.
           // Needs the same fallback the pickup side has two lines up — an
           // agent whose extradropoffs entry was never recorded on the
@@ -8914,7 +8926,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
             const aid = tripRow.extraagentids[i];
             newExtraAgentIds.push(aid);
-            newExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid });
+            // phone fallback — same reasoning as the primary agent's fold-in
+            // 4 lines up (FOUND VIA /code-review, deep pass).
+            newExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid, phone: tripRow.phone });
             const extraDrop = tripRow.extradropoffs?.[i];
             if (extraDrop) newExtraDropoffs.push(extraDrop);
           }
@@ -8971,7 +8985,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             for (let i = 0; i < (tripRow.extraagentids || []).length; i++) {
               const aid = tripRow.extraagentids[i];
               retryExtraAgentIds.push(aid);
-              retryExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid });
+              // phone fallback — same reasoning as the non-retry fold-in
+              // above (FOUND VIA /code-review, deep pass).
+              retryExtraPickups.push(tripRow.extrapickups?.[i] || { lat: tripRow.pickuplat, lng: tripRow.pickuplng, label: tripRow.pickuplocation, agent_id: aid, phone: tripRow.phone });
               const retryExtraDrop = tripRow.extradropoffs?.[i];
               if (retryExtraDrop) retryExtraDropoffs.push(retryExtraDrop);
             }

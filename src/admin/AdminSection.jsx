@@ -1990,7 +1990,17 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
       ? (dropMode === "company" ? { lat: selectedDropCompany.lat, lng: selectedDropCompany.lng } : dropStreetCoord)
       : null;
     try {
-      await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, pickup_label: pickupLabel, pickup_coord: pickupCoord, dropoff_label: dropoffLabel, dropoff_coord: dropoffCoord });
+      // FOUND VIA /code-review (deep pass): this never sent a phone at
+      // all, so the merged-trip phone-number fix (DriverTripsTab/
+      // DriverNavTab/admin TripDetailRow all preferring coord/pickup
+      // phone over the trip-level fallback) had nothing to actually find
+      // for an agent added through this panel — every one of those sites
+      // fell straight through to trip.phone (the PRIMARY agent's number)
+      // for anyone added here. The agent's own current profile phone is
+      // the best signal available at this point (there's no per-booking
+      // phone entry step in this admin flow, unlike an agent's own
+      // self-booking).
+      await dispatch({ type: "TRIP/ADD_AGENT", trip_id: trip.trip_id, agent_id: agentId, phone: selectedAgent?.phone || null, pickup_label: pickupLabel, pickup_coord: pickupCoord, dropoff_label: dropoffLabel, dropoff_coord: dropoffCoord });
       onClose();
     } catch (e) {
       setSaveError(e.message || "Couldn't add the passenger — please try again.");
@@ -3065,15 +3075,23 @@ function FeeRatesPanel({ state, user, dispatch }) {
 }
 
 function AdminHistory({ state, user, dispatch }) {
-  const today = new Date();
   // Viewer is capped at 60 days of trip history; other tiers keep the
   // existing 90-day default (which was never a hard cap for them, just a
   // starting point — they can still pick any earlier date).
   const isViewer = user.admin_level === ADMIN_LEVEL.VIEWER;
   const maxLookbackDays = isViewer ? 60 : 90;
-  const earliestAllowed = new Date(today.getTime() - maxLookbackDays * 24 * 60 * 60 * 1000);
-  const [fromDate, setFromDate] = useState(earliestAllowed.toISOString().slice(0, 10));
-  const [toDate, setToDate] = useState(today.toISOString().slice(0, 10));
+  // SAST-pinned (sastTodayStr/shiftDateStr — same helpers applyQuickRange
+  // below already uses) instead of new Date()/toISOString()'s UTC
+  // calendar day — FOUND VIA /code-review: this component's initial
+  // mount state disagreed with its own (already SAST-pinned)
+  // applyQuickRange for up to 2 hours after SAST midnight. Also hoisted
+  // to one earliestAllowedStr instead of recomputing
+  // earliestAllowed.toISOString().slice(0,10) inline at 6 separate call
+  // sites — a future edit to the lookback-clamp logic only needs to
+  // change one place now.
+  const earliestAllowedStr = shiftDateStr(sastTodayStr(), { days: -maxLookbackDays });
+  const [fromDate, setFromDate] = useState(earliestAllowedStr);
+  const [toDate, setToDate] = useState(sastTodayStr);
   const [agentFilter, setAgentFilter] = useState("");
   const [driverFilter, setDriverFilter] = useState("");
   // Company-level filter — separate from the per-agent filter above,
@@ -3106,8 +3124,8 @@ function AdminHistory({ state, user, dispatch }) {
   // input, so this clamps whatever's actually submitted, not just what
   // the field started as.
   const handleFromDateChange = (v) => {
-    if (isViewer && v < earliestAllowed.toISOString().slice(0, 10)) {
-      setFromDate(earliestAllowed.toISOString().slice(0, 10));
+    if (isViewer && v < earliestAllowedStr) {
+      setFromDate(earliestAllowedStr);
       return;
     }
     setFromDate(v);
@@ -3116,9 +3134,7 @@ function AdminHistory({ state, user, dispatch }) {
   const runSearch = async () => {
     setLoading(true); setErr(null);
     try {
-      const effectiveFromDate = isViewer && fromDate < earliestAllowed.toISOString().slice(0, 10)
-        ? earliestAllowed.toISOString().slice(0, 10)
-        : fromDate;
+      const effectiveFromDate = isViewer && fromDate < earliestAllowedStr ? earliestAllowedStr : fromDate;
       const fromMs = effectiveFromDate ? new Date(`${effectiveFromDate}T00:00:00`).getTime() : undefined;
       const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
       const hits = await fetchTripHistory({
@@ -3161,7 +3177,6 @@ function AdminHistory({ state, user, dispatch }) {
     const startStr = unit === "day" ? shiftDateStr(endStr, { days: -1 })
       : unit === "week" ? shiftDateStr(endStr, { days: -7 })
       : shiftDateStr(endStr, { months: -1 });
-    const earliestAllowedStr = earliestAllowed.toISOString().slice(0, 10);
     const clampedStartStr = isViewer && startStr < earliestAllowedStr ? earliestAllowedStr : startStr;
     setFromDate(clampedStartStr);
     setToDate(endStr);
@@ -3218,7 +3233,7 @@ function AdminHistory({ state, user, dispatch }) {
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <div style={{ flex: "1 1 140px" }}>
             <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FROM</label>
-            <input type="date" className="inp" value={fromDate} min={isViewer ? earliestAllowed.toISOString().slice(0, 10) : undefined} onChange={e => handleFromDateChange(e.target.value)} style={{ width: "100%" }} />
+            <input type="date" className="inp" value={fromDate} min={isViewer ? earliestAllowedStr : undefined} onChange={e => handleFromDateChange(e.target.value)} style={{ width: "100%" }} />
           </div>
           <div style={{ flex: "1 1 140px" }}>
             <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>TO</label>
