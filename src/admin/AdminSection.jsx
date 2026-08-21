@@ -143,6 +143,30 @@ function useIsNarrowScreen(breakpointPx = 768) {
   return isNarrow;
 }
 
+// Forces a periodic re-render by ticking a timestamp every `intervalMs` —
+// for any `useMemo` that reads wall-clock time (Date.now()/new Date())
+// internally without it being part of the memo's own logic. Wall-clock
+// time can never be a real useMemo dependency (it's not a prop/state
+// value the memo receives), so a memoized computation that reads it
+// silently freezes at whatever time it happened to first run, until some
+// UNRELATED dependency forces a recompute. FOUND VIA /code-review, first
+// on AdminDispatch's 30s driver-position-staleness check (a real
+// dispatch-decision-affecting bug — memoizing that derivation without
+// this ticker meant a driver's position could keep scoring as "live"
+// well past the 30s cutoff), then found to be the identical pre-existing
+// gap in computeSchedulingRecommendations/computeWeeklySummary's own
+// memos below (7-day windows, so a coarser interval here is enough to
+// keep those from drifting stale across a midnight rollover without
+// adding meaningful re-render overhead).
+function useTicker(intervalMs) {
+  const [tick, setTick] = useState(() => Date.now());
+  useEffect(() => {
+    const interval = setInterval(() => setTick(Date.now()), intervalMs);
+    return () => clearInterval(interval);
+  }, [intervalMs]);
+  return tick;
+}
+
 function distinctWeekDays(trips) {
   return new Set(trips.map(t => t.scheduled_date)).size;
 }
@@ -691,8 +715,7 @@ function AuditExportPanel({ state }) {
   );
 }
 
-function computeSchedulingRecommendations(trips, driverStatus, companies) {
-  const now = new Date();
+function computeSchedulingRecommendations(trips, driverStatus, companies, now = new Date()) {
   const gaps = [];
 
   // For each of the next 7 days
@@ -745,9 +768,14 @@ function computeSchedulingRecommendations(trips, driverStatus, companies) {
 }
 
 function SmartSchedulingPanel({ state }) {
+  // Only the calendar DAY matters here (which of the next 7 days each gap
+  // falls on) — a 30-minute tick is more than enough to keep this from
+  // drifting stale across a midnight rollover. See useTicker's own header
+  // comment for why a memo reading wall-clock time needs this at all.
+  const nowTick = useTicker(30 * 60 * 1000);
   const gaps = React.useMemo(() =>
-    computeSchedulingRecommendations(state.trips || [], state.driver_status || [], state.companies || []),
-    [state.trips, state.driver_status, state.companies]
+    computeSchedulingRecommendations(state.trips || [], state.driver_status || [], state.companies || [], new Date(nowTick)),
+    [state.trips, state.driver_status, state.companies, nowTick]
   );
   if (gaps.length === 0) return (
     <div style={{ fontSize: 10, color: COLORS.ghost }}>
@@ -778,8 +806,7 @@ function SmartSchedulingPanel({ state }) {
   );
 }
 
-function computeWeeklySummary(trips, users, driverStatus) {
-  const now = Date.now();
+function computeWeeklySummary(trips, users, driverStatus, now = Date.now()) {
   const sevenDaysAgo = now - 7 * 24 * 60 * 60 * 1000;
 
   const lastWeek = trips.filter(t => {
@@ -874,9 +901,14 @@ function formatWeeklySummaryText(s) {
 
 function WeeklyOpsSummaryPanel({ state }) {
   const [copied, setCopied] = React.useState(false);
+  // Only the rolling 7-day WINDOW BOUNDARY matters here — a 30-minute
+  // tick is more than enough to keep "last 7 days" from drifting stale.
+  // See useTicker's own header comment for why a memo reading wall-clock
+  // time needs this at all.
+  const nowTick = useTicker(30 * 60 * 1000);
   const s = React.useMemo(() =>
-    computeWeeklySummary(state.trips || [], state.users || [], state.driver_status || []),
-    [state.trips, state.users, state.driver_status]
+    computeWeeklySummary(state.trips || [], state.users || [], state.driver_status || [], nowTick),
+    [state.trips, state.users, state.driver_status, nowTick]
   );
   const text = formatWeeklySummaryText(s);
   const copy = () => {
@@ -1053,7 +1085,7 @@ export function computeGroupSuggestions(unassigned, users = [], driverStatus = [
   return suggestions;
 }
 
-function scoreDriverForTrip(ds, u, distKm, state, tripAgentIds, trips) {
+function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   let score = 0;
   const proxScore = distKm != null ? Math.max(0, 40 - (distKm / 30) * 40) : 0;
   score += proxScore;
@@ -3688,6 +3720,12 @@ function AdminDispatch({ state, dispatch }) {
   // on a fleet with many drivers.
   const [driverSearch, setDriverSearch] = useState("");
   const [msg, setMsg] = useState(null);
+  // The driver-scoring memo below computes each driver's live-position
+  // "freshness" (30s cutoff) — see useTicker's own header comment for why
+  // memoizing that check needs this. 10s keeps the staleness verdict from
+  // drifting more than ~10s stale, without reintroducing a full recompute
+  // on every render.
+  const nowTick = useTicker(10000);
   // Filters the unassigned bookings list down to one calendar date — with
   // several agents each booking a week (or more), the unassigned list can
   // easily reach 20-30+ cards all mixed together with no way to tell
@@ -3712,91 +3750,111 @@ function AdminDispatch({ state, dispatch }) {
   // multi-agent unassigned booking still matches correctly if ANY of
   // its agents live in the selected area).
   const [areaFilter, setAreaFilter] = useState("");
-  const unassignedAllDates = state.trips.filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING);
-  const availableDates = [...new Set(unassignedAllDates.map(t => t.scheduled_date))].sort();
-  const unassignedByDay = dayFilter ? unassignedAllDates.filter(t => t.scheduled_date === dayFilter) : unassignedAllDates;
-  const availableDirections = [...new Set(unassignedByDay.map(t => t.direction).filter(Boolean))].sort();
-  const unassignedByDirection = directionFilter ? unassignedByDay.filter(t => t.direction === directionFilter) : unassignedByDay;
-  const tripHomeAreas = (t) => (t.agent_ids || [])
-    .map(id => state.users.find(u => String(u.id) === String(id))?.home_address?.area)
-    .filter(Boolean);
-  const availableAreas = directionFilter === "INBOUND"
-    ? [...new Set(unassignedByDirection.flatMap(tripHomeAreas))].sort()
-    : [];
-  const unassigned = (directionFilter === "INBOUND" && areaFilter)
-    ? unassignedByDirection.filter(t => tripHomeAreas(t).includes(areaFilter))
-    : unassignedByDirection;
-  const selectedTrips = unassigned.filter(t => selectedTripIds.has(t.trip_id));
-  // The first-selected trip is the "primary" — whichever one absorbs the
-  // others when merged (see TRIP/DISPATCH_MULTI). Order matters for the
-  // audit trail and for which agent's name the merge notification uses,
-  // so this is insertion order, not sorted order.
-  const primaryTrip = selectedTrips[0] || null;
-  // A selection spanning more than one calendar date needs capacity
-  // checked PER DAY, not summed across the whole selection — day 1's
-  // passengers and day 3's passengers never share a vehicle at the same
-  // time, so summing them is meaningless. The whole selection routes to
-  // TRIP/BULK_ASSIGN_DRIVER (each trip assigned independently — its
-  // handler auto-merges same-day trips server-side) rather than the
-  // merge-into-one-trip path DISPATCH_MULTI uses for a single day.
-  //
-  // FOUND VIA DIRECT USER REPORT (3 agents each with their own separate
-  // week-long return-trip series, assigned to one driver together, got
-  // "13/4 seats — exceeds vehicle capacity"): this used to require every
-  // selected trip to share ONE week_group_id, which only ever holds for
-  // a SINGLE agent's own recurring series. The moment several different
-  // agents' week series are selected together — a totally normal
-  // "these 3 people ride together every day" case — each agent has their
-  // own week_group_id, the check failed, and totalSeats fell through to
-  // the flat sum-everything branch: 3 agents × 6 days summed as if all
-  // 18 bookings needed one vehicle simultaneously. The real constraint is
-  // just "how many agents does this driver carry on this vehicle's
-  // busiest single day" — computed below per calendar date, regardless
-  // of whether one agent or several own the trips on that date.
-  const seatsByDate = new Map();
-  for (const t of selectedTrips) seatsByDate.set(t.scheduled_date, (seatsByDate.get(t.scheduled_date) || 0) + t.agent_ids.length);
-  const isMultiDaySelection = seatsByDate.size > 1;
-  const totalSeats = isMultiDaySelection ? Math.max(...seatsByDate.values(), 0) : selectedTrips.reduce((n, t) => n + t.agent_ids.length, 0);
-  const overCapacity = totalSeats > DRIVER_CAPACITY;
-  // A vehicle trip should combine enough agent bookings to fill it at
-  // least 75% (3 of 4 seats) before dispatching a driver — a single
-  // booking (or two) is under that target. Per explicit decision this is
-  // a WARNING, not a hard block: an admin can still dispatch below 75%
-  // when there's genuinely no one else to combine with, they just see
-  // it flagged rather than the app silently allowing it as if it were
-  // fully optimal. Week bookings are exempt — one agent's own schedule
-  // repeated across several days is not "several agents sharing a ride"
-  // and was never the kind of under-filled trip this rule targets.
+  // FOUND VIA /code-review (resource-usage audit): this whole filter/
+  // selection derivation chain (through availableDriversRaw) used to run
+  // as plain consts on EVERY render — this is the busiest, most-clicked
+  // admin screen in the app, and it re-rendered (and redid all of this)
+  // on every realtime state update anywhere in the app, not just ones
+  // relevant to dispatch. Memoized as one block since every step here
+  // feeds the next; MIN_FULL_PCT stays outside since it's a plain
+  // constant, not a derivation.
   const MIN_FULL_PCT = 0.75;
-  const underCapacityWarning = !isMultiDaySelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
-  const availableDriversRaw = state.driver_status.filter(ds => {
-    // Feature 7: shift filtering — exclude drivers not rostered for this time slot.
-    // isDriverOnShift returns true when no schedule is set (backward compat).
-    const tripTimeStr = primaryTrip?.scheduled_time || null;
-    const tripDateStr = primaryTrip?.scheduled_date || null;
-    if (!isDriverOnShift(ds, tripDateStr, tripTimeStr)) return false;
-    // Real per-vehicle capacity, not the bare DRIVER_CAPACITY default —
-    // matches the pattern every other capacity check in this file already
-    // uses. Without this, a driver with a bigger vehicle got wrongly
-    // EXCLUDED from the available list once loaded past the default of 4
-    // (even with real room left), and a driver with a smaller vehicle
-    // (e.g. a 2-seat sedan) showed as available for a booking their real
-    // car can't fit.
-    const driverCapacity = ds.capacity || DRIVER_CAPACITY;
-    if (isMultiDaySelection) {
-      // Check each distinct date against its FULL batch total (every
-      // selected trip's agents landing on that date, from seatsByDate
-      // above) — not just one trip's own agent count. A driver who
-      // already has room for agent A alone on day 1 isn't necessarily
-      // able to also take agent B's day-1 booking from this same batch.
-      return [...seatsByDate.entries()].every(([date, seats]) => {
-        if (!isDriverOnShift(ds, date, tripTimeStr)) return false;
-        return getDriverLoad(state, ds.driver_id, date) + Math.max(1, seats) <= driverCapacity;
-      });
-    }
-    const checkDate = primaryTrip?.scheduled_date;
-    return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= driverCapacity;
-  });
+  const {
+    unassignedAllDates, availableDates, unassignedByDay, availableDirections, unassignedByDirection,
+    tripHomeAreas, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
+    isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
+  } = React.useMemo(() => {
+    const unassignedAllDates = state.trips.filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING);
+    const availableDates = [...new Set(unassignedAllDates.map(t => t.scheduled_date))].sort();
+    const unassignedByDay = dayFilter ? unassignedAllDates.filter(t => t.scheduled_date === dayFilter) : unassignedAllDates;
+    const availableDirections = [...new Set(unassignedByDay.map(t => t.direction).filter(Boolean))].sort();
+    const unassignedByDirection = directionFilter ? unassignedByDay.filter(t => t.direction === directionFilter) : unassignedByDay;
+    const tripHomeAreas = (t) => (t.agent_ids || [])
+      .map(id => state.users.find(u => String(u.id) === String(id))?.home_address?.area)
+      .filter(Boolean);
+    const availableAreas = directionFilter === "INBOUND"
+      ? [...new Set(unassignedByDirection.flatMap(tripHomeAreas))].sort()
+      : [];
+    const unassigned = (directionFilter === "INBOUND" && areaFilter)
+      ? unassignedByDirection.filter(t => tripHomeAreas(t).includes(areaFilter))
+      : unassignedByDirection;
+    const selectedTrips = unassigned.filter(t => selectedTripIds.has(t.trip_id));
+    // The first-selected trip is the "primary" — whichever one absorbs the
+    // others when merged (see TRIP/DISPATCH_MULTI). Order matters for the
+    // audit trail and for which agent's name the merge notification uses,
+    // so this is insertion order, not sorted order.
+    const primaryTrip = selectedTrips[0] || null;
+    // A selection spanning more than one calendar date needs capacity
+    // checked PER DAY, not summed across the whole selection — day 1's
+    // passengers and day 3's passengers never share a vehicle at the same
+    // time, so summing them is meaningless. The whole selection routes to
+    // TRIP/BULK_ASSIGN_DRIVER (each trip assigned independently — its
+    // handler auto-merges same-day trips server-side) rather than the
+    // merge-into-one-trip path DISPATCH_MULTI uses for a single day.
+    //
+    // FOUND VIA DIRECT USER REPORT (3 agents each with their own separate
+    // week-long return-trip series, assigned to one driver together, got
+    // "13/4 seats — exceeds vehicle capacity"): this used to require every
+    // selected trip to share ONE week_group_id, which only ever holds for
+    // a SINGLE agent's own recurring series. The moment several different
+    // agents' week series are selected together — a totally normal
+    // "these 3 people ride together every day" case — each agent has their
+    // own week_group_id, the check failed, and totalSeats fell through to
+    // the flat sum-everything branch: 3 agents × 6 days summed as if all
+    // 18 bookings needed one vehicle simultaneously. The real constraint is
+    // just "how many agents does this driver carry on this vehicle's
+    // busiest single day" — computed below per calendar date, regardless
+    // of whether one agent or several own the trips on that date.
+    const seatsByDate = new Map();
+    for (const t of selectedTrips) seatsByDate.set(t.scheduled_date, (seatsByDate.get(t.scheduled_date) || 0) + t.agent_ids.length);
+    const isMultiDaySelection = seatsByDate.size > 1;
+    const totalSeats = isMultiDaySelection ? Math.max(...seatsByDate.values(), 0) : selectedTrips.reduce((n, t) => n + t.agent_ids.length, 0);
+    const overCapacity = totalSeats > DRIVER_CAPACITY;
+    // A vehicle trip should combine enough agent bookings to fill it at
+    // least 75% (3 of 4 seats) before dispatching a driver — a single
+    // booking (or two) is under that target. Per explicit decision this is
+    // a WARNING, not a hard block: an admin can still dispatch below 75%
+    // when there's genuinely no one else to combine with, they just see
+    // it flagged rather than the app silently allowing it as if it were
+    // fully optimal. Week bookings are exempt — one agent's own schedule
+    // repeated across several days is not "several agents sharing a ride"
+    // and was never the kind of under-filled trip this rule targets.
+    const underCapacityWarning = !isMultiDaySelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
+    const availableDriversRaw = state.driver_status.filter(ds => {
+      // Feature 7: shift filtering — exclude drivers not rostered for this time slot.
+      // isDriverOnShift returns true when no schedule is set (backward compat).
+      const tripTimeStr = primaryTrip?.scheduled_time || null;
+      const tripDateStr = primaryTrip?.scheduled_date || null;
+      if (!isDriverOnShift(ds, tripDateStr, tripTimeStr)) return false;
+      // Real per-vehicle capacity, not the bare DRIVER_CAPACITY default —
+      // matches the pattern every other capacity check in this file already
+      // uses. Without this, a driver with a bigger vehicle got wrongly
+      // EXCLUDED from the available list once loaded past the default of 4
+      // (even with real room left), and a driver with a smaller vehicle
+      // (e.g. a 2-seat sedan) showed as available for a booking their real
+      // car can't fit.
+      const driverCapacity = ds.capacity || DRIVER_CAPACITY;
+      if (isMultiDaySelection) {
+        // Check each distinct date against its FULL batch total (every
+        // selected trip's agents landing on that date, from seatsByDate
+        // above) — not just one trip's own agent count. A driver who
+        // already has room for agent A alone on day 1 isn't necessarily
+        // able to also take agent B's day-1 booking from this same batch.
+        return [...seatsByDate.entries()].every(([date, seats]) => {
+          if (!isDriverOnShift(ds, date, tripTimeStr)) return false;
+          return getDriverLoad(state, ds.driver_id, date) + Math.max(1, seats) <= driverCapacity;
+        });
+      }
+      const checkDate = primaryTrip?.scheduled_date;
+      return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= driverCapacity;
+    });
+    return {
+      unassignedAllDates, availableDates, unassignedByDay, availableDirections, unassignedByDirection,
+      tripHomeAreas, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
+      isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.trips, state.users, state.driver_status, dayFilter, directionFilter, areaFilter, selectedTripIds]);
 
   const toggleTrip = (tripId) => {
     setSelectedTripIds(prev => {
@@ -3848,42 +3906,49 @@ function AdminDispatch({ state, dispatch }) {
   // position exists (offline, never logged in today, or genuinely
   // stale). Drivers with neither sort to the bottom, deprioritized not
   // excluded — no data doesn't mean unavailable.
-  const pickupCoord = primaryTrip?.pickup_sequence_coords?.[0];
-  const availableDrivers = [...availableDriversRaw]
-    .map(ds => {
-      const u = state.users.find(x => String(x.id) === String(ds.driver_id));
-      const livePos = state.driver_positions?.[ds.driver_id];
-      const liveIsFresh = livePos && (Date.now() - new Date(livePos.updated_at).getTime()) <= 30000;
-      const originCoord = liveIsFresh ? { lat: livePos.lat, lng: livePos.lng } : (u?.home_address || null);
-      const distKm = (pickupCoord && originCoord)
-        ? haversineKm(pickupCoord.lat, pickupCoord.lng, originCoord.lat, originCoord.lng) * ROAD_FACTOR
-        : null;
-      // Feature 4: smart score — combines proximity, load, acceptance rate, and
-      // whether this driver has previously declined any of this trip's agents.
-      const tripAgentIds = selectedTrips.flatMap(t => t.agent_ids || []);
-      const { score, acceptRate, prevDeclinedThisAgent } = scoreDriverForTrip(ds, u, distKm, state, tripAgentIds, state.trips);
-      return { ds, u, distKm, usedLivePosition: liveIsFresh && distKm != null, score, acceptRate, prevDeclinedThisAgent };
-    })
-    .sort((a, b) => b.score - a.score); // highest score first
-  const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
-  const topScoredDriverId = availableDrivers[0]?.ds.driver_id || null;
-  // Search-filtered list for DISPLAY only — per the scan finding, a
-  // fleet with many drivers had no way to narrow this list at all.
-  // Deliberately a SEPARATE list from availableDrivers itself, so
-  // nearestDriverId above still reflects the true nearest driver across
-  // the whole fleet, not just whoever currently matches a search.
-  // Matches on name OR vehicle description (searching "hiace" finds
-  // every driver with a Toyota Hiace, a genuinely useful thing to
-  // filter by when picking a vehicle for a larger group).
-  const displayedDrivers = driverSearch.trim().length >= 1
-    ? availableDrivers.filter(({ u, ds }) => {
-        const q = driverSearch.trim().toLowerCase();
-        return (u?.name || "").toLowerCase().includes(q) ||
-          (ds.vehicle || "").toLowerCase().includes(q) ||
-          (u?.home_address?.area || "").toLowerCase().includes(q) ||
-          (u?.home_address?.label || "").toLowerCase().includes(q);
+  // Same memoization reasoning as the block above — depends on that
+  // block's own outputs (primaryTrip, availableDriversRaw, selectedTrips)
+  // plus driverSearch/state.driver_positions, so it still only recomputes
+  // when something it actually reads has changed.
+  const { pickupCoord, availableDrivers, nearestDriverId, topScoredDriverId, displayedDrivers } = React.useMemo(() => {
+    const pickupCoord = primaryTrip?.pickup_sequence_coords?.[0];
+    const availableDrivers = [...availableDriversRaw]
+      .map(ds => {
+        const u = state.users.find(x => String(x.id) === String(ds.driver_id));
+        const livePos = state.driver_positions?.[ds.driver_id];
+        const liveIsFresh = livePos && (nowTick - new Date(livePos.updated_at).getTime()) <= 30000;
+        const originCoord = liveIsFresh ? { lat: livePos.lat, lng: livePos.lng } : (u?.home_address || null);
+        const distKm = (pickupCoord && originCoord)
+          ? haversineKm(pickupCoord.lat, pickupCoord.lng, originCoord.lat, originCoord.lng) * ROAD_FACTOR
+          : null;
+        // Feature 4: smart score — combines proximity, load, acceptance rate, and
+        // whether this driver has previously declined any of this trip's agents.
+        const tripAgentIds = selectedTrips.flatMap(t => t.agent_ids || []);
+        const { score, acceptRate, prevDeclinedThisAgent } = scoreDriverForTrip(ds, u, distKm, tripAgentIds, state.trips);
+        return { ds, u, distKm, usedLivePosition: liveIsFresh && distKm != null, score, acceptRate, prevDeclinedThisAgent };
       })
-    : availableDrivers;
+      .sort((a, b) => b.score - a.score); // highest score first
+    const nearestDriverId = availableDrivers[0]?.distKm != null ? availableDrivers[0].ds.driver_id : null;
+    const topScoredDriverId = availableDrivers[0]?.ds.driver_id || null;
+    // Search-filtered list for DISPLAY only — per the scan finding, a
+    // fleet with many drivers had no way to narrow this list at all.
+    // Deliberately a SEPARATE list from availableDrivers itself, so
+    // nearestDriverId above still reflects the true nearest driver across
+    // the whole fleet, not just whoever currently matches a search.
+    // Matches on name OR vehicle description (searching "hiace" finds
+    // every driver with a Toyota Hiace, a genuinely useful thing to
+    // filter by when picking a vehicle for a larger group).
+    const displayedDrivers = driverSearch.trim().length >= 1
+      ? availableDrivers.filter(({ u, ds }) => {
+          const q = driverSearch.trim().toLowerCase();
+          return (u?.name || "").toLowerCase().includes(q) ||
+            (ds.vehicle || "").toLowerCase().includes(q) ||
+            (u?.home_address?.area || "").toLowerCase().includes(q) ||
+            (u?.home_address?.label || "").toLowerCase().includes(q);
+        })
+      : availableDrivers;
+    return { pickupCoord, availableDrivers, nearestDriverId, topScoredDriverId, displayedDrivers };
+  }, [primaryTrip, availableDriversRaw, selectedTrips, state.users, state.driver_positions, state.trips, driverSearch, nowTick]);
 
   const handleDispatch = async () => {
     // FOUND VIA AUDIT (2026-08-09): was `|| overCapacity` — overCapacity
