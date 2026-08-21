@@ -1194,7 +1194,7 @@ async function fetchAuditLogsRange({ fromMs, toMs, limit = 1000 } = {}) {
 // group/filter the activity log by category without a hardcoded list of
 // every action type, so a newly-added logAuditAction call site is
 // automatically grouped correctly with no changes needed here.
-function auditLogCategory(actionType) {
+export function auditLogCategory(actionType) {
   return (actionType || "").split("/")[0] || "OTHER";
 }
 
@@ -1203,7 +1203,7 @@ function auditLogCategory(actionType) {
 // applies (see e.g. monthly-billing-export's identical -2*3600000
 // correction). Used by AdminActivityLog's date-range search so the fetch
 // window agrees with auditLogPeriodKey's own SAST-pinned bucketing below.
-function sastMidnightMs(dateStr) {
+export function sastMidnightMs(dateStr) {
   const [y, m, d] = dateStr.split("-").map(Number);
   return Date.UTC(y, m - 1, d, 0, 0, 0, 0) - 2 * 3600000;
 }
@@ -1219,7 +1219,7 @@ function sastMidnightMs(dateStr) {
 // grouping recompute, and Intl.DateTimeFormat construction isn't free.
 const SAST_YMD_FORMAT = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Johannesburg", year: "numeric", month: "2-digit", day: "2-digit" });
 
-function sastTodayStr() {
+export function sastTodayStr() {
   const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date()).map(x => [x.type, x.value]));
   return `${p.year}-${p.month}-${p.day}`;
 }
@@ -1231,7 +1231,7 @@ function sastTodayStr() {
 // time, not SAST), which could misjudge "is this driver full TODAY" for
 // an admin browsing from outside SAST — a real capacity-decision bug at
 // one of the two sites, not just a display mismatch.
-function sastTodaySlashStr() {
+export function sastTodaySlashStr() {
   const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date()).map(x => [x.type, x.value]));
   return `${p.year}/${p.month}/${p.day}`;
 }
@@ -1239,7 +1239,7 @@ function sastTodaySlashStr() {
 // Shifts a "YYYY-MM-DD" date string by N days and/or N calendar months —
 // treats the string as a plain calendar date (UTC midnight, no further
 // timezone conversion needed since it's already the target SAST date).
-function shiftDateStr(dateStr, { days = 0, months = 0 } = {}) {
+export function shiftDateStr(dateStr, { days = 0, months = 0 } = {}) {
   const [y, m, d] = dateStr.split("-").map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
   if (days) dt.setUTCDate(dt.getUTCDate() + days);
@@ -1263,7 +1263,7 @@ function shiftDateStr(dateStr, { days = 0, months = 0 } = {}) {
 // in this app: an admin reviewing "today's" activity from a non-SAST
 // device must see the same boundary everyone else does. Week buckets are
 // Monday-start (ISO), keyed by that Monday's date.
-function auditLogPeriodKey(timestamp, granularity) {
+export function auditLogPeriodKey(timestamp, granularity) {
   const p = Object.fromEntries(SAST_YMD_FORMAT.formatToParts(new Date(timestamp)).map(x => [x.type, x.value]));
   if (granularity === "month") return `${p.year}-${p.month}`;
   if (granularity === "week") {
@@ -1275,7 +1275,7 @@ function auditLogPeriodKey(timestamp, granularity) {
   return `${p.year}-${p.month}-${p.day}`;
 }
 
-function groupAuditLogsByPeriod(logs, granularity) {
+export function groupAuditLogsByPeriod(logs, granularity) {
   const buckets = new Map();
   for (const log of logs) {
     const key = auditLogPeriodKey(log.timestamp, granularity);

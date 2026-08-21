@@ -1352,7 +1352,7 @@ function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropof
 // threshold (which flags one agent's individual pickup->dropoff
 // distance as a long-distance trip) — this caps the driver's WHOLE
 // multi-stop route instead.
-function companyPolicyDistanceCapKm(totalAgentCount) {
+export function companyPolicyDistanceCapKm(totalAgentCount) {
   return 40 * Math.max(1, totalAgentCount);
 }
 
@@ -1395,7 +1395,7 @@ async function recomputeDriverRouteAndCompliance(driverTripRows, companyAnchor, 
 
 // Earliest scheduledtime among a set of raw (DB-shaped) trip rows — used
 // to derive recomputeDriverRouteAndCompliance's departEpoch consistently.
-function earliestScheduledTime(rawRows) {
+export function earliestScheduledTime(rawRows) {
   const times = rawRows.map(r => r.scheduledtime).filter(t => t != null).sort((a, b) => a - b);
   return times[0] ?? null;
 }

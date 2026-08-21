@@ -26,12 +26,29 @@ import {
   computeDriverHoursToday,
   computeDriverHoursThisWeek,
   cropTrailToPickupWindow,
+  earliestScheduledTime,
+  companyPolicyDistanceCapKm,
+  csvEscapeCell,
   TRIP_STATE,
   ROLE,
   ADMIN_LEVEL,
   DRIVER_CAPACITY,
 } from "../TransitOS_web.jsx";
-import { computeGroupSuggestions } from "../admin/AdminSection.jsx";
+import {
+  computeGroupSuggestions,
+  shiftDateStr,
+  sastMidnightMs,
+  sastTodayStr,
+  sastTodaySlashStr,
+  auditLogCategory,
+  auditLogPeriodKey,
+  groupAuditLogsByPeriod,
+} from "../admin/AdminSection.jsx";
+
+// 12:00 SAST (well clear of any midnight boundary) for a given SAST
+// calendar date — shared by the auditLogPeriodKey/groupAuditLogsByPeriod
+// describe blocks below.
+const sastNoon = (y, m, d) => Date.UTC(y, m - 1, d, 10, 0, 0);
 
 const feeRates = {
   normal_zar: 100,
@@ -491,5 +508,166 @@ describe("cropTrailToPickupWindow — GPS trail crop (temporal + spatial)", () =
   it("returns null (strict) or an empty trail (lenient) when the raw trail itself is empty", () => {
     expect(cropTrailToPickupWindow([], {}, {}, null, { strict: true })).toBeNull();
     expect(cropTrailToPickupWindow([], {}, {}, null)).toEqual([]);
+  });
+});
+
+// Added per explicit request to cover the highest-value pure helpers that
+// weren't yet tested — several of these were the actual source of real
+// bugs found via manual /code-review earlier this session (most notably
+// shiftDateStr's month-rollover bug), so these are regression tests for
+// bugs that already happened once, not speculative coverage.
+
+describe("shiftDateStr — calendar-month-safe date-string arithmetic", () => {
+  it("shifts by days, including a year rollover", () => {
+    expect(shiftDateStr("2026-08-20", { days: -7 })).toBe("2026-08-13");
+    expect(shiftDateStr("2026-01-01", { days: -1 })).toBe("2025-12-31");
+  });
+
+  it("shifts by a calendar month in the ordinary case", () => {
+    expect(shiftDateStr("2026-08-20", { months: -1 })).toBe("2026-07-20");
+  });
+
+  it("REGRESSION: clamps to the target month's real last day instead of overflowing forward (Oct 31 - 1mo = Sep 30, not Oct 1)", () => {
+    // The exact bug found via /code-review this session: `setMonth` on a
+    // day that doesn't exist in the target month rolls FORWARD into the
+    // following month (Oct 31 -> "Sep 31" -> normalizes to Oct 1),
+    // silently collapsing a "PAST MONTH" quick-range button to 1 day.
+    expect(shiftDateStr("2026-10-31", { months: -1 })).toBe("2026-09-30");
+  });
+
+  it("REGRESSION: clamps correctly into a non-leap February", () => {
+    expect(shiftDateStr("2026-03-31", { months: -1 })).toBe("2026-02-28"); // 2026 is not a leap year
+  });
+});
+
+describe("sastMidnightMs / sastTodayStr / sastTodaySlashStr — SAST-pinned date helpers", () => {
+  it("sastMidnightMs returns the UTC epoch of SAST midnight (UTC+2) for a given date string", () => {
+    // 2026-08-20 00:00 SAST == 2026-08-19 22:00 UTC.
+    expect(sastMidnightMs("2026-08-20")).toBe(Date.UTC(2026, 7, 19, 22, 0, 0, 0));
+  });
+
+  it("sastTodayStr/sastTodaySlashStr agree on the same calendar day, just dash- vs slash-separated", () => {
+    vi.useFakeTimers();
+    try {
+      // 2026-08-20 10:00 UTC = 12:00 SAST, well clear of any midnight boundary.
+      vi.setSystemTime(new Date(Date.UTC(2026, 7, 20, 10, 0, 0)));
+      expect(sastTodayStr()).toBe("2026-08-20");
+      expect(sastTodaySlashStr()).toBe("2026/08/20");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("REGRESSION: sastTodayStr reads the SAST day, not the UTC day, right after SAST midnight", () => {
+    // 2026-08-19 23:00 UTC = 2026-08-20 01:00 SAST — the exact window
+    // (00:00-01:59 SAST) where a naive `new Date().toISOString()` UTC
+    // read would wrongly still show 2026-08-19.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(Date.UTC(2026, 7, 19, 23, 0, 0)));
+      expect(sastTodayStr()).toBe("2026-08-20");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("earliestScheduledTime — earliest scheduledtime among raw DB-shaped rows", () => {
+  it("returns the smallest scheduledtime, ignoring null/missing", () => {
+    expect(earliestScheduledTime([{ scheduledtime: 300 }, { scheduledtime: 100 }, { scheduledtime: 200 }])).toBe(100);
+    expect(earliestScheduledTime([{ scheduledtime: null }, { scheduledtime: 500 }])).toBe(500);
+  });
+
+  it("returns null when no row has a real scheduledtime", () => {
+    expect(earliestScheduledTime([])).toBeNull();
+    expect(earliestScheduledTime([{ scheduledtime: null }, {}])).toBeNull();
+  });
+});
+
+describe("companyPolicyDistanceCapKm — driver route distance cap scales with passenger count", () => {
+  it("is 40km per agent, minimum 1 agent", () => {
+    expect(companyPolicyDistanceCapKm(1)).toBe(40);
+    expect(companyPolicyDistanceCapKm(3)).toBe(120);
+    expect(companyPolicyDistanceCapKm(0)).toBe(40); // never below the 1-agent floor
+  });
+});
+
+describe("csvEscapeCell — CSV quoting + formula-injection guard", () => {
+  it("passes plain values through unchanged", () => {
+    expect(csvEscapeCell("plain text")).toBe("plain text");
+    expect(csvEscapeCell(42)).toBe("42");
+    expect(csvEscapeCell(null)).toBe("");
+    expect(csvEscapeCell(undefined)).toBe("");
+  });
+
+  it("quotes values containing a comma, quote, or CRLF, doubling any embedded quotes", () => {
+    expect(csvEscapeCell("a,b")).toBe('"a,b"');
+    expect(csvEscapeCell('say "hi"')).toBe('"say ""hi"""');
+    expect(csvEscapeCell("line1\r\nline2")).toBe('"line1\r\nline2"');
+    expect(csvEscapeCell("line1\rline2")).toBe('"line1\rline2"'); // lone \r, not just \r\n
+  });
+
+  it("REGRESSION: neutralizes formula-injection prefixes (=, +, -, @) without mangling ordinary negative numbers visually", () => {
+    expect(csvEscapeCell("=SUM(A1:A9)")).toBe("'=SUM(A1:A9)");
+    expect(csvEscapeCell("+1234")).toBe("'+1234");
+    expect(csvEscapeCell("@mention")).toBe("'@mention");
+    expect(csvEscapeCell("-5")).toBe("'-5"); // a leading "-" is guarded too, even on an otherwise-plain number
+  });
+});
+
+describe("auditLogCategory — action-type category prefix", () => {
+  it("takes the part before the first slash", () => {
+    expect(auditLogCategory("TRIP/ASSIGN_DRIVER")).toBe("TRIP");
+    expect(auditLogCategory("ADMIN/CREATE_USER")).toBe("ADMIN");
+    expect(auditLogCategory("DM/SEND")).toBe("DM");
+  });
+
+  it("falls back to OTHER for anything without a recognizable category", () => {
+    expect(auditLogCategory("")).toBe("OTHER");
+    expect(auditLogCategory(null)).toBe("OTHER");
+    expect(auditLogCategory(undefined)).toBe("OTHER");
+  });
+});
+
+describe("auditLogPeriodKey — SAST-pinned day/week/month bucketing", () => {
+  // 2026-08-17 is a Monday, 2026-08-20 a Thursday, 2026-08-23 a Sunday
+  // (same ISO week), 2026-08-24 the following Monday.
+
+  it("day granularity returns the SAST calendar date", () => {
+    expect(auditLogPeriodKey(sastNoon(2026, 8, 20), "day")).toBe("2026-08-20");
+  });
+
+  it("month granularity returns YYYY-MM", () => {
+    expect(auditLogPeriodKey(sastNoon(2026, 8, 20), "month")).toBe("2026-08");
+  });
+
+  it("week granularity buckets Monday through Sunday under that Monday's date (ISO week)", () => {
+    const monday = auditLogPeriodKey(sastNoon(2026, 8, 17), "week");
+    expect(monday).toBe("2026-08-17");
+    expect(auditLogPeriodKey(sastNoon(2026, 8, 20), "week")).toBe(monday); // Thursday, same week
+    expect(auditLogPeriodKey(sastNoon(2026, 8, 23), "week")).toBe(monday); // Sunday, still same week
+    // The following Monday must land in a DIFFERENT bucket, not the same one.
+    expect(auditLogPeriodKey(sastNoon(2026, 8, 24), "week")).toBe("2026-08-24");
+  });
+});
+
+describe("groupAuditLogsByPeriod — buckets + per-category counts, newest-first", () => {
+
+  it("groups entries into day buckets and tallies each bucket's category breakdown", () => {
+    const logs = [
+      { id: 1, actionType: "TRIP/ASSIGN_DRIVER", timestamp: sastNoon(2026, 8, 20) },
+      { id: 2, actionType: "TRIP/ADD_AGENT", timestamp: sastNoon(2026, 8, 20) },
+      { id: 3, actionType: "ADMIN/CREATE_USER", timestamp: sastNoon(2026, 8, 19) },
+    ];
+    const grouped = groupAuditLogsByPeriod(logs, "day");
+    expect(grouped.map(b => b.key)).toEqual(["2026-08-20", "2026-08-19"]); // newest first
+    const day20 = grouped.find(b => b.key === "2026-08-20");
+    expect(day20.count).toBe(2);
+    expect(day20.byCategory).toEqual({ TRIP: 2 });
+    expect(day20.entries.map(e => e.id)).toEqual([1, 2]);
+  });
+
+  it("returns an empty array for an empty log list", () => {
+    expect(groupAuditLogsByPeriod([], "day")).toEqual([]);
   });
 });
