@@ -1775,11 +1775,18 @@ console.log(
 
 // ── Insurance & compliance triggers ──────────────────────────────────────
 const COMPLIANCE_ROUTE_MAX_KM = 80;  // notify when driver route > 80 km
-// A shift-duration compliance check (originally planned: notify when a
-// driver's been online > 10h) was never actually implemented below — there's
-// no shift-start timestamp anywhere in driver_status to check against
-// (only a plain isonline boolean), so it would need a real schema change,
-// not just wiring up existing pieces. Left out of scope for now.
+// Continuous-shift-duration threshold — driver_status.shiftstartedat is set
+// at login (start of a continuous on-duty session) and cleared at logout;
+// see the DRIVER/CHECK_SHIFT_DURATION handler below and the identically-
+// named edge function (server-side twin, same reasoning as
+// check-hours-compliance/check-document-expiry: the client-side sweep only
+// runs while an admin has the app open). This is deliberately separate from
+// MAX_DRIVER_HOURS_PER_DAY/WEEK — those measure cumulative TRIP DRIVING
+// time (only counts actual trip intervals), this measures continuous ONLINE
+// time (counts idle/waiting time between trips too), so a driver who's been
+// on shift 11 hours with lots of downtime between short trips would trip
+// this even while comfortably under the daily driving-hours cap.
+const MAX_CONTINUOUS_SHIFT_HOURS = 10;
 
 // Called inside TRIP/ASSIGN_DRIVER and TRIP/ADD_AGENT after route is computed.
 // Returns array of compliance issues (empty = all clear).
@@ -6862,7 +6869,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       persistActiveUserId(bioUser.id);
       await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
       if (bioUser.role === ROLE.DRIVER) {
-        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", bioUser.id).then(() => {}, () => {});
+        // shiftstartedat marks the start of this continuous on-duty
+        // session for DRIVER/CHECK_SHIFT_DURATION; shiftdurationnotifiedat
+        // resets so a fresh shift is eligible to fire again even if the
+        // driver was already notified once on a previous shift today.
+        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: nowEpoch(), shiftdurationnotifiedat: null }).eq("driverid", bioUser.id).then(() => {}, () => {});
       }
       // NOT fire-and-forget, unlike the rest of this function — see the
       // header comment for why fire-and-forget is safe everywhere else.
@@ -6942,7 +6953,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // already read it from there.
       await supabase.from("users").update({ isonline: true }).eq("id", loggedInUserId).then(() => {}, () => {});
       if (loginTokenResult.user.role === ROLE.DRIVER) {
-        await supabase.from("driver_status").update({ isonline: true }).eq("driverid", loggedInUserId).then(() => {}, () => {});
+        // See AUTH/LOGIN_BIOMETRIC's identical comment above.
+        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: nowEpoch(), shiftdurationnotifiedat: null }).eq("driverid", loggedInUserId).then(() => {}, () => {});
       }
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above.
       await refetch();
@@ -6956,7 +6968,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const { data: loggedOutUserRow } = await supabase.from("users").select("role").eq("id", loggedOutUserId).maybeSingle();
         await supabase.from("users").update({ isonline: false }).eq("id", loggedOutUserId).then(() => {}, () => {});
         if (loggedOutUserRow?.role === ROLE.DRIVER) {
-          await supabase.from("driver_status").update({ isonline: false }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
+          // Clear shiftstartedat/shiftdurationnotifiedat alongside
+          // isonline — a logged-out driver isn't on a continuous shift
+          // anymore, so DRIVER/CHECK_SHIFT_DURATION should stop
+          // considering them, and their NEXT login starts a fresh shift
+          // eligible to notify again.
+          await supabase.from("driver_status").update({ isonline: false, shiftstartedat: null, shiftdurationnotifiedat: null }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
         }
         // The push_subscriptions row for THIS device deliberately survives
         // logout (subscribeToPushNotifications re-associates the same
@@ -10424,6 +10441,44 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (hoursAnyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
+    case "DRIVER/CHECK_SHIFT_DURATION": {
+      // Advisory-only, same shape as DRIVER/CHECK_HOURS_COMPLIANCE above —
+      // but measures CONTINUOUS ONLINE time (shiftstartedat, set at login/
+      // cleared at logout — see MAX_CONTINUOUS_SHIFT_HOURS's own comment
+      // for why this is deliberately a different signal from cumulative
+      // trip-driving hours). shiftdurationnotifiedat de-dups to at most
+      // once per continuous shift (reset to null on every fresh login), so
+      // this can't re-fire every 10 minutes for the rest of an already-
+      // flagged shift, but naturally becomes eligible again next shift.
+      const { data: shiftRows } = await supabase.from("driver_status")
+        .select("driverid, shiftstartedat, shiftdurationnotifiedat")
+        .eq("isonline", true).not("shiftstartedat", "is", null).is("shiftdurationnotifiedat", null);
+      if (!shiftRows || shiftRows.length === 0) return;
+      const shiftNowTs = nowEpoch();
+      const thresholdMs = MAX_CONTINUOUS_SHIFT_HOURS * 3600000;
+      const overShift = shiftRows.filter(r => shiftNowTs - r.shiftstartedat >= thresholdMs);
+      if (overShift.length === 0) return;
+      // Driver names batched into ONE query — same N+1 avoidance as
+      // check-hours-compliance's own edge-function twin.
+      const { data: shiftDriverRows } = await supabase.from("users").select("id, fullname").in("id", overShift.map(r => r.driverid));
+      const shiftDriverName = (id) => shiftDriverRows?.find(u => String(u.id) === String(id))?.fullname || String(id);
+      for (const r of overShift) {
+        const hoursOnShift = ((shiftNowTs - r.shiftstartedat) / 3600000).toFixed(1);
+        await insertNotification({
+          type: "DRIVER_SHIFT_DURATION_WARNING", for_roles: [ROLE.ADMIN],
+          message: `⚠ ${shiftDriverName(r.driverid)} has been on a continuous shift for ${hoursOnShift}h — exceeds the ${MAX_CONTINUOUS_SHIFT_HOURS}h advisory threshold.`,
+          ts: shiftNowTs, read: false,
+        });
+        await insertNotification({
+          type: "DRIVER_SHIFT_DURATION_WARNING", for_roles: [ROLE.DRIVER], for_user_ids: [r.driverid],
+          message: `⚠ You've been on shift for ${hoursOnShift}h continuously — please plan for adequate rest.`,
+          ts: shiftNowTs, read: false,
+        });
+        await supabase.from("driver_status").update({ shiftdurationnotifiedat: shiftNowTs }).eq("driverid", r.driverid);
+      }
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
     case "NOTIF/DELETE_SELECTED": {
       // Deletes notifications by ID. For agents/drivers: scoped to their own userid.
       // For admins: delete by ID only — no userid constraint. This handles:
@@ -12241,7 +12296,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.

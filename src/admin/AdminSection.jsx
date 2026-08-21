@@ -4467,6 +4467,11 @@ function AdminLiveMap({ state, user, dispatch }) {
   // the admin live map per explicit request. Defaults on.
   const [showTraffic, setShowTraffic] = useState(true);
   const [trafficIncidents, setTrafficIncidents] = useState([]);
+  // Agent home-address pins — off by default (unlike showTraffic) since at
+  // this app's target scale (~1800 agents) rendering every agent's pin
+  // unconditionally would clutter a map whose primary purpose is tracking
+  // DRIVERS, not agents. One tap away via the toggle below either way.
+  const [showAgents, setShowAgents] = useState(false);
   const W = 700, H = 560;
   // Viewport state: center lat/lng + zoom level (standard slippy-map
   // zoom, ~10-18 is a reasonable city-to-street range). Starts centered
@@ -4579,6 +4584,44 @@ function AdminLiveMap({ state, user, dispatch }) {
     return { driverId: ds.driver_id, name: driverUser?.name || "Unknown", vehicle: ds.vehicle, state: ds.state, pos, trip, stale, is_online: ds.is_online, is_away: ds.is_away };
   });
 
+  // Agent home-address pins — memoized on state.users alone (not
+  // livePositions/viewport, both of which change every ~8s per active
+  // driver) so filtering ~1800 agents at this app's target scale doesn't
+  // redo on every GPS tick, only when the user list itself actually
+  // changes. Screen-projecting the (small, already-filtered) result is
+  // cheap and stays inline in the render below, same as driverPoints.
+  const agentHomePoints = React.useMemo(
+    () => state.users.filter(u => u.role === ROLE.AGENT && u.home_address?.lat != null),
+    [state.users]
+  );
+  // Same visibility restriction as showVehicleDetail below — an agent's
+  // home address is the same class of profile detail already gated
+  // behind a permission everywhere else it's shown (Users tab, driver
+  // detail panel). Currently a no-op for the only two tiers that reach
+  // this component (FLEET_OPS/STANDARD both hard-code viewUsers:true),
+  // but stops a future admin tier without viewUsers from seeing every
+  // agent's home address on the map despite lacking it anywhere else.
+  const showAgentPins = hasAdminPermission(user, "viewUsers");
+  // Viewport-culled to only agents currently visible on screen (+ a small
+  // padding so a pin doesn't pop in/out right at the edge while panning)
+  // — FOUND VIA /code-review: projecting+rendering EVERY agent's pin on
+  // every viewport-change re-render (which fires on every pointer-move
+  // frame while dragging) caused real jank once this toggle was on, at
+  // this app's target scale (~1800 agents). Reuses the exact bounding-box
+  // technique the traffic-incident fetch effect above already uses.
+  let visibleAgentPoints = [];
+  if (showAgents && showAgentPins && agentHomePoints.length > 0) {
+    const topLeft = unprojectFromSvg(0, 0, W, H, viewport);
+    const bottomRight = unprojectFromSvg(W, H, W, H, viewport);
+    const pad = 0.05; // ~5km buffer
+    const minLat = Math.min(topLeft.lat, bottomRight.lat) - pad, maxLat = Math.max(topLeft.lat, bottomRight.lat) + pad;
+    const minLng = Math.min(topLeft.lon, bottomRight.lon) - pad, maxLng = Math.max(topLeft.lon, bottomRight.lon) + pad;
+    visibleAgentPoints = agentHomePoints.filter(u =>
+      u.home_address.lat >= minLat && u.home_address.lat <= maxLat &&
+      u.home_address.lng >= minLng && u.home_address.lng <= maxLng
+    );
+  }
+
   const withPosition = driverPoints.filter(d => d.pos);
   const selected = selectedDriverId ? driverPoints.find(d => d.driverId === selectedDriverId) : null;
 
@@ -4679,6 +4722,7 @@ function AdminLiveMap({ state, user, dispatch }) {
             <Button title="📢 ADVISORY" variant={showAdvisoryPanel ? "amber" : "ghost"} size="sm" onClick={() => setShowAdvisoryPanel(v => !v)} />
           )}
           <Button title="🚦 TRAFFIC" variant={showTraffic ? "amber" : "ghost"} size="sm" onClick={() => setShowTraffic(v => !v)} />
+          {showAgentPins && <Button title="📍 AGENTS" variant={showAgents ? "amber" : "ghost"} size="sm" onClick={() => setShowAgents(v => !v)} />}
           <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
           <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
           <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
@@ -4773,6 +4817,24 @@ function AdminLiveMap({ state, user, dispatch }) {
               <g key={co.id}>
                 <rect x={p.x - 5} y={p.y - 5} width={10} height={10} fill={COLORS.amber} opacity={0.7} />
                 <text x={p.x + 8} y={p.y + 4} fontSize={9} fill={COLORS.ghost}>{co.name}</text>
+              </g>
+            );
+          })}
+
+          {/* Agent home-address pins — small red dots, toggled via the
+              📍 AGENTS button. Native <title> gives a hover/tap tooltip
+              (name + address) without needing a popup component, same
+              pattern as the traffic-incident markers above. Deliberately
+              no persistent text label per marker (unlike the company
+              reference points) — at this app's target scale of ~1800
+              agents, always-on labels would make the map unreadable the
+              moment this toggle is on. */}
+          {visibleAgentPoints.map(u => {
+            const p = projectToSvg(u.home_address.lat, u.home_address.lng, W, H, viewport);
+            return (
+              <g key={u.id}>
+                <title>{`${u.name}${u.home_address.label ? ` — ${u.home_address.label}` : ""}`}</title>
+                <circle cx={p.x} cy={p.y} r={4} fill={COLORS.red} stroke={COLORS.panel} strokeWidth={1} opacity={0.85} />
               </g>
             );
           })}
@@ -7151,7 +7213,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -7387,6 +7449,10 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // than in every driver's own polling effect.
     dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
     dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
+    // Continuous-shift-duration compliance — see MAX_CONTINUOUS_SHIFT_HOURS'
+    // own comment (TransitOS_web.jsx) for why this is a separate signal
+    // from CHECK_HOURS_COMPLIANCE's cumulative trip-driving hours.
+    dispatch({ type: "DRIVER/CHECK_SHIFT_DURATION" }).catch(() => {});
     // Same shape as CHECK_LATE_START — catches a booking that never even
     // got a driver, not just one whose confirmed driver hasn't started.
     dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
@@ -7401,6 +7467,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
+      dispatch({ type: "DRIVER/CHECK_SHIFT_DURATION" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_STUCK_IN_TRANSIT" }).catch(() => {});
       dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
