@@ -12668,6 +12668,65 @@ function useAwayDetection(userId, isLoggedIn) {
   }, [userId, isLoggedIn]);
 }
 
+// Shared by useDriverLocationTracking's pickup and dropoff geofence
+// auto-confirm loops — FOUND VIA /code-review (redundancy audit): these
+// were two ~38-line, structurally identical blocks (only the coords
+// field, completed-list, and action type differed), one of which already
+// self-acknowledged the duplication in its own comment ("See the
+// identical fix/reasoning on the pickup geofence loop above").
+function autoConfirmGeofenceStop({
+  agentIds, completedList, coordsField, trip, latitude, longitude, geofenceRadiusKm,
+  kind, actionType, geofenceTriggeredRef, dispatchRef, prerequisiteList,
+}) {
+  for (const aid of agentIds) {
+    // Dropoff checks additionally require the agent to already be
+    // picked up — passed as prerequisiteList rather than pre-filtering
+    // agentIds itself, since aidIdx below must stay indexed against the
+    // FULL original agent_ids order (matching how dropoff_sequence_coords
+    // was built) — pre-filtering agentIds would shift a later agent's
+    // index and resolve their positional fallback to a DIFFERENT agent's
+    // coordinate.
+    if (prerequisiteList && !prerequisiteList.some(c => String(c) === String(aid))) continue;
+    if (completedList.some(c => String(c) === String(aid))) continue;
+    const aidIdx = agentIds.indexOf(aid);
+    // pickup/dropoff_sequence_coords hydrated from Supabase carries no
+    // agent_id at all — falling straight back to index 0 (as this used
+    // to) resolves EVERY non-first agent's geofence check against agent
+    // #1's coordinate instead of their own. Since this loop auto-fires a
+    // confirm action with no human confirmation, that meant driving near
+    // agent #1's stop could silently auto-confirm agent #2 as picked-up/
+    // dropped-off while they were never actually there.
+    const coord = trip[coordsField]?.find(c => String(c.agent_id) === String(aid))
+      || trip[coordsField]?.[aidIdx]
+      || trip[coordsField]?.[0];
+    // FOUND VIA /code-review (4th pass): `!coord?.lat` treats a
+    // legitimate latitude of exactly 0 as missing (falsy), silently
+    // skipping this stop's geofence check forever — carried over
+    // verbatim from the pre-consolidation code, now fixed here for both
+    // the pickup and dropoff loop at once.
+    if (coord?.lat == null || coord?.lng == null) continue;
+    const distKm = haversineKm(latitude, longitude, coord.lat, coord.lng);
+    const geoKey = `${kind}:${trip.trip_id}:${aid}`;
+    if (distKm <= geofenceRadiusKm && !geofenceTriggeredRef.current.has(geoKey)) {
+      geofenceTriggeredRef.current.add(geoKey);
+      console.log(`[Geofence] Auto-confirming ${kind} for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
+      const geoAction = { type: actionType, trip_id: trip.trip_id, agent_id: aid,
+        driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
+      dispatchRef.current(geoAction).catch((err) => {
+        // A network-shaped failure must not permanently block this
+        // stop's auto-confirm. Queue for offline replay AND free the
+        // geoKey so the very next GPS tick can also retry live while
+        // still in range — the confirm action is already safely
+        // idempotent, so a duplicate fire from both racing is harmless.
+        if (isNetworkError(err)) {
+          enqueueOfflineAction(geoAction);
+          geofenceTriggeredRef.current.delete(geoKey);
+        }
+      });
+    }
+  }
+}
+
 function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips = [], dispatch = null) {
   const [tracking, setTracking] = useState(false);
   const [lastError, setLastError] = useState(null);
@@ -12831,83 +12890,19 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           const completedPickups = trip.completed_pickups || [];
           const completedDropoffs = trip.completed_dropoffs || [];
           const agentIds = trip.agent_ids || [];
-          // Check pickups first — agents not yet confirmed picked up
-          for (const aid of agentIds) {
-            if (completedPickups.some(c => String(c) === String(aid))) continue;
-            const aidIdx = agentIds.indexOf(aid);
-            // pickup_sequence_coords hydrated from Supabase carries no
-            // agent_id at all — falling straight back to index 0 (as this
-            // used to) resolves EVERY non-first agent's geofence check
-            // against agent #1's coordinate instead of their own. Since
-            // this loop auto-fires TRIP/CONFIRM_AGENT_PICKUP with no human
-            // confirmation, that meant driving near agent #1's pickup could
-            // silently auto-confirm agent #2 as picked up while they were
-            // never actually in the vehicle. Match the positional-fallback
-            // convention used elsewhere in this codebase for this exact
-            // data shape (find by agent_id, else by position, else [0]).
-            const pCoord = trip.pickup_sequence_coords?.find(p => String(p.agent_id) === String(aid))
-              || trip.pickup_sequence_coords?.[aidIdx]
-              || trip.pickup_sequence_coords?.[0];
-            if (!pCoord?.lat) continue;
-            const distKm = haversineKm(latitude, longitude, pCoord.lat, pCoord.lng);
-            const geoKey = `pickup:${trip.trip_id}:${aid}`;
-            if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
-              geofenceTriggeredRef.current.add(geoKey);
-              console.log(`[Geofence] Auto-confirming pickup for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
-              const geoAction = { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: trip.trip_id, agent_id: aid,
-                driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
-              dispatchRef.current(geoAction).catch((err) => {
-                // Unlike the manual confirm buttons (which enqueue for
-                // offline replay on a network-shaped failure), this used to
-                // just swallow the error — geofenceTriggeredRef permanently
-                // blocked any retry for this exact stop even though GPS
-                // keeps ticking every few seconds while the vehicle is
-                // still right there. Queue for replay on reconnect AND free
-                // the geoKey so the very next GPS tick can also retry live
-                // while still in range — CONFIRM_AGENT_PICKUP is already
-                // safely idempotent, so a duplicate fire from both racing
-                // is harmless.
-                if (isNetworkError(err)) {
-                  enqueueOfflineAction(geoAction);
-                  geofenceTriggeredRef.current.delete(geoKey);
-                }
-              });
-            }
-          }
-          // Check dropoffs — agents confirmed picked up but not yet dropped
-          for (const aid of agentIds) {
-            if (!completedPickups.some(c => String(c) === String(aid))) continue;
-            if (completedDropoffs.some(c => String(c) === String(aid))) continue;
-            const aidIdx = agentIds.indexOf(aid);
-            // Same fix as the pickup loop above — dropoff_sequence_coords
-            // hydrated from Supabase carries no agent_id, so this used to
-            // resolve every non-first agent's geofence check against
-            // agent #1's dropoff address. Since this auto-fires
-            // TRIP/CONFIRM_AGENT_DROPOFF with no human confirmation,
-            // driving near agent #1's home could silently mark agent #2 as
-            // dropped off while they were still in the vehicle.
-            const dCoord = trip.dropoff_sequence_coords?.find(d => String(d.agent_id) === String(aid))
-              || trip.dropoff_sequence_coords?.[aidIdx]
-              || trip.dropoff_sequence_coords?.[0];
-            if (!dCoord?.lat) continue;
-            const distKm = haversineKm(latitude, longitude, dCoord.lat, dCoord.lng);
-            const geoKey = `dropoff:${trip.trip_id}:${aid}`;
-            if (distKm <= GEOFENCE_RADIUS_KM && !geofenceTriggeredRef.current.has(geoKey)) {
-              geofenceTriggeredRef.current.add(geoKey);
-              console.log(`[Geofence] Auto-confirming dropoff for agent ${aid} on trip ${trip.trip_id} (${(distKm * 1000).toFixed(0)}m away)`);
-              const geoAction = { type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: trip.trip_id, agent_id: aid,
-                driver_coord: { lat: latitude, lng: longitude }, confirmed_at: Date.now() };
-              dispatchRef.current(geoAction).catch((err) => {
-                // See the identical fix/reasoning on the pickup geofence
-                // loop above — a network-shaped failure must not
-                // permanently block this stop's auto-confirm.
-                if (isNetworkError(err)) {
-                  enqueueOfflineAction(geoAction);
-                  geofenceTriggeredRef.current.delete(geoKey);
-                }
-              });
-            }
-          }
+          // Check pickups first — agents not yet confirmed picked up.
+          autoConfirmGeofenceStop({
+            agentIds, completedList: completedPickups, coordsField: "pickup_sequence_coords", trip,
+            latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
+            kind: "pickup", actionType: "TRIP/CONFIRM_AGENT_PICKUP", geofenceTriggeredRef, dispatchRef,
+          });
+          // Check dropoffs — agents confirmed picked up but not yet dropped.
+          autoConfirmGeofenceStop({
+            agentIds, completedList: completedDropoffs, coordsField: "dropoff_sequence_coords", trip,
+            latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
+            kind: "dropoff", actionType: "TRIP/CONFIRM_AGENT_DROPOFF", geofenceTriggeredRef, dispatchRef,
+            prerequisiteList: completedPickups,
+          });
         }
       }
       // Feature: Speed anomaly detection ───────────────────────────────────

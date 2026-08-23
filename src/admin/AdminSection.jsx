@@ -975,6 +975,14 @@ function scheduledTimeToMinutes(timeStr) {
   return h * 60 + m;
 }
 
+// Shared by computeGroupSuggestions and AdminTrips' search — both need an
+// O(1) id → user lookup over the same users list. FOUND VIA /code-review
+// (4th pass): AdminTrips had re-inlined this exact Map-building line
+// rather than reusing this one.
+export function usersByIdMap(users) {
+  return new Map(users.map(u => [String(u.id), u]));
+}
+
 // Resolves the ONE company a booking belongs to via its first agent's
 // branch_id — same field scopeTripsToCompany (AdminSection.jsx:95-100)
 // reads. Bookings pre-dispatch normally carry exactly one agent, so
@@ -1006,7 +1014,7 @@ function bookingRankCoord(trip) {
 }
 
 export function computeGroupSuggestions(unassigned, users = [], driverStatus = []) {
-  const usersById = new Map(users.map(u => [String(u.id), u]));
+  const usersById = usersByIdMap(users);
   const suggestions = [];
   const used = new Set();
 
@@ -2583,6 +2591,12 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // was) — per explicit decision, this move is a relocation of the UI,
   // not an expansion of what can be bulk-deleted.
   const [dateFilter, setDateFilter] = useState("");
+  // FOUND VIA /code-review (productivity audit): this is the single
+  // largest, most comprehensive trip list in the app, yet unlike
+  // AdminUsers/AdminProfileSearch/AdminHistory/AdminActivityLog (all
+  // given search this session), it had no text search at all — finding
+  // "did agent X's booking get assigned" meant scrolling/scanning by eye.
+  const [searchQuery, setSearchQuery] = useState("");
   // Per-driver-group collapse — each group's trip list starts expanded
   // (matches the existing behavior before this was added), toggled by
   // tapping that group's own header. Keyed by the same string group key
@@ -2611,6 +2625,16 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
       setFilter("ALL");
       setDateFilter("");
       setSelectedDriverId(null);
+      // FOUND VIA /code-review: a stale search string was never cleared
+      // here, so a notification tap could jump to a trip that the still-
+      // active search text then immediately filtered right back out of
+      // view, defeating the whole point of this effect.
+      setSearchQuery("");
+      // selectedTripIds is no longer cleared manually here — the
+      // visibility-pruning effect below (keyed on displayTrips/
+      // selectedDriverId) handles it: any previously-selected trip
+      // that's actually hidden by these resets gets dropped there,
+      // while one that stays visible correctly stays selected.
       onJumpConsumed?.();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2619,9 +2643,50 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // refetch timing — see handleBulkDeleteTrips.
   const [locallyHiddenTripIds, setLocallyHiddenTripIds] = useState(new Set());
   const filters = ["ALL", ...Object.values(TRIP_STATE)];
-  const visibleStateTrips = state.trips.filter(t => !locallyHiddenTripIds.has(t.trip_id));
-  const displayTripsByState = filter === "ALL" ? visibleStateTrips : visibleStateTrips.filter(t => t.state === filter);
-  const displayTrips = dateFilter ? displayTripsByState.filter(t => t.scheduled_date === dateFilter) : displayTripsByState;
+  // Each step memoized on its own inputs — FOUND VIA /code-review: these
+  // were plain consts before, rebuilt with a fresh array identity every
+  // render; the displayTrips memo below depends on displayTripsByDate, so
+  // an unstable identity here defeated that memoization entirely (it
+  // re-ran the full search filter on every render, not just on actual
+  // search/filter changes).
+  const visibleStateTrips = React.useMemo(
+    () => state.trips.filter(t => !locallyHiddenTripIds.has(t.trip_id)),
+    [state.trips, locallyHiddenTripIds]
+  );
+  const displayTripsByState = React.useMemo(
+    () => filter === "ALL" ? visibleStateTrips : visibleStateTrips.filter(t => t.state === filter),
+    [visibleStateTrips, filter]
+  );
+  const displayTripsByDate = React.useMemo(
+    () => dateFilter ? displayTripsByState.filter(t => t.scheduled_date === dateFilter) : displayTripsByState,
+    [displayTripsByState, dateFilter]
+  );
+  // FOUND VIA /code-review: state.users.find() per agent per trip was an
+  // O(trips × agents × users) linear scan on every render — reusing the
+  // same usersById-Map pattern computeGroupSuggestions already uses for
+  // this identical trips×agents×users shape (AdminSection.jsx:1009).
+  const usersById = React.useMemo(() => usersByIdMap(state.users), [state.users]);
+  // Matches on any agent's name/staff number, the driver's name, or the
+  // trip id itself — same fields AdminDispatch's own driver search and
+  // AdminProfileSearch already match on, for consistency.
+  const displayTrips = React.useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return displayTripsByDate;
+    return displayTripsByDate.filter(t => {
+      if (String(t.trip_id).toLowerCase().includes(q)) return true;
+      // FOUND VIA /code-review (7th pass): `if (t.driver_id)` treats a
+      // driver_id of 0 as falsy/missing, same bug class the geofence
+      // coord.lat check was fixed for elsewhere in this diff.
+      if (t.driver_id != null) {
+        const driverUser = usersById.get(String(t.driver_id));
+        if ((driverUser?.name || "").toLowerCase().includes(q)) return true;
+      }
+      return (t.agent_ids || []).some(id => {
+        const u = usersById.get(String(id));
+        return (u?.name || "").toLowerCase().includes(q) || (u?.staff_number || "").toLowerCase().includes(q);
+      });
+    });
+  }, [displayTripsByDate, searchQuery, usersById]);
   const availableTripDates = [...new Set(state.trips.map(t => t.scheduled_date).filter(Boolean))].sort();
   // Per explicit decision: this trips CSV always includes the Trip Fee
   // column/total now, so access to it is gated by viewTripFees (Fleet
@@ -2707,7 +2772,12 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // mode) — Number(key) turned demo ids into NaN, breaking driver names
   // and the per-driver filter there. String-compare instead, which is
   // correct for both id shapes.
-  const findUserByKey = (key) => state.users.find(u => String(u.id) === String(key));
+  // FOUND VIA /code-review (9th pass): re-scanned state.users per call
+  // instead of reusing usersById (already in scope two lines above for
+  // this exact O(trips × users) shape) — called once per driver-group
+  // header/button, which at this app's target scale (~1800 agents) adds
+  // up across every render.
+  const findUserByKey = (key) => usersById.get(String(key));
   const sortedDriverIds = driverIds.sort((a, b) => {
     const nameA = findUserByKey(a)?.name || "";
     const nameB = findUserByKey(b)?.name || "";
@@ -2715,6 +2785,29 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   });
   const orderedKeys = [...sortedDriverIds, ...(groups.UNASSIGNED ? ["UNASSIGNED"] : [])];
   const visibleKeys = selectedDriverId ? orderedKeys.filter(k => k === String(selectedDriverId)) : orderedKeys;
+
+  // Prunes the bulk-delete selection to whatever is actually rendered
+  // under the CURRENT filters (status/date/search/driver-group), rather
+  // than wiping the whole selection on every filter-changing
+  // interaction. FOUND VIA /code-review (6th pass): the search input's
+  // per-keystroke full clear was far more disruptive than intended —
+  // every character typed wiped an in-progress bulk-delete selection
+  // even for trips that stayed visible. Replaces that and the other
+  // setSelectedTripIds(new Set()) calls previously scattered across the
+  // status filter, date filter, driver-group buttons, and the
+  // notification jump effect: a trip still visible after whatever
+  // filter just changed stays selected; one that's been filtered out of
+  // view is dropped — the actual hazard those calls existed to guard
+  // against, not a full wipe on every interaction.
+  useEffect(() => {
+    const renderedIds = new Set(visibleKeys.flatMap(k => groups[k]).map(t => t.trip_id));
+    setSelectedTripIds(prev => {
+      if (prev.size === 0) return prev;
+      const next = new Set([...prev].filter(id => renderedIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [displayTrips, selectedDriverId]);
 
   return (
     <div className="pad">
@@ -2748,10 +2841,19 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         )}
       </div>
 
+      <div>
+        <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>SEARCH</label>
+        <input
+          className="inp" value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          placeholder="Agent name / staff number / driver name / trip ID…" style={{ width: "100%" }}
+        />
+      </div>
+
       {availableTripDates.length > 1 && (
         <div>
           <label style={{ fontSize: 9, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>FILTER BY DATE</label>
-          <select className="inp" value={dateFilter} onChange={e => { setDateFilter(e.target.value); setSelectedTripIds(new Set()); }} style={{ width: "100%" }}>
+          <select className="inp" value={dateFilter} onChange={e => setDateFilter(e.target.value)} style={{ width: "100%" }}>
             <option value="">All dates</option>
             {availableTripDates.map(d => <option key={d} value={d}>{d}</option>)}
           </select>
@@ -2765,7 +2867,16 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         />
       )}
 
-      {driverIds.length > 1 && (
+      {/* FOUND VIA /code-review (11th pass): gated purely on
+          driverIds.length > 1 (how many driver groups the CURRENT
+          search/date/status filters happen to leave standing) — if a
+          search narrowed the trip list down to a single driver's trips
+          while a DIFFERENT driver was selected, this whole bar (the only
+          way to reset selectedDriverId) vanished, leaving no visible
+          path back to a non-empty view. Also shows whenever a driver
+          filter is active, regardless of how many groups currently
+          remain, so "ALL DRIVERS" always stays reachable. */}
+      {(driverIds.length > 1 || selectedDriverId) && (
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
           <Button size="sm" variant={!selectedDriverId ? "amber" : "ghost"} title="ALL DRIVERS" onClick={() => setSelectedDriverId(null)} />
           {sortedDriverIds.map(id => (
@@ -2776,7 +2887,17 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         </div>
       )}
 
-      {displayTrips.length === 0 ? <Empty icon="⊟" text="No bookings or trips" /> : visibleKeys.map(key => {
+      {displayTrips.length === 0 ? (
+        <Empty icon="⊟" text="No bookings or trips" />
+      ) : visibleKeys.length === 0 ? (
+        // FOUND VIA /code-review (11th pass): the driver-group filter
+        // (selectedDriverId) isn't baked into displayTrips itself — a
+        // search/date/status change can leave the selected driver with
+        // zero matching trips while displayTrips is still non-empty for
+        // OTHER drivers, which previously rendered nothing at all with
+        // no message, since only displayTrips.length was checked here.
+        <Empty icon="⊟" text="This driver has no trips matching the current search/filters — try ALL DRIVERS above." />
+      ) : visibleKeys.map(key => {
         const isUnassigned = key === "UNASSIGNED";
         const driverUser = isUnassigned ? null : findUserByKey(key);
         const groupTrips = groups[key];
@@ -3720,6 +3841,27 @@ function AdminDispatch({ state, dispatch }) {
   // on a fleet with many drivers.
   const [driverSearch, setDriverSearch] = useState("");
   const [msg, setMsg] = useState(null);
+  const [dispatching, setDispatching] = useState(false);
+  // Which driver a dispatch was actually started for — FOUND VIA
+  // /code-review (10th pass): the loading spinner/disabled button was
+  // rendered purely off `sel` (the CURRENTLY selected driver's card), so
+  // if the admin changed selection while a dispatch was still in flight
+  // (a different trip checkbox, a different driver card, any of the
+  // day/direction/area filters — all of which reset selectedDriverId),
+  // the spinner silently vanished from the driver actually being
+  // dispatched and could misleadingly appear on an uninvolved,
+  // newly-selected driver instead. This tracks the real target
+  // independent of whatever is currently selected.
+  const [dispatchingDriverId, setDispatchingDriverId] = useState(null);
+  // FOUND VIA /code-review (4th pass): `dispatching` state alone can't
+  // stop a rapid double-click — both click-handler invocations read the
+  // same pre-update `dispatching === false` from this render's closure
+  // before React commits the first setDispatching(true), so both pass
+  // the `if (dispatching) return` guard. A ref is mutated synchronously
+  // (no render/commit needed), so the second invocation sees it flip
+  // immediately, closing the gap the state-only guard's own comment
+  // already flagged as open.
+  const dispatchingRef = useRef(false);
   // The driver-scoring memo below computes each driver's live-position
   // "freshness" (30s cutoff) — see useTicker's own header comment for why
   // memoizing that check needs this. 10s keeps the staleness verdict from
@@ -3960,6 +4102,19 @@ function AdminDispatch({ state, dispatch }) {
     // generic constant here just wrongly blocked dispatch to a real,
     // available bigger vehicle (e.g. capacity 6) whenever totalSeats > 4.
     if (!primaryTrip || !selectedDriverId) return;
+    // FOUND VIA /code-review (productivity audit): the dispatch button had
+    // no loading/disabled state at all — at high-volume overnight dispatch,
+    // an admin unsure whether a click registered could double-tap (or tap
+    // a different driver's button while the first request is still in
+    // flight), assigning the same booking twice. dispatchingRef is the
+    // real guard (mutated synchronously, so a rapid double-click's second
+    // invocation sees it immediately — see its own declaration comment);
+    // `dispatching` state stays purely for the button's disabled/spinner
+    // rendering, which doesn't need to be synchronous.
+    if (dispatchingRef.current) return;
+    dispatchingRef.current = true;
+    setDispatching(true);
+    setDispatchingDriverId(selectedDriverId);
     const driverName = state.users.find(u => String(u.id) === String(selectedDriverId))?.name;
     try {
       if (isMultiDaySelection) {
@@ -4000,10 +4155,25 @@ function AdminDispatch({ state, dispatch }) {
       // row is a genuinely common workflow, and re-picking the same
       // driver from the list after every single assignment was a real,
       // repeated, unnecessary step.
-      setSelectedTripIds(new Set());
+      // FOUND VIA /code-review (3rd pass): used to reset selectedTripIds
+      // to an empty Set outright — fine if nothing changed the selection
+      // during the await, but the checkboxes stay interactive while
+      // `dispatching` is true (only the DISPATCH button itself is
+      // disabled), so an admin who deselected this batch and picked a
+      // different one to queue up next had that unrelated new selection
+      // silently wiped when this batch's dispatch resolved. Only remove
+      // the ids that were ACTUALLY part of this dispatch (captured via
+      // `selectedTrips`, closed over at click time) instead.
+      setSelectedTripIds(prev => {
+        const dispatchedIds = new Set(selectedTrips.map(t => t.trip_id));
+        return new Set([...prev].filter(id => !dispatchedIds.has(id)));
+      });
     } catch (e) {
       setMsg(`✗ ${e.message || "Dispatch failed — please try again."}`);
     } finally {
+      dispatchingRef.current = false;
+      setDispatching(false);
+      setDispatchingDriverId(null);
       setTimeout(() => setMsg(null), 4000);
     }
   };
@@ -4225,10 +4395,25 @@ function AdminDispatch({ state, dispatch }) {
                   </span>
                 )}
                 <CapacityBar load={load} capacity={driverCapacityDispatch} />
-                {sel && (
+                {/* FOUND VIA /code-review (10th pass): used to render
+                    purely off `sel`, so changing the selection while a
+                    dispatch was still in flight (a different trip
+                    checkbox, a different driver card, any of the day/
+                    direction/area filters — all of which reset
+                    selectedDriverId) made the spinner vanish from the
+                    driver actually being dispatched, with no visible
+                    confirmation it was still processing. Now also renders
+                    on whichever card dispatchingDriverId actually points
+                    at, independent of the current selection. */}
+                {(sel || ds.driver_id === dispatchingDriverId) && (
                   <Button
+                    // FOUND VIA /code-review (4th pass): Button swaps its
+                    // whole label for a spinner whenever loading is true
+                    // (see Button, TransitOS_web.jsx), so the "DISPATCHING…"
+                    // branch here was computed every render but never
+                    // actually shown — dropped as dead work.
                     title={isMultiDaySelection ? `⊕ ASSIGN DRIVER TO ${distinctWeekDays(selectedTrips)} DAYS` : selectedTrips.length > 1 ? `⊕ COMBINE & DISPATCH (${selectedTrips.length} BOOKINGS)` : "⊕ DISPATCH NOW"}
-                    variant="amber" full onClick={(e) => { e.stopPropagation(); handleDispatch(); }}
+                    variant="amber" full disabled={dispatching} loading={ds.driver_id === dispatchingDriverId} onClick={(e) => { e.stopPropagation(); handleDispatch(); }}
                   />
                 )}
               </div>
@@ -4542,6 +4727,31 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
 
 function AdminLiveMap({ state, user, dispatch }) {
   const [selectedDriverId, setSelectedDriverId] = useState(null);
+  // Drivers explicitly hidden from the map — a "hidden" set rather than a
+  // "visible" one so a driver who comes online mid-session (or a newly
+  // hired driver) defaults to shown without this needing to be kept in
+  // sync with the roster. Per explicit request: at this app's growing
+  // scale, being able to declutter the map to just the drivers you're
+  // watching matters more once more than a handful are reporting at once.
+  const [hiddenDriverIds, setHiddenDriverIds] = useState(() => new Set());
+  const toggleDriverVisibility = (driverId) => {
+    const isCurrentlyHidden = hiddenDriverIds.has(driverId);
+    setHiddenDriverIds(prev => {
+      const next = new Set(prev);
+      if (next.has(driverId)) next.delete(driverId); else next.add(driverId);
+      return next;
+    });
+    // FOUND VIA /code-review (9th pass): hiding the currently-selected
+    // driver used to leave selectedDriverId pointing at a pin that no
+    // longer renders on the map — the info Card below kept showing that
+    // driver's stale position/state as if nothing had changed.
+    if (!isCurrentlyHidden && driverId === selectedDriverId) setSelectedDriverId(null);
+  };
+  // Combined driver/agent search — per explicit request. Filters the
+  // driver list below and, when agent pins are enabled, surfaces matching
+  // agents too so either can be located quickly instead of scanning
+  // unlabeled dots on the map.
+  const [mapSearchQuery, setMapSearchQuery] = useState("");
   const [showAdvisoryPanel, setShowAdvisoryPanel] = useState(false);
   // "Show traffic" — same toggle concept as DriverNavMap's, extended to
   // the admin live map per explicit request. Defaults on.
@@ -4703,10 +4913,59 @@ function AdminLiveMap({ state, user, dispatch }) {
   }
 
   const withPosition = driverPoints.filter(d => d.pos);
+  // Excludes drivers hidden via the eye-toggle — FOUND VIA /code-review:
+  // fitAllDrivers used to fit withPosition (every reporting driver)
+  // regardless of hiddenDriverIds, so "SEE ALL DRIVERS" zoomed out to fit
+  // pins the admin had just explicitly hidden, undoing the declutter the
+  // hide feature exists for.
+  const visibleWithPosition = withPosition.filter(d => !hiddenDriverIds.has(d.driverId));
   const selected = selectedDriverId ? driverPoints.find(d => d.driverId === selectedDriverId) : null;
+  const mapSearchQueryTrimmed = mapSearchQuery.trim().toLowerCase();
+  const filteredDriverPoints = mapSearchQueryTrimmed
+    ? driverPoints.filter(d => d.name.toLowerCase().includes(mapSearchQueryTrimmed))
+    : driverPoints;
+  // Capped at 20 — at this app's target scale (~1800 agents) an unbounded
+  // match list on a broad query (e.g. a common first name) would be its
+  // own scroll-wall; a search is only useful here for narrowing down to
+  // the handful the admin is actually looking for.
+  const matchingAgents = React.useMemo(() => {
+    if (!mapSearchQueryTrimmed || !showAgentPins) return [];
+    return agentHomePoints.filter(u => (u.name || "").toLowerCase().includes(mapSearchQueryTrimmed)).slice(0, 20);
+  }, [mapSearchQueryTrimmed, showAgentPins, agentHomePoints]);
 
   const zoomIn = () => setViewport(v => ({ ...v, zoom: Math.min(18, v.zoom + 1) }));
   const zoomOut = () => setViewport(v => ({ ...v, zoom: Math.max(3, v.zoom - 1) }));
+
+  // Selecting a driver (from the map pin, the list, or a search match)
+  // also un-hides them (a hidden driver has no pin to click on the map in
+  // the first place, but the list/search paths can reach a hidden one)
+  // and recenters the map on their current position — makes "search for a
+  // driver" and "select a driver" the same jump-to-them action instead of
+  // just opening the info panel on a pin that might be off-screen.
+  const selectDriver = (driverId) => {
+    const isDeselecting = driverId === selectedDriverId;
+    setSelectedDriverId(isDeselecting ? null : driverId);
+    if (isDeselecting) return;
+    setHiddenDriverIds(prev => { if (!prev.has(driverId)) return prev; const next = new Set(prev); next.delete(driverId); return next; });
+    const d = driverPoints.find(x => x.driverId === driverId);
+    if (d?.pos) setViewport(v => ({ ...v, centerLat: d.pos.lat, centerLng: d.pos.lng, zoom: Math.max(v.zoom, 14) }));
+    // Same fix as focusOnAgent below (FOUND VIA /code-review, 10th
+    // pass): once a driver's been jumped to, a leftover search query
+    // just keeps the list/results narrowed for no further reason.
+    setMapSearchQuery("");
+  };
+  const focusOnAgent = (agentUser) => {
+    if (agentUser.home_address?.lat == null) return;
+    setShowAgents(true);
+    setViewport(v => ({ ...v, centerLat: agentUser.home_address.lat, centerLng: agentUser.home_address.lng, zoom: Math.max(v.zoom, 15) }));
+    // FOUND VIA /code-review (10th pass): left mapSearchQuery untouched,
+    // so after jumping to the agent the driver list stayed narrowed to
+    // the stale query and the "Matching Agents" panel kept rendering,
+    // even though the search's job (locating this agent) was already
+    // done. selectDriver above had the identical gap for its own jump
+    // action, fixed the same way.
+    setMapSearchQuery("");
+  };
 
   // "See all active drivers" — recenter and zoom the viewport so every
   // currently-reporting driver fits on screen at once. This is the real
@@ -4715,8 +4974,8 @@ function AdminLiveMap({ state, user, dispatch }) {
   // zooming — recentering makes both cases immediately visible instead
   // of requiring someone to guess where an off-screen pin might be.
   const fitAllDrivers = () => {
-    if (withPosition.length === 0) return;
-    const lats = withPosition.map(d => d.pos.lat), lngs = withPosition.map(d => d.pos.lng);
+    if (visibleWithPosition.length === 0) return;
+    const lats = visibleWithPosition.map(d => d.pos.lat), lngs = visibleWithPosition.map(d => d.pos.lng);
     const minLat = Math.min(...lats), maxLat = Math.max(...lats);
     const minLng = Math.min(...lngs), maxLng = Math.max(...lngs);
     const centerLat = (minLat + maxLat) / 2, centerLng = (minLng + maxLng) / 2;
@@ -4803,7 +5062,7 @@ function AdminLiveMap({ state, user, dispatch }) {
           )}
           <Button title="🚦 TRAFFIC" variant={showTraffic ? "amber" : "ghost"} size="sm" onClick={() => setShowTraffic(v => !v)} />
           {showAgentPins && <Button title="📍 AGENTS" variant={showAgents ? "amber" : "ghost"} size="sm" onClick={() => setShowAgents(v => !v)} />}
-          <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} />
+          <Button title="🎯 SEE ALL DRIVERS" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={visibleWithPosition.length === 0} />
           <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 32 }} />
           <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 32 }} />
           <Button title={isMapExpanded ? "⤡ SHRINK" : "⤢ EXPAND"} variant="ghost" size="sm" onClick={() => setIsMapExpanded(v => !v)} />
@@ -4835,7 +5094,7 @@ function AdminLiveMap({ state, user, dispatch }) {
             flexShrink: 0,
           }}>
             <div style={{ display: "flex", gap: 6 }}>
-              <Button title="🎯" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={withPosition.length === 0} style={{ width: 36 }} />
+              <Button title="🎯" variant="ghost" size="sm" onClick={fitAllDrivers} disabled={visibleWithPosition.length === 0} style={{ width: 36 }} />
               <Button title="−" variant="ghost" size="sm" onClick={zoomOut} style={{ width: 36 }} />
               <Button title="+" variant="ghost" size="sm" onClick={zoomIn} style={{ width: 36 }} />
             </div>
@@ -4919,7 +5178,11 @@ function AdminLiveMap({ state, user, dispatch }) {
             );
           })}
 
-          {driverPoints.filter(d => d.pos).map(d => {
+          {/* FOUND VIA /code-review (7th pass): re-filtered driverPoints
+              here instead of reusing visibleWithPosition, which is
+              exactly this expression, defined above — kept in sync by
+              construction instead of by hand now. */}
+          {visibleWithPosition.map(d => {
             const p = projectToSvg(d.pos.lat, d.pos.lng, W, H, viewport);
             const color = d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green;
             const isSelected = selectedDriverId === d.driverId;
@@ -4936,7 +5199,7 @@ function AdminLiveMap({ state, user, dispatch }) {
               <g key={d.driverId}
                 className="svg-driver-marker"
                 transform={`translate(${p.x},${p.y})`}
-                onClick={() => setSelectedDriverId(isSelected ? null : d.driverId)}
+                onClick={() => selectDriver(d.driverId)}
                 style={{ cursor: "pointer" }}>
                 {/* Invisible hit target — 44px equivalent in SVG coords (~22 units radius
                     at typical zoom) so taps land on mobile even with imprecise fingers */}
@@ -5023,10 +5286,62 @@ function AdminLiveMap({ state, user, dispatch }) {
         </Card>
       )}
 
-      <SectionHeader label="All Drivers" />
-      {driverPoints.map(d => (
-        <div key={d.driverId} onClick={() => setSelectedDriverId(d.driverId === selectedDriverId ? null : d.driverId)}
-          style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}`, background: d.driverId === selectedDriverId ? "rgba(245,166,35,.05)" : "transparent" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <SectionHeader label="All Drivers" />
+        <div style={{ display: "flex", gap: 6 }}>
+          {/* FOUND VIA /code-review (9th pass): SHOW ALL used to
+              unconditionally clear the ENTIRE hidden set, asymmetric with
+              HIDE ALL's own search-scoping fix right below — searching
+              "north", hiding just those matches, then later searching
+              something else and hitting SHOW ALL would un-hide every
+              driver hidden all session, not just the current search's.
+              Now scoped to filteredDriverPoints on both sides. */}
+          <Button
+            title="SHOW ALL" variant="ghost" size="sm"
+            disabled={!filteredDriverPoints.some(d => hiddenDriverIds.has(d.driverId))}
+            onClick={() => setHiddenDriverIds(prev => {
+              const next = new Set(prev);
+              filteredDriverPoints.forEach(d => next.delete(d.driverId));
+              return next;
+            })}
+          />
+          {/* FOUND VIA /code-review (8th pass): used to hide the whole
+              fleet (driverPoints) regardless of an active search, so
+              searching down to a few drivers then hitting HIDE ALL wiped
+              every pin on the map instead of just the searched ones —
+              defeating the point of scoping HIDE ALL to what's actually
+              shown in the (possibly search-filtered) list right above
+              it. Unions into the existing hidden set rather than
+              replacing it, so drivers hidden outside the current search
+              stay hidden too. */}
+          {/* FOUND VIA /code-review (11th pass): had no disabled guard
+              (unlike SHOW ALL right above), so clicking it when every
+              filtered driver was already hidden still built and
+              committed a brand-new Set with identical contents — a
+              no-op re-render on every redundant click. */}
+          <Button
+            title="HIDE ALL" variant="ghost" size="sm"
+            disabled={filteredDriverPoints.every(d => hiddenDriverIds.has(d.driverId))}
+            onClick={() => {
+              setHiddenDriverIds(prev => new Set([...prev, ...filteredDriverPoints.map(d => d.driverId)]));
+              // FOUND VIA /code-review (9th pass): same stale-info-panel
+              // hazard as the per-row eye-toggle above, but for the bulk
+              // action — if the currently-selected driver falls within
+              // the batch just hidden, clear the selection too.
+              if (selectedDriverId && filteredDriverPoints.some(d => d.driverId === selectedDriverId)) setSelectedDriverId(null);
+            }}
+          />
+        </div>
+      </div>
+      <input
+        className="inp" value={mapSearchQuery} onChange={e => setMapSearchQuery(e.target.value)}
+        placeholder="Search drivers or agents…" style={{ width: "100%", marginBottom: 8 }}
+      />
+      {filteredDriverPoints.map(d => {
+        const isHidden = hiddenDriverIds.has(d.driverId);
+        return (
+        <div key={d.driverId} onClick={() => selectDriver(d.driverId)}
+          style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}`, background: d.driverId === selectedDriverId ? "rgba(245,166,35,.05)" : "transparent", opacity: isHidden ? 0.5 : 1 }}>
           <span style={{ width: 8, height: 8, borderRadius: 4, background: !d.pos || d.stale ? COLORS.ghost : d.state === DRIVER_STATE.BUSY ? COLORS.amber : COLORS.green, flexShrink: 0 }} />
           <div style={{ flex: 1 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -5043,8 +5358,43 @@ function AdminLiveMap({ state, user, dispatch }) {
             <div style={{ fontSize: 9, color: COLORS.ghost }}>{d.pos ? timeSinceLabel(d.pos.updated_at) : "never reported"}</div>
           </div>
           <StateBadge state={!d.pos || d.stale ? "OFFLINE" : d.state} />
+          {/* Visibility toggle — separate from the row's own select-and-jump
+              click above (stopPropagation so tapping the eye doesn't also
+              select/jump), hides just this driver's pin from the map
+              without affecting the info panel or the list itself. */}
+          <button
+            onClick={(e) => { e.stopPropagation(); toggleDriverVisibility(d.driverId); }}
+            title={isHidden ? "Show on map" : "Hide from map"}
+            style={{ background: "none", border: "none", cursor: "pointer", fontSize: 14, padding: 4, lineHeight: 1, color: isHidden ? COLORS.ghost : COLORS.mist }}
+          >{isHidden ? "🚫" : "👁"}</button>
         </div>
-      ))}
+        );
+      })}
+      {/* FOUND VIA /code-review (6th pass): matchingAgents is forced to []
+          whenever showAgentPins is false (no viewUsers permission), same
+          as visibleAgentPoints above — without accounting for that here,
+          an admin lacking that permission would see "no matches" even
+          when a real agent match exists, just not shown to their tier. */}
+      {mapSearchQueryTrimmed && filteredDriverPoints.length === 0 && matchingAgents.length === 0 && (
+        <div style={{ fontSize: 10, color: COLORS.ghost, padding: 10 }}>
+          {showAgentPins ? "No matching drivers or agents." : "No matching drivers."}
+        </div>
+      )}
+      {matchingAgents.length > 0 && (
+        <>
+          <SectionHeader label="Matching Agents" />
+          {matchingAgents.map(u => (
+            <div key={u.id} onClick={() => focusOnAgent(u)}
+              style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 10, padding: 10, borderBottom: `1px solid ${COLORS.wire}` }}>
+              <span style={{ width: 8, height: 8, borderRadius: 4, background: COLORS.red, flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <span style={{ fontSize: 11, fontWeight: 700 }}>{u.name}</span>
+                <div style={{ fontSize: 9, color: COLORS.ghost }}>{u.home_address?.label || u.home_address?.area || "Home address on file"}</div>
+              </div>
+            </div>
+          ))}
+        </>
+      )}
     </div>
   );
 }
