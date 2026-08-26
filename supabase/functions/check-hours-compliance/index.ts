@@ -149,15 +149,14 @@ Deno.serve(async (req) => {
         ? `${hoursToday.toFixed(1)}h today and ${hoursWeek.toFixed(1)}h this week`
         : overDay ? `${hoursToday.toFixed(1)}h today` : `${hoursWeek.toFixed(1)}h this week`;
 
+      // Admin-only per explicit request — same fix as the app's own
+      // identical client-side sweep (DRIVER/CHECK_HOURS_COMPLIANCE):
+      // used to also insert a driver-facing row here; removed so
+      // hours-compliance stays an admin-facing advisory only.
       await supabase.from("notifications").insert([
         {
           title: "DRIVER HOURS WARNING", type: "DRIVER_HOURS_WARNING", forroles: ["ADMIN"], userid: null,
           message: `⚠ ${driverName} has logged ${reason} — approaching/over the advisory limit (${MAX_DRIVER_HOURS_PER_DAY}h/day, ${MAX_DRIVER_HOURS_PER_WEEK}h/week).`,
-          timestamp: nowMs, isread: false,
-        },
-        {
-          title: "DRIVER HOURS WARNING", type: "DRIVER_HOURS_WARNING", forroles: ["DRIVER"], userid: driverid,
-          message: `⚠ You've logged ${reason} — please plan for adequate rest.`,
           timestamp: nowMs, isread: false,
         },
       ]);

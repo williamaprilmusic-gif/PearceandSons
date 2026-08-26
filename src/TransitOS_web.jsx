@@ -10442,14 +10442,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const reasonHours = overDay && overWeek
           ? `${hoursToday.toFixed(1)}h today and ${hoursWeek.toFixed(1)}h this week`
           : overDay ? `${hoursToday.toFixed(1)}h today` : `${hoursWeek.toFixed(1)}h this week`;
+        // Admin-only per explicit request — this used to also notify the
+        // driver directly ("You've logged X — please plan for adequate
+        // rest"); removed so hours-compliance stays an admin-facing
+        // advisory rather than something drivers/agents see on their own
+        // side of the app.
         await insertNotification({
           type: "DRIVER_HOURS_WARNING", for_roles: [ROLE.ADMIN],
           message: `⚠ ${driverNameHours} has logged ${reasonHours} — approaching/over the advisory limit (${MAX_DRIVER_HOURS_PER_DAY}h/day, ${MAX_DRIVER_HOURS_PER_WEEK}h/week).`,
-          ts: hoursNowTs, read: false,
-        });
-        await insertNotification({
-          type: "DRIVER_HOURS_WARNING", for_roles: [ROLE.DRIVER], for_user_ids: [dsHours.driverid],
-          message: `⚠ You've logged ${reasonHours} — please plan for adequate rest.`,
           ts: hoursNowTs, read: false,
         });
         await supabase.from("driver_status").update({ hourscompliancenotifiedfor: { date: todayDateStr, notifiedAt: hoursNowTs } }).eq("driverid", dsHours.driverid);
