@@ -1405,6 +1405,19 @@ export function earliestScheduledTime(rawRows) {
 }
 
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
+// String-id normalizer for the hydration layer. Supabase bigint id
+// columns (users.id, trips.id, driverid, agentid, branchid, …) come back
+// as JS numbers on some paths and strings on others (PostgREST, realtime
+// payloads, nested JSON columns), and this app compares them with === /
+// Set.has() / [].includes() in hundreds of places. Rather than wrap every
+// one of those sites in String() (the whack-a-mole this codebase kept
+// hitting — see the Client Portal branch_id bug, fetchMyConversations,
+// computeGroupSuggestions), the row mappers below coerce every id-shaped
+// field to a string ONCE so all of app state is string-id'd by
+// construction. Null/undefined pass through untouched — an unassigned
+// trip's driver_id must stay null, not become "null".
+const sid = (v) => (v == null ? v : String(v));
+const sidArr = (a) => (Array.isArray(a) ? a.filter(v => v != null).map(String) : []);
 export const now = () => new Date().toLocaleString("en-ZA", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
 // now() returns a formatted display string, which is what the in-memory
 // reducer's mock UI expects everywhere it renders a timestamp directly.
@@ -3803,7 +3816,7 @@ function appReducer(state, action) {
       for (const targetId of action.user_ids || []) {
         const target = workingState.users.find(u => String(u.id) === String(targetId));
         if (!target) { results.push({ id: targetId, ok: false, reason: "User not found" }); continue; }
-        if (targetId === action.acting_admin_id) { results.push({ id: targetId, ok: false, name: target.name, reason: "You can't delete your own account" }); continue; }
+        if (String(targetId) === String(action.acting_admin_id)) { results.push({ id: targetId, ok: false, name: target.name, reason: "You can't delete your own account" }); continue; }
         // Matches the real DB foreign-key behavior (confirmed via
         // pg_constraint): trips.agentid/driverid, messages.senderid, and
         // notifications.userid are all RESTRICT, not cascade — Postgres
@@ -5910,23 +5923,23 @@ function appReducer(state, action) {
 // in the app (reducer, UI) keeps using the clean snake_case shape.
 // id columns are bigint (DB-generated), not app-generated USR_/TRP_
 // strings — see ADMIN/CREATE_USER and TRIP/BOOK for insert+readback.
-function userRowToApp(row) {
+export function userRowToApp(row) {
   // auth.pass (passwordhash) was dropped here — nothing in the real
   // Supabase-backed UI ever reads it (only auth.login, for username
   // display); it was pure over-retention that sat in every session's
   // client state. See AUTH/LOGIN's comment for the full incident.
-  const user = { id: row.id, role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
+  const user = { id: sid(row.id), role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
   // Home address is meaningful for both agents (pickup point) and drivers
   // (which area they live in, for assignment purposes) — not agent-only.
   if ((row.role === ROLE.AGENT || row.role === ROLE.DRIVER) && row.homelat != null) {
     user.home_address = { label: row.homeaddress, area: row.homearea, lat: row.homelat, lng: row.homelng };
   }
   if (row.role === ROLE.AGENT || row.role === ROLE.DRIVER) {
-    user.branch_id = row.branchid || null;
+    user.branch_id = row.branchid != null ? sid(row.branchid) : null;
   }
   if (row.role === ROLE.AGENT) {
     user.branch_history = Array.isArray(row.branchhistory) ? row.branchhistory : [];
-    user.campaign_id = row.campaignid || null;
+    user.campaign_id = row.campaignid != null ? sid(row.campaignid) : null;
   }
   if (row.role === ROLE.ADMIN) {
     user.branch_id = null; // admins are not scoped to a single branch
@@ -5936,12 +5949,12 @@ function userRowToApp(row) {
     // sensible value for FLEET_OPS/STANDARD who see everything
     // regardless). Read for any admin role so a level change back to
     // FLEET_OPS doesn't need this field cleared separately.
-    user.scoped_company_ids = row.scopedcompanyids || [];
+    user.scoped_company_ids = sidArr(row.scopedcompanyids);
   }
   return user;
 }
-function driverStatusRowToApp(row) {
-  return { driver_id: row.driverid, state: row.state, current_trip_id: row.currenttripid, vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_away: row.isaway || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
+export function driverStatusRowToApp(row) {
+  return { driver_id: sid(row.driverid), state: row.state, current_trip_id: sid(row.currenttripid), vehicle: row.vehicle, phone: row.phone, capacity: row.capacity, is_online: row.isonline || false, is_away: row.isaway || false, is_unavailable: row.isunavailable || false, availability_schedule: row.availability_schedule || [], documents: row.documents || {}, unavailable_reason: row.unavailablereason || null, unavailable_note: row.unavailablenote || null };
 }
 // Every pickup coordinate on a raw trip row (primary + extras), in the
 // same shape tripRowToApp exposes as pickup_sequence_coords — shared so
@@ -5954,34 +5967,36 @@ function pickupSequenceCoordsFromRow(row) {
   // own booking-time number — required at booking) so a per-agent phone
   // lookup can read pickup_sequence_coords uniformly for every agent,
   // primary or extra, instead of needing a special case for index 0.
-  const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: row.agentid, phone: row.phone }] : [];
-  const extraPickups = Array.isArray(row.extrapickups) ? row.extrapickups : [];
+  const firstPickup = row.pickuplat != null ? [{ lat: row.pickuplat, lng: row.pickuplng, label: row.pickuplabel, agent_id: sid(row.agentid), phone: row.phone }] : [];
+  const extraPickups = (Array.isArray(row.extrapickups) ? row.extrapickups : [])
+    .map(p => (p && p.agent_id != null ? { ...p, agent_id: sid(p.agent_id) } : p));
   return [...firstPickup, ...extraPickups];
 }
 
-function tripRowToApp(row, chatByTrip) {
+export function tripRowToApp(row, chatByTrip) {
   const pickupSequenceCoords = pickupSequenceCoordsFromRow(row);
   // Per-agent dropoffs — primary agent uses dropofflat/lng/label; extra agents
   // use extradropoffs (parallel to extrapickups). For INBOUND trips all agents
   // drop at the same company location, so extradropoffs is typically empty and
   // the primary dropoff is reused. For OUTBOUND each agent drops at their own
   // home address — extradropoffs holds those individual home coords.
-  const firstDropoff = row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel, agent_id: row.agentid }] : [];
-  const extraDropoffs = Array.isArray(row.extradropoffs) ? row.extradropoffs : [];
+  const firstDropoff = row.dropofflat != null ? [{ lat: row.dropofflat, lng: row.dropofflng, label: row.dropofflabel, agent_id: sid(row.agentid) }] : [];
+  const extraDropoffs = (Array.isArray(row.extradropoffs) ? row.extradropoffs : [])
+    .map(d => (d && d.agent_id != null ? { ...d, agent_id: sid(d.agent_id) } : d));
   return {
-    trip_id: row.id, agent_ids: [row.agentid, ...(row.extraagentids || [])].filter(Boolean), driver_id: row.driverid, state: row.status,
+    trip_id: sid(row.id), agent_ids: sidArr([row.agentid, ...(row.extraagentids || [])]), driver_id: sid(row.driverid), state: row.status,
     pickup_sequence_coords: pickupSequenceCoords,
     dropoff_sequence_coords: extraDropoffs.length > 0 ? [...firstDropoff, ...extraDropoffs] : firstDropoff,
-    completed_pickups: row.completedpickups || [], custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
-    no_shows: row.noshows || [],
+    completed_pickups: sidArr(row.completedpickups), custom_pickup: row.pickuplocation, custom_dropoff: row.dropofflocation,
+    no_shows: (row.noshows || []).map(ns => (ns && ns.agent_id != null ? { ...ns, agent_id: sid(ns.agent_id) } : ns)),
     late_start_notified: row.latestartnotified || false,
-    pickup_company_id: row.pickupcompanyid, dropoff_company_id: row.dropoffcompanyid,
+    pickup_company_id: sid(row.pickupcompanyid), dropoff_company_id: sid(row.dropoffcompanyid),
     pickup_is_manual: row.pickupismanual || false, dropoff_is_manual: row.dropoffismanual || false,
-    direction: row.direction, is_exception: row.isexception || false, completed_dropoffs: row.completeddropoffs || [],
+    direction: row.direction, is_exception: row.isexception || false, completed_dropoffs: sidArr(row.completeddropoffs),
     pickup_timestamps: row.pickuptimestamps || {}, dropoff_timestamps: row.dropofftimestamps || {},
     pickup_locations: row.pickuplocations || {}, dropoff_locations: row.dropofflocations || {},
     route_total_km: row.routetotalkm,
-    week_group_id: row.weekgroupid || null, week_day_num: row.weekdaynum || null,
+    week_group_id: row.weekgroupid != null ? sid(row.weekgroupid) : null, week_day_num: row.weekdaynum || null,
     trip_type: row.triptype, scheduled_date: row.scheduleddate,
     scheduled_time: row.scheduledtimestr || row.scheduledtime, scheduled_time_epoch: row.scheduledtime,
     booked_at: epochToDisplay(row.bookedat), confirmed_at: epochToDisplay(row.confirmedat),
@@ -5992,25 +6007,25 @@ function tripRowToApp(row, chatByTrip) {
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, actual_distance_km: row.actualdistancekm,
     driverAccepted: row.driveraccepted, acceptedAt: epochToDisplay(row.acceptedat), accepted_at_epoch: row.acceptedat || null,
-    declinedBy: row.declinedby || [],
+    declinedBy: sidArr(row.declinedby),
     rejection_reason: row.rejectionreason || null,
     rejection_note: row.rejectionnote || null,
     rejected_at: epochToDisplay(row.rejectedat),
-    rejection_driver_id: row.rejectiondriverid || null,
+    rejection_driver_id: row.rejectiondriverid != null ? sid(row.rejectiondriverid) : null,
     reminder_sent: row.remindersent,
     last_reminder_at: row.lastreminderat || null,
     long_distance_flag: row.longdistanceflag || false, admin_note: row.adminnote || null,
     driver_route_km: row.driverroutekm != null ? Number(row.driverroutekm) : null,
     driver_route_cap_km: row.driverroutecapkm != null ? Number(row.driverroutecapkm) : null,
     driver_route_exceeds_policy: row.driverrouteexceedspolicy || false,
-    chat_messages: chatByTrip[row.id] || [],
+    chat_messages: chatByTrip[sid(row.id)] || [],
     agent_ratings: row.agentratings || {},
     share_token: row.sharetoken || null,
     dispute: row.dispute || null,
   };
 }
 function notifRowToApp(row) {
-  return { id: row.id, type: row.type, for_roles: row.forroles || [], for_user_ids: row.userid != null ? [row.userid] : [], message: row.message, trip_id: row.tripid, ts: epochToDisplay(row.timestamp), ts_epoch: row.timestamp, read: row.isread };
+  return { id: sid(row.id), type: row.type, for_roles: row.forroles || [], for_user_ids: row.userid != null ? [sid(row.userid)] : [], message: row.message, trip_id: sid(row.tripid), ts: epochToDisplay(row.timestamp), ts_epoch: row.timestamp, read: row.isread };
 }
 
 async function fetchAllFromSupabase() {
@@ -6077,7 +6092,7 @@ async function fetchAllFromSupabase() {
 
   const chatByTrip = {};
   for (const m of chatRes.data) {
-    (chatByTrip[m.tripid] ||= []).push({ id: m.id, sender_id: m.senderid, sender_name: m.sendername, sender_role: m.senderrole, recipient_id: m.recipientid ?? null, text: m.content, ts: epochToDisplay(m.timestamp) });
+    (chatByTrip[sid(m.tripid)] ||= []).push({ id: sid(m.id), sender_id: sid(m.senderid), sender_name: m.sendername, sender_role: m.senderrole, recipient_id: m.recipientid != null ? sid(m.recipientid) : null, text: m.content, ts: epochToDisplay(m.timestamp) });
   }
   // The real notifications table is one row per (notification, user) —
   // for_roles-only broadcasts are written as a single row with userid=null
@@ -6139,7 +6154,7 @@ export async function fetchDelaysForTrips(tripIds) {
 export async function fetchTripDelays(tripId) {
   const { data, error } = await supabase.from("trip_delays").select("*").eq("tripid", tripId).order("reportedat", { ascending: true });
   if (error) throw error;
-  return (data || []).map(d => ({ id: d.id, trip_id: d.tripid, driver_id: d.driverid, reason: d.reason, note: d.note, reported_at: d.reportedat }));
+  return (data || []).map(d => ({ id: sid(d.id), trip_id: sid(d.tripid), driver_id: sid(d.driverid), reason: d.reason, note: d.note, reported_at: d.reportedat }));
 }
 
 // On-demand fetch of a trip's raw GPS breadcrumb trail — driver_position_log
@@ -6298,7 +6313,7 @@ export async function fetchMyConversations(myUserId, users) {
       : m.sendername;
     byCounterpart.set(counterpartId, {
       counterpart_id: counterpartId, counterpart_name: counterpartName,
-      last_message: m.content, last_ts_epoch: m.timestamp, last_sender_id: m.senderid,
+      last_message: m.content, last_ts_epoch: m.timestamp, last_sender_id: sid(m.senderid),
     });
   }
   return [...byCounterpart.values()];
@@ -6466,8 +6481,11 @@ export async function fetchDriverSafetyHistory({ driverId, fromMs, toMs }) {
     .gte("timestamp", fromMs)
     .lte("timestamp", toMs);
   if (error) throw error;
+  // trips come from tripRowToApp → trip_id is a string (see sid()); the
+  // notifications query above is raw/un-mapped, so n.tripid is still a
+  // number — normalize the probe side to match.
   const myTripIds = new Set(trips.map(t => t.trip_id));
-  const notifications = (notifRows || []).filter(n => myTripIds.has(n.tripid));
+  const notifications = (notifRows || []).filter(n => myTripIds.has(sid(n.tripid)));
   return { trips, notifications };
 }
 
@@ -6934,7 +6952,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // this yet. The webauthn edge function already minted this token as
       // part of verifying the biometric assertion.
       await applySessionToken(action.session_token);
-      activeUserRef.current = bioUser.id;
+      activeUserRef.current = sid(bioUser.id); // string-id shape, see the login path + sid() note
       persistActiveUserId(bioUser.id);
       await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
       if (bioUser.role === ROLE.DRIVER) {
@@ -7010,7 +7028,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         throw new Error(e.message || "Invalid credentials");
       }
       await applySessionToken(loginTokenResult.token);
-      const loggedInUserId = loginTokenResult.user.id;
+      // sid() so activeUserRef.current matches the String-id shape every
+      // hydrated user/trip row now carries (see the sid() note by mkId) —
+      // otherwise a bare compare against a hydrated id (e.g. the
+      // self-delete guard in ADMIN/BULK_DELETE_USERS) would silently
+      // mismatch number-vs-string.
+      const loggedInUserId = sid(loginTokenResult.user.id);
       activeUserRef.current = loggedInUserId;
       persistActiveUserId(loggedInUserId);
       // Per explicit decision: "online" means logged in right now — set
@@ -7143,7 +7166,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       for (const targetId of action.user_ids || []) {
         const { data: target } = await supabase.from("users").select("id, role, fullname").eq("id", targetId).maybeSingle();
         if (!target) { results.push({ id: targetId, ok: false, reason: "User not found" }); continue; }
-        if (targetId === activeUserRef.current) { results.push({ id: targetId, ok: false, name: target.fullname, reason: "You can't delete your own account" }); continue; }
+        if (String(targetId) === String(activeUserRef.current)) { results.push({ id: targetId, ok: false, name: target.fullname, reason: "You can't delete your own account" }); continue; }
         try {
           await assertAdminPermission(activeUserRef, target.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
         } catch (e) {
@@ -10781,9 +10804,9 @@ function useAppStore() {
     if (error) return; // non-fatal — live map just stays empty/stale, doesn't break the app
     const byDriver = {};
     for (const row of data) {
-      byDriver[row.driverid] = {
+      byDriver[sid(row.driverid)] = {
         lat: row.lat, lng: row.lng, heading: row.heading, speed_kmh: row.speed_kmh,
-        accuracy_m: row.accuracy_m, trip_id: row.tripid, updated_at: row.updatedat,
+        accuracy_m: row.accuracy_m, trip_id: sid(row.tripid), updated_at: row.updatedat,
       };
     }
     setDriverPositions(byDriver);
@@ -10798,7 +10821,7 @@ function useAppStore() {
     if (!supabase) return;
     const { data, error } = await supabase.from("campaigns").select("*").order("name");
     if (error) return;
-    setCampaigns((data || []).map(c => ({ id: c.id, name: c.name, active: c.active })));
+    setCampaigns((data || []).map(c => ({ id: sid(c.id), name: c.name, active: c.active })));
   }, []);
 
   // Companies — replaces the old hardcoded COMPANY_LOCATIONS constant.
@@ -10863,8 +10886,8 @@ function useAppStore() {
     const { data, error } = await ticketsQuery;
     if (error) return;
     setTickets((data || []).map(t => ({
-      id: t.id, agent_id: t.agentid, trip_id: t.tripid, category: t.category, message: t.message,
-      status: t.status, admin_id: t.adminid, admin_reply: t.adminreply, replies: t.replies || [], role: t.role || ROLE.AGENT,
+      id: sid(t.id), agent_id: sid(t.agentid), trip_id: sid(t.tripid), category: t.category, message: t.message,
+      status: t.status, admin_id: sid(t.adminid), admin_reply: t.adminreply, replies: t.replies || [], role: t.role || ROLE.AGENT,
       created_at: t.createdat, updated_at: t.updatedat, resolved_at: t.resolvedat,
     })));
   }, []);
@@ -10907,8 +10930,8 @@ function useAppStore() {
       return now - r.createdat <= windowHours * 60 * 60 * 1000;
     });
     setHazardReports(fresh.map(r => ({
-      id: r.id, driver_id: r.driverid, driver_name: r.drivername, category: r.category,
-      source: r.source || "driver", lat: r.lat, lng: r.lng, note: r.note, trip_id: r.tripid, created_at: r.createdat,
+      id: sid(r.id), driver_id: sid(r.driverid), driver_name: r.drivername, category: r.category,
+      source: r.source || "driver", lat: r.lat, lng: r.lng, note: r.note, trip_id: sid(r.tripid), created_at: r.createdat,
     })));
   }, []);
 

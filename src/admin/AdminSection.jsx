@@ -3302,8 +3302,8 @@ function AdminHistory({ state, user, dispatch }) {
       const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
       const hits = await fetchTripHistory({
         fromMs, toMs,
-        agentId: agentFilter ? Number(agentFilter) : undefined,
-        driverId: driverFilter ? Number(driverFilter) : undefined,
+        agentId: agentFilter || undefined,
+        driverId: driverFilter || undefined,
       });
       // fetchTripHistory queries Supabase directly, independent of the
       // already-scoped state.trips the rest of this tab reads from — so
@@ -3357,8 +3357,8 @@ function AdminHistory({ state, user, dispatch }) {
       const toMs = new Date(`${toStr}T23:59:59`).getTime();
       const hits = await fetchTripHistory({
         fromMs, toMs,
-        agentId: agentFilter ? Number(agentFilter) : undefined,
-        driverId: driverFilter ? Number(driverFilter) : undefined,
+        agentId: agentFilter || undefined,
+        driverId: driverFilter || undefined,
       });
       // Same scoping as runSearch — this was previously missing entirely
       // here, so the quick-range buttons let a company-scoped Viewer see

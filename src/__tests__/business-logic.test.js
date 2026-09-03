@@ -29,6 +29,9 @@ import {
   earliestScheduledTime,
   companyPolicyDistanceCapKm,
   csvEscapeCell,
+  tripRowToApp,
+  userRowToApp,
+  driverStatusRowToApp,
   TRIP_STATE,
   ROLE,
   ADMIN_LEVEL,
@@ -682,5 +685,53 @@ describe("groupAuditLogsByPeriod — buckets + per-category counts, newest-first
 
   it("returns an empty array for an empty log list", () => {
     expect(groupAuditLogsByPeriod([], "day")).toEqual([]);
+  });
+});
+
+describe("row mappers — hydration-boundary id normalization", () => {
+  it("tripRowToApp stringifies every id-shaped field, keeps null null", () => {
+    const t = tripRowToApp({
+      id: 42, agentid: 7, extraagentids: [8, 9], driverid: 3, status: "ASSIGNED",
+      pickuplat: -33.9, pickuplng: 18.4, pickuplabel: "X", phone: "021",
+      completedpickups: [7, 8], completeddropoffs: [], noshows: [{ agent_id: 9, reason: "x" }],
+      pickupcompanyid: 2, dropoffcompanyid: null, weekgroupid: 100,
+      declinedby: [3, 4], rejectiondriverid: 5,
+    }, {});
+    expect(t.trip_id).toBe("42");
+    expect(t.agent_ids).toEqual(["7", "8", "9"]);
+    expect(t.driver_id).toBe("3");
+    expect(t.completed_pickups).toEqual(["7", "8"]);
+    expect(t.no_shows[0].agent_id).toBe("9");
+    expect(t.pickup_company_id).toBe("2");
+    expect(t.dropoff_company_id).toBe(null); // null passes through, not "null"
+    expect(t.week_group_id).toBe("100");
+    expect(t.declinedBy).toEqual(["3", "4"]);
+    expect(t.rejection_driver_id).toBe("5");
+    expect(t.pickup_sequence_coords[0].agent_id).toBe("7");
+  });
+
+  it("tripRowToApp leaves an unassigned booking's driver_id null", () => {
+    expect(tripRowToApp({ id: 1, agentid: 2, driverid: null, status: "UNASSIGNED_BOOKING" }, {}).driver_id).toBe(null);
+  });
+
+  it("userRowToApp / driverStatusRowToApp stringify ids", () => {
+    const u = userRowToApp({ id: 5, role: ROLE.AGENT, fullname: "A", branchid: 2, campaignid: 9 });
+    expect(u.id).toBe("5");
+    expect(u.branch_id).toBe("2");
+    expect(u.campaign_id).toBe("9");
+    const ds = driverStatusRowToApp({ driverid: 5, currenttripid: 42, state: "AVAILABLE" });
+    expect(ds.driver_id).toBe("5");
+    expect(ds.current_trip_id).toBe("42");
+    expect(driverStatusRowToApp({ driverid: 6, currenttripid: null }).current_trip_id).toBe(null);
+  });
+
+  it("scopeUsersToCompany matches a numeric branch_id against a string companyId (post-hydration shape)", () => {
+    const users = [
+      { id: "1", role: ROLE.AGENT, branch_id: 2 },       // number branch_id
+      { id: "2", role: ROLE.AGENT, branch_id: "2" },     // string branch_id
+      { id: "3", role: ROLE.AGENT, branch_id: 9 },
+    ];
+    const scoped = scopeUsersToCompany(users, [], ["2"]); // string companyId
+    expect(scoped.map(u => u.id).sort()).toEqual(["1", "2"]);
   });
 });
