@@ -455,6 +455,19 @@ describe("computeGroupSuggestions — dispatch pooling suggestions", () => {
     const trips = [mkTrip("A", [1]), mkTrip("B", [2])];
     expect(computeGroupSuggestions(trips, users, [])).toHaveLength(0);
   });
+
+  it("REGRESSION: detects an agent overlap even when the two bookings carry the same id as different types (2 vs \"2\")", () => {
+    const users = [mkUser(1, 1, "Woodstock"), mkUser(2, 1, "Woodstock"), mkUser(3, 1, "Woodstock")];
+    const trips = [
+      mkTrip("A", [1]),
+      mkTrip("B", [2]),        // numeric agent id
+      mkTrip("C", [3, "2"]),   // same agent, string id — a raw Set.has() would miss this
+    ];
+    const driverStatus = [{ driver_id: "D1", capacity: 10 }];
+    const suggestions = computeGroupSuggestions(trips, users, driverStatus);
+    // C must NOT be pulled in — it shares agent 2 with B
+    expect(suggestions[0].trips.map(t => t.trip_id)).toEqual(["A", "B"]);
+  });
 });
 
 describe("cropTrailToPickupWindow — GPS trail crop (temporal + spatial)", () => {

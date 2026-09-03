@@ -83,7 +83,16 @@ window.addEventListener('vite:preloadError', (event) => {
   let alreadyAttempted;
   try {
     alreadyAttempted = sessionStorage.getItem(key) === '1';
-    if (!alreadyAttempted) sessionStorage.setItem(key, '1');
+    if (!alreadyAttempted) {
+      sessionStorage.setItem(key, '1');
+      // FOUND VIA /code-review: some embedded webviews / privacy-restricted
+      // contexts accept setItem without throwing AND without persisting it —
+      // getItem would still read null on the next page load, so a genuinely
+      // broken (not stale-cache) deploy would reload-loop, since the
+      // try/catch only covers the throw case. Read it back and bail if the
+      // guard didn't actually stick.
+      if (sessionStorage.getItem(key) !== '1') return;
+    }
   } catch (e) {
     return; // can't confirm the guard held — don't risk an unguarded reload loop
   }

@@ -94,39 +94,45 @@ function hasAdminPermission(user, permission) {
   return !!ADMIN_PERMISSIONS[level][permission];
 }
 
+// All id membership tests below are String-normalized — Supabase bigint
+// ids (company/branch, user, driver, trip) can surface as number or
+// string depending on hydration path, and a raw Set.has() mismatch here
+// would silently drop a company-scoped admin's trips/tickets/
+// notifications/drivers from their dashboard (same id-comparison class
+// fixed in computeGroupSuggestions / fetchMyConversations).
 function scopeTripsToCompany(trips, users, companyIds) {
   if (!companyIds?.length) return trips;
-  const idSet = new Set(companyIds);
-  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
-  return trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id)));
+  const idSet = new Set(companyIds.map(String));
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(String(u.branch_id))).map(u => String(u.id)));
+  return trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(String(id))));
 }
 
 function scopeTicketsToCompany(tickets, users, trips, companyIds) {
   if (!companyIds?.length) return tickets;
-  const idSet = new Set(companyIds);
-  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  const idSet = new Set(companyIds.map(String));
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(String(u.branch_id))).map(u => String(u.id)));
   const relevantDriverIds = new Set(
-    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(String(id)))).map(t => t.driver_id).filter(Boolean).map(String)
   );
-  return tickets.filter(t => scopedAgentIds.has(t.agent_id) || relevantDriverIds.has(t.agent_id));
+  return tickets.filter(t => scopedAgentIds.has(String(t.agent_id)) || relevantDriverIds.has(String(t.agent_id)));
 }
 
 function scopeNotificationsToCompany(notifications, trips, users, companyIds) {
   if (!companyIds?.length) return notifications;
-  const idSet = new Set(companyIds);
-  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
-  const scopedTripIds = new Set(trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.trip_id));
-  return notifications.filter(n => !n.trip_id || scopedTripIds.has(n.trip_id));
+  const idSet = new Set(companyIds.map(String));
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(String(u.branch_id))).map(u => String(u.id)));
+  const scopedTripIds = new Set(trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(String(id)))).map(t => String(t.trip_id)));
+  return notifications.filter(n => !n.trip_id || scopedTripIds.has(String(n.trip_id)));
 }
 
 function scopeDriverStatusToCompany(driverStatus, trips, users, companyIds) {
   if (!companyIds?.length) return driverStatus;
-  const idSet = new Set(companyIds);
-  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  const idSet = new Set(companyIds.map(String));
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(String(u.branch_id))).map(u => String(u.id)));
   const relevantDriverIds = new Set(
-    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+    (trips || []).filter(t => t.agent_ids?.some(id => scopedAgentIds.has(String(id)))).map(t => t.driver_id).filter(Boolean).map(String)
   );
-  return driverStatus.filter(ds => relevantDriverIds.has(ds.driver_id));
+  return driverStatus.filter(ds => relevantDriverIds.has(String(ds.driver_id)));
 }
 
 function useIsNarrowScreen(breakpointPx = 768) {
@@ -1066,17 +1072,21 @@ export function computeGroupSuggestions(unassigned, users = [], driverStatus = [
 
     const group = [a];
     const groupIdxs = [i];
-    const groupAgentIds = new Set(a.agent_ids || []);
+    // String-normalized ids — Supabase bigint agent ids can surface as
+    // either number or string across hydration paths; a raw Set.has()
+    // would silently miss a 123 vs "123" overlap and merge two bookings
+    // that share an agent (same id-comparison class as fetchMyConversations).
+    const groupAgentIds = new Set((a.agent_ids || []).map(String));
     for (const c of candidates) {
       if (group.length >= groupCap) break;
       // Tracked cumulatively against every agent already in the group,
       // not just the anchor's agents, so a booking sharing an agent
       // with an already-added 2nd/3rd member can't slip in either.
-      const hasOverlap = (c.trip.agent_ids || []).some(id => groupAgentIds.has(id));
+      const hasOverlap = (c.trip.agent_ids || []).some(id => groupAgentIds.has(String(id)));
       if (hasOverlap) continue;
       group.push(c.trip);
       groupIdxs.push(c.idx);
-      (c.trip.agent_ids || []).forEach(id => groupAgentIds.add(id));
+      (c.trip.agent_ids || []).forEach(id => groupAgentIds.add(String(id)));
     }
 
     if (group.length >= 2) {
@@ -1103,16 +1113,16 @@ function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
     [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state)
   ).reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
   score += Math.max(0, 30 - (load / cap) * 30);
-  const driverTrips = trips.filter(t => t.driver_id === ds.driver_id || (t.declinedBy || []).some(id => String(id) === String(ds.driver_id)));
+  const driverTrips = trips.filter(t => String(t.driver_id) === String(ds.driver_id) || (t.declinedBy || []).some(id => String(id) === String(ds.driver_id)));
   const completed = driverTrips.filter(t => String(t.driver_id) === String(ds.driver_id) && t.state === TRIP_STATE.ARCHIVED_COMPLETED).length;
   const declined = driverTrips.filter(t => (t.declinedBy || []).some(id => String(id) === String(ds.driver_id))).length;
   const total = completed + declined;
   const acceptRate = total > 0 ? completed / total : 1;
   score += acceptRate * 20;
-  const agentSet = new Set(tripAgentIds || []);
+  const agentSet = new Set((tripAgentIds || []).map(String));
   const prevDeclinedThisAgent = trips.some(t =>
     (t.declinedBy || []).some(id => String(id) === String(ds.driver_id)) &&
-    (t.agent_ids || []).some(aid => agentSet.has(aid))
+    (t.agent_ids || []).some(aid => agentSet.has(String(aid)))
   );
   if (prevDeclinedThisAgent) score -= 10;
   return { score: Math.round(Math.max(0, Math.min(100, score))), proxScore: Math.round(proxScore), load, acceptRate, prevDeclinedThisAgent };
@@ -4024,8 +4034,8 @@ function AdminDispatch({ state, dispatch }) {
       if (tripBeingAdded) {
         const currentlySelected = unassigned.filter(t => next.has(t.trip_id));
         const sameDateSelected = currentlySelected.filter(t => t.scheduled_date === tripBeingAdded.scheduled_date);
-        const incomingAgentIds = new Set(tripBeingAdded.agent_ids || []);
-        const alreadySelectedAgentIdsSameDate = new Set(sameDateSelected.flatMap(t => t.agent_ids || []));
+        const incomingAgentIds = new Set((tripBeingAdded.agent_ids || []).map(String));
+        const alreadySelectedAgentIdsSameDate = new Set(sameDateSelected.flatMap(t => (t.agent_ids || []).map(String)));
         const overlap = [...incomingAgentIds].find(id => alreadySelectedAgentIdsSameDate.has(id));
         if (overlap) {
           const overlapName = state.users.find(u => String(u.id) === String(overlap))?.name || "This agent";
@@ -4116,6 +4126,13 @@ function AdminDispatch({ state, dispatch }) {
     setDispatching(true);
     setDispatchingDriverId(selectedDriverId);
     const driverName = state.users.find(u => String(u.id) === String(selectedDriverId))?.name;
+    // Which trip ids to drop from the selection once this resolves — the
+    // DISPATCH_MULTI / single-trip branches throw on any failure so they
+    // only ever reach the prune below on full success (all of them). The
+    // multi-day branch narrows this to just the legs that actually
+    // succeeded, so a partial failure leaves the failed days still
+    // checked and immediately retryable (FOUND VIA /code-review).
+    let dispatchedIds = selectedTrips.map(t => t.trip_id);
     try {
       if (isMultiDaySelection) {
         const results = await dispatch({
@@ -4132,6 +4149,7 @@ function AdminDispatch({ state, dispatch }) {
         const failResults = (results || []).filter(r => !r.ok);
         const okDays = new Set(okResults.map(r => tripDateById[r.trip_id])).size;
         const failDays = new Set(failResults.map(r => tripDateById[r.trip_id])).size;
+        dispatchedIds = okResults.map(r => r.trip_id);
         setMsg(failDays === 0
           ? `✓ All ${okDays} day${okDays !== 1 ? "s" : ""} assigned to ${driverName}`
           : `⚠ ${okDays} day${okDays !== 1 ? "s" : ""} assigned, ${failDays} failed — ${failResults.map(r => r.reason).join("; ")}`);
@@ -4164,10 +4182,8 @@ function AdminDispatch({ state, dispatch }) {
       // silently wiped when this batch's dispatch resolved. Only remove
       // the ids that were ACTUALLY part of this dispatch (captured via
       // `selectedTrips`, closed over at click time) instead.
-      setSelectedTripIds(prev => {
-        const dispatchedIds = new Set(selectedTrips.map(t => t.trip_id));
-        return new Set([...prev].filter(id => !dispatchedIds.has(id)));
-      });
+      const dispatchedIdSet = new Set(dispatchedIds);
+      setSelectedTripIds(prev => new Set([...prev].filter(id => !dispatchedIdSet.has(id))));
     } catch (e) {
       setMsg(`✗ ${e.message || "Dispatch failed — please try again."}`);
     } finally {

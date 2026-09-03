@@ -345,15 +345,19 @@ export function isCompanyScoped(user, companies) {
 // membership can be computed from real trip history rather than guessed.
 export function scopeUsersToCompany(users, trips, companyIds) {
   if (!companyIds?.length) return users;
-  const idSet = new Set(companyIds);
-  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(u.branch_id)).map(u => u.id));
+  // String-normalized id membership — see scopeTripsToCompany's note;
+  // Supabase bigint ids can arrive as number or string across hydration
+  // paths and a raw mismatch here would silently hide a scoped Viewer's
+  // own company's agents/drivers from the Users list.
+  const idSet = new Set(companyIds.map(String));
+  const scopedAgentIds = new Set(users.filter(u => u.role === ROLE.AGENT && idSet.has(String(u.branch_id))).map(u => String(u.id)));
   const relevantDriverIds = new Set(
-    trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(id))).map(t => t.driver_id).filter(Boolean)
+    trips.filter(t => t.agent_ids?.some(id => scopedAgentIds.has(String(id)))).map(t => t.driver_id).filter(Boolean).map(String)
   );
   return users.filter(u =>
     u.role === ROLE.ADMIN ||
-    (u.role === ROLE.AGENT && scopedAgentIds.has(u.id)) ||
-    (u.role === ROLE.DRIVER && relevantDriverIds.has(u.id))
+    (u.role === ROLE.AGENT && scopedAgentIds.has(String(u.id))) ||
+    (u.role === ROLE.DRIVER && relevantDriverIds.has(String(u.id)))
   );
 }
 
@@ -2203,9 +2207,17 @@ function setOfflineQueue(q) {
 function isNetworkError(e) {
   return e instanceof TypeError || /fetch|network|failed to connect/i.test(e?.message || "");
 }
+let _offlineQidSeq = 0;
 function enqueueOfflineAction(action) {
   const q = getOfflineQueue();
-  q.push({ ...action, _queuedAt: Date.now() });
+  // _qid is a stable per-item identity. The replay loop removes items
+  // from localStorage strictly by _qid as each one succeeds, so an item
+  // enqueued CONCURRENTLY during a replay (a GPS-geofence auto-confirm,
+  // an interactive pickup/dropoff while navigator.onLine briefly
+  // flickered true, a queued SOS) is never in the removal set and can't
+  // be clobbered by the loop rewriting the queue from a stale in-memory
+  // view — which is what used to silently drop it.
+  q.push({ ...action, _queuedAt: Date.now(), _qid: `${Date.now()}_${_offlineQidSeq++}_${Math.random().toString(36).slice(2, 9)}` });
   setOfflineQueue(q);
   console.log(`[Offline] Queued: ${action.type} (queue depth: ${q.length})`);
 }
@@ -2215,69 +2227,124 @@ function useOfflineSync(dispatch) {
   const [isOnline, setIsOnline] = React.useState(navigator.onLine);
   const [syncing, setSyncing] = React.useState(false);
   const [syncResult, setSyncResult] = React.useState(null); // { replayed, failed }
+  // Re-entrancy guard — mobile browsers routinely fire 'online' more than
+  // once on a single network transition (tunnel exit, airplane-mode
+  // toggle), and the sweep interval / visibilitychange can overlap those.
+  // Without this, two concurrent drainQueue runs each replay the same
+  // snapshot and dispatch every queued confirm twice. The queued
+  // actions are themselves idempotent (confirmed_at/driver_coord are
+  // baked in at enqueue time, never re-read at replay time), so this is
+  // not data corruption — but it is redundant network calls and a
+  // duplicate "all passengers picked up" admin notification per trip.
+  const replayingRef = React.useRef(false);
 
   React.useEffect(() => {
-    const goOnline = async () => {
-      setIsOnline(true);
-      // Queued-Waze-nav replay was removed along with the external Waze
-      // handoff itself — navigation now happens entirely in-app
-      // (DriverNavMap), which handles "no connection yet" on its own via
-      // its own error/retry state rather than needing an offline queue.
-      const q = getOfflineQueue();
-      if (q.length === 0) return;
+    // Queued-Waze-nav replay was removed along with the external Waze
+    // handoff itself — navigation now happens entirely in-app
+    // (DriverNavMap), which handles "no connection yet" on its own via
+    // its own error/retry state rather than needing an offline queue.
+    //
+    // `announce` = surface the result banner. True for an explicit
+    // reconnect/foreground (matches the original always-show-a-result
+    // behaviour); false for the periodic safety-net sweep, which only
+    // pops the banner when it actually synced something — a driver with
+    // one persistently-failing item shouldn't see a "0 synced" flash
+    // every minute.
+    const drainQueue = async (announce = false) => {
+      if (replayingRef.current) return;
+      if (!navigator.onLine) return;
+      if (getOfflineQueue().length === 0) return;
+      replayingRef.current = true;
       setSyncing(true);
-      let replayed = 0, failed = 0;
-      // Keep failed actions queued instead of unconditionally clearing —
-      // a replay failure (flaky reconnect, one bad request) used to
-      // permanently delete a driver's pickup/dropoff confirmation with no
-      // retry, defeating the entire point of this queue.
-      const stillPending = [];
-      let notYetProcessed = q;
-      for (const action of q) {
-        notYetProcessed = notYetProcessed.slice(1);
-        try {
-          await dispatch(action);
-          replayed++;
-        } catch (e) {
-          failed++;
-          // Found via a dedicated audit: this used to unconditionally
-          // re-queue EVERY replay failure, with no way to tell a
-          // genuinely transient network blip from a real, permanent
-          // server-side rejection (the trip got cancelled by an admin
-          // while offline, the agent was removed, the trip already
-          // completed via another path). isNetworkError() is already
-          // used at ENQUEUE time (only network-shaped failures get
-          // queued in the first place) — this was the one place that
-          // same discrimination was missing, meaning a permanent
-          // rejection retried forever on every future reconnect,
-          // identically failing each time, with nothing visible to the
-          // driver beyond a console.warn.
-          if (isNetworkError(e)) {
-            console.warn(`[Offline] Replay failed for ${action.type} (network — will retry):`, e.message);
-            stillPending.push(action);
-          } else {
-            console.warn(`[Offline] Replay permanently failed for ${action.type} (not a network error, giving up):`, e.message);
-          }
+      let totalReplayed = 0, totalFailed = 0;
+      try {
+        // Backfill _qid onto any pre-this-deploy items still queued, so
+        // the remove-by-_qid logic below has a key for every item.
+        const raw0 = getOfflineQueue();
+        if (raw0.some(a => !a._qid)) {
+          for (const a of raw0) if (!a._qid) a._qid = `legacy_${Date.now()}_${_offlineQidSeq++}`;
+          setOfflineQueue(raw0);
         }
-        // Persist after EVERY item, not just once after the whole loop —
-        // this hook runs in a moving vehicle with flaky signal; if the
-        // tab/PWA gets backgrounded or killed mid-replay, localStorage
-        // must already reflect what's actually still pending. Persisting
-        // only once at the end meant an interrupted replay left the
-        // ORIGINAL full queue in storage, including items that had
-        // already succeeded — the next reconnect would replay them a
-        // second time, silently overwriting a correct pickup/dropoff
-        // timestamp+GPS with a new, later, wrong pair.
-        setOfflineQueue([...stillPending, ...notYetProcessed]);
+        // Drain in passes. Each pass attempts only items not already
+        // attempted THIS run (`attemptedQids`), so a later pass exists
+        // purely to pick up anything enqueued CONCURRENTLY during an
+        // earlier pass's awaits (a GPS-geofence auto-confirm, a queued
+        // SOS) — a network-failing item is left in place and retried on
+        // the NEXT 'online' event, never re-hammered within this one.
+        // Bounded so a steady trickle of concurrent adds can't spin here.
+        const attemptedQids = new Set();
+        for (let pass = 0; pass < 8; pass++) {
+          if (!navigator.onLine) break;
+          const q = getOfflineQueue().filter(a => !attemptedQids.has(a._qid));
+          if (q.length === 0) break;
+          let passReplayed = 0;
+          for (const action of q) {
+            attemptedQids.add(action._qid);
+            let drop = false;
+            try {
+              await dispatch(action);
+              totalReplayed++; passReplayed++;
+              drop = true;
+            } catch (e) {
+              totalFailed++;
+              // isNetworkError discriminates a transient blip (leave
+              // queued, retry next 'online') from a permanent server-side
+              // rejection — the trip was cancelled/completed by another
+              // path while offline, the agent was removed. A permanent
+              // reject is dropped here so it can't retry-fail forever on
+              // every future reconnect; only network-shaped failures stay.
+              if (isNetworkError(e)) {
+                console.warn(`[Offline] Replay failed for ${action.type} (network — will retry):`, e.message);
+              } else {
+                console.warn(`[Offline] Replay permanently failed for ${action.type} (not a network error, giving up):`, e.message);
+                drop = true;
+              }
+            }
+            // Persist immediately, removing STRICTLY this item by _qid —
+            // never rewriting the whole queue from an in-memory view.
+            // This hook runs in a moving vehicle on flaky signal; if the
+            // tab is killed mid-replay, localStorage already reflects
+            // exactly "everything still pending" with no already-done
+            // item left to replay a second time (which would overwrite a
+            // correct pickup/dropoff timestamp+GPS with a later wrong
+            // one), and nothing enqueued concurrently ever clobbered.
+            if (drop) setOfflineQueue(getOfflineQueue().filter(a => a._qid !== action._qid));
+          }
+          if (passReplayed === 0) break; // only concurrent adds could remain; none appeared
+        }
+      } finally {
+        replayingRef.current = false;
+        setSyncing(false);
+        if (announce || totalReplayed > 0) {
+          setSyncResult({ replayed: totalReplayed, failed: totalFailed });
+          setTimeout(() => setSyncResult(null), 5000);
+        }
       }
-      setSyncing(false);
-      setSyncResult({ replayed, failed });
-      setTimeout(() => setSyncResult(null), 5000);
     };
+    const goOnline = () => { setIsOnline(true); drainQueue(true); };
     const goOffline = () => setIsOnline(false);
+    const onVisible = () => { if (document.visibilityState === "visible") drainQueue(true); };
     window.addEventListener("online", goOnline);
     window.addEventListener("offline", goOffline);
-    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+    document.addEventListener("visibilitychange", onVisible);
+    // Safety net for the common field case where usable signal returns on
+    // a moving vehicle WITHOUT the browser firing an 'online' event —
+    // navigator.onLine only reflects an associated interface, not real
+    // connectivity, so it often never went false in the first place.
+    // Without this sweep, an action queued on a fetch failure while
+    // "online" would sit unsent until the next genuine offline->online
+    // transition, which may never happen during a shift: the driver sees
+    // the pickup/dropoff as confirmed while admin still shows the
+    // passenger as not picked up. A no-op localStorage read once a minute
+    // when the queue is empty (the normal case) is negligible.
+    const sweep = setInterval(() => drainQueue(false), 60000);
+    drainQueue(false); // flush once on mount — the queue survives an app close/reopen
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+      document.removeEventListener("visibilitychange", onVisible);
+      clearInterval(sweep);
+    };
   }, [dispatch]);
 
   return { isOnline, syncing, syncResult };
