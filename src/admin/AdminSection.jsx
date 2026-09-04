@@ -6891,7 +6891,13 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
   // whatever address is currently in the form (not necessarily saved yet),
   // so the admin sees the warning before committing the change.
   const branchDistanceKm = (() => {
-    if (!form.homeCoord) return null;
+    // FOUND VIA /code-review: form.homeCoord is seeded straight from an
+    // existing home_address, which can be the truthy-but-unresolved
+    // {lat:null,lng:null} shape (bulk import/legacy row) — a bare
+    // truthiness check let that through, and haversineKm(null, null, ...)
+    // returns Infinity, rendering "Infinity km from home address — exceeds
+    // 40 km" for every such agent.
+    if (!hasResolvedCoord(form.homeCoord)) return null;
     const branch = companyById(state, form.branchId);
     if (!branch || branch.lat == null) return null;
     return haversineKm(form.homeCoord.lat, form.homeCoord.lng, branch.lat, branch.lng) * ROAD_FACTOR;
@@ -6914,10 +6920,14 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
     // without selecting a suggestion left it null — home_address was then
     // sent as `undefined` ("leave unchanged"), silently discarding the
     // edit with no indication it hadn't saved. Only fires when the street
-    // text actually changed from what's on file; leaving an existing
-    // address field untouched while editing something else still saves fine.
-    if ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER)
-      && form.homeStreet.trim() !== (user.home_address?.label || "").trim() && !form.homeCoord) {
+    // text actually changed to something new and non-empty; leaving an
+    // existing address field untouched still saves fine, and CLEARING it
+    // to empty (removing the address) doesn't hit this guard either — a
+    // first version of this fix blocked that too, refusing to save ANY
+    // field on the form (even an unrelated name fix) the moment an admin
+    // cleared the address field with intent to remove it.
+    if ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER) && form.homeStreet.trim() !== ""
+      && form.homeStreet.trim() !== (user.home_address?.label || "").trim() && !hasResolvedCoord(form.homeCoord)) {
       setSaveError("Pick the address from the search results (not just typed) before saving — or leave the address field as it was to keep it unchanged.");
       return;
     }
@@ -6947,7 +6957,7 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
         // was empty or typed-but-unconfirmed silently WIPED the person's
         // home address — including label-only bulk-imported addresses
         // that were sitting in the DB awaiting confirmation.
-        home_address: ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER) && form.homeCoord)
+        home_address: ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER) && hasResolvedCoord(form.homeCoord))
           ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng }
           : undefined,
         branch_id: (user.role === ROLE.AGENT || user.role === ROLE.DRIVER) ? form.branchId : undefined,
@@ -6974,8 +6984,15 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
         <>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <SectionHeader label="Home Address (Cape Town)" />
+            {/* FOUND VIA /code-review (sibling of the branchDistanceKm fix
+                above): preConfirmed used to pass the truthy-but-unresolved
+                {lat:null,lng:null} shape straight through, which StreetInput
+                reads as "a real address was confirmed" and shows a green ✅ —
+                misleadingly telling the admin this exact unresolved address
+                (the whole reason they're here, via the "needs confirming"
+                filter) was already resolved. */}
             <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
-              preConfirmed={form.homeCoord ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
+              preConfirmed={hasResolvedCoord(form.homeCoord) ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
               onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: confirmed ? coord : null }))} />
           </div>
 
@@ -7028,8 +7045,9 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             <SectionHeader label="Home Area (Cape Town)" />
             <span style={{ fontSize: 9, color: COLORS.ghost, marginTop: -4 }}>Used by admins to see which area this driver lives in when assigning trips.</span>
+            {/* Same preConfirmed fix as the AGENT branch above — see its comment. */}
             <StreetInput value={form.homeStreet} placeholder="e.g. Main Road, Claremont"
-              preConfirmed={form.homeCoord ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
+              preConfirmed={hasResolvedCoord(form.homeCoord) ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null}
               onChange={({ street, area, coord, confirmed }) => setForm(f => ({ ...f, homeStreet: street, homeArea: area, homeCoord: confirmed ? coord : null }))} />
           </div>
           <SectionHeader label="Company" />
@@ -7260,7 +7278,13 @@ function BulkUserImportPanel({ state, dispatch, onClose, onDone }) {
     }
     setResults({ succeeded, failed, succeededNeedingAddress });
     setImporting(false);
-    if (failed.length === 0) onDone?.();
+    // FOUND VIA /code-review: onDone (setShowBulkImport(false) in the
+    // parent) used to fire whenever there were zero failed rows — batched
+    // into the same commit as setResults above, so this panel unmounted
+    // before the "N of these still need confirming" line a few lines below
+    // ever painted. Only auto-close when there's truly nothing left for
+    // the admin to see here.
+    if (failed.length === 0 && succeededNeedingAddress === 0) onDone?.();
   };
 
   return (
@@ -7562,6 +7586,20 @@ function CampaignManagerPanel({ state, dispatch, onClose }) {
   );
 }
 
+// A home_address object always carries both lat/lng keys once any address
+// is on file — a resolved one has real numbers, an unresolved bulk-import/
+// legacy one is {lat:null, lng:null} (never omits the keys — EditUserPanel
+// seeds form.homeCoord straight from user.home_address, so that same
+// truthy-but-null shape flows into the form state too). "Resolved" means
+// BOTH are actually set; checked through this one helper everywhere it
+// matters so a partial/null pair can't read as resolved in one spot
+// (a truthy-object check alone) and unresolved in another. FOUND VIA
+// /code-review: three separate call sites below used to check truthiness
+// alone and each broke a different way on an unresolved address.
+function hasResolvedCoord(addr) {
+  return !!addr && addr.lat != null && addr.lng != null;
+}
+
 // Agents/drivers whose home address has a label but was never resolved to
 // real coordinates — reachable via bulk CSV import (BulkUserImportPanel
 // deliberately allows this, since geocoding hundreds of rows synchronously
@@ -7579,7 +7617,7 @@ export function usersNeedingAddressConfirmation(users) {
   return (users || []).filter(u =>
     (u.role === ROLE.AGENT || u.role === ROLE.DRIVER) &&
     u.home_address?.label &&
-    (u.home_address.lat == null || u.home_address.lng == null)
+    !hasResolvedCoord(u.home_address)
   );
 }
 
@@ -7676,7 +7714,7 @@ function AdminUsers({ state, dispatch, user }) {
     // silently vanished on submit (not even saved as an unresolved label
     // the way bulk import does), with no error telling the admin why.
     // Same gate CompanyManagerPanel's addCompany() already uses.
-    if ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && form.homeStreet.trim() && !form.homeCoord) {
+    if ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && form.homeStreet.trim() && !hasResolvedCoord(form.homeCoord)) {
       setSubmitError("Pick the address from the search results (not just typed) before creating this account — or clear the address field to add it later.");
       return;
     }
@@ -7686,7 +7724,7 @@ function AdminUsers({ state, dispatch, user }) {
         type: "ADMIN/CREATE_USER", name: form.name, role: form.role, vehicle: form.vehicle, phone: form.phone,
         staff_number: form.staffNumber,
         auth: { login: form.name, pass: form.staffNumber }, // username = full name, password = staff number
-        home_address: ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && form.homeCoord) ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null,
+        home_address: ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && hasResolvedCoord(form.homeCoord)) ? { label: form.homeStreet, area: form.homeArea, lat: form.homeCoord.lat, lng: form.homeCoord.lng } : null,
         branch_id: (form.role === ROLE.AGENT || form.role === ROLE.DRIVER) ? form.branchId : undefined,
         campaign_id: form.role === ROLE.AGENT ? form.campaignId : undefined,
         admin_level: form.role === ROLE.ADMIN ? form.adminLevel : undefined,
@@ -7863,10 +7901,19 @@ function AdminUsers({ state, dispatch, user }) {
           </div>
         </Card>
       )}
-      {needsAddressConfirmation.length > 0 && (
+      {/* FOUND VIA /code-review: gating this purely on
+          needsAddressConfirmation.length > 0 meant that once an admin
+          toggled the filter on and then resolved every flagged address,
+          the count hit 0, this banner (the ONLY control that can turn
+          showOnlyUnconfirmed back off) disappeared, and the Users list was
+          stuck showing "No users match" with no way back short of leaving
+          the tab. Also keep rendering while the filter is still active. */}
+      {(needsAddressConfirmation.length > 0 || showOnlyUnconfirmed) && (
         <div onClick={() => setShowOnlyUnconfirmed(v => !v)}
           style={{ cursor: "pointer", background: "rgba(245,166,35,.08)", border: `1px solid ${showOnlyUnconfirmed ? COLORS.amber : "rgba(245,166,35,.3)"}`, borderRadius: 4, padding: 10, fontSize: 10, color: COLORS.chalk }}>
-          ⚠ {needsAddressConfirmation.length} agent/driver address{needsAddressConfirmation.length !== 1 ? "es" : ""} still need{needsAddressConfirmation.length === 1 ? "s" : ""} confirming — they'll rank last in dispatch-pooling suggestions until resolved.
+          {needsAddressConfirmation.length > 0
+            ? <>⚠ {needsAddressConfirmation.length} agent/driver address{needsAddressConfirmation.length !== 1 ? "es" : ""} still need{needsAddressConfirmation.length === 1 ? "s" : ""} confirming — they'll rank last in dispatch-pooling suggestions until resolved.</>
+            : <>✓ No addresses need confirming right now.</>}
           {" "}<b>{showOnlyUnconfirmed ? "SHOWING ONLY THESE — tap to clear" : "TAP TO SHOW THEM"}</b>
         </div>
       )}
@@ -7908,7 +7955,7 @@ function AdminUsers({ state, dispatch, user }) {
                   <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}{isSelf && selectMode && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> (you)</span>}</div>
                   <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>Staff #: {u.staff_number || "—"}</div>
                   {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && u.home_address && (
-                    u.home_address.lat != null
+                    hasResolvedCoord(u.home_address)
                       ? <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>
                       // FOUND VIA /code-review: this line used to show the
                       // same green pin whether or not the address had ever
