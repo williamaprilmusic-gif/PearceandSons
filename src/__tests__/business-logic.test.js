@@ -55,6 +55,7 @@ import {
   auditLogCategory,
   auditLogPeriodKey,
   groupAuditLogsByPeriod,
+  usersNeedingAddressConfirmation,
 } from "../admin/AdminSection.jsx";
 
 // 12:00 SAST (well clear of any midnight boundary) for a given SAST
@@ -1176,5 +1177,34 @@ describe("rosterMondayOf / buildRosterWeek — roster grid model", () => {
     };
     const week = buildRosterWeek(state, MON);
     expect(week.drivers[0].driver_id).toBe(2);
+  });
+});
+
+describe("usersNeedingAddressConfirmation — flags label-only home addresses from bulk import/legacy rows", () => {
+  it("flags an agent/driver with a label but no resolved lat/lng", () => {
+    const users = [
+      { id: 1, role: ROLE.AGENT, home_address: { label: "Main Rd, Claremont", area: "Claremont", lat: null, lng: null } },
+      { id: 2, role: ROLE.DRIVER, home_address: { label: "Voortrekker Rd, Bellville", area: "Bellville", lat: null, lng: null } },
+    ];
+    expect(usersNeedingAddressConfirmation(users).map(u => u.id)).toEqual([1, 2]);
+  });
+
+  it("does not flag a resolved address, no address at all, or a non-agent/driver role", () => {
+    const users = [
+      { id: 1, role: ROLE.AGENT, home_address: { label: "Main Rd, Claremont", area: "Claremont", lat: -33.98, lng: 18.46 } },
+      { id: 2, role: ROLE.AGENT, home_address: null },
+      { id: 3, role: ROLE.ADMIN, home_address: { label: "Unresolved", area: "X", lat: null, lng: null } },
+    ];
+    expect(usersNeedingAddressConfirmation(users)).toEqual([]);
+  });
+
+  it("flags a partially-resolved address (only one of lat/lng missing)", () => {
+    const users = [{ id: 1, role: ROLE.DRIVER, home_address: { label: "Somewhere", area: "X", lat: -33.9, lng: null } }];
+    expect(usersNeedingAddressConfirmation(users).map(u => u.id)).toEqual([1]);
+  });
+
+  it("handles an empty/undefined users list", () => {
+    expect(usersNeedingAddressConfirmation([])).toEqual([]);
+    expect(usersNeedingAddressConfirmation(undefined)).toEqual([]);
   });
 });

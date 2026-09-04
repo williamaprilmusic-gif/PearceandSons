@@ -6831,6 +6831,18 @@ function EditUserPanel({ user, driverStatus, dispatch, state, onClose }) {
       setSaveError("Select at least one company for a Viewer admin — without one, they won't be able to see any data.");
       return;
     }
+    // FOUND VIA /code-review, same shape as AdminUsers' create submit():
+    // homeCoord only carries a resolved pick, so typing a NEW address
+    // without selecting a suggestion left it null — home_address was then
+    // sent as `undefined` ("leave unchanged"), silently discarding the
+    // edit with no indication it hadn't saved. Only fires when the street
+    // text actually changed from what's on file; leaving an existing
+    // address field untouched while editing something else still saves fine.
+    if ((user.role === ROLE.AGENT || user.role === ROLE.DRIVER)
+      && form.homeStreet.trim() !== (user.home_address?.label || "").trim() && !form.homeCoord) {
+      setSaveError("Pick the address from the search results (not just typed) before saving — or leave the address field as it was to keep it unchanged.");
+      return;
+    }
     setSaving(true);
     setSaveError(null);
     try {
@@ -7143,6 +7155,7 @@ function BulkUserImportPanel({ state, dispatch, onClose, onDone }) {
     setProgress({ done: 0, total: parsed.records.length });
     const failed = [];
     let succeeded = 0;
+    let succeededNeedingAddress = 0;
     // Sequential, not Promise.all — each ADMIN/CREATE_USER call needs to
     // land before the next one for clean error attribution per row, and
     // this is an infrequent bulk-admin operation, not something latency-
@@ -7161,12 +7174,13 @@ function BulkUserImportPanel({ state, dispatch, onClose, onDone }) {
           branch_id: (rec.role === ROLE.AGENT || rec.role === ROLE.DRIVER) ? (rec.branchId || null) : undefined,
         });
         succeeded++;
+        if (rec.homeAddress) succeededNeedingAddress++;
       } catch (e) {
         failed.push({ row: rec.rowNum, name: rec.name, reason: e.message || "Unknown error" });
       }
       setProgress(p => ({ ...p, done: p.done + 1 }));
     }
-    setResults({ succeeded, failed });
+    setResults({ succeeded, failed, succeededNeedingAddress });
     setImporting(false);
     if (failed.length === 0) onDone?.();
   };
@@ -7200,6 +7214,11 @@ function BulkUserImportPanel({ state, dispatch, onClose, onDone }) {
       {results && (
         <div>
           <div style={{ fontSize: 11, color: COLORS.green, fontWeight: 700 }}>✓ {results.succeeded} user{results.succeeded !== 1 ? "s" : ""} created</div>
+          {results.succeededNeedingAddress > 0 && (
+            <div style={{ fontSize: 10, color: COLORS.amber, marginTop: 4 }}>
+              ⚠ {results.succeededNeedingAddress} of these have a home address that still needs confirming — find them in User Registry below (use the "needs confirming" filter that appears once this panel closes) and edit each to pick the real address via search.
+            </div>
+          )}
           {results.failed.length > 0 && (
             <>
               <div style={{ fontSize: 11, color: COLORS.red, fontWeight: 700, marginTop: 6 }}>✗ {results.failed.length} failed</div>
@@ -7465,6 +7484,27 @@ function CampaignManagerPanel({ state, dispatch, onClose }) {
   );
 }
 
+// Agents/drivers whose home address has a label but was never resolved to
+// real coordinates — reachable via bulk CSV import (BulkUserImportPanel
+// deliberately allows this, since geocoding hundreds of rows synchronously
+// against a live search UI isn't feasible) or a legacy row predating the
+// confirm-gate added to AdminUsers'/EditUserPanel's own forms below. This
+// doesn't break dispatch pooling outright — computeGroupSuggestions groups
+// by home_address.area (a string, always present even without coords) and
+// only uses the coordinate as a secondary distance tie-breaker, ranking an
+// unresolved one last rather than excluding it — but at fleet scale (see
+// project memory transitos-dispatch-pooling-scale: ~1800 agents target)
+// enough unresolved rows in one area flattens that tie-breaker back to
+// arrival order. Exported so both the badge below and a future automated
+// sweep can share one definition of "needs confirming."
+export function usersNeedingAddressConfirmation(users) {
+  return (users || []).filter(u =>
+    (u.role === ROLE.AGENT || u.role === ROLE.DRIVER) &&
+    u.home_address?.label &&
+    (u.home_address.lat == null || u.home_address.lng == null)
+  );
+}
+
 function AdminUsers({ state, dispatch, user }) {
   const [show, setShow] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -7493,12 +7533,20 @@ function AdminUsers({ state, dispatch, user }) {
   // staff number, or role (typing "driver"/"admin"/"agent" filters by
   // role too, a natural thing to want on a screen mixing all three).
   const [userSearch, setUserSearch] = useState("");
-  const filteredUsers = userSearch.trim().length >= 1
+  // "Needs address" quick filter — see usersNeedingAddressConfirmation's
+  // own comment for why this list can be non-empty by design (bulk CSV
+  // import), not just a bug backlog. ANDs with the text search rather than
+  // replacing it, so an admin can still narrow by name/role at the same time.
+  const [showOnlyUnconfirmed, setShowOnlyUnconfirmed] = useState(false);
+  const needsAddressConfirmation = React.useMemo(() => usersNeedingAddressConfirmation(state.users), [state.users]);
+  const needsAddressConfirmationIds = React.useMemo(() => new Set(needsAddressConfirmation.map(u => u.id)), [needsAddressConfirmation]);
+  const filteredUsers = (userSearch.trim().length >= 1
     ? state.users.filter(u => {
         const q = userSearch.trim().toLowerCase();
         return u.name.toLowerCase().includes(q) || (u.staff_number || "").toLowerCase().includes(q) || u.role.toLowerCase().includes(q);
       })
-    : state.users;
+    : state.users
+  ).filter(u => !showOnlyUnconfirmed || needsAddressConfirmationIds.has(u.id));
   const toggleSelected = (id) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
@@ -7542,6 +7590,16 @@ function AdminUsers({ state, dispatch, user }) {
     // only when the new Viewer logs in and reports an empty portal.
     if (form.role === ROLE.ADMIN && form.adminLevel === ADMIN_LEVEL.VIEWER && form.scopedCompanyIds.length === 0) {
       setSubmitError("Select at least one company for a Viewer admin — without one, they won't be able to see any data.");
+      return;
+    }
+    // FOUND VIA /code-review: typing an address without picking a search
+    // result left form.homeCoord null, and this action's home_address was
+    // only ever included `if (form.homeCoord)` — so the whole typed address
+    // silently vanished on submit (not even saved as an unresolved label
+    // the way bulk import does), with no error telling the admin why.
+    // Same gate CompanyManagerPanel's addCompany() already uses.
+    if ((form.role === ROLE.AGENT || form.role === ROLE.DRIVER) && form.homeStreet.trim() && !form.homeCoord) {
+      setSubmitError("Pick the address from the search results (not just typed) before creating this account — or clear the address field to add it later.");
       return;
     }
     setSubmitError(null);
@@ -7727,6 +7785,13 @@ function AdminUsers({ state, dispatch, user }) {
           </div>
         </Card>
       )}
+      {needsAddressConfirmation.length > 0 && (
+        <div onClick={() => setShowOnlyUnconfirmed(v => !v)}
+          style={{ cursor: "pointer", background: "rgba(245,166,35,.08)", border: `1px solid ${showOnlyUnconfirmed ? COLORS.amber : "rgba(245,166,35,.3)"}`, borderRadius: 4, padding: 10, fontSize: 10, color: COLORS.chalk }}>
+          ⚠ {needsAddressConfirmation.length} agent/driver address{needsAddressConfirmation.length !== 1 ? "es" : ""} still need{needsAddressConfirmation.length === 1 ? "s" : ""} confirming — they'll rank last in dispatch-pooling suggestions until resolved.
+          {" "}<b>{showOnlyUnconfirmed ? "SHOWING ONLY THESE — tap to clear" : "TAP TO SHOW THEM"}</b>
+        </div>
+      )}
       <TextField label="Search by name, staff number, or role" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="e.g. Nomsa Dlamini, AG1001, or driver" />
       <Card body={false}>
         {filteredUsers.length === 0 ? (
@@ -7764,7 +7829,17 @@ function AdminUsers({ state, dispatch, user }) {
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}{isSelf && selectMode && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> (you)</span>}</div>
                   <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>Staff #: {u.staff_number || "—"}</div>
-                  {u.role === ROLE.AGENT && u.home_address && <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>}
+                  {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && u.home_address && (
+                    u.home_address.lat != null
+                      ? <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>
+                      // FOUND VIA /code-review: this line used to show the
+                      // same green pin whether or not the address had ever
+                      // resolved to real coordinates (label-only bulk-
+                      // import rows looked identical to confirmed ones,
+                      // and drivers never got this line at all — added
+                      // here too, same shape as the agent case).
+                      : <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>⚠ {u.home_address.label} (needs confirming)</div>
+                  )}
                   {u.role === ROLE.DRIVER && driverStatus?.vehicle && <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>🚐 {driverStatus.vehicle}</div>}
                   {u.role === ROLE.ADMIN && u.admin_level && <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>{ADMIN_LEVEL_LABEL[u.admin_level]}</div>}
                 </div>
