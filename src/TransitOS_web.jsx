@@ -18171,9 +18171,6 @@ function AdminSectionLoading() {
   );
 }
 
-// See AppInner's new-notification toast effect for why this exists.
-const NOTIFICATION_TOAST_MAX_AGE_MS = 2 * 60 * 1000;
-
 function AppInner() {
   const [state, dispatch] = useAppStore();
   const [toasts, setToasts] = useState([]);
@@ -18277,20 +18274,32 @@ function AppInner() {
     // itself with a toast+sound the instant they log in.
     //
     // FOUND VIA A REAL USER REPORT ("every time I click Clear All in
-    // Alerts it shows me an incoming message from an old trip"): "new to
-    // this session" alone isn't the same as "actually just happened."
-    // Root cause was the notifications query's ORDER BY having no
-    // tie-breaker (fixed at the query in fetchAllFromSupabase — see its
-    // own comment for the full mechanism, live-verified against
-    // production), which let an old notification unpredictably re-enter
-    // the 500-row window and look "new" to this effect. Kept as a second,
-    // independent layer here too: even a notification genuinely new to
-    // this array is only toast-worthy if it actually happened recently —
-    // anything older is something that just became visible, not a live
-    // event, and doesn't deserve an intrusive toast+sound.
-    const recentNewOnes = newOnes.filter(n => n.ts_epoch != null && Date.now() - n.ts_epoch < NOTIFICATION_TOAST_MAX_AGE_MS);
-    if (prevMyNotifIds.current.size > 0 && recentNewOnes.length > 0) {
-      const newest = recentNewOnes[0];
+    // Alerts it shows me an incoming message from an old trip"): root
+    // cause was the notifications query's ORDER BY having no tie-breaker
+    // (fixed at the query in fetchAllFromSupabase — see its own comment
+    // for the full mechanism, live-verified against production), which let
+    // an old notification unpredictably re-enter the 500-row window and
+    // look "new" to this effect.
+    //
+    // A first version of this fix ALSO added a client-clock recency check
+    // here ("only toast if ts_epoch is within the last 2 minutes"),
+    // reasoning it as harmless defense-in-depth. FOUND VIA /code-review:
+    // it wasn't — ts_epoch is the INSERTING device's own Date.now() at
+    // write time (insertNotification writes n.ts verbatim), not a
+    // server-authoritative clock, and this app's own established normal
+    // operating condition is a driver's phone backgrounded/disconnected
+    // for minutes at a time in a moving vehicle. A genuinely brand-new SOS
+    // or dispatch alert arriving on reconnect after being backgrounded
+    // >2 minutes (or from a device whose clock merely reads a few minutes
+    // fast/slow) would silently never toast or sound — and since
+    // prevMyNotifIds still marks it seen, there's no later retry either.
+    // That trade — occasionally re-toasting a stale message vs. sometimes
+    // silently swallowing a live SOS alert — is the wrong one, and the
+    // query fix above already fully closes the reported bug on its own.
+    // Reverted; not reintroducing a client-clock comparison without a
+    // server-stamped timestamp to check it against.
+    if (prevMyNotifIds.current.size > 0 && newOnes.length > 0) {
+      const newest = newOnes[0];
       pushToast(newest.type.replace(/_/g, " "), newest.message);
       playAlertSound();
     }
