@@ -178,6 +178,75 @@ function useTicker(intervalMs) {
   return tick;
 }
 
+// ── Live dispatch-selection presence ────────────────────────────────────
+// Broadcasts which unassigned trips THIS admin currently has staged for a
+// combine-and-dispatch (selectedTripIds in AdminDispatch) to every other
+// admin viewing the same tab, via Supabase Realtime Presence — no new
+// table, purely ephemeral, and auto-clears the instant a tab disconnects
+// (verified live against this project before shipping: two independent
+// clients tracking/subscribing to the same channel name see each other's
+// presence within ~1s, no extra RLS/config needed for a presence-only
+// channel). This is a proactive HEADS-UP, not a new correctness guard —
+// TRIP/ASSIGN_DRIVER and TRIP/DISPATCH_MULTI already have a real
+// optimistic-concurrency guard (withUpdatedAtGuard) that makes a genuine
+// double-dispatch race impossible to land silently; an admin who races one
+// anyway already gets a clear "just changed by someone else" error at
+// write time (see those handlers' own comments). What was actually missing
+// at 4-6 concurrent admins working the same unassigned-bookings queue is a
+// warning BEFORE two people independently spend the effort building the
+// exact same group — wasted duplicate work, not a data-integrity risk.
+function useDispatchPresence(user, selectedTripIds) {
+  const [othersByTripId, setOthersByTripId] = useState(new Map());
+  const channelRef = useRef(null);
+  const readyRef = useRef(false);
+  // Read via a ref (not the selectedTripIds closure) inside the mount
+  // effect's subscribe callback, so the very first track() call after
+  // SUBSCRIBED sends whatever the admin has selected AT THAT MOMENT, not a
+  // stale snapshot from whenever the effect happened to run.
+  const selectedTripIdsRef = useRef(selectedTripIds);
+  selectedTripIdsRef.current = selectedTripIds;
+
+  useEffect(() => {
+    if (!user?.id) return;
+    readyRef.current = false;
+    const channel = supabase.channel("dispatch-selection-presence", { config: { presence: { key: String(user.id) } } });
+    channelRef.current = channel;
+    const syncFromState = () => {
+      const presenceState = channel.presenceState();
+      const map = new Map();
+      for (const [key, entries] of Object.entries(presenceState)) {
+        if (key === String(user.id)) continue; // never warn an admin about their own selection
+        const latest = entries[entries.length - 1]; // most recent tracked payload for this key
+        for (const tripId of latest?.trip_ids || []) {
+          map.set(tripId, [...(map.get(tripId) || []), { admin_id: key, admin_name: latest.admin_name }]);
+        }
+      }
+      setOthersByTripId(map);
+    };
+    channel.on("presence", { event: "sync" }, syncFromState);
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        readyRef.current = true;
+        await channel.track({ admin_name: user.name, trip_ids: [...selectedTripIdsRef.current] });
+      }
+    });
+    return () => { readyRef.current = false; supabase.removeChannel(channel); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  // Re-track whenever the selection itself changes — separate from the
+  // mount effect above so toggling a trip in/out doesn't tear down and
+  // resubscribe the whole channel (which would also briefly drop this
+  // admin's presence from everyone else's view).
+  useEffect(() => {
+    if (!readyRef.current || !channelRef.current) return;
+    channelRef.current.track({ admin_name: user?.name, trip_ids: [...selectedTripIds] });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTripIds]);
+
+  return othersByTripId;
+}
+
 function distinctWeekDays(trips) {
   return new Set(trips.map(t => t.scheduled_date)).size;
 }
@@ -4318,7 +4387,7 @@ function AuditLogEntryRow({ log, compact }) {
   );
 }
 
-function AdminDispatch({ state, dispatch }) {
+function AdminDispatch({ state, dispatch, user }) {
   // Multiple unassigned trips can be selected together — for when several
   // agents happen to be going the same way and one driver should pick up
   // all of them in a single run instead of separate dispatches. A Set
@@ -4353,6 +4422,9 @@ function AdminDispatch({ state, dispatch }) {
   // immediately, closing the gap the state-only guard's own comment
   // already flagged as open.
   const dispatchingRef = useRef(false);
+  // See useDispatchPresence's own header comment — a proactive "someone
+  // else already has this staged" warning, not a new correctness guard.
+  const otherAdminSelectionsByTripId = useDispatchPresence(user, selectedTripIds);
   // The driver-scoring memo below computes each driver's live-position
   // "freshness" (30s cutoff) — see useTicker's own header comment for why
   // memoizing that check needs this. 10s keeps the staleness verdict from
@@ -4759,6 +4831,7 @@ function AdminDispatch({ state, dispatch }) {
       <span style={{ fontSize: 9, color: COLORS.ghost }}>Tap to select — pick multiple bookings to combine them into one trip.</span>
       {unassigned.length === 0 ? <Empty icon="⊕" text="No unassigned bookings" /> : unassigned.map(t => {
         const sel = selectedTripIds.has(t.trip_id);
+        const otherSelectors = otherAdminSelectionsByTripId.get(t.trip_id) || [];
         return (
           <div key={t.trip_id} onClick={() => toggleTrip(t.trip_id)}
             style={{ cursor: "pointer", background: COLORS.card, border: `1px solid ${sel ? COLORS.amber : COLORS.wire}`, borderRadius: 4, padding: 13, display: "flex", flexDirection: "column", gap: 6 }}>
@@ -4769,6 +4842,11 @@ function AdminDispatch({ state, dispatch }) {
               </div>
               <StateBadge state={t.state} />
             </div>
+            {otherSelectors.length > 0 && (
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, padding: "2px 6px", borderRadius: 2, width: "fit-content" }}>
+                👀 also selected by {otherSelectors.map(o => o.admin_name).join(", ")} — check before dispatching to avoid duplicate work
+              </span>
+            )}
             <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_ids.length} passenger{t.agent_ids.length !== 1 ? "s" : ""}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
@@ -9371,7 +9449,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       )}
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
-      {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
+      {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} user={user} />}
       {tab === "roster" && hasAdminPermission(user, "manageDispatch") && <AdminRoster state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
