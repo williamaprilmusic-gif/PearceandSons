@@ -2858,6 +2858,30 @@ export function SlaReportPanel({ trips, users }) {
 export const MAX_DRIVER_HOURS_PER_DAY = 12;
 export const MAX_DRIVER_HOURS_PER_WEEK = 60;
 
+// Escalation rules engine — the condition kinds a rule can target, and
+// the max threshold (minutes) allowed for each. Defined HERE (not in
+// AdminSection.jsx, which imports these) specifically so the client
+// (validation in EscalationRulesPanel) and the server
+// (ADMIN/UPSERT_ESCALATION_RULE / RUN_ESCALATIONS below) read the exact
+// same object — no hand-copied twin to drift, unlike the two-file
+// constant mirrors this app otherwise has to live with (e.g.
+// MAX_DRIVER_HOURS_* vs its edge-function copy) because THOSE run in a
+// genuinely separate deployable. Values are set comfortably below the
+// window computeOpsExceptions actually keeps emitting each kind of item
+// (late_start 12h, stuck/no_show 24h — see their *_STALE_MS/*_RECENCY_MS
+// constants), so a rule at the max still has several 10-min sweeps to
+// fire before the item vanishes; `unassigned` is measured from when the
+// booking was made, not from departure, so its cap is generous (3 days).
+export const ESCALATION_KINDS = ["late_start", "unassigned", "stuck", "no_show", "dispute", "ticket"];
+export const ESCALATION_KIND_MAX_MINUTES = {
+  late_start: 600,
+  unassigned: 4320,
+  stuck: 1200,
+  no_show: 1200,
+  dispute: 20160,
+  ticket: 20160,
+};
+
 // Derives "hours worked" from actual trip activity timestamps, not
 // driver_status.availability_schedule (that's planned availability, not
 // actual worked time — would badly overstate hours). Only trips that
@@ -9425,14 +9449,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "ADMIN/UPSERT_ESCALATION_RULE": {
       const actingEr = await assertAdminPermission(activeUserRef, "manageDispatch");
       const kind = action.condition_kind;
-      // MIRROR of ESCALATION_KIND_MAX_MINUTES (AdminSection.jsx, pinned by
-      // business-logic.test.js). Kept in step by hand, same as this app's
-      // other client/server constant twins (e.g. MAX_DRIVER_HOURS_*).
-      const KIND_MAX_MIN = { late_start: 600, unassigned: 4320, stuck: 1200, no_show: 1200, dispute: 20160, ticket: 20160 };
-      if (!KIND_MAX_MIN[kind]) throw new Error("Unknown escalation condition.");
+      if (!ESCALATION_KIND_MAX_MINUTES[kind]) throw new Error("Unknown escalation condition.");
       const threshold = Math.round(Number(action.threshold_minutes));
       if (!Number.isFinite(threshold) || threshold < 1) throw new Error("Threshold must be at least 1 minute.");
-      if (threshold > KIND_MAX_MIN[kind]) throw new Error(`This condition is only tracked for ${KIND_MAX_MIN[kind]} min — use a threshold at or below that.`);
+      if (threshold > ESCALATION_KIND_MAX_MINUTES[kind]) throw new Error(`This condition is only tracked for ${ESCALATION_KIND_MAX_MINUTES[kind]} min — use a threshold at or below that.`);
       const roles = Array.isArray(action.notify_roles) ? action.notify_roles.filter(r => [ROLE.ADMIN, ROLE.AGENT, ROLE.DRIVER].includes(r)) : [];
       const userIds = Array.isArray(action.notify_user_ids) ? action.notify_user_ids.map(Number).filter(Number.isFinite) : [];
       if (roles.length === 0 && userIds.length === 0) throw new Error("Pick at least one role or person to notify.");
@@ -9472,75 +9492,116 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
 
     case "ADMIN/RUN_ESCALATIONS": {
       // Periodic sweep (wired into AdminApp's 10-min poll) — no permission
-      // gate, same convention as every other CHECK_* sweep. The CALLER
-      // (computeEscalations, client-side) has already matched current
-      // unresolved items against the active rules and passed the
-      // (rule, item) pairs that are past their threshold; this handler
-      // only dedupes against escalation_events and notifies.
+      // gate, same convention as every other CHECK_* sweep: this fires
+      // for any logged-in session, admin or not, since it's a background
+      // check, not an admin-initiated action.
+      //
+      // SECURITY — the CALLER (computeEscalations, client-side) matches
+      // current unresolved items against the active rules and passes the
+      // (rule, item) pairs past their threshold, but a client dispatch is
+      // NEVER trusted for WHO gets notified or WHAT the message claims:
+      // action.matches[].notify_roles/notify_user_ids/rule_label/
+      // threshold_minutes are attacker-shaped fields (any authenticated
+      // session, any role, can call dispatch directly) — exactly the
+      // identity/authorization-spoofing class this codebase has hit
+      // before (see TRIP/BOOK, TICKET/CREATE, DM/SEND and others: a
+      // client-supplied identity/target field used verbatim instead of
+      // re-derived server-side). Every match is re-resolved against the
+      // REAL escalation_rules row for its rule_id below; a match whose
+      // rule_id doesn't correspond to an existing ACTIVE rule is dropped
+      // before anything is sent, and the actual recipients/label/
+      // threshold always come from that fetched row, never from the
+      // client payload.
       const matches = Array.isArray(action.matches) ? action.matches : [];
-      if (matches.length === 0) return;
-      const RE_ESCALATE_MS = 6 * 60 * 60 * 1000; // re-notify an item still unresolved 6h later
       const runNowTs = nowEpoch();
-      const ruleIds = [...new Set(matches.map(m => m.rule_id).filter(v => v != null))];
-      const { data: existingEvents } = ruleIds.length
-        ? await supabase.from("escalation_events").select("rule_id, item_key, last_fired_at").in("rule_id", ruleIds)
-        : { data: [] };
-      const lastFiredByKey = new Map((existingEvents || []).map(e => [`${e.rule_id}|${e.item_key}`, e.last_fired_at]));
       let anyFired = false;
-      for (const m of matches) {
-        if (m.rule_id == null || !m.item_key) continue;
-        const k = `${m.rule_id}|${m.item_key}`;
-        const last = lastFiredByKey.get(k);
-        if (last != null && runNowTs - last < RE_ESCALATE_MS) continue; // already escalated recently
-        // Claim this fire atomically so two admin browsers running the
-        // sweep at the same moment can't both notify. escalation_events
-        // has UNIQUE(rule_id, item_key) (migration
-        // add_escalation_rules_and_events) and an "allow all" RLS policy,
-        // so the write and the select-back are both reliable:
-        //  - new item → plain insert; a losing race raises 23505 (ins.error
-        //    set) so we don't claim.
-        //  - re-escalation → conditional update keyed on the OLD
-        //    last_fired_at; 0 rows back = another browser already bumped it.
-        let claimed = false;
-        if (last == null) {
-          const ins = await supabase.from("escalation_events")
-            .insert({ rule_id: m.rule_id, item_key: m.item_key, first_fired_at: runNowTs, last_fired_at: runNowTs });
-          claimed = !ins.error;
-        } else {
-          const upd = await supabase.from("escalation_events")
-            .update({ last_fired_at: runNowTs })
-            .eq("rule_id", m.rule_id).eq("item_key", m.item_key).eq("last_fired_at", last)
-            .select("id");
-          claimed = !upd.error && (upd.data?.length ?? 0) > 0;
-        }
-        if (!claimed) continue;
-        const hrs = Math.max(1, Math.round((m.overdue_minutes || 0) / 60));
-        const mins = m.overdue_minutes || 0;
-        const ageStr = mins < 90 ? `${mins} min` : `${hrs}h`;
-        try {
-          await insertNotification({
-            type: "ESCALATION",
-            for_roles: Array.isArray(m.notify_roles) ? m.notify_roles : [],
-            for_user_ids: Array.isArray(m.notify_user_ids) ? m.notify_user_ids : [],
-            message: `🔺 Escalation "${m.rule_label}": ${m.item_label || m.item_key} still unresolved after ${ageStr} (threshold ${m.threshold_minutes}m).`,
-            trip_id: m.trip_id ?? null, ts: runNowTs, read: false,
-          });
-          anyFired = true;
-        } catch (notifErr) {
-          // The notify failed but we already claimed the fire — roll the
-          // claim back so the NEXT sweep retries instead of silently
-          // suppressing this escalation for the 6h re-escalate window.
-          console.warn(`[Escalation] notify failed for ${k}, rolling back claim:`, notifErr?.message);
+      if (matches.length > 0) {
+        const ruleIds = [...new Set(matches.map(m => m.rule_id).filter(v => v != null))];
+        const [{ data: rulesData }, { data: existingEvents }] = await Promise.all([
+          ruleIds.length ? supabase.from("escalation_rules").select("*").in("id", ruleIds) : Promise.resolve({ data: [] }),
+          ruleIds.length ? supabase.from("escalation_events").select("rule_id, item_key, last_fired_at").in("rule_id", ruleIds) : Promise.resolve({ data: [] }),
+        ]);
+        const ruleById = new Map((rulesData || []).filter(r => r.active).map(r => [String(r.id), r]));
+        const RE_ESCALATE_MS = 6 * 60 * 60 * 1000; // re-notify an item still unresolved 6h later
+        const lastFiredByKey = new Map((existingEvents || []).map(e => [`${e.rule_id}|${e.item_key}`, e.last_fired_at]));
+        for (const m of matches) {
+          if (m.rule_id == null || !m.item_key) continue;
+          const rule = ruleById.get(String(m.rule_id));
+          if (!rule) continue; // rule doesn't exist or isn't active — never invented client-side
+          const k = `${m.rule_id}|${m.item_key}`;
+          const last = lastFiredByKey.get(k);
+          if (last != null && runNowTs - last < RE_ESCALATE_MS) continue; // already escalated recently
+          // Claim this fire atomically so two admin browsers running the
+          // sweep at the same moment can't both notify. escalation_events
+          // has UNIQUE(rule_id, item_key) (migration
+          // add_escalation_rules_and_events) and an "allow all" RLS policy,
+          // so the write and the select-back are both reliable:
+          //  - new item → plain insert; a losing race raises 23505 (ins.error
+          //    set) so we don't claim.
+          //  - re-escalation → conditional update keyed on the OLD
+          //    last_fired_at; 0 rows back = another browser already bumped it.
+          let claimed = false;
           if (last == null) {
-            await supabase.from("escalation_events").delete().eq("rule_id", m.rule_id).eq("item_key", m.item_key).then(() => {}, () => {});
+            const ins = await supabase.from("escalation_events")
+              .insert({ rule_id: rule.id, item_key: m.item_key, first_fired_at: runNowTs, last_fired_at: runNowTs });
+            claimed = !ins.error;
           } else {
-            await supabase.from("escalation_events").update({ last_fired_at: last }).eq("rule_id", m.rule_id).eq("item_key", m.item_key).then(() => {}, () => {});
+            const upd = await supabase.from("escalation_events")
+              .update({ last_fired_at: runNowTs })
+              .eq("rule_id", rule.id).eq("item_key", m.item_key).eq("last_fired_at", last)
+              .select("id");
+            claimed = !upd.error && (upd.data?.length ?? 0) > 0;
+          }
+          if (!claimed) continue;
+          // Descriptive fields only (WHICH item, roughly how overdue) —
+          // client-supplied, but harmless: they can only ever reach the
+          // real rule's real, admin-configured recipients above, never an
+          // attacker-chosen audience. Clamped/truncated defensively so a
+          // forged match can't inject an absurd age or an oversized label.
+          const overdueMin = Math.max(0, Math.min(999999, Math.round(Number(m.overdue_minutes)) || 0));
+          const itemLabel = String(m.item_label || m.item_key).slice(0, 200);
+          const ageStr = overdueMin < 90 ? `${overdueMin} min` : `${Math.max(1, Math.round(overdueMin / 60))}h`;
+          const message = `🔺 Escalation "${rule.label}": ${itemLabel} still unresolved after ${ageStr} (threshold ${rule.threshold_minutes}m).`;
+          // trip_id is used only to make the notification tappable —
+          // worth a light existence check so a forged match can't point
+          // an official-looking escalation at an arbitrary/fake trip.
+          let tripId = null;
+          if (m.trip_id != null) {
+            const { data: tripCheck } = await supabase.from("trips").select("id").eq("id", m.trip_id).maybeSingle();
+            if (tripCheck) tripId = m.trip_id;
+          }
+          try {
+            // insertNotification fans out to EITHER a role broadcast OR
+            // specific users from ONE call, never both (for_user_ids
+            // non-empty makes for_roles irrelevant on those rows) — a
+            // rule configured with both real roles AND specific admins
+            // needs two calls, same "two separate rows" convention this
+            // codebase already uses elsewhere for that combination.
+            if (rule.notify_roles?.length) {
+              await insertNotification({ type: "ESCALATION", for_roles: rule.notify_roles, for_user_ids: [], message, trip_id: tripId, ts: runNowTs, read: false });
+            }
+            if (rule.notify_user_ids?.length) {
+              await insertNotification({ type: "ESCALATION", for_roles: [], for_user_ids: rule.notify_user_ids, message, trip_id: tripId, ts: runNowTs, read: false });
+            }
+            anyFired = true;
+          } catch (notifErr) {
+            // The notify failed but we already claimed the fire — roll the
+            // claim back so the NEXT sweep retries instead of silently
+            // suppressing this escalation for the 6h re-escalate window.
+            console.warn(`[Escalation] notify failed for ${k}, rolling back claim:`, notifErr?.message);
+            if (last == null) {
+              await supabase.from("escalation_events").delete().eq("rule_id", rule.id).eq("item_key", m.item_key).then(() => {}, () => {});
+            } else {
+              await supabase.from("escalation_events").update({ last_fired_at: last }).eq("rule_id", rule.id).eq("item_key", m.item_key).then(() => {}, () => {});
+            }
           }
         }
       }
       // Age out long-dead dedup rows (item long since resolved) so the
       // table doesn't grow unbounded and a recurrence of the same key
-      // isn't permanently suppressed.
+      // isn't permanently suppressed. Runs every sweep regardless of
+      // whether THIS sweep had any current matches — a quiet stretch
+      // (everything resolved, or rules paused) must not pause pruning too.
       await supabase.from("escalation_events").delete().lt("last_fired_at", runNowTs - 7 * 24 * 60 * 60 * 1000).then(() => {}, () => {});
       if (anyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;

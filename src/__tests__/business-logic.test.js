@@ -36,14 +36,15 @@ import {
   ROLE,
   ADMIN_LEVEL,
   DRIVER_CAPACITY,
+  ESCALATION_KINDS,
+  ESCALATION_KIND_MAX_MINUTES,
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
   computeOpsExceptions,
   computeDispatchWhatIf,
   computeEscalations,
-  ESCALATION_KINDS,
-  ESCALATION_KIND_MAX_MINUTES,
+  buildEscalationItems,
   buildRosterWeek,
   rosterMondayOf,
   cronIntervalMs,
@@ -1045,6 +1046,46 @@ describe("computeEscalations — rule matcher for the escalation engine", () => 
     expect(ESCALATION_KIND_MAX_MINUTES.unassigned).toBe(4320);  // measured since BOOKED, not departure
     expect(ESCALATION_KIND_MAX_MINUTES.stuck).toBe(1200);       // < 1440 (24h window)
     expect(ESCALATION_KIND_MAX_MINUTES.no_show).toBe(1200);     // < 1440 (24h window)
+  });
+});
+
+describe("buildEscalationItems — unassigned is measured from BOOKED, not the board's departure window", () => {
+  const NOW = 1_000_000_000_000;
+  const HR = 3_600_000;
+
+  it("includes an unassigned booking timed from booked_at even when it's far outside the board's ±departure window", () => {
+    // Booked 30h ago, departing in 20h — the board's own "unassigned"
+    // item wouldn't exist yet (only appears within 2h of departure), but
+    // this booking has genuinely sat unassigned for 30h.
+    const trip = { trip_id: "T1", state: TRIP_STATE.UNASSIGNED_BOOKING, booked_at_epoch: NOW - 30 * HR, scheduled_time_epoch: NOW + 20 * HR };
+    const items = buildEscalationItems({ trips: [trip], tickets: [] }, [] /* board sweep found nothing yet */);
+    const u = items.find(i => i.key === "unassigned:T1");
+    expect(u).toBeTruthy();
+    expect(u.at).toBe(NOW - 30 * HR);
+    expect(u.trip_id).toBe("T1");
+  });
+
+  it("does not duplicate a board-supplied 'unassigned' item — the dedicated one replaces it", () => {
+    const trip = { trip_id: "T1", state: TRIP_STATE.UNASSIGNED_BOOKING, booked_at_epoch: NOW - HR, scheduled_time_epoch: NOW + HR };
+    const boardItem = { id: "unassigned:T1", kind: "unassigned", at: NOW + HR /* departure-based, would be wrong for escalation */, title: "Unassigned booking departs in 60 min", trip_id: "T1" };
+    const items = buildEscalationItems({ trips: [trip], tickets: [] }, [boardItem]);
+    const matches = items.filter(i => i.key === "unassigned:T1");
+    expect(matches).toHaveLength(1);
+    expect(matches[0].at).toBe(NOW - HR); // booked_at wins, not the board item's departure-based `at`
+  });
+
+  it("passes non-unassigned exception items through unchanged, and adds open tickets", () => {
+    const boardItem = { id: "dispute:T2", kind: "dispute", at: NOW - HR, title: "Open dispute on trip T2", trip_id: "T2" };
+    const ticket = { id: 5, status: "OPEN", created_at: NOW - 2 * HR, category: "Complaint" };
+    const items = buildEscalationItems({ trips: [], tickets: [ticket] }, [boardItem]);
+    expect(items.find(i => i.key === "dispute:T2")).toMatchObject({ kind: "dispute", at: NOW - HR, trip_id: "T2" });
+    expect(items.find(i => i.key === "ticket:5")).toMatchObject({ kind: "ticket", at: NOW - 2 * HR });
+  });
+
+  it("excludes an unassigned booking with no booked_at (nothing to measure elapsed time from)", () => {
+    const trip = { trip_id: "T3", state: TRIP_STATE.UNASSIGNED_BOOKING, booked_at_epoch: null, scheduled_time_epoch: NOW + HR };
+    const items = buildEscalationItems({ trips: [trip], tickets: [] }, []);
+    expect(items.find(i => i.key === "unassigned:T3")).toBeUndefined();
   });
 });
 

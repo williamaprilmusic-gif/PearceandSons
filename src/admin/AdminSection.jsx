@@ -52,6 +52,8 @@ import {
   driverRouteAndPolicySync,
   driverAvgRating,
   driverPositionChannelName,
+  ESCALATION_KINDS,
+  ESCALATION_KIND_MAX_MINUTES,
   epochToDisplay,
   exceptionLabel,
   exportGpsTrailToCsv,
@@ -1191,12 +1193,15 @@ export function computeOpsExceptions(state, { now = Date.now(), includeDriverHou
       const minsToGo = Math.round((sched - nowMs) / 60000);
       const overdue = minsToGo < 0;
       items.push({
+        // `at` is departure time (this item is a DISPLAY concern: "is this
+        // approaching/past its own pickup with nobody assigned"). The
+        // escalation engine deliberately does NOT reuse this item — it
+        // asks a different question ("how long unassigned since BOOKED")
+        // and builds its own unwindowed list straight from state.trips
+        // (see escalationInput in AdminApp) so a booking made hours or
+        // days ahead of departure can still escalate well before this
+        // item even starts existing.
         id: `unassigned:${t.trip_id}`, kind: "unassigned", severity: overdue ? "high" : "med", trip_id: t.trip_id, at: sched,
-        // For escalation "unresolved for N min" this means "no driver for N
-        // min since it was BOOKED" — not minutes past departure (`at`,
-        // which is negative before departure). Every other exception kind's
-        // `at` already IS its unresolved-since moment.
-        escalationAt: t.booked_at_epoch ?? sched,
         title: overdue ? `Unassigned booking is ${Math.abs(minsToGo)} min overdue` : `Unassigned booking departs in ${minsToGo} min`,
         detail: `${(t.agent_ids || []).map(nameFor).join(", ") || "No agents"} — no driver assigned yet.`,
       });
@@ -1315,28 +1320,11 @@ export function computeOpsExceptions(state, { now = Date.now(), includeDriverHou
   return items;
 }
 
-// The exception kinds an escalation rule can target — the ones that carry
-// a real "unresolved since" timestamp. hours/doc are excluded (no `at`).
-export const ESCALATION_KINDS = ["late_start", "unassigned", "stuck", "no_show", "dispute", "ticket"];
-
-// Max threshold (minutes) the UI offers and the server accepts for each
-// kind — set a comfortable margin BELOW the window computeOpsExceptions
-// stops emitting that kind of item, so a rule right at the max still has
-// several 10-min sweeps to actually fire before the item vanishes:
-//   late_start  window 12h → 10h    unassigned  window (post-departure)
-//   6h, but measured since BOOKED → 3d    stuck 24h → 20h    no_show
-//   24h → 20h    dispute/ticket  no window → 14d sanity cap.
-// Explicit literals (not derived) so tuning a *_MS window is a deliberate
-// two-place edit; the server's KIND_MAX_MIN mirrors these and the values
-// are pinned by business-logic.test.js.
-export const ESCALATION_KIND_MAX_MINUTES = {
-  late_start: 600,
-  unassigned: 4320,
-  stuck: 1200,
-  no_show: 1200,
-  dispute: 20160,
-  ticket: 20160,
-};
+// ESCALATION_KINDS / ESCALATION_KIND_MAX_MINUTES now live in
+// TransitOS_web.jsx (imported above) — a single source of truth the
+// server handlers (ADMIN/UPSERT_ESCALATION_RULE, RUN_ESCALATIONS) read
+// directly, closing the drift risk a hand-copied twin would otherwise
+// carry between this file and the server-side validation.
 
 // Given a flat list of unresolved items ({ kind, key, at, label }) and the
 // configured rules, returns every (rule, item) pair where the item's kind
@@ -1344,6 +1332,32 @@ export const ESCALATION_KIND_MAX_MINUTES = {
 // threshold. Pure — the caller builds `items` (from computeOpsExceptions
 // output + open tickets) and hands the result to ADMIN/RUN_ESCALATIONS,
 // which dedupes against escalation_events before actually notifying.
+// Builds the escalation engine's flat item list from current app state +
+// an already-computed computeOpsExceptions() sweep (the caller's own, so
+// this doesn't run that O(trips × drivers) pass a second time). Pulled
+// out of AdminApp as a pure function specifically so its one deliberate
+// divergence from the exception board is unit-testable: `unassigned`
+// here is NOT the board's item (which only exists in a narrow ±departure
+// window, so it doesn't reflect how long the booking has sat unresolved
+// since it was actually MADE) — it's a separate, unwindowed list built
+// straight from state.trips, timed from booked_at. Without this split, a
+// rule's threshold would only start counting once the board's display
+// window opened, firing immediately (already wildly overdue) instead of
+// at the intended elapsed time for anything booked more than a few hours
+// ahead of its own departure.
+export function buildEscalationItems(state, exceptionItems) {
+  const unassignedItems = (state.trips || [])
+    .filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING && t.booked_at_epoch != null)
+    .map(t => ({ kind: "unassigned", key: `unassigned:${t.trip_id}`, at: t.booked_at_epoch, label: `Unassigned booking ${t.trip_id}`, trip_id: t.trip_id }));
+  return [
+    ...(exceptionItems || []).filter(e => e.kind !== "unassigned").map(e => ({ kind: e.kind, key: e.id, at: e.at, label: e.title, trip_id: e.trip_id ?? null })),
+    ...unassignedItems,
+    ...(state.tickets || [])
+      .filter(t => t.status === "OPEN" && t.created_at != null)
+      .map(t => ({ kind: "ticket", key: `ticket:${t.id}`, at: t.created_at, label: `Ticket ${t.id} (${t.category})`, trip_id: t.trip_id ?? null })),
+  ];
+}
+
 export function computeEscalations(items, rules, nowMs = Date.now()) {
   const active = (rules || []).filter(r => r && r.active);
   if (active.length === 0 || !items || items.length === 0) return [];
@@ -9190,26 +9204,25 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   const opsExceptionsUrgent = opsExceptionItems.filter(e => e.severity === "high").length;
 
   // Escalation engine input — current unresolved items (exception items +
-  // open tickets) + the configured rules. Runs over the UNSCOPED `state`,
-  // not scopedState: escalations are global (their recipients are set on
-  // the rule) and this is bundled with the server-side-unscoped CHECK_*
-  // sweeps, so coverage must not depend on which admin's browser is open.
-  // Memoized off the few things it derives from (not rebuilt every render
-  // of this large component) and read via a ref inside the []-deps sweep
-  // effect below so that effect keeps its dependency-free shape.
+  // a dedicated unassigned-booking list + open tickets) + the configured
+  // rules. Runs over the UNSCOPED `state`, not scopedState: escalations
+  // are global (their recipients are set on the rule) and this is
+  // bundled with the server-side-unscoped CHECK_* sweeps, so coverage
+  // must not depend on which admin's browser is open. Memoized off the
+  // few things it derives from (not rebuilt every render of this large
+  // component) and read via a ref inside the []-deps sweep effect below
+  // so that effect keeps its dependency-free shape.
   const escalationInput = React.useMemo(() => {
-    const exItems = computeOpsExceptions(state, { includeDriverHours: false });
-    return {
-    items: [
-      ...exItems.map(e => ({ kind: e.kind, key: e.id, at: e.kind === "unassigned" ? (e.escalationAt ?? e.at) : e.at, label: e.title, trip_id: e.trip_id ?? null })),
-      ...(state.tickets || [])
-        .filter(t => t.status === "OPEN" && t.created_at != null)
-        .map(t => ({ kind: "ticket", key: `ticket:${t.id}`, at: t.created_at, label: `Ticket ${t.id} (${t.category})`, trip_id: t.trip_id ?? null })),
-    ],
-    rules: state.escalation_rules || [],
-  };
+    // Reuse the nav badge's own sweep when it's already over the SAME
+    // (unscoped) data — true for every unrestricted admin tier (master /
+    // FLEET_OPS / STANDARD, the only tiers that reach this screen),
+    // rather than paying for an identical O(trips × drivers) pass twice
+    // every badgeTick. A genuinely company-scoped admin still gets (and
+    // needs) its own separate unscoped pass.
+    const exItems = scopedState === state ? opsExceptionItems : computeOpsExceptions(state, { includeDriverHours: false });
+    return { items: buildEscalationItems(state, exItems), rules: state.escalation_rules || [] };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [state.trips, state.tickets, state.escalation_rules, state.users, badgeTick]);
+  }, [state.trips, state.tickets, state.escalation_rules, state.users, scopedState, opsExceptionItems, badgeTick]);
   const runEscalationsRef = useRef(() => {});
   runEscalationsRef.current = () => {
     const { items, rules } = escalationInput;
