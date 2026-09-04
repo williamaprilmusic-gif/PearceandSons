@@ -1103,6 +1103,191 @@ export function computeGroupSuggestions(unassigned, users = [], driverStatus = [
   return suggestions;
 }
 
+// ── Live exceptions board ───────────────────────────────────────────────
+// One pure sweep over current app state that surfaces every "something
+// needs a human" condition the app otherwise only fires as individual,
+// easily-missed notifications: late/overdue starts, unassigned bookings
+// about to depart, trips stuck in transit, no-shows, open disputes,
+// drivers over the hours advisory, and expiring/expired driver documents.
+// Thresholds are taken from the matching periodic checks
+// (TRIP/CHECK_LATE_START = 30 min, CHECK_UNASSIGNED_APPROACHING = 2 h,
+// CHECK_STUCK_IN_TRANSIT = 3 h, MAX_DRIVER_HOURS_PER_DAY/WEEK,
+// docExpiryStatus). The board is INTENTIONALLY a little broader than the
+// notifications in two spots — it also flags an ASSIGNED-but-never-
+// accepted trip that's now past its start (the periodic check only looks
+// at DRIVER_CONFIRMED), and an already-overdue unassigned booking (the
+// periodic check only warns ahead of time) — bounded by
+// UNASSIGNED_OVERDUE_MS / NO_SHOW_RECENCY_MS so genuinely stale rows
+// don't pile up. Rows here can therefore exist with no matching
+// notification; that's deliberate, this screen's job is to catch what
+// slipped past.
+const LATE_START_MIN = 30;
+// Every time-based condition has BOTH bounds: a lower one (how late/stale
+// before it's worth surfacing) and an upper one (past which the trip is
+// abandoned data for the Trips tab to clean up, not today's triage — and
+// must not keep inflating the red urgent badge forever, since the app has
+// no auto-archive and the trips query keeps non-ARCHIVED rows
+// indefinitely).
+const UNASSIGNED_WARN_MS = 2 * 60 * 60 * 1000;
+const UNASSIGNED_OVERDUE_MS = 6 * 60 * 60 * 1000;
+const LATE_START_STALE_MS = 12 * 60 * 60 * 1000;     // a confirmed/assigned trip >12h past its start never happened
+const STUCK_IN_TRANSIT_MS = 3 * 60 * 60 * 1000;
+const STUCK_STALE_MS = 24 * 60 * 60 * 1000;          // >24h "in transit" = a forgotten completion, days-old
+const NO_SHOW_RECENCY_MS = 24 * 60 * 60 * 1000;      // a no-show is only "live" to act on (follow-up/billing) for ~a day
+const SEVERITY_RANK = { high: 0, med: 1, low: 2 };
+
+export function computeOpsExceptions(state, { now = Date.now(), includeDriverHours = true } = {}) {
+  const nowMs = now;
+  const trips = state.trips || [];
+  const driverStatus = state.driver_status || [];
+  const usersById = usersByIdMap(state.users || []);
+  const nameFor = (id) => (id == null ? "Unassigned" : usersById.get(String(id))?.name || `#${id}`);
+  const items = [];
+
+  for (const t of trips) {
+    const sched = t.scheduled_time_epoch;
+    const minsLate = sched ? (nowMs - sched) / 60000 : null;
+
+    // Late / overdue start — a confirmed OR merely assigned trip that's
+    // 30 min to 12h past its scheduled departure and hasn't gone
+    // IN_TRANSIT (beyond 12h it's a dead record, not a "chase the driver").
+    if ((t.state === TRIP_STATE.DRIVER_CONFIRMED || t.state === TRIP_STATE.ASSIGNED)
+        && minsLate != null && minsLate >= LATE_START_MIN && nowMs - sched <= LATE_START_STALE_MS) {
+      const unconfirmed = t.state === TRIP_STATE.ASSIGNED;
+      items.push({
+        id: `late_start:${t.trip_id}`, kind: "late_start", severity: "high", trip_id: t.trip_id, at: sched,
+        title: `Trip ${t.trip_id} ${unconfirmed ? "assigned but not accepted" : "hasn't started"}`,
+        detail: `${nameFor(t.driver_id)} — ${Math.floor(minsLate)} min past the ${t.scheduled_time || "?"} start.`,
+      });
+    }
+
+    // Unassigned booking inside the pre-departure window, or overdue but
+    // still recent enough to actually chase (past UNASSIGNED_OVERDUE_MS
+    // it's stale data that should have been archived/cancelled).
+    if (t.state === TRIP_STATE.UNASSIGNED_BOOKING && sched
+        && sched - nowMs <= UNASSIGNED_WARN_MS && nowMs - sched <= UNASSIGNED_OVERDUE_MS) {
+      const minsToGo = Math.round((sched - nowMs) / 60000);
+      const overdue = minsToGo < 0;
+      items.push({
+        id: `unassigned:${t.trip_id}`, kind: "unassigned", severity: overdue ? "high" : "med", trip_id: t.trip_id, at: sched,
+        title: overdue ? `Unassigned booking is ${Math.abs(minsToGo)} min overdue` : `Unassigned booking departs in ${minsToGo} min`,
+        detail: `${(t.agent_ids || []).map(nameFor).join(", ") || "No agents"} — no driver assigned yet.`,
+      });
+    }
+
+    // Trip stuck in transit far longer than any real run (3h–24h;
+    // past 24h it's a long-completed trip nobody closed out).
+    if (t.state === TRIP_STATE.IN_TRANSIT && t.in_transit_at_epoch
+        && nowMs - t.in_transit_at_epoch >= STUCK_IN_TRANSIT_MS
+        && nowMs - t.in_transit_at_epoch <= STUCK_STALE_MS) {
+      items.push({
+        id: `stuck:${t.trip_id}`, kind: "stuck", severity: "high", trip_id: t.trip_id, at: t.in_transit_at_epoch,
+        title: `Trip ${t.trip_id} stuck in transit`,
+        detail: `${((nowMs - t.in_transit_at_epoch) / 3600000).toFixed(1)}h in transit — ${nameFor(t.driver_id)}, never marked complete.`,
+      });
+    }
+
+    // No-shows recorded on the trip (per-agent), only while still recent
+    // enough to act on — otherwise every completed trip in the 30-day
+    // load window that ever had a no-show would sit here forever. Skip
+    // cancelled trips: a cancellation isn't a no-show even if the column
+    // is set.
+    const noShowAt = t.completed_at_epoch || sched || null;
+    if ((t.no_shows || []).length > 0 && t.state !== TRIP_STATE.ARCHIVED_CANCELLED
+        && noShowAt != null && nowMs - noShowAt <= NO_SHOW_RECENCY_MS) {
+      items.push({
+        id: `no_show:${t.trip_id}`, kind: "no_show", severity: "med", trip_id: t.trip_id, at: noShowAt,
+        title: `No-show on trip ${t.trip_id}`,
+        detail: `${t.no_shows.map(ns => nameFor(ns.agent_id)).join(", ")} not picked up.`,
+      });
+    }
+
+    // Open (unresolved) dispute — OPEN or DRIVER_RESPONDED, not the two
+    // RESOLVED_* terminal states.
+    const d = t.dispute;
+    if (d && (d.state === DISPUTE_STATE.OPEN || d.state === DISPUTE_STATE.DRIVER_RESPONDED)) {
+      items.push({
+        id: `dispute:${t.trip_id}`, kind: "dispute", severity: "high", trip_id: t.trip_id, at: d.filed_at || null,
+        title: `Open dispute on trip ${t.trip_id}`,
+        detail: `${d.category || "Dispute"}${d.description ? ` — ${d.description}` : ""}${d.state === DISPUTE_STATE.DRIVER_RESPONDED ? " (driver has responded)" : ""}`,
+      });
+    }
+  }
+
+  // Group trips by driver ONCE (not re-scan the whole array inside
+  // computeDriverHoursToday/ThisWeek per driver) — that pair is the only
+  // O(drivers × trips) cost and this runs on a 30s tick. computeDriverHours*
+  // still filter internally, so passing each driver's own slice is
+  // correct, it just makes the filter a no-op. Built only when needed.
+  const tripsByDriver = new Map();
+  if (includeDriverHours) {
+    for (const t of trips) {
+      const k = String(t.driver_id);
+      if (!tripsByDriver.has(k)) tripsByDriver.set(k, []);
+      tripsByDriver.get(k).push(t);
+    }
+  }
+  // De-dupe by driver_id — a duplicate hydrated driver_status row would
+  // otherwise emit colliding item ids (`hours:9`, `doc:9:prdp`) and one
+  // would be dropped as a duplicate React key.
+  const seenDrivers = new Set();
+  for (const ds of driverStatus) {
+    const dKey = String(ds.driver_id);
+    if (seenDrivers.has(dKey)) continue;
+    seenDrivers.add(dKey);
+
+    // Driver hours over the advisory limit (cumulative trip-driving time,
+    // same math the DRIVER_HOURS_WARNING sweep uses). Skipped for the
+    // cheap badge-only pass — hours rows are never "high" so they don't
+    // affect the urgent count.
+    if (includeDriverHours) {
+      const dTrips = tripsByDriver.get(dKey) || [];
+      const hoursToday = computeDriverHoursToday(ds.driver_id, dTrips, nowMs);
+      const hoursWeek = computeDriverHoursThisWeek(ds.driver_id, dTrips, nowMs);
+      const overDay = hoursToday >= MAX_DRIVER_HOURS_PER_DAY;
+      const overWeek = hoursWeek >= MAX_DRIVER_HOURS_PER_WEEK;
+      if (overDay || overWeek) {
+        const parts = [];
+        if (overDay) parts.push(`${hoursToday.toFixed(1)}h today`);
+        if (overWeek) parts.push(`${hoursWeek.toFixed(1)}h this week`);
+        items.push({
+          id: `hours:${ds.driver_id}`, kind: "hours", severity: "med", driver_id: ds.driver_id, at: null,
+          title: `${nameFor(ds.driver_id)} over the hours advisory`,
+          detail: `${parts.join(", ")} — limit ${MAX_DRIVER_HOURS_PER_DAY}h/day, ${MAX_DRIVER_HOURS_PER_WEEK}h/week.`,
+        });
+      }
+    }
+
+    // Expiring / expired driver documents. Severity tracks whether the
+    // document is required (PrDP, vehicle licence) vs advisory
+    // (roadworthy cert) — mirrors driversWithExpiredRequiredDocs.
+    const docs = ds.documents || {};
+    for (const dt of DOC_TYPES) {
+      const { status, daysLeft } = docExpiryStatus(docs[dt.key], nowMs);
+      if (status === "expired") {
+        items.push({
+          id: `doc:${ds.driver_id}:${dt.key}`, kind: "doc", severity: dt.required ? "high" : "low", driver_id: ds.driver_id, at: null,
+          title: `${nameFor(ds.driver_id)}: ${dt.label} expired ${Math.abs(daysLeft)}d ago`,
+          detail: dt.required ? "Required document — this driver should not be dispatched until renewed." : "Advisory document — renew when possible.",
+        });
+      } else if (status === "expiring") {
+        items.push({
+          id: `doc:${ds.driver_id}:${dt.key}`, kind: "doc", severity: dt.required ? "med" : "low", driver_id: ds.driver_id, at: null,
+          title: `${nameFor(ds.driver_id)}: ${dt.label} expires in ${daysLeft}d`,
+          detail: dt.required ? `Required document — renew before it lapses. On file: ${docs[dt.key]}.` : `On file: ${docs[dt.key]}.`,
+        });
+      }
+    }
+  }
+
+  items.sort((a, b) =>
+    (SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]) ||
+    ((b.at || 0) - (a.at || 0)) ||
+    a.id.localeCompare(b.id)
+  );
+  return items;
+}
+
 function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   let score = 0;
   const proxScore = distKm != null ? Math.max(0, 40 - (distKm / 30) * 40) : 0;
@@ -7827,7 +8012,121 @@ function AdminAIAssistant({ user }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const EXCEPTION_KIND_META = {
+  late_start:  { label: "Late starts",   icon: "⏰" },
+  unassigned:  { label: "Unassigned",    icon: "🚫" },
+  stuck:       { label: "Stuck in transit", icon: "🚦" },
+  no_show:     { label: "No-shows",      icon: "🙅" },
+  dispute:     { label: "Disputes",      icon: "⚖" },
+  hours:       { label: "Driver hours",  icon: "⏳" },
+  doc:         { label: "Documents",     icon: "📄" },
+};
+const EXCEPTION_SEV_COLOR = { high: COLORS.red, med: COLORS.amber, low: COLORS.ghost };
+
+function exceptionWhenLabel(at, nowMs) {
+  if (at == null) return "";
+  const diffMin = Math.round((nowMs - at) / 60000);
+  if (diffMin >= 0) {
+    if (diffMin < 60) return `${diffMin}m ago`;
+    if (diffMin < 1440) return `${Math.round(diffMin / 60)}h ago`;
+    return `${Math.round(diffMin / 1440)}d ago`;
+  }
+  const inMin = -diffMin;
+  return inMin < 60 ? `in ${inMin}m` : `in ${Math.round(inMin / 60)}h`;
+}
+
+// Live Exceptions board — every "needs a human" condition in one triage
+// screen. Read-only: rows link to the relevant trip / the Drivers tab so
+// the admin acts from the normal place, this view just makes sure
+// nothing is sitting unseen. Data comes from computeOpsExceptions over
+// the same scopedState every other admin screen uses.
+function AdminExceptions({ state, onJumpToTrip, onJumpToDrivers }) {
+  const [kindFilter, setKindFilter] = useState("all");
+  // Re-evaluate on a 30s tick WHILE this screen is mounted only — several
+  // conditions (late start, overdue unassigned, stuck-in-transit) are
+  // purely time-based, so without this a trip that crossed the 30-min
+  // line would not appear until the next unrelated realtime refetch.
+  // Costs nothing when the board isn't open.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const h = setInterval(() => setNowMs(Date.now()), 30000);
+    return () => clearInterval(h);
+  }, []);
+
+  const exceptions = React.useMemo(() => computeOpsExceptions(state, { now: nowMs }), [state, nowMs]);
+
+  const counts = React.useMemo(() => {
+    const c = { all: exceptions.length, high: 0, med: 0, low: 0 };
+    for (const e of exceptions) {
+      c[e.severity] = (c[e.severity] || 0) + 1;
+      c[e.kind] = (c[e.kind] || 0) + 1;
+    }
+    return c;
+  }, [exceptions]);
+
+  // If the kind currently filtered on drops to zero (its last row cleared
+  // on the 30s recompute), fall back to "all" so the board never sits on
+  // a blank view with a filter that no longer has a button. `shown` also
+  // falls back immediately (before this effect commits) so there's not
+  // even a one-frame blank.
+  const activeKind = kindFilter !== "all" && counts[kindFilter] ? kindFilter : "all";
+  useEffect(() => {
+    if (kindFilter !== "all" && !counts[kindFilter]) setKindFilter("all");
+  }, [counts, kindFilter]);
+
+  const shown = activeKind === "all" ? exceptions : exceptions.filter(e => e.kind === activeKind);
+  const kindsPresent = Object.keys(EXCEPTION_KIND_META).filter(k => counts[k]);
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 4 }}>
+        <SectionHeader label="Live Exceptions" />
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>
+          {counts.all === 0 ? "nothing needs attention" : `${counts.all} open`}
+          {counts.high > 0 && <span style={{ color: COLORS.red, fontWeight: 700 }}> · {counts.high} urgent</span>}
+        </span>
+      </div>
+
+      {counts.all === 0 ? (
+        <Empty icon="✓" text="All clear — no exceptions right now." />
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+            <Button size="sm" variant={activeKind === "all" ? "amber" : "ghost"} title={`ALL (${counts.all})`} onClick={() => setKindFilter("all")} />
+            {kindsPresent.map(k => (
+              <Button key={k} size="sm" variant={activeKind === k ? "amber" : "ghost"}
+                title={`${EXCEPTION_KIND_META[k].icon} ${EXCEPTION_KIND_META[k].label.toUpperCase()} (${counts[k]})`}
+                onClick={() => setKindFilter(k)} />
+            ))}
+          </div>
+
+          {shown.map(e => {
+            const clickable = e.trip_id != null || e.driver_id != null;
+            const when = exceptionWhenLabel(e.at, nowMs);
+            return (
+              <div key={e.id}
+                onClick={() => { if (e.trip_id != null) onJumpToTrip(e.trip_id); else if (e.driver_id != null) onJumpToDrivers(); }}
+                style={{
+                  display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 8px",
+                  borderBottom: `1px solid ${COLORS.wire}`, cursor: clickable ? "pointer" : "default",
+                }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: EXCEPTION_SEV_COLOR[e.severity], flexShrink: 0, marginTop: 4 }} />
+                <span style={{ fontSize: 13, flexShrink: 0, marginTop: -1 }}>{EXCEPTION_KIND_META[e.kind]?.icon || "⚠"}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>{e.title}</div>
+                  <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 2 }}>{e.detail}</div>
+                </div>
+                {when && <span style={{ fontSize: 9, color: COLORS.ghost, flexShrink: 0, marginTop: 2 }}>{when}</span>}
+              </div>
+            );
+          })}
+        </>
+      )}
+    </div>
+  );
+}
+
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["exceptions", "⚠", "Exceptions"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -7845,6 +8144,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // Note: VIEWER admins never reach AdminApp — they're routed to
     // ViewerPortal. Same for FINANCIAL — routed to FinancialPortal.
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
+    if (id === "exceptions") return hasAdminPermission(user, "manageDispatch");
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
@@ -7970,6 +8270,26 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     };
   }, [state, user]);
 
+  // Nav badge only needs the count of URGENT (high-severity) exceptions,
+  // so this runs the sweep with includeDriverHours:false — that skips the
+  // one O(drivers × trips) step, and hours rows are never "high" anyway.
+  // The Exceptions screen itself does its own full sweep on a 30s tick.
+  // A slow 60s tick here too, so a purely time-based transition (a trip
+  // crossing 30 min late, an unassigned going overdue, a stuck trip
+  // passing 3h) bumps the at-a-glance badge without waiting on an
+  // unrelated realtime event — the cheap sweep (no hours) is fine at
+  // this cadence.
+  const [badgeTick, setBadgeTick] = useState(0);
+  useEffect(() => {
+    const h = setInterval(() => setBadgeTick(t => t + 1), 60000);
+    return () => clearInterval(h);
+  }, []);
+  const opsExceptionsUrgent = React.useMemo(
+    () => computeOpsExceptions(scopedState, { includeDriverHours: false }).filter(e => e.severity === "high").length,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [scopedState, badgeTick]
+  );
+
   // Shared nav content — identical markup whether it's rendered as the
   // permanent wide-screen sidebar or the narrow-screen slide-in drawer,
   // so the two never drift apart into two different navs to maintain.
@@ -7999,12 +8319,14 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
           const unreadDmCount = state.notifications.filter(n =>
             n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.some(id => String(id) === String(user.id))
           ).length;
-          const badge = id === "notifs" ? notifCount : id === "contacts" ? unreadDmCount : 0;
+          const badge = id === "notifs" ? notifCount : id === "contacts" ? unreadDmCount : id === "exceptions" ? opsExceptionsUrgent : 0;
+          // Exceptions badge is red (urgent, act now), everything else amber (unread).
+          const badgeBg = id === "exceptions" ? COLORS.red : COLORS.amber;
           return (
             <div key={id} onClick={() => { setTab(id); setDrawerOpen(false); }} style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", cursor: "pointer", background: active ? "rgba(245,166,35,.06)" : "transparent", borderLeft: `2px solid ${active ? COLORS.amber : "transparent"}` }}>
               <span style={{ fontSize: 14, width: 16, textAlign: "center", color: COLORS.ghost }}>{icon}</span>
               <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: 1, color: active ? COLORS.amber : COLORS.ghost, flex: 1, textTransform: "uppercase" }}>{label}</span>
-              {badge > 0 && <span style={{ background: COLORS.amber, borderRadius: 2, padding: "1px 5px", fontSize: 9, fontWeight: 800, color: "#000" }}>{badge}</span>}
+              {badge > 0 && <span style={{ background: badgeBg, borderRadius: 2, padding: "1px 5px", fontSize: 9, fontWeight: 800, color: "#000" }}>{badge}</span>}
             </div>
           );
         })}
@@ -8023,6 +8345,13 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   const mainContent = (
     <div style={{ flex: 1, overflowY: "auto", minWidth: 0 }}>
       {tab === "dashboard" && <AdminDashboard state={scopedState} user={user} dispatch={dispatch} />}
+      {tab === "exceptions" && hasAdminPermission(user, "manageDispatch") && (
+        <AdminExceptions
+          state={scopedState}
+          onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }}
+          onJumpToDrivers={() => setTab("drivers")}
+        />
+      )}
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}

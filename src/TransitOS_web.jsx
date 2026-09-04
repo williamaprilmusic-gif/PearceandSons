@@ -2715,7 +2715,7 @@ export const DOC_TYPES = [
 ];
 const DOC_WARN_DAYS = 30;
 
-export function docExpiryStatus(dateStr) {
+export function docExpiryStatus(dateStr, nowMs = Date.now()) {
   if (!dateStr) return { status: "missing", daysLeft: null };
   // `new Date(dateStr)` on a date-only string ("YYYY-MM-DD") parses as
   // UTC MIDNIGHT per the ECMAScript spec, not local midnight — for Cape
@@ -2731,7 +2731,7 @@ export function docExpiryStatus(dateStr) {
   const [y, m, d] = dateStr.split("-").map(Number);
   if (!y || !m || !d) return { status: "missing", daysLeft: null };
   const expiry = new Date(y, m - 1, d, 23, 59, 59, 999);
-  const now = new Date();
+  const now = new Date(nowMs);
   const daysLeft = Math.ceil((expiry - now) / (1000 * 60 * 60 * 24));
   if (daysLeft < 0) return { status: "expired", daysLeft };
   if (daysLeft <= DOC_WARN_DAYS) return { status: "expiring", daysLeft };
@@ -2840,13 +2840,17 @@ export const MAX_DRIVER_HOURS_PER_WEEK = 60;
 // time. Intervals are merged before summing so two overlapping trip
 // windows for the same driver (e.g. a merged multi-passenger trip
 // reflected as more than one row) can't double-count the same minutes.
-function driverTripIntervalsMs(driverId, trips, fromMs, toMs) {
+// nowMs is threaded through (default: real clock) so callers that reason
+// about a fixed "now" — the Live Exceptions board's 30s tick, tests —
+// get a result fully determined by their arguments, including the
+// still-IN_TRANSIT interval end below.
+function driverTripIntervalsMs(driverId, trips, fromMs, toMs, nowMs = Date.now()) {
   const intervals = [];
   for (const t of trips) {
     if (String(t.driver_id) !== String(driverId)) continue;
     const start = t.accepted_at_epoch || t.confirmed_at_epoch || t.booked_at_epoch;
     if (!start) continue;
-    const end = t.completed_at_epoch || (t.state === TRIP_STATE.IN_TRANSIT ? Date.now() : null);
+    const end = t.completed_at_epoch || (t.state === TRIP_STATE.IN_TRANSIT ? nowMs : null);
     if (!end || end <= start) continue;
     if (end < fromMs || start > toMs) continue;
     intervals.push([Math.max(start, fromMs), Math.min(end, toMs)]);
@@ -2861,17 +2865,17 @@ function driverTripIntervalsMs(driverId, trips, fromMs, toMs) {
   return merged.reduce((sum, [s, e]) => sum + (e - s), 0);
 }
 
-export function computeDriverHoursToday(driverId, trips) {
-  const now = new Date();
+export function computeDriverHoursToday(driverId, trips, nowMs = Date.now()) {
+  const now = new Date(nowMs);
   const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  return driverTripIntervalsMs(driverId, trips, startOfDay, Date.now()) / (1000 * 60 * 60);
+  return driverTripIntervalsMs(driverId, trips, startOfDay, nowMs, nowMs) / (1000 * 60 * 60);
 }
 
-export function computeDriverHoursThisWeek(driverId, trips) {
-  const now = new Date();
+export function computeDriverHoursThisWeek(driverId, trips, nowMs = Date.now()) {
+  const now = new Date(nowMs);
   const diffToMonday = now.getDay() === 0 ? 6 : now.getDay() - 1;
   const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday).getTime();
-  return driverTripIntervalsMs(driverId, trips, startOfWeek, Date.now()) / (1000 * 60 * 60);
+  return driverTripIntervalsMs(driverId, trips, startOfWeek, nowMs, nowMs) / (1000 * 60 * 60);
 }
 
 // ── Fleet utilization reporting (v1 scope) ───────────────────────────────

@@ -39,6 +39,7 @@ import {
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
+  computeOpsExceptions,
   shiftDateStr,
   sastMidnightMs,
   sastTodayStr,
@@ -733,5 +734,135 @@ describe("row mappers — hydration-boundary id normalization", () => {
     ];
     const scoped = scopeUsersToCompany(users, [], ["2"]); // string companyId
     expect(scoped.map(u => u.id).sort()).toEqual(["1", "2"]);
+  });
+});
+
+describe("computeOpsExceptions — live exceptions board sweep", () => {
+  // 13:00 local — late enough in the day that >12h can fall within
+  // "today" for the driver-hours case (computeDriverHoursToday reads the
+  // real wall clock, so the system time is faked to match NOW here).
+  const NOW = new Date(2026, 8, 15, 13, 0, 0).getTime();
+  const MIN = 60 * 1000, HR = 60 * MIN;
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date(NOW)); });
+  afterEach(() => vi.useRealTimers());
+  const users = [
+    { id: 1, role: ROLE.AGENT, name: "Agent One" },
+    { id: 2, role: ROLE.AGENT, name: "Agent Two" },
+    { id: 9, role: ROLE.DRIVER, name: "Driver Nine" },
+  ];
+  const baseTrip = (over) => ({
+    trip_id: "T1", driver_id: 9, agent_ids: [1], scheduled_time: "06:00",
+    scheduled_time_epoch: NOW - 45 * MIN, no_shows: [], ...over,
+  });
+  const call = (state) => computeOpsExceptions({ users, driver_status: [], trips: [], ...state }, { now: NOW });
+
+  it("returns [] when nothing is wrong", () => {
+    expect(call({})).toEqual([]);
+  });
+
+  it("flags a confirmed trip 45 min past its start as a high-severity late_start", () => {
+    const out = call({ trips: [baseTrip({ state: TRIP_STATE.DRIVER_CONFIRMED })] });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: "late_start", severity: "high", trip_id: "T1" });
+  });
+
+  it("does NOT flag a confirmed trip only 10 min late", () => {
+    const out = call({ trips: [baseTrip({ state: TRIP_STATE.DRIVER_CONFIRMED, scheduled_time_epoch: NOW - 10 * MIN })] });
+    expect(out).toEqual([]);
+  });
+
+  it("flags an unassigned booking inside the 2h window (med) and an overdue one (high)", () => {
+    const soon = call({ trips: [baseTrip({ trip_id: "S", state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_time_epoch: NOW + 30 * MIN })] });
+    expect(soon[0]).toMatchObject({ kind: "unassigned", severity: "med" });
+    const overdue = call({ trips: [baseTrip({ trip_id: "O", state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_time_epoch: NOW - 20 * MIN })] });
+    expect(overdue[0]).toMatchObject({ kind: "unassigned", severity: "high" });
+    const farOff = call({ trips: [baseTrip({ trip_id: "F", state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_time_epoch: NOW + 5 * HR })] });
+    expect(farOff).toEqual([]);
+  });
+
+  it("flags a trip in transit for 4h as stuck, but not one only 1h in", () => {
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.IN_TRANSIT, in_transit_at_epoch: NOW - 4 * HR })] })[0])
+      .toMatchObject({ kind: "stuck", severity: "high" });
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.IN_TRANSIT, in_transit_at_epoch: NOW - 1 * HR })] })).toEqual([]);
+  });
+
+  it("stops flagging late_start / stuck once the trip is stale (>12h / >24h) so old records don't sit as permanent 'high' rows", () => {
+    // Confirmed 15h past its start — never happened, not today's problem.
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.DRIVER_CONFIRMED, scheduled_time_epoch: NOW - 15 * HR })] })).toEqual([]);
+    // "In transit" for 30h — a long-finished trip nobody closed out.
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.IN_TRANSIT, in_transit_at_epoch: NOW - 30 * HR })] })).toEqual([]);
+  });
+
+  it("de-dupes by driver_id — a duplicated driver_status row yields ONE doc row, not colliding keys", () => {
+    const out = call({
+      driver_status: [
+        { driver_id: 9, documents: { prdp: "2020-01-01" } },
+        { driver_id: 9, documents: { prdp: "2020-01-01" } }, // dupe hydrated row
+      ],
+    });
+    const docRows = out.filter(e => e.kind === "doc");
+    expect(docRows).toHaveLength(1);
+    expect(new Set(out.map(e => e.id)).size).toBe(out.length); // all ids unique
+  });
+
+  it("flags a no-show on a completed trip, but ignores no_shows on a cancelled trip", () => {
+    const completed = call({ trips: [baseTrip({ state: TRIP_STATE.ARCHIVED_COMPLETED, no_shows: [{ agent_id: 2 }], completed_at_epoch: NOW - HR })] });
+    expect(completed[0]).toMatchObject({ kind: "no_show", severity: "med" });
+    expect(completed[0].detail).toContain("Agent Two");
+    const cancelled = call({ trips: [baseTrip({ state: TRIP_STATE.ARCHIVED_CANCELLED, no_shows: [{ agent_id: 2 }] })] });
+    expect(cancelled).toEqual([]);
+  });
+
+  it("stops showing a no-show once it is more than ~a day old", () => {
+    const stale = call({ trips: [baseTrip({ state: TRIP_STATE.ARCHIVED_COMPLETED, no_shows: [{ agent_id: 2 }], completed_at_epoch: NOW - 25 * HR })] });
+    expect(stale).toEqual([]);
+  });
+
+  it("ignores an unassigned booking that is hours past its start (stale, not actionable)", () => {
+    const stale = call({ trips: [baseTrip({ trip_id: "STALE", state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_time_epoch: NOW - 8 * HR })] });
+    expect(stale).toEqual([]);
+  });
+
+  it("flags an OPEN / DRIVER_RESPONDED dispute but not a resolved one", () => {
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.ARCHIVED_COMPLETED, dispute: { state: "OPEN", category: "Route", filed_at: NOW - HR } })] })[0])
+      .toMatchObject({ kind: "dispute", severity: "high" });
+    expect(call({ trips: [baseTrip({ state: TRIP_STATE.ARCHIVED_COMPLETED, dispute: { state: "RESOLVED_UPHELD" } })] })).toEqual([]);
+  });
+
+  it("flags an expired required document as high, a non-required one as low", () => {
+    const prdp = call({ driver_status: [{ driver_id: 9, documents: { prdp: "2020-01-01" } }] });
+    expect(prdp[0]).toMatchObject({ kind: "doc", severity: "high", driver_id: 9 });
+    const rw = call({ driver_status: [{ driver_id: 9, documents: { roadworthy: "2020-01-01" } }] });
+    expect(rw[0]).toMatchObject({ kind: "doc", severity: "low" });
+  });
+
+  it("ranks a required document that is merely EXPIRING as med (not low, not high)", () => {
+    // 5 days out from the faked NOW (2026-09-15) → within docExpiryStatus's 30-day warn window.
+    const soon = call({ driver_status: [{ driver_id: 9, documents: { prdp: "2026-09-20" } }] });
+    expect(soon[0]).toMatchObject({ kind: "doc", severity: "med" });
+    const rwSoon = call({ driver_status: [{ driver_id: 9, documents: { roadworthy: "2026-09-20" } }] });
+    expect(rwSoon[0]).toMatchObject({ kind: "doc", severity: "low" });
+  });
+
+  it("flags a driver over the daily hours advisory", () => {
+    // One completed trip spanning 13h of "today" (00:00–13:00 with the
+    // clock faked to 13:00) — over MAX_DRIVER_HOURS_PER_DAY = 12.
+    const out = call({
+      driver_status: [{ driver_id: 9, documents: {} }],
+      trips: [{ trip_id: "H", driver_id: 9, state: TRIP_STATE.ARCHIVED_COMPLETED, accepted_at_epoch: NOW - 13 * HR, completed_at_epoch: NOW }],
+    });
+    const hoursRows = out.filter(e => e.kind === "hours");
+    expect(hoursRows).toHaveLength(1);
+    expect(hoursRows[0]).toMatchObject({ severity: "med", driver_id: 9 });
+  });
+
+  it("sorts high-severity items ahead of lower ones", () => {
+    const out = call({
+      trips: [
+        baseTrip({ trip_id: "LATE", state: TRIP_STATE.DRIVER_CONFIRMED }),                       // high
+        baseTrip({ trip_id: "NS", state: TRIP_STATE.ARCHIVED_COMPLETED, no_shows: [{ agent_id: 1 }] }), // med
+      ],
+    });
+    expect(out.map(e => e.severity)).toEqual(["high", "med"]);
   });
 });
