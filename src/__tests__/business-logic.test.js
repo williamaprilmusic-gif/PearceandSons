@@ -41,6 +41,9 @@ import {
   computeGroupSuggestions,
   computeOpsExceptions,
   computeDispatchWhatIf,
+  computeEscalations,
+  ESCALATION_KINDS,
+  ESCALATION_KIND_MAX_MINUTES,
   cronIntervalMs,
   shiftDateStr,
   sastMidnightMs,
@@ -990,5 +993,55 @@ describe("computeDispatchWhatIf — pre-dispatch seat + route + policy preview",
     expect(w.route.capKm).toBe(120);        // 3 agents → 120km cap
     // Route stays modest because p2/p3 (FAR) don't add pickup legs — only d1..d3 (all NEAR) do.
     expect(w.route.routeKm).toBeLessThan(120);
+  });
+});
+
+describe("computeEscalations — rule matcher for the escalation engine", () => {
+  const NOW = 1_000_000_000_000;
+  const MIN = 60_000;
+  const rule = (over) => ({ id: 1, label: "R", condition_kind: "dispute", threshold_minutes: 60, notify_roles: ["ADMIN"], notify_user_ids: [], active: true, ...over });
+  const item = (over) => ({ kind: "dispute", key: "dispute:T1", at: NOW - 90 * MIN, label: "Dispute on T1", ...over });
+
+  it("returns [] with no active rules or no items", () => {
+    expect(computeEscalations([item()], [rule({ active: false })], NOW)).toEqual([]);
+    expect(computeEscalations([], [rule()], NOW)).toEqual([]);
+  });
+
+  it("matches an item of the rule's kind that is past the threshold, carrying trip_id through", () => {
+    const out = computeEscalations([item({ trip_id: "T1" })], [rule()], NOW);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ rule_id: 1, item_key: "dispute:T1", notify_roles: ["ADMIN"], trip_id: "T1" });
+    expect(out[0].overdue_minutes).toBe(90);
+  });
+
+  it("does NOT match an item younger than the threshold", () => {
+    expect(computeEscalations([item({ at: NOW - 30 * MIN })], [rule({ threshold_minutes: 60 })], NOW)).toEqual([]);
+  });
+
+  it("does NOT match a different kind, or an item with no timestamp", () => {
+    expect(computeEscalations([item({ kind: "no_show" })], [rule({ condition_kind: "dispute" })], NOW)).toEqual([]);
+    expect(computeEscalations([item({ at: null })], [rule()], NOW)).toEqual([]);
+  });
+
+  it("produces one pair per (active rule × matching item)", () => {
+    const items = [item({ key: "dispute:T1" }), item({ key: "dispute:T2" })];
+    const rules = [rule({ id: 1 }), rule({ id: 2, threshold_minutes: 120 })]; // rule 2's threshold not met (90m)
+    const out = computeEscalations(items, rules, NOW);
+    expect(out.map(m => `${m.rule_id}:${m.item_key}`).sort()).toEqual(["1:dispute:T1", "1:dispute:T2"]);
+  });
+
+  it("ESCALATION_KINDS excludes the timestamp-less kinds (hours, doc)", () => {
+    expect(computeEscalations).toBeTypeOf("function");
+    expect(["hours", "doc"].some(k => ESCALATION_KINDS.includes(k))).toBe(false);
+  });
+
+  it("every escalation kind has a max threshold comfortably below its detection window", () => {
+    for (const k of ESCALATION_KINDS) expect(ESCALATION_KIND_MAX_MINUTES[k]).toBeGreaterThan(0);
+    // deliberately below the 12h / (post-departure) 6h / 24h / 24h windows
+    // so a rule at the max still has several 10-min sweeps to fire.
+    expect(ESCALATION_KIND_MAX_MINUTES.late_start).toBe(600);   // < 720 (12h window)
+    expect(ESCALATION_KIND_MAX_MINUTES.unassigned).toBe(4320);  // measured since BOOKED, not departure
+    expect(ESCALATION_KIND_MAX_MINUTES.stuck).toBe(1200);       // < 1440 (24h window)
+    expect(ESCALATION_KIND_MAX_MINUTES.no_show).toBe(1200);     // < 1440 (24h window)
   });
 });

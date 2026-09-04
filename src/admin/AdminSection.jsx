@@ -1181,6 +1181,11 @@ export function computeOpsExceptions(state, { now = Date.now(), includeDriverHou
       const overdue = minsToGo < 0;
       items.push({
         id: `unassigned:${t.trip_id}`, kind: "unassigned", severity: overdue ? "high" : "med", trip_id: t.trip_id, at: sched,
+        // For escalation "unresolved for N min" this means "no driver for N
+        // min since it was BOOKED" — not minutes past departure (`at`,
+        // which is negative before departure). Every other exception kind's
+        // `at` already IS its unresolved-since moment.
+        escalationAt: t.booked_at_epoch ?? sched,
         title: overdue ? `Unassigned booking is ${Math.abs(minsToGo)} min overdue` : `Unassigned booking departs in ${minsToGo} min`,
         detail: `${(t.agent_ids || []).map(nameFor).join(", ") || "No agents"} — no driver assigned yet.`,
       });
@@ -1297,6 +1302,56 @@ export function computeOpsExceptions(state, { now = Date.now(), includeDriverHou
     a.id.localeCompare(b.id)
   );
   return items;
+}
+
+// The exception kinds an escalation rule can target — the ones that carry
+// a real "unresolved since" timestamp. hours/doc are excluded (no `at`).
+export const ESCALATION_KINDS = ["late_start", "unassigned", "stuck", "no_show", "dispute", "ticket"];
+
+// Max threshold (minutes) the UI offers and the server accepts for each
+// kind — set a comfortable margin BELOW the window computeOpsExceptions
+// stops emitting that kind of item, so a rule right at the max still has
+// several 10-min sweeps to actually fire before the item vanishes:
+//   late_start  window 12h → 10h    unassigned  window (post-departure)
+//   6h, but measured since BOOKED → 3d    stuck 24h → 20h    no_show
+//   24h → 20h    dispute/ticket  no window → 14d sanity cap.
+// Explicit literals (not derived) so tuning a *_MS window is a deliberate
+// two-place edit; the server's KIND_MAX_MIN mirrors these and the values
+// are pinned by business-logic.test.js.
+export const ESCALATION_KIND_MAX_MINUTES = {
+  late_start: 600,
+  unassigned: 4320,
+  stuck: 1200,
+  no_show: 1200,
+  dispute: 20160,
+  ticket: 20160,
+};
+
+// Given a flat list of unresolved items ({ kind, key, at, label }) and the
+// configured rules, returns every (rule, item) pair where the item's kind
+// matches an ACTIVE rule and it has been unresolved at least the rule's
+// threshold. Pure — the caller builds `items` (from computeOpsExceptions
+// output + open tickets) and hands the result to ADMIN/RUN_ESCALATIONS,
+// which dedupes against escalation_events before actually notifying.
+export function computeEscalations(items, rules, nowMs = Date.now()) {
+  const active = (rules || []).filter(r => r && r.active);
+  if (active.length === 0 || !items || items.length === 0) return [];
+  const out = [];
+  for (const r of active) {
+    const thresholdMs = Math.max(0, r.threshold_minutes || 0) * 60000;
+    for (const it of items) {
+      if (it.kind !== r.condition_kind || it.at == null) continue;
+      if (nowMs - it.at < thresholdMs) continue;
+      out.push({
+        rule_id: r.id, rule_label: r.label, condition_kind: r.condition_kind,
+        threshold_minutes: r.threshold_minutes,
+        notify_roles: r.notify_roles || [], notify_user_ids: r.notify_user_ids || [],
+        item_key: it.key, item_label: it.label, item_at: it.at, trip_id: it.trip_id ?? null,
+        overdue_minutes: Math.floor((nowMs - it.at) / 60000),
+      });
+    }
+  }
+  return out;
 }
 
 function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
@@ -7994,7 +8049,7 @@ function AdminNotifs({ state, user, dispatch, onJumpToTrip }) {
   // Without this, each fell back to the generic "◈" diamond, including
   // SOS_ALERT — the one type where a distinctive icon matters most for an
   // admin scanning a notification list. Icons reused from AlertsTab's map.
-  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "📋", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", DRIVER_FULLY_BOOKED: "⚠", TRIP_ACCEPTED: "✅", TRIP_DECLINED: "🚫", UPCOMING_TRIP: "⏰", LONG_DISTANCE_TRIP: "📏", LATE_BOOKING: "⏰", BRANCH_REASSIGNED_FAR: "📍", TRIP_CANCELLED: "✕", TICKET_OPENED: "🎫", TICKET_UPDATED: "🎫", BOOKING_EXCEPTION: "⚠", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", TRIP_DISPUTE: "⚠", APP_CRASH: "💥", DRIVER_DOCUMENT_EXPIRY: "📄", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", ROUTE_DEVIATION: "📍", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠", ESCALATION: "🔺" };
   return (
     <div className="pad">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -8463,7 +8518,7 @@ const EXCEPTION_SEV_COLOR = { high: COLORS.red, med: COLORS.amber, low: COLORS.g
 // the admin acts from the normal place, this view just makes sure
 // nothing is sitting unseen. Data comes from computeOpsExceptions over
 // the same scopedState every other admin screen uses.
-function AdminExceptions({ state, onJumpToTrip, onJumpToDrivers }) {
+function AdminExceptions({ state, dispatch, onJumpToTrip, onJumpToDrivers }) {
   const [kindFilter, setKindFilter] = useState("all");
   // Re-evaluate on a 30s tick WHILE this screen is mounted only — several
   // conditions (late start, overdue unassigned, stuck-in-transit) are
@@ -8544,6 +8599,124 @@ function AdminExceptions({ state, onJumpToTrip, onJumpToDrivers }) {
             );
           })}
         </>
+      )}
+
+      {/* AdminExceptions is itself only rendered under a manageDispatch
+          gate (VIEWER/FINANCIAL never reach AdminApp), so no inner check. */}
+      <EscalationRulesPanel rules={state.escalation_rules || []} users={state.users || []} dispatch={dispatch} />
+    </div>
+  );
+}
+
+const ESCALATION_KIND_LABEL = {
+  late_start: "Late / overdue start", unassigned: "Unassigned booking", stuck: "Stuck in transit",
+  no_show: "No-show", dispute: "Open dispute", ticket: "Open support ticket",
+};
+
+// CRUD for escalation rules — "if a <condition> stays unresolved for
+// <N> minutes, notify <who>". The engine (AdminApp's 10-min sweep +
+// ADMIN/RUN_ESCALATIONS) reads these; this panel just edits them.
+function EscalationRulesPanel({ rules, users, dispatch }) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState({ condition_kind: "dispute", threshold_minutes: 60, notify_roles: ["ADMIN"], notify_user_ids: [] });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [armedDeleteId, setArmedDeleteId] = useState(null);
+  const admins = users.filter(u => u.role === ROLE.ADMIN);
+
+  // Returns true on success, false (with err set) on failure — callers
+  // that mutate UI state (e.g. clearing the NEW RULE form) key off that.
+  const save = async (rule) => {
+    setBusy(true); setErr(null);
+    try { await dispatch({ type: "ADMIN/UPSERT_ESCALATION_RULE", ...rule }); return true; }
+    catch (e) { setErr(e.message || "Couldn't save the rule."); return false; }
+    finally { setBusy(false); }
+  };
+  const draftMax = ESCALATION_KIND_MAX_MINUTES[draft.condition_kind] || 20160;
+  const addDraft = async () => {
+    if (draft.notify_roles.length === 0 && draft.notify_user_ids.length === 0) { setErr("Pick at least one role or person to notify."); return; }
+    const th = Math.round(Number(draft.threshold_minutes));
+    if (!Number.isFinite(th) || th < 1) { setErr("Threshold must be at least 1 minute."); return; }
+    if (th > draftMax) { setErr(`"${ESCALATION_KIND_LABEL[draft.condition_kind]}" is only tracked for ${draftMax} min — pick a threshold at or below that.`); return; }
+    // Only clear the form if it actually saved — a failed insert keeps
+    // the admin's input so they can retry.
+    if (await save({ ...draft, threshold_minutes: th, active: true })) {
+      setDraft({ condition_kind: "dispute", threshold_minutes: 60, notify_roles: ["ADMIN"], notify_user_ids: [] });
+    }
+  };
+  const toggleRole = (obj, setObj, role) => setObj({ ...obj, notify_roles: obj.notify_roles.includes(role) ? obj.notify_roles.filter(r => r !== role) : [...obj.notify_roles, role] });
+
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div onClick={() => setOpen(v => !v)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+        <SectionHeader label={`Escalation Rules${rules.length ? ` (${rules.filter(r => r.active).length} active)` : ""}`} />
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>{open ? "▾" : "▸"}</span>
+      </div>
+      {open && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ fontSize: 10, color: COLORS.ghost }}>
+            When a matching item stays unresolved past its threshold, an escalation notification fires to the chosen recipients — and re-fires every 6h while it's still open.
+          </div>
+          {rules.length === 0 && <div style={{ fontSize: 10, color: COLORS.ghost, padding: "6px 0" }}>No rules yet — add one below.</div>}
+          {rules.map(r => (
+            <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 8px", border: `1px solid ${COLORS.wire}`, borderRadius: 4, fontSize: 10, opacity: r.active ? 1 : 0.5 }}>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 700, color: COLORS.chalk }}>
+                  {ESCALATION_KIND_LABEL[r.condition_kind] || r.condition_kind} · unresolved &gt; {r.threshold_minutes} min
+                </div>
+                <div style={{ color: COLORS.ghost, marginTop: 2 }}>
+                  notify {[...(r.notify_roles || []), ...(r.notify_user_ids || []).map(id => admins.find(a => String(a.id) === String(id))?.name || `#${id}`)].join(", ") || "nobody"}
+                </div>
+              </div>
+              <Button size="sm" variant="ghost" title={r.active ? "PAUSE" : "RESUME"} disabled={busy}
+                onClick={() => save({ id: r.id, label: r.label, condition_kind: r.condition_kind, threshold_minutes: r.threshold_minutes, notify_roles: r.notify_roles, notify_user_ids: r.notify_user_ids, active: !r.active })} />
+              <Button size="sm" variant={armedDeleteId === r.id ? "danger" : "ghost"} title={armedDeleteId === r.id ? "CONFIRM ✕" : "✕"} disabled={busy}
+                onClick={() => {
+                  if (armedDeleteId !== r.id) { setArmedDeleteId(r.id); return; }
+                  setArmedDeleteId(null);
+                  dispatch({ type: "ADMIN/DELETE_ESCALATION_RULE", id: r.id }).catch(e => setErr(e.message));
+                }} />
+            </div>
+          ))}
+
+          <div style={{ border: `1px dashed ${COLORS.wire}`, borderRadius: 4, padding: 8, display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+            <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.ghost, letterSpacing: 1 }}>NEW RULE</div>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+              <select className="inp" value={draft.condition_kind} onChange={e => setDraft({ ...draft, condition_kind: e.target.value })} style={{ flex: 1, minWidth: 150 }}>
+                {ESCALATION_KINDS.map(k => <option key={k} value={k}>{ESCALATION_KIND_LABEL[k]}</option>)}
+              </select>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>unresolved &gt;</span>
+              <input className="inp" type="number" min="1" max={draftMax} value={draft.threshold_minutes}
+                onChange={e => setDraft({ ...draft, threshold_minutes: e.target.value })} style={{ width: 70 }} />
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>min (max {draftMax})</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", fontSize: 10 }}>
+              <span style={{ color: COLORS.ghost }}>Notify:</span>
+              {[ROLE.ADMIN, ROLE.AGENT, ROLE.DRIVER].map(role => (
+                <label key={role} style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                  <input type="checkbox" checked={draft.notify_roles.includes(role)} onChange={() => toggleRole(draft, setDraft, role)} />
+                  all {role.toLowerCase()}s
+                </label>
+              ))}
+            </div>
+            {admins.length > 0 && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 10 }}>
+                <span style={{ color: COLORS.ghost }}>…or specific admins:</span>
+                {admins.map(a => (
+                  <label key={a.id} style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer" }}>
+                    <input type="checkbox" checked={draft.notify_user_ids.some(id => String(id) === String(a.id))}
+                      onChange={() => setDraft({ ...draft, notify_user_ids: draft.notify_user_ids.some(id => String(id) === String(a.id)) ? draft.notify_user_ids.filter(id => String(id) !== String(a.id)) : [...draft.notify_user_ids, a.id] })} />
+                    {a.name}
+                  </label>
+                ))}
+              </div>
+            )}
+            <div>
+              <Button size="sm" variant="amber" title={busy ? "SAVING…" : "ADD RULE"} disabled={busy} onClick={addDraft} />
+            </div>
+          </div>
+          {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
+        </div>
       )}
     </div>
   );
@@ -8633,6 +8806,10 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // previously fired one notification on open and never resurfaced.
     dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
     dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
+    // Escalation engine — same cadence, folded into this one interval
+    // (not a second timer). Reads current data via the ref so this
+    // effect keeps its []-deps.
+    runEscalationsRef.current();
     const intervalId = setInterval(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
@@ -8642,6 +8819,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       dispatch({ type: "TRIP/CHECK_STUCK_IN_TRANSIT" }).catch(() => {});
       dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
+      runEscalationsRef.current();
     }, 10 * 60 * 1000);
     return () => clearInterval(intervalId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -8708,11 +8886,43 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     const h = setInterval(() => setBadgeTick(t => t + 1), 60000);
     return () => clearInterval(h);
   }, []);
-  const opsExceptionsUrgent = React.useMemo(
-    () => computeOpsExceptions(scopedState, { includeDriverHours: false }).filter(e => e.severity === "high").length,
+  // Nav badge sweep — over the admin's OWN scoped view (matches every
+  // other count they see). One cheap (no-hours) pass.
+  const opsExceptionItems = React.useMemo(
+    () => computeOpsExceptions(scopedState, { includeDriverHours: false }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [scopedState, badgeTick]
   );
+  const opsExceptionsUrgent = opsExceptionItems.filter(e => e.severity === "high").length;
+
+  // Escalation engine input — current unresolved items (exception items +
+  // open tickets) + the configured rules. Runs over the UNSCOPED `state`,
+  // not scopedState: escalations are global (their recipients are set on
+  // the rule) and this is bundled with the server-side-unscoped CHECK_*
+  // sweeps, so coverage must not depend on which admin's browser is open.
+  // Memoized off the few things it derives from (not rebuilt every render
+  // of this large component) and read via a ref inside the []-deps sweep
+  // effect below so that effect keeps its dependency-free shape.
+  const escalationInput = React.useMemo(() => {
+    const exItems = computeOpsExceptions(state, { includeDriverHours: false });
+    return {
+    items: [
+      ...exItems.map(e => ({ kind: e.kind, key: e.id, at: e.kind === "unassigned" ? (e.escalationAt ?? e.at) : e.at, label: e.title, trip_id: e.trip_id ?? null })),
+      ...(state.tickets || [])
+        .filter(t => t.status === "OPEN" && t.created_at != null)
+        .map(t => ({ kind: "ticket", key: `ticket:${t.id}`, at: t.created_at, label: `Ticket ${t.id} (${t.category})`, trip_id: t.trip_id ?? null })),
+    ],
+    rules: state.escalation_rules || [],
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.trips, state.tickets, state.escalation_rules, state.users, badgeTick]);
+  const runEscalationsRef = useRef(() => {});
+  runEscalationsRef.current = () => {
+    const { items, rules } = escalationInput;
+    if (!rules.some(r => r.active)) return;
+    const matches = computeEscalations(items, rules, Date.now());
+    if (matches.length) dispatch({ type: "ADMIN/RUN_ESCALATIONS", matches }).catch(() => {});
+  };
 
   // Shared nav content — identical markup whether it's rendered as the
   // permanent wide-screen sidebar or the narrow-screen slide-in drawer,
@@ -8772,6 +8982,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "exceptions" && hasAdminPermission(user, "manageDispatch") && (
         <AdminExceptions
           state={scopedState}
+          dispatch={dispatch}
           onJumpToTrip={(tripId) => { setJumpTripId(tripId); setTab("trips"); }}
           onJumpToDrivers={() => setTab("drivers")}
         />

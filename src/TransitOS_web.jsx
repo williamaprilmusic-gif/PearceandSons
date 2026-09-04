@@ -9422,6 +9422,130 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "ADMIN/UPSERT_ESCALATION_RULE": {
+      const actingEr = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const kind = action.condition_kind;
+      // MIRROR of ESCALATION_KIND_MAX_MINUTES (AdminSection.jsx, pinned by
+      // business-logic.test.js). Kept in step by hand, same as this app's
+      // other client/server constant twins (e.g. MAX_DRIVER_HOURS_*).
+      const KIND_MAX_MIN = { late_start: 600, unassigned: 4320, stuck: 1200, no_show: 1200, dispute: 20160, ticket: 20160 };
+      if (!KIND_MAX_MIN[kind]) throw new Error("Unknown escalation condition.");
+      const threshold = Math.round(Number(action.threshold_minutes));
+      if (!Number.isFinite(threshold) || threshold < 1) throw new Error("Threshold must be at least 1 minute.");
+      if (threshold > KIND_MAX_MIN[kind]) throw new Error(`This condition is only tracked for ${KIND_MAX_MIN[kind]} min — use a threshold at or below that.`);
+      const roles = Array.isArray(action.notify_roles) ? action.notify_roles.filter(r => [ROLE.ADMIN, ROLE.AGENT, ROLE.DRIVER].includes(r)) : [];
+      const userIds = Array.isArray(action.notify_user_ids) ? action.notify_user_ids.map(Number).filter(Number.isFinite) : [];
+      if (roles.length === 0 && userIds.length === 0) throw new Error("Pick at least one role or person to notify.");
+      const label = (action.label || "").trim() || `${kind} > ${threshold}m`;
+      const nowTsEr = nowEpoch();
+      const row = {
+        label, condition_kind: kind, threshold_minutes: threshold,
+        notify_roles: roles, notify_user_ids: userIds, active: action.active !== false, updated_at: nowTsEr,
+      };
+      if (action.id != null) {
+        must(await supabase.from("escalation_rules").update(row).eq("id", action.id));
+      } else {
+        must(await supabase.from("escalation_rules").insert({ ...row, created_at: nowTsEr }));
+      }
+      await logAuditAction({
+        actorId: actingEr.id, actorName: actingEr.name, actionType: "ADMIN/UPSERT_ESCALATION_RULE",
+        details: `${action.id != null ? "Updated" : "Created"} escalation rule: ${label}`,
+      });
+      if (extraRefetchers.fetchEscalationRules) await extraRefetchers.fetchEscalationRules();
+      return;
+    }
+
+    case "ADMIN/DELETE_ESCALATION_RULE": {
+      const actingErD = await assertAdminPermission(activeUserRef, "manageDispatch");
+      if (action.id == null) throw new Error("No rule specified.");
+      must(await supabase.from("escalation_rules").delete().eq("id", action.id));
+      // Its dedup rows are now dead weight — clear them so a rule id
+      // reused later (identity sequence) can't inherit stale fire state.
+      await supabase.from("escalation_events").delete().eq("rule_id", action.id).then(() => {}, () => {});
+      await logAuditAction({
+        actorId: actingErD.id, actorName: actingErD.name, actionType: "ADMIN/DELETE_ESCALATION_RULE",
+        details: `Deleted escalation rule #${action.id}`,
+      });
+      if (extraRefetchers.fetchEscalationRules) await extraRefetchers.fetchEscalationRules();
+      return;
+    }
+
+    case "ADMIN/RUN_ESCALATIONS": {
+      // Periodic sweep (wired into AdminApp's 10-min poll) — no permission
+      // gate, same convention as every other CHECK_* sweep. The CALLER
+      // (computeEscalations, client-side) has already matched current
+      // unresolved items against the active rules and passed the
+      // (rule, item) pairs that are past their threshold; this handler
+      // only dedupes against escalation_events and notifies.
+      const matches = Array.isArray(action.matches) ? action.matches : [];
+      if (matches.length === 0) return;
+      const RE_ESCALATE_MS = 6 * 60 * 60 * 1000; // re-notify an item still unresolved 6h later
+      const runNowTs = nowEpoch();
+      const ruleIds = [...new Set(matches.map(m => m.rule_id).filter(v => v != null))];
+      const { data: existingEvents } = ruleIds.length
+        ? await supabase.from("escalation_events").select("rule_id, item_key, last_fired_at").in("rule_id", ruleIds)
+        : { data: [] };
+      const lastFiredByKey = new Map((existingEvents || []).map(e => [`${e.rule_id}|${e.item_key}`, e.last_fired_at]));
+      let anyFired = false;
+      for (const m of matches) {
+        if (m.rule_id == null || !m.item_key) continue;
+        const k = `${m.rule_id}|${m.item_key}`;
+        const last = lastFiredByKey.get(k);
+        if (last != null && runNowTs - last < RE_ESCALATE_MS) continue; // already escalated recently
+        // Claim this fire atomically so two admin browsers running the
+        // sweep at the same moment can't both notify. escalation_events
+        // has UNIQUE(rule_id, item_key) (migration
+        // add_escalation_rules_and_events) and an "allow all" RLS policy,
+        // so the write and the select-back are both reliable:
+        //  - new item → plain insert; a losing race raises 23505 (ins.error
+        //    set) so we don't claim.
+        //  - re-escalation → conditional update keyed on the OLD
+        //    last_fired_at; 0 rows back = another browser already bumped it.
+        let claimed = false;
+        if (last == null) {
+          const ins = await supabase.from("escalation_events")
+            .insert({ rule_id: m.rule_id, item_key: m.item_key, first_fired_at: runNowTs, last_fired_at: runNowTs });
+          claimed = !ins.error;
+        } else {
+          const upd = await supabase.from("escalation_events")
+            .update({ last_fired_at: runNowTs })
+            .eq("rule_id", m.rule_id).eq("item_key", m.item_key).eq("last_fired_at", last)
+            .select("id");
+          claimed = !upd.error && (upd.data?.length ?? 0) > 0;
+        }
+        if (!claimed) continue;
+        const hrs = Math.max(1, Math.round((m.overdue_minutes || 0) / 60));
+        const mins = m.overdue_minutes || 0;
+        const ageStr = mins < 90 ? `${mins} min` : `${hrs}h`;
+        try {
+          await insertNotification({
+            type: "ESCALATION",
+            for_roles: Array.isArray(m.notify_roles) ? m.notify_roles : [],
+            for_user_ids: Array.isArray(m.notify_user_ids) ? m.notify_user_ids : [],
+            message: `🔺 Escalation "${m.rule_label}": ${m.item_label || m.item_key} still unresolved after ${ageStr} (threshold ${m.threshold_minutes}m).`,
+            trip_id: m.trip_id ?? null, ts: runNowTs, read: false,
+          });
+          anyFired = true;
+        } catch (notifErr) {
+          // The notify failed but we already claimed the fire — roll the
+          // claim back so the NEXT sweep retries instead of silently
+          // suppressing this escalation for the 6h re-escalate window.
+          console.warn(`[Escalation] notify failed for ${k}, rolling back claim:`, notifErr?.message);
+          if (last == null) {
+            await supabase.from("escalation_events").delete().eq("rule_id", m.rule_id).eq("item_key", m.item_key).then(() => {}, () => {});
+          } else {
+            await supabase.from("escalation_events").update({ last_fired_at: last }).eq("rule_id", m.rule_id).eq("item_key", m.item_key).then(() => {}, () => {});
+          }
+        }
+      }
+      // Age out long-dead dedup rows (item long since resolved) so the
+      // table doesn't grow unbounded and a recurrence of the same key
+      // isn't permanently suppressed.
+      await supabase.from("escalation_events").delete().lt("last_fired_at", runNowTs - 7 * 24 * 60 * 60 * 1000).then(() => {}, () => {});
+      if (anyFired) refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
+
     case "TRIP/SET_SHARE_TOKEN": {
       // Admin-facing only (see copyShareLink's one call site, on the admin
       // user-detail screen). Previously had no permission gate: any
@@ -10785,6 +10909,7 @@ function useAppStore() {
   const [companies, setCompanies] = useState([]); // [{ id, name, active, address }]
   const [tickets, setTickets] = useState([]);
   const [feeRates, setFeeRates] = useState(null); // { normal_zar, late_booking_zar, late_cancellation_zar, no_show_zar } | null until loaded
+  const [escalationRules, setEscalationRules] = useState([]); // [{ id, label, condition_kind, threshold_minutes, notify_roles, notify_user_ids, active }]
   const [hazardReports, setHazardReports] = useState([]); // [{ id, driver_id, driver_name, category, lat, lng, note, trip_id, created_at }]
 
   const refetch = useCallback(async () => {
@@ -10936,6 +11061,23 @@ function useAppStore() {
       driver_pay_per_agent_zar: Number(data.driverpayperagentzar) || 0,
       driver_pay_per_extra_km_zar: Number(data.driverpayperextrakmzar) || 0,
     });
+  }, []);
+
+  // Escalation rules — admin-configured "if <condition> unresolved for
+  // <N> min → notify <who>". Own fetch cycle, same pattern as tickets/
+  // fee-rates: only admins ever read or write them.
+  const fetchEscalationRules = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("escalation_rules").select("*").order("id", { ascending: true });
+    if (error) return;
+    setEscalationRules((data || []).map(r => ({
+      id: sid(r.id), label: r.label, condition_kind: r.condition_kind,
+      threshold_minutes: r.threshold_minutes,
+      notify_roles: Array.isArray(r.notify_roles) ? r.notify_roles : [],
+      notify_user_ids: sidArr(r.notify_user_ids),
+      active: !!r.active,
+      created_at: r.created_at, updated_at: r.updated_at,
+    })));
   }, []);
 
   // Driver-reported hazards ("⚠ Report Hazard" in DriverNavMap) AND
@@ -11214,6 +11356,21 @@ function useAppStore() {
   }, [fetchFeeRates, myRole]);
 
   useEffect(() => {
+    // escalation_rules only render inside admin screens (the Exceptions
+    // tab's rules panel) — same broad ROLE.ADMIN gate as fee-rates above.
+    if (!supabase || myRole !== ROLE.ADMIN) return;
+    fetchEscalationRules();
+    const channel = supabase
+      .channel("transitos-escalation-rules")
+      .on("postgres_changes", { event: "*", schema: "public", table: "escalation_rules" }, fetchEscalationRules)
+      .subscribe();
+    const onVisible = () => { if (document.visibilityState === "visible") fetchEscalationRules(); };
+    document.addEventListener("visibilitychange", onVisible);
+    const pollInterval = setInterval(fetchEscalationRules, 5 * 60 * 1000);
+    return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
+  }, [fetchEscalationRules, myRole]);
+
+  useEffect(() => {
     // hazard_reports only ever renders inside DriverNavMap (driver hazard
     // markers + report button) and RouteAdvisoryPanel (admin-posted
     // advisories, part of the admin live-map tooling) — confirmed by
@@ -11304,7 +11461,7 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports });
+      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports, fetchEscalationRules });
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -11320,12 +11477,12 @@ function useAppStore() {
       Sentry.captureException(e, { extra: { action_type: action?.type } });
       throw e;
     }
-  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports]);
+  }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports, fetchEscalationRules]);
 
   const loading = !useFallback && !!supabase && supaState === null;
   const state = useFallback || !supabase
     ? { ...localState, driver_positions: driverPositions, campaigns: localState.campaigns || [], companies: localState.companies || [], tickets: localState.tickets || [], fee_rates: localState.fee_rates || null, hazard_reports: localState.hazard_reports || [], _error: null, _loading: false, _dmVersion: dmVersion }
-    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, fee_rates: feeRates, hazard_reports: hazardReports, _error: supaError, _loading: loading, _dmVersion: dmVersion };
+    : { ...(supaState || INITIAL_STATE), driver_positions: driverPositions, campaigns, companies, tickets, fee_rates: feeRates, hazard_reports: hazardReports, escalation_rules: escalationRules, _error: supaError, _loading: loading, _dmVersion: dmVersion };
 
   return [state, dispatch];
 }
@@ -12432,7 +12589,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠", ESCALATION: "🔺" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.
