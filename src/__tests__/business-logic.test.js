@@ -40,6 +40,7 @@ import {
 import {
   computeGroupSuggestions,
   computeOpsExceptions,
+  cronIntervalMs,
   shiftDateStr,
   sastMidnightMs,
   sastTodayStr,
@@ -864,5 +865,40 @@ describe("computeOpsExceptions — live exceptions board sweep", () => {
       ],
     });
     expect(out.map(e => e.severity)).toEqual(["high", "med"]);
+  });
+});
+
+describe("cronIntervalMs — expected interval from a 5-field cron expr (Status page)", () => {
+  const MIN = 60000, HR = 60 * MIN, DAY = 24 * HR;
+  it("handles */N minute and hour steps", () => {
+    expect(cronIntervalMs("*/10 * * * *")).toBe(10 * MIN);
+    expect(cronIntervalMs("*/30 * * * *")).toBe(30 * MIN);
+    expect(cronIntervalMs("*/2 * * * *")).toBe(2 * MIN);
+  });
+  it("treats a fixed hour with wildcard day as daily", () => {
+    expect(cronIntervalMs("0 5 * * *")).toBe(DAY);
+    expect(cronIntervalMs("45 3 * * *")).toBe(DAY);
+  });
+  it("widens to weekly / monthly when a day-of-week / day-of-month is pinned", () => {
+    expect(cronIntervalMs("0 4 * * 1")).toBe(7 * DAY);      // weekly digest
+    expect(cronIntervalMs("0 4 1 * *")).toBe(31 * DAY);     // monthly export
+  });
+  it("uses the smallest gap for a comma-list minute field", () => {
+    expect(cronIntervalMs("0,30 * * * *")).toBe(30 * MIN);
+    expect(cronIntervalMs("0,15,30,45 * * * *")).toBe(15 * MIN);
+  });
+  it("treats hour '*' with a fixed minute as hourly", () => {
+    expect(cronIntervalMs("17 * * * *")).toBe(HR);
+  });
+  it("uses the smallest gap for a comma-list / range / step hour field", () => {
+    expect(cronIntervalMs("0 6,18 * * *")).toBe(12 * HR);   // twice daily
+    expect(cronIntervalMs("0 9-17 * * *")).toBe(HR);        // hourly within a window
+    expect(cronIntervalMs("0 */4 * * *")).toBe(4 * HR);
+  });
+  it("returns null for empty, non-string, non-5-field, or pg_cron interval syntax", () => {
+    expect(cronIntervalMs("")).toBeNull();
+    expect(cronIntervalMs(null)).toBeNull();
+    expect(cronIntervalMs("30 seconds")).toBeNull();        // pg_cron interval form
+    expect(cronIntervalMs("0 4 * * * *")).toBeNull();       // 6 fields
   });
 });

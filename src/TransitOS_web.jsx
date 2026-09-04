@@ -1405,6 +1405,9 @@ export function earliestScheduledTime(rawRows) {
 }
 
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
+// When this JS bundle first started executing — used by the admin Status
+// page to show how long the current session/tab has been live.
+export const APP_BOOTED_AT = Date.now();
 // String-id normalizer for the hydration layer. Supabase bigint id
 // columns (users.id, trips.id, driverid, agentid, branchid, …) come back
 // as JS numbers on some paths and strings on others (PostgREST, realtime
@@ -2204,7 +2207,7 @@ export function copyShareLink(trip, dispatch) {
 // This prevents drivers losing confirmation data when signal drops mid-route.
 const OFFLINE_QUEUE_KEY = "transitos_offline_queue";
 
-function getOfflineQueue() {
+export function getOfflineQueue() {
   try { return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]"); } catch { return []; }
 }
 function setOfflineQueue(q) {

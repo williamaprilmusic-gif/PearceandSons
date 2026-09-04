@@ -3,6 +3,7 @@ import {
   ADMIN_ADVISORY_WINDOW_HOURS,
   ADMIN_LEVEL,
   ADMIN_PERMISSIONS,
+  APP_BOOTED_AT,
   AlertSoundToggle,
   BiometricEnrollButton,
   Button,
@@ -62,6 +63,7 @@ import {
   fetchTripDelays,
   fetchTripHistory,
   fmtSastDateTime,
+  getOfflineQueue,
   getAdminCompanyIds,
   getDriverLoad,
   haversineKm,
@@ -1144,7 +1146,15 @@ export function computeOpsExceptions(state, { now = Date.now(), includeDriverHou
   const nameFor = (id) => (id == null ? "Unassigned" : usersById.get(String(id))?.name || `#${id}`);
   const items = [];
 
+  // De-dupe by trip_id — same guard the driver_status loop below has:
+  // a duplicated hydrated row would otherwise emit colliding item ids
+  // (`late_start:<trip_id>` etc.) and one row would be dropped as a
+  // duplicate React key.
+  const seenTrips = new Set();
   for (const t of trips) {
+    const tKey = String(t.trip_id);
+    if (seenTrips.has(tKey)) continue;
+    seenTrips.add(tKey);
     const sched = t.scheduled_time_epoch;
     const minsLate = sched ? (nowMs - sched) / 60000 : null;
 
@@ -8012,6 +8022,291 @@ function AdminAIAssistant({ user }) {
   );
 }
 
+// ── Admin Status page ──────────────────────────────────────────────────
+// Read-only health check: Supabase reachability + latency, realtime
+// channel, every pg_cron scheduled job's last run (via the
+// get_cron_job_status RPC), service-worker state, recent client crashes,
+// and this device's offline-queue depth. Self-contained — runs its own
+// probes, does not touch useAppStore.
+
+const MIN_MS = 60 * 1000, HR_MS = 60 * MIN_MS, DAY_MS = 24 * HR_MS;
+
+// How often a single cron field (minute or hour) fires, in that field's
+// own units — the smallest gap between successive values. `*` → 1,
+// `*/N` → N, `a-b` (contiguous range) → 1, `a,b,c` → min consecutive gap
+// (wrap-aware). Returns null for a single fixed value or anything
+// unrecognised, so the caller falls through to a coarser cadence.
+function cronFieldGap(field, wrap) {
+  if (field === "*") return 1;
+  const stepM = field.match(/^(?:\*|\d+-\d+)\/(\d+)$/) || field.match(/^\*\/(\d+)$/);
+  if (stepM) { const n = Number(stepM[1]); return n > 0 ? n : null; }
+  if (/^\d+-\d+$/.test(field)) return 1;
+  if (field.includes(",")) {
+    const vals = field.split(",").map(Number).filter(v => Number.isInteger(v) && v >= 0 && v < wrap).sort((a, b) => a - b);
+    if (vals.length < 2) return null;
+    let gap = wrap + vals[0] - vals[vals.length - 1]; // wrap-around
+    for (let i = 1; i < vals.length; i++) gap = Math.min(gap, vals[i] - vals[i - 1]);
+    return gap > 0 ? gap : null;
+  }
+  return null;
+}
+
+// Rough expected interval (ms) from a standard 5-field cron expression,
+// enough to judge "this job hasn't run when it should have". Unknown /
+// non-standard shapes (pg_cron interval strings like '30 seconds', 6-field
+// exprs) return null and the caller skips the staleness check for that job.
+export function cronIntervalMs(schedule) {
+  if (!schedule || typeof schedule !== "string") return null;
+  const f = schedule.trim().split(/\s+/);
+  if (f.length !== 5) return null;                               // not a standard 5-field cron
+  const [min, hr, dom, , dow] = f;
+
+  const minGap = cronFieldGap(min, 60);
+  if (minGap != null) return minGap * MIN_MS;                    // min is *, */N, range, or list
+
+  // Minute is a single fixed value — cadence is set by the hour field…
+  if (!/^\d+$/.test(min)) return null;                           // e.g. 'seconds' → unknown
+  const hrGap = cronFieldGap(hr, 24);
+  if (hrGap != null) return hrGap * HR_MS;                       // hr is *, */N, range, or list
+
+  // …or, hour also fixed, by the day fields.
+  if (!/^\d+$/.test(hr)) return null;
+  if (dow && dow !== "*") return 7 * DAY_MS;                     // weekly
+  if (dom && dom !== "*") return 31 * DAY_MS;                    // monthly
+  return DAY_MS;                                                 // daily
+}
+
+function statusDotColor(s) {
+  return s === "ok" ? COLORS.green : s === "warn" ? COLORS.amber : s === "down" ? COLORS.red : COLORS.ghost;
+}
+function worstStatus(list) {
+  const rank = { checking: 0, ok: 1, warn: 2, down: 3 };
+  return list.reduce((w, s) => (rank[s] > rank[w] ? s : w), "ok");
+}
+// Row used by the status page — hoisted to module scope so it isn't a new
+// component type on every AdminStatus render.
+function StatusRow({ s, title, detail, children }) {
+  return (
+    <div style={{ padding: "10px 8px", borderBottom: `1px solid ${COLORS.wire}` }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ width: 8, height: 8, borderRadius: 4, background: statusDotColor(s), flexShrink: 0 }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk, flex: 1 }}>{title}</span>
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>{detail}</span>
+      </div>
+      {children && <div style={{ marginTop: 6, marginLeft: 18 }}>{children}</div>}
+    </div>
+  );
+}
+// Single relative-time formatter for the admin screens added this session
+// (Exceptions board, System Status). `deltaMs` is now-minus-then, so a
+// positive value is in the past ("5m ago"); pass allowFuture for
+// callers that can be handed a negative delta ("in 5m").
+function relTimeLabel(deltaMs, allowFuture = false) {
+  if (deltaMs == null || !Number.isFinite(deltaMs)) return "—";
+  if (deltaMs < 0 && !allowFuture) return "—";
+  const s = Math.round(Math.abs(deltaMs) / 1000);
+  const v = s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
+  return deltaMs < 0 ? `in ${v}` : `${v} ago`;
+}
+
+function AdminStatus() {
+  const [checks, setChecks] = useState(null);
+  const [running, setRunning] = useState(false);
+  const [ranAt, setRanAt] = useState(null);
+  // Re-render every 10s so the "checked Xs ago" label stays truthful
+  // while the admin sits on this (diagnostic-only) page.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const h = setInterval(() => forceTick((t) => t + 1), 10000);
+    return () => clearInterval(h);
+  }, []);
+
+  const runChecks = useCallback(async () => {
+    if (!supabase) { setChecks({ noBackend: true }); return; }
+    setRunning(true);
+    const nowMs = Date.now();
+
+    // 1. Database round-trip
+    const dbP = (async () => {
+      const t0 = performance.now();
+      try {
+        const { error } = await supabase.from("trip_fee_rates").select("id").limit(1);
+        if (error) throw error;
+        const latency = Math.round(performance.now() - t0);
+        return { status: latency > 1500 ? "warn" : "ok", detail: `${latency} ms round-trip`, latency };
+      } catch (e) {
+        return { status: "down", detail: e?.message || "query failed" };
+      }
+    })();
+
+    // 2. Realtime channel — throwaway probe subscription
+    const rtP = new Promise((resolve) => {
+      let done = false;
+      const ch = supabase.channel(`status-probe-${nowMs}`);
+      const finish = (r) => { if (done) return; done = true; clearTimeout(to); try { supabase.removeChannel(ch); } catch { /* noop */ } resolve(r); };
+      const to = setTimeout(() => finish({ status: "warn", detail: "no SUBSCRIBED within 8s" }), 8000);
+      ch.subscribe((s) => {
+        if (s === "SUBSCRIBED") finish({ status: "ok", detail: "connected" });
+        else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT" || s === "CLOSED") finish({ status: "down", detail: s });
+      });
+    });
+
+    // 3. Scheduled jobs
+    const cronP = (async () => {
+      try {
+        const { data, error } = await supabase.rpc("get_cron_job_status");
+        if (error) throw error;
+        const jobs = (data || []).map((j) => {
+          const lastStart = j.last_start ? new Date(j.last_start).getTime() : null;
+          const interval = cronIntervalMs(j.schedule);
+          let status = "ok";
+          if (!j.active) status = "warn";
+          else if (j.last_status && j.last_status !== "succeeded") status = "down";
+          else if (lastStart == null) status = "warn";
+          else if (interval && nowMs - lastStart > interval * 3) status = "warn";
+          return {
+            name: j.jobname, schedule: j.schedule, active: j.active,
+            lastStatus: j.last_status || "never run",
+            ago: lastStart != null ? relTimeLabel(nowMs - lastStart) : "never",
+            status,
+          };
+        });
+        if (jobs.length === 0) return { status: "down", detail: "no scheduled jobs found — pg_cron may be misconfigured", jobs };
+        return { status: worstStatus(jobs.map((j) => j.status)), jobs, detail: `${jobs.length} jobs` };
+      } catch (e) {
+        return { status: "down", detail: e?.message || "RPC failed", jobs: [] };
+      }
+    })();
+
+    // 4. Service worker
+    const swP = (async () => {
+      try {
+        if (!("serviceWorker" in navigator)) return { status: "warn", detail: "not supported in this browser" };
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (!reg) return { status: "warn", detail: "not registered" };
+        if (reg.waiting) return { status: "warn", detail: "update downloaded — pending a reload to activate" };
+        if (reg.active && navigator.serviceWorker.controller) return { status: "ok", detail: "active and controlling this page" };
+        if (reg.active) return { status: "warn", detail: "active but not yet controlling this page (first load)" };
+        return { status: "warn", detail: "registered, no active worker" };
+      } catch (e) {
+        return { status: "warn", detail: e?.message || "check failed" };
+      }
+    })();
+
+    // 5. Recent client crashes — exact counts via head:true (not derived
+    // from a capped list), plus a short list for display.
+    const errP = (async () => {
+      try {
+        const weekAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
+        const dayAgo = nowMs - 24 * 60 * 60 * 1000;
+        const [wk, day, recent] = await Promise.all([
+          supabase.from("client_errors").select("id", { count: "exact", head: true }).gte("createdat", weekAgo),
+          supabase.from("client_errors").select("id", { count: "exact", head: true }).gte("createdat", dayAgo),
+          supabase.from("client_errors").select("id, message, createdat").gte("createdat", weekAgo).order("createdat", { ascending: false }).limit(5),
+        ]);
+        if (wk.error || day.error) throw wk.error || day.error;
+        const last24 = day.count ?? 0;
+        const last7d = wk.count ?? 0;
+        const status = last24 === 0 ? "ok" : last24 <= 3 ? "warn" : "down";
+        return {
+          status,
+          detail: `${last24} in last 24h · ${last7d} in last 7d`,
+          // recent list is best-effort — a failure there doesn't invalidate the counts
+          recent: (recent.data || []).map((r) => ({ id: r.id, message: r.message, ago: relTimeLabel(nowMs - r.createdat) })),
+        };
+      } catch (e) {
+        return { status: "warn", detail: e?.message || "query failed", recent: [] };
+      }
+    })();
+
+    // 6. This device's offline queue
+    let queueRes;
+    try {
+      const q = getOfflineQueue();
+      queueRes = { status: q.length === 0 ? "ok" : "warn", detail: q.length === 0 ? "empty" : `${q.length} action${q.length !== 1 ? "s" : ""} waiting to sync` };
+    } catch {
+      queueRes = { status: "ok", detail: "empty" };
+    }
+
+    try {
+      const [db, rt, cron, sw, errs] = await Promise.all([dbP, rtP, cronP, swP, errP]);
+      setChecks({ db, rt, cron, sw, errs, queue: queueRes, online: navigator.onLine });
+    } catch (e) {
+      setChecks({ fatal: e?.message || "checks failed to run" });
+    } finally {
+      setRanAt(Date.now());
+      setRunning(false);
+    }
+  }, []);
+
+  useEffect(() => { runChecks(); }, [runChecks]);
+
+  const overall = checks && !checks.noBackend && !checks.fatal
+    ? worstStatus([checks.db.status, checks.rt.status, checks.cron.status, checks.sw.status, checks.errs.status, checks.queue.status])
+    : "checking";
+
+  const Row = StatusRow;
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+        <SectionHeader label="System Status" />
+        {checks && !checks.noBackend && !checks.fatal && (
+          <span style={{ fontSize: 10, color: statusDotColor(overall), fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>
+            {overall === "ok" ? "all systems normal" : overall === "warn" ? "needs attention" : "problem detected"}
+          </span>
+        )}
+        <div style={{ flex: 1 }} />
+        {ranAt && <span style={{ fontSize: 9, color: COLORS.ghost }}>checked {relTimeLabel(Date.now() - ranAt)}</span>}
+        <Button size="sm" variant="ghost" title={running ? "CHECKING…" : "RE-CHECK"} disabled={running} onClick={runChecks} />
+      </div>
+
+      {!checks ? (
+        <div style={{ fontSize: 11, color: COLORS.ghost, padding: 10 }}>Running checks…</div>
+      ) : checks.noBackend ? (
+        <Empty icon="⚙" text="No Supabase backend configured — running in local/demo mode." />
+      ) : checks.fatal ? (
+        <div style={{ fontSize: 11, color: COLORS.red, padding: 10 }}>Couldn't run the checks: {checks.fatal}. Try RE-CHECK.</div>
+      ) : (
+        <>
+          <Row s={checks.db.status} title="Database" detail={checks.db.detail} />
+          <Row s={checks.rt.status} title="Realtime updates" detail={checks.rt.detail} />
+          <Row s={checks.cron.status} title="Scheduled jobs" detail={checks.cron.detail}>
+            {checks.cron.jobs && checks.cron.jobs.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {checks.cron.jobs.map((j) => (
+                  <div key={j.name} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 10 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: 3, background: statusDotColor(j.status), flexShrink: 0 }} />
+                    <span style={{ color: COLORS.mist, minWidth: 170 }}>{j.name}</span>
+                    <span style={{ color: COLORS.ghost }}>{j.schedule}</span>
+                    <span style={{ flex: 1 }} />
+                    <span style={{ color: j.lastStatus === "succeeded" ? COLORS.ghost : COLORS.red }}>{j.lastStatus}</span>
+                    <span style={{ color: COLORS.ghost, minWidth: 66, textAlign: "right" }}>{j.ago}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Row>
+          <Row s={checks.sw.status} title="Service worker (offline / updates)" detail={checks.sw.detail} />
+          <Row s={checks.errs.status} title="Client crashes" detail={checks.errs.detail}>
+            {checks.errs.recent && checks.errs.recent.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                {checks.errs.recent.map((r) => (
+                  <div key={r.id} style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    <span style={{ color: COLORS.mist }}>{r.ago}</span> — {r.message}
+                  </div>
+                ))}
+              </div>
+            )}
+          </Row>
+          <Row s={checks.queue.status} title="This device — pending sync" detail={checks.queue.detail} />
+          <Row s={checks.online ? "ok" : "down"} title="This device — connectivity" detail={`${checks.online ? "online" : "offline"} · tab open ${relTimeLabel(Date.now() - APP_BOOTED_AT)}`} />
+        </>
+      )}
+    </div>
+  );
+}
+
 const EXCEPTION_KIND_META = {
   late_start:  { label: "Late starts",   icon: "⏰" },
   unassigned:  { label: "Unassigned",    icon: "🚫" },
@@ -8022,18 +8317,6 @@ const EXCEPTION_KIND_META = {
   doc:         { label: "Documents",     icon: "📄" },
 };
 const EXCEPTION_SEV_COLOR = { high: COLORS.red, med: COLORS.amber, low: COLORS.ghost };
-
-function exceptionWhenLabel(at, nowMs) {
-  if (at == null) return "";
-  const diffMin = Math.round((nowMs - at) / 60000);
-  if (diffMin >= 0) {
-    if (diffMin < 60) return `${diffMin}m ago`;
-    if (diffMin < 1440) return `${Math.round(diffMin / 60)}h ago`;
-    return `${Math.round(diffMin / 1440)}d ago`;
-  }
-  const inMin = -diffMin;
-  return inMin < 60 ? `in ${inMin}m` : `in ${Math.round(inMin / 60)}h`;
-}
 
 // Live Exceptions board — every "needs a human" condition in one triage
 // screen. Read-only: rows link to the relevant trip / the Drivers tab so
@@ -8102,7 +8385,7 @@ function AdminExceptions({ state, onJumpToTrip, onJumpToDrivers }) {
 
           {shown.map(e => {
             const clickable = e.trip_id != null || e.driver_id != null;
-            const when = exceptionWhenLabel(e.at, nowMs);
+            const when = e.at != null ? relTimeLabel(nowMs - e.at, true) : "";
             return (
               <div key={e.id}
                 onClick={() => { if (e.trip_id != null) onJumpToTrip(e.trip_id); else if (e.driver_id != null) onJumpToDrivers(); }}
@@ -8126,7 +8409,7 @@ function AdminExceptions({ state, onJumpToTrip, onJumpToDrivers }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["exceptions", "⚠", "Exceptions"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["exceptions", "⚠", "Exceptions"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["status", "🩺", "System Status"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -8145,6 +8428,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // ViewerPortal. Same for FINANCIAL — routed to FinancialPortal.
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
     if (id === "exceptions") return hasAdminPermission(user, "manageDispatch");
+    if (id === "status") return hasAdminPermission(user, "manageDispatch");
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
@@ -8362,6 +8646,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "activity" && hasAdminPermission(user, "viewAuditLog") && <AdminActivityLog />}
+      {tab === "status" && hasAdminPermission(user, "manageDispatch") && <AdminStatus />}
       {tab === "ai" && hasAdminPermission(user, "manageDispatch") && <AdminAIAssistant user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}
