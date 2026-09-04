@@ -6139,7 +6139,28 @@ async function fetchAllFromSupabase() {
     tripIdsInScope.length > 0
       ? supabase.from("messages").select("*").in("tripid", tripIdsInScope).order("timestamp")
       : supabase.from("messages").select("*").order("timestamp"),
-    supabase.from("notifications").select("*").order("timestamp", { ascending: false }).limit(500),
+    // ROOT CAUSE of a real user-reported bug ("every time I click Clear
+    // All in Alerts it shows me an incoming message from an old trip"):
+    // ORDER BY timestamp alone has no tie-breaker, and this app routinely
+    // inserts several notification rows sharing the EXACT SAME epoch (any
+    // handler that computes `ts = nowEpoch()` once and reuses it across a
+    // fan-out loop — dispatch, escalations, announcements, etc.) — live-
+    // verified against production: the 500-row cutoff currently lands
+    // mid-tie (3 rows share the boundary timestamp; ties of 4-6 rows are
+    // common throughout the table). Postgres does not guarantee which of
+    // several tied rows a LIMIT keeps across repeated executions of the
+    // same query — an UPDATE (e.g. NOTIF/MARK_ALL_READ's own bulk
+    // isread flip, unbounded by age, run immediately before the refetch
+    // that follows every action) writes a new MVCC tuple version and can
+    // shuffle a tied row's physical scan position, so the very next fetch
+    // can include a DIFFERENT subset of the tied rows than the previous
+    // one did. A notification that had fallen out of this 500-row window
+    // could then reappear in state.notifications with an id the toast
+    // effect below has never seen before — read as "new," toasted as
+    // "incoming," even though it's actually old. Ordering by id as a
+    // secondary key makes the query deterministic: the same 500 rows,
+    // every time, until a genuinely newer row actually displaces one.
+    supabase.from("notifications").select("*").order("timestamp", { ascending: false }).order("id", { ascending: false }).limit(500),
   ]);
   const secondError = chatRes.error || notifsRes.error;
   if (secondError) throw secondError;
@@ -18150,6 +18171,9 @@ function AdminSectionLoading() {
   );
 }
 
+// See AppInner's new-notification toast effect for why this exists.
+const NOTIFICATION_TOAST_MAX_AGE_MS = 2 * 60 * 1000;
+
 function AppInner() {
   const [state, dispatch] = useAppStore();
   const [toasts, setToasts] = useState([]);
@@ -18251,8 +18275,22 @@ function AppInner() {
     // initial load) — otherwise every notification already sitting in
     // the person's inbox from before this session would re-announce
     // itself with a toast+sound the instant they log in.
-    if (prevMyNotifIds.current.size > 0 && newOnes.length > 0) {
-      const newest = newOnes[0];
+    //
+    // FOUND VIA A REAL USER REPORT ("every time I click Clear All in
+    // Alerts it shows me an incoming message from an old trip"): "new to
+    // this session" alone isn't the same as "actually just happened."
+    // Root cause was the notifications query's ORDER BY having no
+    // tie-breaker (fixed at the query in fetchAllFromSupabase — see its
+    // own comment for the full mechanism, live-verified against
+    // production), which let an old notification unpredictably re-enter
+    // the 500-row window and look "new" to this effect. Kept as a second,
+    // independent layer here too: even a notification genuinely new to
+    // this array is only toast-worthy if it actually happened recently —
+    // anything older is something that just became visible, not a live
+    // event, and doesn't deserve an intrusive toast+sound.
+    const recentNewOnes = newOnes.filter(n => n.ts_epoch != null && Date.now() - n.ts_epoch < NOTIFICATION_TOAST_MAX_AGE_MS);
+    if (prevMyNotifIds.current.size > 0 && recentNewOnes.length > 0) {
+      const newest = recentNewOnes[0];
       pushToast(newest.type.replace(/_/g, " "), newest.message);
       playAlertSound();
     }
