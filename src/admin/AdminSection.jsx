@@ -1354,6 +1354,91 @@ export function computeEscalations(items, rules, nowMs = Date.now()) {
   return out;
 }
 
+// ── Roster / rota week grid ────────────────────────────────────────────
+// scheduled_date is stored "YYYY/MM/DD" (slash). These do UTC-midnight
+// calendar arithmetic on that shape directly.
+function rosterDow(slashDate) {
+  const [y, m, d] = slashDate.split("/").map(Number);
+  return new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0=Sun
+}
+function rosterAddDays(slashDate, n) {
+  const [y, m, d] = slashDate.split("/").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return `${dt.getUTCFullYear()}/${String(dt.getUTCMonth() + 1).padStart(2, "0")}/${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+export function rosterMondayOf(slashDate) {
+  const dow = rosterDow(slashDate);
+  return rosterAddDays(slashDate, dow === 0 ? -6 : 1 - dow);
+}
+
+// Whether an availability_schedule has ANY slot touching this calendar
+// day-of-week — same night-shift-crossing logic as isDriverOnShift (a
+// slot whose end is earlier than its start wraps past midnight, so it
+// also covers the early hours of the FOLLOWING day), just answering "at
+// all today" instead of "at this specific time". Kept in sync with
+// isDriverOnShift deliberately: that function's own fix comment explains
+// why the naive same-day-only check silently excluded a night-shift
+// driver from dispatch candidate lists for their entire real shift —
+// this is the same bug shape for the roster's "off" dimming.
+function rosterOnShiftDay(schedule, dow) {
+  return schedule.some(s => {
+    if (s.day === dow) return true;
+    const [sh, sm] = s.start.split(":").map(Number);
+    const [eh, em] = s.end.split(":").map(Number);
+    const crossesMidnight = eh * 60 + em < sh * 60 + sm;
+    return crossesMidnight && (s.day + 1) % 7 === dow;
+  });
+}
+
+// Pure model for the roster grid: 7 dates from mondaySlash, each driver's
+// on-shift flag + assigned-trip load per day, and the unassigned bookings
+// ("gaps") per day. Seat math matches getDriverLoad (passengers on the
+// driver's active trips that date).
+export function buildRosterWeek(state, mondaySlash) {
+  const dates = Array.from({ length: 7 }, (_, i) => rosterAddDays(mondaySlash, i));
+  const dateSet = new Set(dates);
+  const usersById = usersByIdMap(state.users || []);
+  const ACTIVE = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
+
+  const byDriverDate = new Map();
+  const gapsByDate = new Map(dates.map(d => [d, []]));
+  for (const t of state.trips || []) {
+    if (!dateSet.has(t.scheduled_date)) continue;
+    if (t.state === TRIP_STATE.UNASSIGNED_BOOKING) { gapsByDate.get(t.scheduled_date).push(t); continue; }
+    if (t.driver_id == null || !ACTIVE.includes(t.state)) continue;
+    const k = `${t.driver_id}|${t.scheduled_date}`;
+    if (!byDriverDate.has(k)) byDriverDate.set(k, []);
+    byDriverDate.get(k).push(t);
+  }
+
+  const drivers = (state.driver_status || []).map(ds => {
+    const capacity = ds.capacity || DRIVER_CAPACITY;
+    const sched = ds.availability_schedule || [];
+    const hasSchedule = sched.length > 0;
+    const days = dates.map(date => {
+      const dTrips = byDriverDate.get(`${ds.driver_id}|${date}`) || [];
+      const seats = dTrips.reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
+      const onShift = !hasSchedule || rosterOnShiftDay(sched, rosterDow(date));
+      return {
+        date, onShift, tripCount: dTrips.length, seats, capacity,
+        load: seats === 0 ? "free" : seats >= capacity ? "full" : "some",
+        trips: dTrips,
+      };
+    });
+    const weekSeats = days.reduce((n, d) => n + d.seats, 0);
+    const anyShift = !hasSchedule || days.some(d => d.onShift);
+    return { driver_id: ds.driver_id, name: usersById.get(String(ds.driver_id))?.name || `#${ds.driver_id}`, capacity, days, weekSeats, anyShift };
+  });
+  drivers.sort((a, b) =>
+    ((b.weekSeats > 0 || b.anyShift ? 1 : 0) - (a.weekSeats > 0 || a.anyShift ? 1 : 0)) ||
+    a.name.localeCompare(b.name)
+  );
+
+  const gaps = dates.map(d => ({ date: d, bookings: gapsByDate.get(d) || [] }));
+  return { dates, drivers, gaps, totalGaps: gaps.reduce((n, g) => n + g.bookings.length, 0) };
+}
+
 function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   let score = 0;
   const proxScore = distKm != null ? Math.max(0, 40 - (distKm / 30) * 40) : 0;
@@ -8722,7 +8807,177 @@ function EscalationRulesPanel({ rules, users, dispatch }) {
   );
 }
 
-const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["exceptions", "⚠", "Exceptions"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["status", "🩺", "System Status"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
+// Roster / rota — a week grid of drivers × days showing on-shift status
+// and assigned-trip load, plus the week's unassigned bookings, which can
+// be dragged (or tapped, then tapped onto a cell) onto a driver's cell
+// for the same day to dispatch. Read-only apart from that one assign
+// action — deeper edits stay in Dispatch / the driver shift editor.
+const ROSTER_DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+function AdminRoster({ state, dispatch }) {
+  const [monday, setMonday] = useState(() => rosterMondayOf(sastTodaySlashStr()));
+  const [pending, setPending] = useState(null);    // { trip_id, date } picked to place by tap
+  const [dragging, setDragging] = useState(null);  // { trip_id, date } during a drag
+  const [assigningCell, setAssigningCell] = useState(null); // `${driver_id}|${date}` in flight
+  const [busyTripId, setBusyTripId] = useState(null); // gap chip currently being assigned
+  const [msg, setMsg] = useState(null);
+  // Synchronous guard (mutated immediately, not via setState) against
+  // assigning the SAME booking twice from a rapid double-tap/drop before
+  // the first request resolves — same shape as Dispatch's own
+  // dispatchingRef, needed for the identical reason: React state updates
+  // aren't visible to a second invocation that starts before the first
+  // one's setAssigningCell has committed.
+  const assigningTripIdsRef = useRef(new Set());
+
+  const week = React.useMemo(() => buildRosterWeek(state, monday), [state, monday]);
+  const usersById = React.useMemo(() => usersByIdMap(state.users || []), [state.users]);
+
+  const activePlace = dragging || pending;
+
+  const assign = async (booking, driver_id, date) => {
+    if (booking.scheduled_date !== date) return; // a booking only fits a driver ON its own day
+    if (assigningTripIdsRef.current.has(booking.trip_id)) return;
+    assigningTripIdsRef.current.add(booking.trip_id);
+    const cellKey = `${driver_id}|${date}`;
+    setAssigningCell(cellKey); setBusyTripId(booking.trip_id); setMsg(null);
+    try {
+      await dispatch({ type: "TRIP/ASSIGN_DRIVER", trip_id: booking.trip_id, driver_id });
+      setMsg(`✓ Assigned ${(booking.agent_ids || []).map(id => usersById.get(String(id))?.name).filter(Boolean).join(", ") || "booking"} to ${usersById.get(String(driver_id))?.name || "driver"}`);
+    } catch (e) {
+      setMsg(`✗ ${e.message || "Couldn't assign — try again."}`);
+    } finally {
+      assigningTripIdsRef.current.delete(booking.trip_id);
+      setAssigningCell(null); setBusyTripId(null); setPending(null); setDragging(null);
+      setTimeout(() => setMsg(null), 4000);
+    }
+  };
+
+  const onCellActivate = (driver, day) => {
+    if (!activePlace || activePlace.date !== day.date) return;
+    const booking = week.gaps.find(g => g.date === activePlace.date)?.bookings.find(b => b.trip_id === activePlace.trip_id);
+    if (booking) assign(booking, driver.driver_id, day.date);
+  };
+
+  const loadColor = (l) => l === "full" ? COLORS.red : l === "some" ? COLORS.amber : COLORS.ghost;
+  const todaySlash = sastTodaySlashStr();
+
+  return (
+    <div className="pad">
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <SectionHeader label="Roster" />
+        <div style={{ flex: 1 }} />
+        <Button size="sm" variant="ghost" title="‹ PREV" onClick={() => setMonday(m => rosterAddDays(m, -7))} />
+        <Button size="sm" variant="ghost" title="THIS WEEK" onClick={() => setMonday(rosterMondayOf(sastTodaySlashStr()))} />
+        <Button size="sm" variant="ghost" title="NEXT ›" onClick={() => setMonday(m => rosterAddDays(m, 7))} />
+      </div>
+      <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 8 }}>
+        Week of {week.dates[0]} — {week.dates[6]}
+        {week.totalGaps > 0
+          ? <span style={{ color: COLORS.amber, fontWeight: 700 }}> · {week.totalGaps} unassigned booking{week.totalGaps !== 1 ? "s" : ""}</span>
+          : <span style={{ color: COLORS.green }}> · fully assigned</span>}
+        {activePlace && <span style={{ color: COLORS.amber }}> · drop on a driver's {ROSTER_DAY_LABELS[rosterDow(activePlace.date)]} cell</span>}
+      </div>
+      {msg && (
+        <div style={{ fontSize: 11, fontWeight: 700, color: msg.startsWith("✗") ? COLORS.red : COLORS.green, marginBottom: 8 }}>{msg}</div>
+      )}
+
+      {/* Gaps to place */}
+      {week.totalGaps > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 12 }}>
+          {week.gaps.filter(g => g.bookings.length > 0).map(g => (
+            <div key={g.date} style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ fontSize: 9, fontWeight: 700, color: COLORS.ghost, minWidth: 78 }}>
+                {ROSTER_DAY_LABELS[rosterDow(g.date)]} {g.date.slice(5)}
+              </span>
+              {g.bookings.map(b => {
+                const picked = pending?.trip_id === b.trip_id;
+                const busy = busyTripId === b.trip_id;
+                return (
+                  <span key={b.trip_id}
+                    draggable={!busy}
+                    onDragStart={(e) => {
+                      if (busy) return;
+                      // Some browsers (Firefox) require dataTransfer to
+                      // actually carry data or the drag is aborted before
+                      // dragover/drop ever fire — the value itself isn't
+                      // read back, state (`dragging`) is the source of truth.
+                      e.dataTransfer.setData("text/plain", String(b.trip_id));
+                      e.dataTransfer.effectAllowed = "move";
+                      setDragging({ trip_id: b.trip_id, date: g.date }); setPending(null);
+                    }}
+                    onDragEnd={() => setDragging(null)}
+                    onClick={() => { if (!busy) setPending(picked ? null : { trip_id: b.trip_id, date: g.date }); }}
+                    title={busy ? "Assigning…" : `${b.scheduled_time || "?"} · ${(b.agent_ids || []).map(id => usersById.get(String(id))?.name).filter(Boolean).join(", ")}`}
+                    style={{
+                      cursor: busy ? "default" : "pointer", fontSize: 9, padding: "3px 7px", borderRadius: 10,
+                      border: `1px solid ${picked ? COLORS.amber : COLORS.wire}`,
+                      background: picked ? "rgba(245,166,35,.12)" : COLORS.surface, color: COLORS.chalk, whiteSpace: "nowrap",
+                      opacity: busy ? 0.5 : 1,
+                    }}>
+                    {busy ? "assigning…" : <>{b.scheduled_time || "?"} · {(b.agent_ids || []).length || 1}p{b.direction ? ` · ${b.direction[0]}` : ""}</>}
+                  </span>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Grid */}
+      <div style={{ overflowX: "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: `minmax(120px, 1.4fr) repeat(7, minmax(64px, 1fr))`, gap: 1, background: COLORS.wire, border: `1px solid ${COLORS.wire}`, minWidth: 620 }}>
+          <div style={{ background: COLORS.panel, padding: "6px 8px", fontSize: 9, fontWeight: 700, color: COLORS.ghost }}>DRIVER</div>
+          {week.dates.map(d => (
+            <div key={d} style={{ background: d === todaySlash ? "rgba(245,166,35,.08)" : COLORS.panel, padding: "6px 4px", fontSize: 9, fontWeight: 700, color: d === todaySlash ? COLORS.amber : COLORS.ghost, textAlign: "center" }}>
+              {ROSTER_DAY_LABELS[rosterDow(d)]}<br /><span style={{ fontWeight: 400 }}>{d.slice(5)}</span>
+            </div>
+          ))}
+          {week.drivers.map(driver => (
+            <React.Fragment key={driver.driver_id}>
+              <div style={{ background: COLORS.card, padding: "6px 8px", fontSize: 10 }}>
+                <div style={{ fontWeight: 700, color: COLORS.chalk, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{driver.name}</div>
+                <div style={{ fontSize: 8, color: COLORS.ghost }}>{driver.capacity} seats · {driver.weekSeats} pax this wk</div>
+              </div>
+              {driver.days.map(day => {
+                const cellKey = `${driver.driver_id}|${day.date}`;
+                const isDropTarget = activePlace && activePlace.date === day.date;
+                const inFlight = assigningCell === cellKey;
+                return (
+                  <div key={day.date}
+                    onDragOver={e => { if (isDropTarget) e.preventDefault(); }}
+                    onDrop={e => { e.preventDefault(); onCellActivate(driver, day); }}
+                    onClick={() => onCellActivate(driver, day)}
+                    style={{
+                      background: inFlight ? "rgba(245,166,35,.2)" : isDropTarget ? "rgba(29,185,84,.10)" : COLORS.ink,
+                      padding: "6px 4px", textAlign: "center", minHeight: 40,
+                      opacity: day.onShift ? 1 : 0.4,
+                      outline: isDropTarget ? `1px dashed ${COLORS.green}` : "none",
+                      cursor: isDropTarget ? "copy" : "default",
+                    }}>
+                    {!day.onShift && day.tripCount === 0 ? (
+                      <span style={{ fontSize: 8, color: COLORS.ghost }}>off</span>
+                    ) : day.tripCount === 0 ? (
+                      <span style={{ fontSize: 9, color: COLORS.ghost }}>—</span>
+                    ) : (
+                      <>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: loadColor(day.load) }}>{day.seats}/{day.capacity}</div>
+                        <div style={{ fontSize: 8, color: COLORS.ghost }}>{day.tripCount} trip{day.tripCount !== 1 ? "s" : ""}</div>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+      <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 8 }}>
+        Drag an unassigned booking onto a driver's cell for the same day (or tap the booking, then tap the cell) to dispatch it. A booking can only go to a driver on its own date.
+      </div>
+    </div>
+  );
+}
+
+const ADMIN_NAV = [["dashboard", "◈", "Dashboard"], ["exceptions", "⚠", "Exceptions"], ["trips", "⊟", "All Bookings & Trips"], ["active", "🚦", "Active Trips"], ["dispatch", "⊕", "Dispatch"], ["roster", "🗓", "Roster"], ["map", "📍", "Live Map"], ["drivers", "◉", "Drivers"], ["users", "◐", "Users"], ["profiles", "🔍", "Search Profiles"], ["tickets", "🎫", "Tickets"], ["contacts", "💬", "Contacts"], ["history", "🕐", "History"], ["utilization", "📊", "Fleet Utilization"], ["activity", "📜", "Activity Log"], ["status", "🩺", "System Status"], ["ai", "🤖", "AI Assistant"], ["portal", "🏢", "Client Portal"], ["notifs", "◬", "Alerts"]];
 
 const ADMIN_LEVEL_LABEL = { FLEET_OPS: "Fleet Operations Administrator", STANDARD: "Control Admin", FINANCIAL: "Financial Administrator", VIEWER: "Viewer Administrator" };
 
@@ -8742,6 +8997,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (id === "dispatch") return hasAdminPermission(user, "manageDispatch");
     if (id === "exceptions") return hasAdminPermission(user, "manageDispatch");
     if (id === "status") return hasAdminPermission(user, "manageDispatch");
+    if (id === "roster") return hasAdminPermission(user, "manageDispatch");
     if (id === "active") return hasAdminPermission(user, "manageDispatch");
     if (id === "users") return hasAdminPermission(user, "viewUsers");
     if (id === "contacts") return hasAdminPermission(user, "manageTrips");
@@ -8990,6 +9246,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "trips" && <AdminTrips state={scopedState} dispatch={dispatch} user={user} jumpTripId={jumpTripId} onJumpConsumed={() => setJumpTripId(null)} />}
       {tab === "active" && hasAdminPermission(user, "manageDispatch") && <AdminActiveTrips state={scopedState} />}
       {tab === "dispatch" && hasAdminPermission(user, "manageDispatch") && <AdminDispatch state={scopedState} dispatch={dispatch} />}
+      {tab === "roster" && hasAdminPermission(user, "manageDispatch") && <AdminRoster state={scopedState} dispatch={dispatch} />}
       {tab === "map" && <AdminLiveMap state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "drivers" && <AdminDrivers state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "users" && hasAdminPermission(user, "viewUsers") && <AdminUsers state={scopedState} dispatch={dispatch} user={user} />}

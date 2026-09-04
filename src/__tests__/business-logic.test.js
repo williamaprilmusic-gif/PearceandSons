@@ -44,6 +44,8 @@ import {
   computeEscalations,
   ESCALATION_KINDS,
   ESCALATION_KIND_MAX_MINUTES,
+  buildRosterWeek,
+  rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
   sastMidnightMs,
@@ -1043,5 +1045,95 @@ describe("computeEscalations — rule matcher for the escalation engine", () => 
     expect(ESCALATION_KIND_MAX_MINUTES.unassigned).toBe(4320);  // measured since BOOKED, not departure
     expect(ESCALATION_KIND_MAX_MINUTES.stuck).toBe(1200);       // < 1440 (24h window)
     expect(ESCALATION_KIND_MAX_MINUTES.no_show).toBe(1200);     // < 1440 (24h window)
+  });
+});
+
+describe("rosterMondayOf / buildRosterWeek — roster grid model", () => {
+  const MON = "2026/09/07"; // confirmed Monday
+  const WEEK = ["2026/09/07", "2026/09/08", "2026/09/09", "2026/09/10", "2026/09/11", "2026/09/12", "2026/09/13"];
+
+  it("rosterMondayOf finds the Monday on/before any date, including a Sunday (wraps to the PREVIOUS Monday)", () => {
+    expect(rosterMondayOf("2026/09/09")).toBe(MON);   // mid-week Wednesday
+    expect(rosterMondayOf(MON)).toBe(MON);            // already Monday
+    expect(rosterMondayOf("2026/09/06")).toBe("2026/08/31"); // Sunday -> the Monday that started ITS week
+  });
+
+  it("buildRosterWeek returns the 7 consecutive dates starting at the given Monday", () => {
+    const week = buildRosterWeek({ trips: [], driver_status: [], users: [] }, MON);
+    expect(week.dates).toEqual(WEEK);
+  });
+
+  it("counts a driver's seats/trips only on the day they're scheduled, from state.trips", () => {
+    const state = {
+      users: [{ id: 9, role: ROLE.DRIVER, name: "Driver Nine" }],
+      driver_status: [{ driver_id: 9, capacity: 4 }],
+      trips: [
+        { trip_id: "T1", driver_id: 9, state: TRIP_STATE.ASSIGNED, scheduled_date: "2026/09/08", agent_ids: [1, 2] },
+        { trip_id: "T2", driver_id: 9, state: TRIP_STATE.DRIVER_CONFIRMED, scheduled_date: "2026/09/08", agent_ids: [3] },
+      ],
+    };
+    const week = buildRosterWeek(state, MON);
+    const driver = week.drivers.find(d => d.driver_id === 9);
+    const tue = driver.days.find(d => d.date === "2026/09/08");
+    const wed = driver.days.find(d => d.date === "2026/09/09");
+    expect(tue.tripCount).toBe(2);
+    expect(tue.seats).toBe(3);
+    expect(tue.load).toBe(driver.capacity <= 3 ? "full" : "some");
+    expect(wed.tripCount).toBe(0);
+    expect(driver.weekSeats).toBe(3);
+  });
+
+  it("a driver with no availability_schedule is on-shift every day", () => {
+    const state = { users: [], driver_status: [{ driver_id: 1, capacity: 4 }], trips: [] };
+    const week = buildRosterWeek(state, MON);
+    expect(week.drivers[0].days.every(d => d.onShift)).toBe(true);
+  });
+
+  it("a same-day schedule only flags its own day-of-week on-shift", () => {
+    // day:1 = Monday only
+    const state = { users: [], driver_status: [{ driver_id: 1, capacity: 4, availability_schedule: [{ day: 1, start: "06:00", end: "18:00" }] }], trips: [] };
+    const week = buildRosterWeek(state, MON);
+    const days = week.drivers[0].days;
+    expect(days.find(d => d.date === "2026/09/07").onShift).toBe(true);  // Monday
+    expect(days.find(d => d.date === "2026/09/08").onShift).toBe(false); // Tuesday
+  });
+
+  it("REGRESSION: a night shift crossing midnight also flags the FOLLOWING day on-shift, not just its start day", () => {
+    // Friday (day:5) 22:00 -> 02:00 covers late Friday AND early Saturday.
+    const state = { users: [], driver_status: [{ driver_id: 1, capacity: 4, availability_schedule: [{ day: 5, start: "22:00", end: "02:00" }] }], trips: [] };
+    const week = buildRosterWeek(state, MON);
+    const days = week.drivers[0].days;
+    expect(days.find(d => d.date === "2026/09/11").onShift).toBe(true); // Friday
+    expect(days.find(d => d.date === "2026/09/12").onShift).toBe(true); // Saturday (the wrap)
+    expect(days.find(d => d.date === "2026/09/10").onShift).toBe(false); // Thursday
+  });
+
+  it("buckets unassigned bookings into gaps by date, and excludes them from any driver's load", () => {
+    const state = {
+      users: [],
+      driver_status: [{ driver_id: 1, capacity: 4 }],
+      trips: [
+        { trip_id: "U1", driver_id: null, state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_date: "2026/09/10", agent_ids: [1] },
+        { trip_id: "U2", driver_id: null, state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_date: "2026/09/10", agent_ids: [2] },
+        { trip_id: "OLD", driver_id: null, state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_date: "2026/08/01", agent_ids: [3] }, // outside this week
+      ],
+    };
+    const week = buildRosterWeek(state, MON);
+    expect(week.totalGaps).toBe(2);
+    expect(week.gaps.find(g => g.date === "2026/09/10").bookings.map(b => b.trip_id).sort()).toEqual(["U1", "U2"]);
+    expect(week.drivers[0].weekSeats).toBe(0);
+  });
+
+  it("sorts drivers with real activity (a shift or trips) ahead of completely idle ones", () => {
+    const state = {
+      users: [],
+      driver_status: [
+        { driver_id: 1, capacity: 4, availability_schedule: [{ day: 9, start: "00:00", end: "01:00" }] }, // bogus day, never on-shift this week
+        { driver_id: 2, capacity: 4 }, // no schedule -> always on-shift
+      ],
+      trips: [],
+    };
+    const week = buildRosterWeek(state, MON);
+    expect(week.drivers[0].driver_id).toBe(2);
   });
 });
