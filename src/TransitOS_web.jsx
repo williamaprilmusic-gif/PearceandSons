@@ -2928,16 +2928,66 @@ export function computeDriverHoursThisWeek(driverId, trips, nowMs = Date.now()) 
   return driverTripIntervalsMs(driverId, trips, startOfWeek, nowMs, nowMs) / (1000 * 60 * 60);
 }
 
-// ── Fleet utilization reporting (v1 scope) ───────────────────────────────
-// Per-trip timestamp breakdown only — driving / loading-dispatch-lag /
-// gap-between-trips — NOT true online/away idle-time tracking (that needs
-// a new driver_status_history table that doesn't exist; explicitly
-// deferred, see project memory). "Gap" only counts time between two trips
-// on the SAME calendar day, since an overnight/multi-day gap is off-duty
-// time, not idle time, and there's no way to distinguish the two without
-// the deferred infrastructure — an explicit, honest limitation surfaced
-// in the UI, not hidden.
-export function computeFleetUtilization(trips, users) {
+// ── Real driver presence intervals ──────────────────────────────────────
+// Merges a driver's ONLINE/OFFLINE driver_status_history rows into shift
+// intervals, clipped to [fromMs, toMs]. Handles the history being messier
+// than a clean alternation (a real possibility — see logDriverStatusEvent's
+// call sites, all best-effort/fire-and-forget):
+//   - a second ONLINE before a matching OFFLINE (e.g. a crashed tab that
+//     never ran AUTH/LOGOUT, then a fresh login) keeps the EARLIER start —
+//     the shift genuinely began there, the interval isn't restarted;
+//   - a stray OFFLINE with no open ONLINE (e.g. history starting mid-shift,
+//     right after this feature shipped) is ignored, not treated as a
+//     negative-length interval;
+//   - a shift still open at the end of the queried rows runs through
+//     toMs, not real-world "now" — a report for a past date range
+//     shouldn't count presence beyond the range being reported.
+export function computeDriverShiftIntervals(historyRows, fromMs, toMs) {
+  const byDriver = {};
+  for (const r of historyRows || []) {
+    if (r.event !== "ONLINE" && r.event !== "OFFLINE") continue;
+    (byDriver[r.driver_id] = byDriver[r.driver_id] || []).push(r);
+  }
+  const result = {};
+  for (const driverId of Object.keys(byDriver)) {
+    const rows = [...byDriver[driverId]].sort((a, b) => a.ts - b.ts);
+    const intervals = [];
+    let openStart = null;
+    for (const r of rows) {
+      if (r.event === "ONLINE") {
+        if (openStart == null) openStart = r.ts;
+      } else if (openStart != null) {
+        intervals.push([openStart, r.ts]);
+        openStart = null;
+      }
+    }
+    if (openStart != null) intervals.push([openStart, toMs]);
+    const clipped = intervals
+      .map(([s, e]) => [Math.max(s, fromMs), Math.min(e, toMs)])
+      .filter(([s, e]) => e > s);
+    if (clipped.length) result[driverId] = clipped;
+  }
+  return result;
+}
+
+// ── Fleet utilization reporting ──────────────────────────────────────────
+// Per-trip timestamp breakdown — driving / loading-dispatch-lag / idle —
+// for whichever drivers have real driver_status_history in this window
+// (see computeDriverShiftIntervals + logDriverStatusEvent). For those,
+// idle time is genuinely real: total ONLINE duration minus driving/loading
+// actually spent, correctly excluding anything overnight/off-shift since
+// that time was never inside an ONLINE interval to begin with. Falls back
+// to the original v1 proxy — same-calendar-day gap between two trips —
+// for any driver with no history yet in this window (every shift before
+// this feature shipped, or a driver whose session never wrote the table
+// at all, e.g. demo/offline-fallback mode). `gap_is_real` tells the caller
+// which one a given row got, so the UI can be honest about which figure
+// it's showing rather than silently mixing the two under one label.
+export function computeFleetUtilization(trips, users, options = {}) {
+  const { statusHistory, fromMs, toMs } = options;
+  const shiftIntervalsByDriver = (statusHistory && fromMs != null && toMs != null)
+    ? computeDriverShiftIntervals(statusHistory, fromMs, toMs)
+    : null;
   const byDriver = {};
   for (const t of trips) {
     if (!t.driver_id) continue;
@@ -2961,7 +3011,14 @@ export function computeFleetUtilization(trips, users) {
       }
     }
     const u = users.find(uu => String(uu.id) === String(driverId));
-    rows.push({ driver_id: driverId, driver_name: u?.name || driverId, trips: sorted.length, driving_ms: drivingMs, loading_ms: loadingMs, gap_ms: gapMs });
+    const shiftIntervals = shiftIntervalsByDriver?.[driverId];
+    let idleMs = gapMs, idleIsReal = false;
+    if (shiftIntervals && shiftIntervals.length) {
+      const onlineMs = shiftIntervals.reduce((sum, [s, e]) => sum + (e - s), 0);
+      idleMs = Math.max(0, onlineMs - drivingMs - loadingMs);
+      idleIsReal = true;
+    }
+    rows.push({ driver_id: driverId, driver_name: u?.name || driverId, trips: sorted.length, driving_ms: drivingMs, loading_ms: loadingMs, gap_ms: idleMs, gap_is_real: idleIsReal });
   }
   return rows.sort((a, b) => b.driving_ms - a.driving_ms);
 }
@@ -6522,6 +6579,34 @@ async function logAuditAction({ actorId, actorName, actionType, tripId, targetUs
   }
 }
 
+// ── Real driver presence log ────────────────────────────────────────────
+// Records ONLINE/OFFLINE (login/logout, i.e. a driver's actual shift
+// boundary) with a real timestamp. Feeds computeFleetUtilization's real
+// idle-time computation — Fleet Utilization previously had no way to
+// distinguish genuine idle time (parked between two trips, still on
+// shift) from off-duty time (see that function's own comment; this was
+// explicit v1 scope deferred at the time it shipped). A shift's total
+// ONLINE duration minus its driving/loading time gives real idle time,
+// correctly excluding anything overnight/off-shift since that was never
+// inside an ONLINE interval at all — no need to also log AWAY/BACK (app
+// backgrounded mid-shift, see useAwayDetection) for that computation, and
+// deliberately not doing so: visibilitychange can fire often for an
+// active driver (screen lock/unlock through a shift), and this table has
+// no retention/cleanup job — the 'AWAY'/'BACK' values are reserved in the
+// check constraint below if a future feature needs finer-grained
+// in-shift presence, but nothing writes them yet.
+// Best-effort/fire-and-forget like logAuditAction just above — a failed
+// presence-log insert should never block the login/logout it's riding
+// alongside. Same "allow all" RLS as every other operational table in
+// this app (hazard_reports, vehicles, escalation_events, etc.).
+async function logDriverStatusEvent(driverId, event, ts = nowEpoch()) {
+  try {
+    await supabase.from("driver_status_history").insert({ driverid: driverId, event, ts });
+  } catch (e) {
+    console.warn("[DriverStatusHistory] failed to record event (action itself still succeeded):", e.message);
+  }
+}
+
 // On-demand query for completed trips OLDER than the live window (current
 // + previous month) that fetchAllFromSupabase normally loads. Deliberately
 // separate from the live
@@ -6562,6 +6647,23 @@ export async function fetchDriverSafetyHistory({ driverId, fromMs, toMs }) {
   const myTripIds = new Set(trips.map(t => t.trip_id));
   const notifications = (notifRows || []).filter(n => myTripIds.has(sid(n.tripid)));
   return { trips, notifications };
+}
+
+// On-demand, fleet-wide (or single-driver) query for computeFleetUtilization's
+// real idle-time computation — see computeDriverShiftIntervals. Widens the
+// DB-side lower bound by a day so a shift that started before `fromMs` but
+// is still open (or ended just after it) isn't invisible to the merge —
+// computeDriverShiftIntervals still clips every interval to the CALLER's
+// real [fromMs, toMs], so overfetching here is safe, never lossy. A day is
+// comfortably wider than any single real shift (MAX_DRIVER_HOURS_PER_DAY).
+export async function fetchDriverStatusHistory({ fromMs, toMs, driverId } = {}) {
+  let q = supabase.from("driver_status_history").select("driverid, event, ts").order("ts", { ascending: true });
+  if (fromMs != null) q = q.gte("ts", fromMs - 24 * 3600 * 1000);
+  if (toMs != null) q = q.lte("ts", toMs);
+  if (driverId != null) q = q.eq("driverid", driverId);
+  const { data, error } = await q;
+  if (error) throw error;
+  return (data || []).map(r => ({ driver_id: sid(r.driverid), event: r.event, ts: r.ts }));
 }
 
 // Pure aggregation over an already-fetched window — modeled on
@@ -7031,11 +7133,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       persistActiveUserId(bioUser.id);
       await supabase.from("users").update({ isonline: true }).eq("id", bioUser.id).then(() => {}, () => {});
       if (bioUser.role === ROLE.DRIVER) {
+        const bioLoginTs = nowEpoch();
         // shiftstartedat marks the start of this continuous on-duty
         // session for DRIVER/CHECK_SHIFT_DURATION; shiftdurationnotifiedat
         // resets so a fresh shift is eligible to fire again even if the
         // driver was already notified once on a previous shift today.
-        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: nowEpoch(), shiftdurationnotifiedat: null }).eq("driverid", bioUser.id).then(() => {}, () => {});
+        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: bioLoginTs, shiftdurationnotifiedat: null }).eq("driverid", bioUser.id).then(() => {}, () => {});
+        logDriverStatusEvent(bioUser.id, "ONLINE", bioLoginTs);
       }
       // NOT fire-and-forget, unlike the rest of this function — see the
       // header comment for why fire-and-forget is safe everywhere else.
@@ -7120,8 +7224,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // already read it from there.
       await supabase.from("users").update({ isonline: true }).eq("id", loggedInUserId).then(() => {}, () => {});
       if (loginTokenResult.user.role === ROLE.DRIVER) {
+        const loginTs = nowEpoch();
         // See AUTH/LOGIN_BIOMETRIC's identical comment above.
-        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: nowEpoch(), shiftdurationnotifiedat: null }).eq("driverid", loggedInUserId).then(() => {}, () => {});
+        await supabase.from("driver_status").update({ isonline: true, shiftstartedat: loginTs, shiftdurationnotifiedat: null }).eq("driverid", loggedInUserId).then(() => {}, () => {});
+        logDriverStatusEvent(loggedInUserId, "ONLINE", loginTs);
       }
       // NOT fire-and-forget — see AUTH/LOGIN_BIOMETRIC's comment above.
       await refetch();
@@ -7141,6 +7247,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // considering them, and their NEXT login starts a fresh shift
           // eligible to notify again.
           await supabase.from("driver_status").update({ isonline: false, shiftstartedat: null, shiftdurationnotifiedat: null }).eq("driverid", loggedOutUserId).then(() => {}, () => {});
+          logDriverStatusEvent(loggedOutUserId, "OFFLINE");
         }
         // The push_subscriptions row for THIS device deliberately survives
         // logout (subscribeToPushNotifications re-associates the same

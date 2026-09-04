@@ -38,6 +38,8 @@ import {
   DRIVER_CAPACITY,
   ESCALATION_KINDS,
   ESCALATION_KIND_MAX_MINUTES,
+  computeDriverShiftIntervals,
+  computeFleetUtilization,
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
@@ -1206,5 +1208,113 @@ describe("usersNeedingAddressConfirmation — flags label-only home addresses fr
   it("handles an empty/undefined users list", () => {
     expect(usersNeedingAddressConfirmation([])).toEqual([]);
     expect(usersNeedingAddressConfirmation(undefined)).toEqual([]);
+  });
+});
+
+describe("computeDriverShiftIntervals — merges ONLINE/OFFLINE presence history into shift intervals", () => {
+  const H = 60 * 60 * 1000;
+  const DAY0 = Date.UTC(2026, 0, 1); // arbitrary fixed epoch, hour-aligned math below
+
+  it("merges a clean ONLINE->OFFLINE pair into one interval", () => {
+    const rows = [
+      { driver_id: "1", event: "ONLINE", ts: DAY0 },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + 8 * H },
+    ];
+    const result = computeDriverShiftIntervals(rows, DAY0 - H, DAY0 + 24 * H);
+    expect(result["1"]).toEqual([[DAY0, DAY0 + 8 * H]]);
+  });
+
+  it("runs a still-open ONLINE (no matching OFFLINE) through toMs, not past it", () => {
+    const rows = [{ driver_id: "1", event: "ONLINE", ts: DAY0 }];
+    const result = computeDriverShiftIntervals(rows, DAY0 - H, DAY0 + 5 * H);
+    expect(result["1"]).toEqual([[DAY0, DAY0 + 5 * H]]);
+  });
+
+  it("ignores a stray OFFLINE with no preceding open ONLINE", () => {
+    const rows = [{ driver_id: "1", event: "OFFLINE", ts: DAY0 + 2 * H }];
+    const result = computeDriverShiftIntervals(rows, DAY0, DAY0 + 24 * H);
+    expect(result["1"]).toBeUndefined();
+  });
+
+  it("keeps the EARLIER start when a second ONLINE arrives before the matching OFFLINE (crashed tab, re-login)", () => {
+    const rows = [
+      { driver_id: "1", event: "ONLINE", ts: DAY0 },
+      { driver_id: "1", event: "ONLINE", ts: DAY0 + 3 * H }, // e.g. re-login after a crash, no OFFLINE recorded
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + 8 * H },
+    ];
+    const result = computeDriverShiftIntervals(rows, DAY0 - H, DAY0 + 24 * H);
+    expect(result["1"]).toEqual([[DAY0, DAY0 + 8 * H]]);
+  });
+
+  it("clips an interval spanning outside the window and drops one entirely outside it", () => {
+    const rows = [
+      // Shift 1: starts before fromMs, ends inside the window — should clip its start.
+      { driver_id: "1", event: "ONLINE", ts: DAY0 - 2 * H },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + 2 * H },
+      // Shift 2: entirely before fromMs — should be dropped.
+      { driver_id: "1", event: "ONLINE", ts: DAY0 - 10 * H },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 - 9 * H },
+    ];
+    const result = computeDriverShiftIntervals(rows, DAY0, DAY0 + 24 * H);
+    expect(result["1"]).toEqual([[DAY0, DAY0 + 2 * H]]);
+  });
+
+  it("keeps separate drivers independent", () => {
+    const rows = [
+      { driver_id: "1", event: "ONLINE", ts: DAY0 },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + H },
+      { driver_id: "2", event: "ONLINE", ts: DAY0 + 5 * H },
+      { driver_id: "2", event: "OFFLINE", ts: DAY0 + 6 * H },
+    ];
+    const result = computeDriverShiftIntervals(rows, DAY0, DAY0 + 24 * H);
+    expect(result["1"]).toEqual([[DAY0, DAY0 + H]]);
+    expect(result["2"]).toEqual([[DAY0 + 5 * H, DAY0 + 6 * H]]);
+  });
+});
+
+describe("computeFleetUtilization — real idle time from presence history, with a proxy fallback", () => {
+  const H = 60 * 60 * 1000;
+  const DAY0 = Date.UTC(2026, 0, 1);
+  const users = [{ id: "1", name: "Driver One" }, { id: "2", name: "Driver Two" }];
+
+  it("uses real idle time (online minus driving/loading) when statusHistory covers the driver", () => {
+    // Driver 1: online 08:00-16:00 (8h), one trip driving 1h + loading 0.5h.
+    const trips = [{
+      driver_id: "1", confirmed_at_epoch: DAY0 + 9 * H, in_transit_at_epoch: DAY0 + 9.5 * H, completed_at_epoch: DAY0 + 10.5 * H,
+    }];
+    const statusHistory = [
+      { driver_id: "1", event: "ONLINE", ts: DAY0 + 8 * H },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + 16 * H },
+    ];
+    const rows = computeFleetUtilization(trips, users, { statusHistory, fromMs: DAY0, toMs: DAY0 + 24 * H });
+    const row = rows.find(r => r.driver_id === "1");
+    expect(row.gap_is_real).toBe(true);
+    expect(row.driving_ms).toBe(H);
+    expect(row.loading_ms).toBe(0.5 * H);
+    // 8h online - 1h driving - 0.5h loading = 6.5h idle.
+    expect(row.gap_ms).toBe(6.5 * H);
+  });
+
+  it("falls back to the same-day-gap proxy for a driver with no presence history in the window", () => {
+    const trips = [
+      { driver_id: "2", confirmed_at_epoch: DAY0 + 8 * H, in_transit_at_epoch: DAY0 + 8 * H, completed_at_epoch: DAY0 + 9 * H },
+      { driver_id: "2", confirmed_at_epoch: DAY0 + 11 * H, in_transit_at_epoch: DAY0 + 11 * H, completed_at_epoch: DAY0 + 12 * H },
+    ];
+    const rows = computeFleetUtilization(trips, users, { statusHistory: [], fromMs: DAY0, toMs: DAY0 + 24 * H });
+    const row = rows.find(r => r.driver_id === "2");
+    expect(row.gap_is_real).toBe(false);
+    // Gap between the two same-day trips: 11h start - 9h previous completion = 2h.
+    expect(row.gap_ms).toBe(2 * H);
+  });
+
+  it("behaves exactly like the pre-existing v1 proxy when called with no options at all (backward compatible)", () => {
+    const trips = [
+      { driver_id: "2", confirmed_at_epoch: DAY0 + 8 * H, in_transit_at_epoch: DAY0 + 8 * H, completed_at_epoch: DAY0 + 9 * H },
+      { driver_id: "2", confirmed_at_epoch: DAY0 + 11 * H, in_transit_at_epoch: DAY0 + 11 * H, completed_at_epoch: DAY0 + 12 * H },
+    ];
+    const rows = computeFleetUtilization(trips, users);
+    const row = rows.find(r => r.driver_id === "2");
+    expect(row.gap_is_real).toBe(false);
+    expect(row.gap_ms).toBe(2 * H);
   });
 });

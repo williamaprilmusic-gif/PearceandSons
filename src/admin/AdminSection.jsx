@@ -61,6 +61,7 @@ import {
   fetchDelaysForTrips,
   fetchDirectMessages,
   fetchDriverSafetyHistory,
+  fetchDriverStatusHistory,
   fetchGpsTrailForTrip,
   fetchMyConversations,
   fetchTripDelays,
@@ -4075,9 +4076,9 @@ function AdminHistory({ state, user, dispatch }) {
 }
 
 function fleetUtilizationToCsv(rows) {
-  const headers = ["Driver", "Trips", "Driving (hrs)", "Loading/Dispatch Lag (hrs)", "Gap Between Trips (hrs)"];
+  const headers = ["Driver", "Trips", "Driving (hrs)", "Loading/Dispatch Lag (hrs)", "Idle (hrs)", "Idle Figure Is"];
   const toHrs = (ms) => (ms / (1000 * 60 * 60)).toFixed(2);
-  const dataRows = rows.map(r => [r.driver_name, r.trips, toHrs(r.driving_ms), toHrs(r.loading_ms), toHrs(r.gap_ms)]);
+  const dataRows = rows.map(r => [r.driver_name, r.trips, toHrs(r.driving_ms), toHrs(r.loading_ms), toHrs(r.gap_ms), r.gap_is_real ? "Real (presence log)" : "Estimated (same-day gap)"]);
   const csv = [headers, ...dataRows].map(r => r.map(csvEscapeCell).join(",")).join("\r\n");
   return "﻿" + csv;
 }
@@ -4097,8 +4098,15 @@ function AdminFleetUtilization({ state, user, dispatch }) {
     try {
       const fromMs = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : undefined;
       const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
-      const hits = await fetchTripHistory({ fromMs, toMs });
-      setResults(computeFleetUtilization(hits, state.users));
+      // Presence history is fetched best-effort alongside trips — a failure
+      // here shouldn't block the report, it just falls back to the older
+      // same-day-gap proxy for every driver (computeFleetUtilization
+      // handles a missing/empty statusHistory gracefully either way).
+      const [hits, statusHistory] = await Promise.all([
+        fetchTripHistory({ fromMs, toMs }),
+        fetchDriverStatusHistory({ fromMs, toMs }).catch(() => []),
+      ]);
+      setResults(computeFleetUtilization(hits, state.users, { statusHistory, fromMs, toMs }));
     } catch (e) {
       setErr(e.message || "Search failed");
       setResults(null);
@@ -4116,9 +4124,10 @@ function AdminFleetUtilization({ state, user, dispatch }) {
     <div className="pad">
       <SectionHeader label="Fleet Utilization" />
       <div style={{ fontSize: 9, color: COLORS.ghost }}>
-        Per-trip timestamp breakdown (driving / loading / gap between trips) for completed trips in the selected
-        range. "Gap" only counts time between two trips on the SAME day — it's the closest available proxy for idle
-        time today, not a true online/away log, so it can't distinguish genuine idle from off-duty.
+        Per-trip timestamp breakdown (driving / loading / idle) for completed trips in the selected range. Idle time
+        is real for any driver who has logged in/out since driver presence tracking shipped — total time online minus
+        time actually driving/loading. Drivers with no presence history yet in this window (shifts before that
+        feature existed) fall back to a same-calendar-day gap-between-trips estimate, marked "GAP (EST.)" below.
       </div>
       <Card>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
@@ -4162,7 +4171,7 @@ function AdminFleetUtilization({ state, user, dispatch }) {
                 {[
                   ["DRIVING", `${toHrs(r.driving_ms)}h`, COLORS.green],
                   ["LOADING/LAG", `${toHrs(r.loading_ms)}h`, COLORS.amber],
-                  ["GAP", `${toHrs(r.gap_ms)}h`, COLORS.ghost],
+                  [r.gap_is_real ? "IDLE" : "GAP (EST.)", `${toHrs(r.gap_ms)}h`, COLORS.ghost],
                 ].map(([label, val, color]) => (
                   <div key={label} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 3, padding: "4px 10px", minWidth: 80 }}>
                     <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.8 }}>{label}</div>
