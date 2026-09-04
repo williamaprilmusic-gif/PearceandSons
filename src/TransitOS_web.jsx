@@ -1159,7 +1159,7 @@ function computeOptimalRoute(trips, driverCurrentCoord) {
   return { pickupOrder, dropoffOrder, legs, totalRoadKm: totalKm };
 }
 
-function buildPickupSequence(trips, driverStartCoord) {
+export function buildPickupSequence(trips, driverStartCoord) {
   // Last-resort fallback only — every real call site passes a resolved
   // anchor (see defaultCompanyAnchor(state) at the call sites). No
   // `state` available in this pure route-math function.
@@ -1223,7 +1223,7 @@ async function buildPickupSequenceTomTom(trips, driverStartCoord, departAtEpoch 
 // Per explicit decision, dispatch-time sequencing now matches live
 // navigation exactly — this is the number a route actually costs in
 // petrol, not a scheduling label that happens to usually agree with it.
-function buildDropoffSequence(trips, lastPickupCoord) {
+export function buildDropoffSequence(trips, lastPickupCoord) {
   let remaining = [...trips];
   if (!lastPickupCoord || remaining.length <= 1) return remaining;
   const ordered = [];
@@ -1269,7 +1269,7 @@ function buildDropoffSequence(trips, lastPickupCoord) {
 // their dropoff route recalculated as if starting fresh from the company
 // office, which can send them the LONG way around instead of continuing
 // on from where they actually are.
-function dropoffAnchor(allForDriver, pickupOrdered, companyCoord) {
+export function dropoffAnchor(allForDriver, pickupOrdered, companyCoord) {
   const lastPickup = pickupOrdered[pickupOrdered.length - 1]?.coord;
   return lastPickup ?? companyCoord;
 }
@@ -1314,7 +1314,7 @@ export function sortDropoffsByProximity(dropStops, lastPickupCoord) {
 // actually navigate, not a second, possibly-diverging guess. Includes
 // the road-distance correction factor (ROAD_FACTOR) since straight-line
 // haversine distance understates real driving distance.
-function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropoffs) {
+export function computeDriverRouteDistanceKm(startAnchor, orderedPickups, orderedDropoffs) {
   // Same duplicate-stop safety net as tomtomRealRouteKm — skip a leg
   // whose destination is the same physical location the driver is already
   // at (to ~1m precision), rather than adding an artificial zero-purpose
@@ -1395,6 +1395,29 @@ async function recomputeDriverRouteAndCompliance(driverTripRows, companyAnchor, 
   const policyCapKm = companyPolicyDistanceCapKm(totalAgentCount);
   const exceedsPolicy = routeDistanceKm > policyCapKm;
   return { seqMap, dropMap, totalAgentCount, routeDistanceKm, policyCapKm, exceedsPolicy, tomtomKm };
+}
+
+// Synchronous (haversine, no network) route + policy computation for a
+// driver's app-shaped trip set — the same buildPickupSequence ->
+// buildDropoffSequence(dropoffAnchor) -> computeDriverRouteDistanceKm ->
+// companyPolicyDistanceCapKm pipeline recomputeDriverRouteAndCompliance
+// runs, minus the TomTom optimisation/real-distance layer it adds for the
+// live write path. Extracted so the dispatch what-if preview (which can't
+// await a network call per render) shares one implementation with that
+// path instead of hand-rolling a 7th copy. Rows are app-shaped ({
+// trip_id, agent_ids, pickup_sequence_coords, dropoff_sequence_coords,
+// direction }); callers scope the set to one date themselves, matching
+// the Supabase dispatch handlers.
+export function driverRouteAndPolicySync(driverTripRows, companyAnchor) {
+  const ordered = buildPickupSequence(driverTripRows, companyAnchor);
+  const dropOrdered = buildDropoffSequence(driverTripRows, dropoffAnchor(driverTripRows, ordered, companyAnchor));
+  const seqMap = {}, dropMap = {};
+  ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+  dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+  const totalAgentCount = driverTripRows.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+  const routeDistanceKm = computeDriverRouteDistanceKm(companyAnchor, ordered, dropOrdered);
+  const policyCapKm = companyPolicyDistanceCapKm(totalAgentCount);
+  return { ordered, dropOrdered, seqMap, dropMap, totalAgentCount, routeDistanceKm, policyCapKm, exceedsPolicy: routeDistanceKm > policyCapKm };
 }
 
 // Earliest scheduledtime among a set of raw (DB-shaped) trip rows — used

@@ -40,6 +40,7 @@ import {
 import {
   computeGroupSuggestions,
   computeOpsExceptions,
+  computeDispatchWhatIf,
   cronIntervalMs,
   shiftDateStr,
   sastMidnightMs,
@@ -900,5 +901,94 @@ describe("cronIntervalMs — expected interval from a 5-field cron expr (Status 
     expect(cronIntervalMs(null)).toBeNull();
     expect(cronIntervalMs("30 seconds")).toBeNull();        // pg_cron interval form
     expect(cronIntervalMs("0 4 * * * *")).toBeNull();       // 6 fields
+  });
+});
+
+describe("computeDispatchWhatIf — pre-dispatch seat + route + policy preview", () => {
+  const CBD = { lat: -33.9249, lng: 18.4241 };          // Cape Town CBD (anchor fallback)
+  const NEAR = { lat: -33.93, lng: 18.45 };             // ~2.5 km from CBD
+  const FAR = { lat: -34.20, lng: 18.85 };              // ~45 km from CBD
+  const mkTrip = (id, agentIds, pickup, dropoff, over = {}) => ({
+    trip_id: id, agent_ids: agentIds, state: TRIP_STATE.UNASSIGNED_BOOKING,
+    scheduled_date: "2026/09/20", direction: "OUTBOUND",
+    pickup_sequence_coords: [{ ...pickup, agent_id: agentIds[0] }],
+    dropoff_sequence_coords: [{ ...dropoff, agent_id: agentIds[0] }],
+    ...over,
+  });
+  const stateWith = (trips, ds) => ({ trips, driver_status: ds, companies: [], users: [] });
+
+  it("returns null for a missing driver or an empty selection", () => {
+    expect(computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 4 }]), 9, [])).toBeNull();
+    expect(computeDispatchWhatIf(stateWith([], []), 9, [mkTrip("A", [1], NEAR, NEAR)])).toBeNull();
+  });
+
+  it("adds the incoming seats to the driver's current same-day load", () => {
+    const existing = { ...mkTrip("E", [1, 2], NEAR, NEAR), trip_id: "E", state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: 9 };
+    const sel = [mkTrip("NEW", [3], NEAR, NEAR)];
+    const w = computeDispatchWhatIf(stateWith([existing], [{ driver_id: 9, capacity: 4 }]), 9, sel);
+    expect(w.currentLoad).toBe(2);
+    expect(w.incomingSeats).toBe(1);
+    expect(w.newLoad).toBe(3);
+    expect(w.capacity).toBe(4);
+    expect(w.overCapacity).toBe(false);
+    expect(w.multiDay).toBe(false);
+    expect(w.route.otherActiveTrips).toBe(1);
+  });
+
+  it("flags over-capacity when the combined seats exceed the vehicle", () => {
+    const existing = { ...mkTrip("E", [1, 2, 3], NEAR, NEAR), trip_id: "E", state: TRIP_STATE.ASSIGNED, driver_id: 9 };
+    const w = computeDispatchWhatIf(stateWith([existing], [{ driver_id: 9, capacity: 4 }]), 9, [mkTrip("NEW", [4, 5], NEAR, NEAR)]);
+    expect(w.newLoad).toBe(5);
+    expect(w.overCapacity).toBe(true);
+  });
+
+  it("flags a route over the 40km-per-agent policy cap, and the amount over", () => {
+    const w = computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 4 }]), 9, [mkTrip("LONG", [1], CBD, FAR)]);
+    expect(w.route.capKm).toBe(40);            // 1 agent → 40km cap
+    expect(w.route.routeKm).toBeGreaterThan(40);
+    expect(w.route.exceedsPolicy).toBe(true);
+    expect(w.route.overByKm).toBeGreaterThan(0);
+  });
+
+  it("stays within policy for a short local route", () => {
+    const w = computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 4 }]), 9, [mkTrip("SHORT", [1], CBD, NEAR)]);
+    expect(w.route.routeKm).toBeLessThan(40);
+    expect(w.route.exceedsPolicy).toBe(false);
+  });
+
+  it("does not double-count a selected trip that's already assigned to this driver", () => {
+    const t = { ...mkTrip("T", [1], NEAR, NEAR), trip_id: "T", state: TRIP_STATE.ASSIGNED, driver_id: 9 };
+    const w = computeDispatchWhatIf(stateWith([t], [{ driver_id: 9, capacity: 4 }]), 9, [{ ...t }]);
+    expect(w.route.otherActiveTrips).toBe(0); // excluded from the route's "existing" set
+    expect(w.currentLoad).toBe(0);            // getDriverLoad sees it, but it's subtracted back out
+    expect(w.incomingSeats).toBe(1);
+    expect(w.newLoad).toBe(1);                // re-dispatch of one already-there trip = still 1, not 2
+  });
+
+  it("checks a multi-day selection per day (worst day), and shows no combined route", () => {
+    const d1 = [mkTrip("M1", [1, 2], NEAR, NEAR, { scheduled_date: "2026/09/21" })];
+    const d2 = [mkTrip("M2", [1, 2, 3], NEAR, NEAR, { scheduled_date: "2026/09/22" })]; // busier day
+    const w = computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 4 }]), 9, [...d1, ...d2]);
+    expect(w.multiDay).toBe(true);
+    expect(w.dayCount).toBe(2);
+    expect(w.newLoad).toBe(3);              // the worse of {2, 3}, NOT 2+3=5
+    expect(w.overCapacity).toBe(false);
+    expect(w.route).toBeNull();
+  });
+
+  it("mirrors DISPATCH_MULTI's merge — several same-day bookings route as ONE trip (first pickup + all dropoffs)", () => {
+    // 3 same-day bookings. buildPickupSequence uses pickup_sequence_coords[0]
+    // per trip, so the merged trip contributes only its FIRST pickup to
+    // sequencing; all 3 dropoffs still count. Route = CBD-anchor → p1 → d1 d2 d3.
+    const sel = [
+      mkTrip("A", [1], CBD, NEAR),
+      mkTrip("B", [2], FAR, NEAR),   // this pickup is dropped from the route (not first)
+      mkTrip("C", [3], FAR, NEAR),
+    ];
+    const w = computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 6 }]), 9, sel);
+    expect(w.incomingSeats).toBe(3);
+    expect(w.route.capKm).toBe(120);        // 3 agents → 120km cap
+    // Route stays modest because p2/p3 (FAR) don't add pickup legs — only d1..d3 (all NEAR) do.
+    expect(w.route.routeKm).toBeLessThan(120);
   });
 });

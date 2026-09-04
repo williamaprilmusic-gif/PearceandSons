@@ -49,6 +49,7 @@ import {
   csvEscapeCell,
   defaultCompanyAnchor,
   docExpiryStatus,
+  driverRouteAndPolicySync,
   driverAvgRating,
   driverPositionChannelName,
   epochToDisplay,
@@ -1321,6 +1322,133 @@ function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   );
   if (prevDeclinedThisAgent) score -= 10;
   return { score: Math.round(Math.max(0, Math.min(100, score))), proxScore: Math.round(proxScore), load, acceptRate, prevDeclinedThisAgent };
+}
+
+// "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
+// the outcome the admin is about to commit, matching how handleDispatch
+// actually routes the selection:
+//  - multi-DAY selection  → TRIP/BULK_ASSIGN_DRIVER (each date assigned
+//    independently, one vehicle carries one date's passengers at a time)
+//    → seats are checked PER DAY, and no single combined route is shown.
+//  - single-day, 1+ trips → TRIP/DISPATCH_MULTI folds them into ONE trip
+//    (concatenated pickup/dropoff coord lists) then TRIP/ASSIGN_DRIVER →
+//    mirror that merge, then run the exact same route + policy math.
+// Route km is the haversine estimate (matches the demo reducer); the
+// live Supabase path may shave a little off via TomTom optimisation,
+// hence "~".
+const ACTIVE_STATES_FOR_LOAD = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
+
+export function computeDispatchWhatIf(state, driverId, selectedTrips) {
+  const ds = (state.driver_status || []).find(d => String(d.driver_id) === String(driverId));
+  if (!ds || !selectedTrips || selectedTrips.length === 0) return null;
+  const capacity = ds.capacity || DRIVER_CAPACITY;
+  const allTrips = state.trips || [];
+  const selectedIds = new Set(selectedTrips.map(t => String(t.trip_id)));
+  const seatsOf = (trips) => trips.reduce((n, t) => n + Math.max(1, t.agent_ids?.length || 0), 0);
+
+  // Group the selection by date — BULK_ASSIGN assigns per date.
+  const byDate = new Map();
+  for (const t of selectedTrips) {
+    const d = t.scheduled_date;
+    if (!byDate.has(d)) byDate.set(d, []);
+    byDate.get(d).push(t);
+  }
+  const dates = [...byDate.keys()];
+  const multiDay = dates.length > 1;
+
+  // Seats: the WORST day — highest resulting on-vehicle count. currentLoad
+  // for a day excludes any selected trip already on this driver (a
+  // re-dispatch changes nothing), so it's not double-counted.
+  let worst = null;
+  for (const [d, dayTrips] of byDate) {
+    const alreadyOnDriver = allTrips.filter(t =>
+      String(t.driver_id) === String(driverId) && ACTIVE_STATES_FOR_LOAD.includes(t.state)
+      && t.scheduled_date === d && selectedIds.has(String(t.trip_id)));
+    const currentLoad = getDriverLoad(state, driverId, d) - seatsOf(alreadyOnDriver);
+    const incomingSeats = seatsOf(dayTrips);
+    const newLoad = currentLoad + incomingSeats;
+    if (!worst || newLoad > worst.newLoad) worst = { date: d, currentLoad, incomingSeats, newLoad };
+  }
+
+  const result = {
+    multiDay, dayCount: dates.length,
+    currentLoad: worst.currentLoad, incomingSeats: worst.incomingSeats, newLoad: worst.newLoad,
+    capacity, overCapacity: worst.newLoad > capacity, worstDate: multiDay ? worst.date : null,
+    route: null,
+  };
+
+  // Combined route only makes sense for a single-day dispatch.
+  if (!multiDay) {
+    const day = dates[0];
+    const dayTrips = byDate.get(day);
+    // DISPATCH_MULTI merges several same-day bookings into one trip; its
+    // route math then reads one coord per trip (pickup_sequence_coords[0])
+    // for sequencing and every dropoff coord for the drop legs — so a
+    // single synthetic trip with the concatenated coord lists reproduces
+    // exactly what gets stamped as driver_route_km.
+    const merged = dayTrips.length === 1 ? { ...dayTrips[0] } : {
+      trip_id: dayTrips[0].trip_id,
+      agent_ids: dayTrips.flatMap(t => t.agent_ids || []),
+      direction: dayTrips[0].direction,
+      scheduled_date: day,
+      pickup_sequence_coords: dayTrips.flatMap(t => t.pickup_sequence_coords || []),
+      dropoff_sequence_coords: dayTrips.flatMap(t => t.dropoff_sequence_coords || []),
+    };
+    const existingActive = allTrips.filter(t =>
+      String(t.driver_id) === String(driverId)
+      && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)
+      && t.scheduled_date === day                       // same-day route only
+      && !selectedIds.has(String(t.trip_id))
+    );
+    const allForDriver = [...existingActive, { ...merged, driver_id: driverId }];
+    // Same sync pipeline the Supabase dispatch handlers run
+    // (recomputeDriverRouteAndCompliance minus its TomTom layer). NOTE:
+    // this matches the LIVE (Supabase) path, which date-scopes the
+    // driver's other trips exactly as done here. The demo/offline reducer's
+    // route math is NOT date-scoped (it sums a driver's whole multi-day
+    // backlog into one route) — a known pre-existing inconsistency in the
+    // fallback path only; the preview follows what actually ships.
+    const { routeDistanceKm: routeKm, policyCapKm: capKm } = driverRouteAndPolicySync(allForDriver, defaultCompanyAnchor(state));
+    result.route = {
+      routeKm, capKm, exceedsPolicy: routeKm > capKm,
+      overByKm: Math.max(0, routeKm - capKm), otherActiveTrips: existingActive.length,
+    };
+  }
+  return result;
+}
+
+function DispatchWhatIfPanel({ whatIf, driverName }) {
+  if (!whatIf) return null;
+  const seatColor = whatIf.overCapacity ? COLORS.red : whatIf.newLoad === whatIf.capacity ? COLORS.amber : COLORS.green;
+  const r = whatIf.route;
+  return (
+    <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px", fontSize: 10, display: "flex", flexDirection: "column", gap: 4 }}>
+      <div style={{ fontSize: 8, color: COLORS.ghost, fontWeight: 700, letterSpacing: 1 }}>
+        IF DISPATCHED TO {(driverName || "this driver").toUpperCase()}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between" }}>
+        <span style={{ color: COLORS.mist }}>Seats{whatIf.multiDay ? ` (busiest of ${whatIf.dayCount} days${whatIf.worstDate ? `, ${whatIf.worstDate}` : ""})` : ""}</span>
+        <span style={{ color: seatColor, fontWeight: 700 }}>
+          {whatIf.currentLoad} + {whatIf.incomingSeats} = {whatIf.newLoad} / {whatIf.capacity}
+          {whatIf.overCapacity ? " — over capacity" : ""}
+        </span>
+      </div>
+      {r ? (
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <span style={{ color: COLORS.mist }}>Route{r.otherActiveTrips > 0 ? ` (with ${r.otherActiveTrips} existing trip${r.otherActiveTrips !== 1 ? "s" : ""})` : ""}</span>
+          <span style={{ color: r.exceedsPolicy ? COLORS.red : COLORS.green, fontWeight: 700 }}>
+            ~{r.routeKm.toFixed(1)} km / {r.capKm} km policy
+            {r.exceedsPolicy ? ` — over by ${r.overByKm.toFixed(1)} km` : ""}
+          </span>
+        </div>
+      ) : (
+        <div style={{ display: "flex", justifyContent: "space-between", color: COLORS.ghost }}>
+          <span>Route</span>
+          <span>{whatIf.dayCount} days — each assigned & capacity-checked separately</span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 async function tomtomGeocodeAddress(address) {
@@ -4297,6 +4425,17 @@ function AdminDispatch({ state, dispatch }) {
     return { pickupCoord, availableDrivers, nearestDriverId, topScoredDriverId, displayedDrivers };
   }, [primaryTrip, availableDriversRaw, selectedTrips, state.users, state.driver_positions, state.trips, driverSearch, nowTick]);
 
+  // "What-if" preview for the currently selected driver — the exact seat +
+  // route + policy outcome of dispatching this selection to them, shown on
+  // their card above the DISPATCH button. Cheap (the nearest-neighbour
+  // route math runs over just this driver's handful of trips) and only
+  // computed while a driver is actually selected.
+  const dispatchWhatIf = React.useMemo(
+    () => (selectedDriverId && selectedTrips.length ? computeDispatchWhatIf(state, selectedDriverId, selectedTrips) : null),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [state.trips, state.driver_status, state.companies, selectedDriverId, selectedTrips]
+  );
+
   const handleDispatch = async () => {
     // FOUND VIA AUDIT (2026-08-09): was `|| overCapacity` — overCapacity
     // is totalSeats > the bare DRIVER_CAPACITY default (4), unrelated to
@@ -4606,6 +4745,7 @@ function AdminDispatch({ state, dispatch }) {
                   </span>
                 )}
                 <CapacityBar load={load} capacity={driverCapacityDispatch} />
+                {sel && dispatchWhatIf && <DispatchWhatIfPanel whatIf={dispatchWhatIf} driverName={u?.name} />}
                 {/* FOUND VIA /code-review (10th pass): used to render
                     purely off `sel`, so changing the selection while a
                     dispatch was still in flight (a different trip
