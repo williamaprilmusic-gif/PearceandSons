@@ -317,6 +317,18 @@ function CapacityForecastPanel({ state }) {
   );
 }
 
+// Shared by isDriverOnShift and rosterOnShiftDay (the roster grid's own
+// "on shift at all today" check) — whether a slot's end is earlier than
+// its start, meaning it's a night shift that wraps past midnight and its
+// coverage spans into slot.day + 1. The single source of truth for that
+// rule, so a future change to it can't update one call site and miss
+// the other.
+function slotWrapsPastMidnight(slot) {
+  const [sh, sm] = slot.start.split(":").map(Number);
+  const [eh, em] = slot.end.split(":").map(Number);
+  return eh * 60 + em < sh * 60 + sm;
+}
+
 function isDriverOnShift(ds, scheduledDateStr, scheduledTimeStr) {
   const schedule = ds.availability_schedule;
   if (!schedule || schedule.length === 0) return true; // no schedule = always available
@@ -333,14 +345,13 @@ function isDriverOnShift(ds, scheduledDateStr, scheduledTimeStr) {
     const [eh, em] = slot.end.split(":").map(Number);
     const startMins = sh * 60 + sm;
     const endMins = eh * 60 + em;
-    if (endMins >= startMins) {
+    if (!slotWrapsPastMidnight(slot)) {
       // Normal same-day shift.
       return slot.day === tripDow && tripMins >= startMins && tripMins <= endMins;
     }
     // Shift crosses midnight (e.g. start:"22:00", end:"02:00" — a
-    // perfectly normal night shift). endMins < startMins used to make
-    // `tripMins >= startMins && tripMins <= endMins` impossible to
-    // satisfy for ANY minute of the day, so a night-shift driver was
+    // perfectly normal night shift). The old `endMins >= startMins`
+    // check made this branch unreachable, so a night-shift driver was
     // silently treated as off-shift for their entire actual shift,
     // including hours they explicitly configured as available —
     // excluded from real dispatch candidate lists and undercounted in
@@ -1373,32 +1384,25 @@ export function rosterMondayOf(slashDate) {
 }
 
 // Whether an availability_schedule has ANY slot touching this calendar
-// day-of-week — same night-shift-crossing logic as isDriverOnShift (a
-// slot whose end is earlier than its start wraps past midnight, so it
-// also covers the early hours of the FOLLOWING day), just answering "at
-// all today" instead of "at this specific time". Kept in sync with
-// isDriverOnShift deliberately: that function's own fix comment explains
-// why the naive same-day-only check silently excluded a night-shift
-// driver from dispatch candidate lists for their entire real shift —
-// this is the same bug shape for the roster's "off" dimming.
+// day-of-week — shares slotWrapsPastMidnight with isDriverOnShift (see
+// its own fix comment for why the naive same-day-only check silently
+// excluded a night-shift driver from dispatch candidate lists for their
+// entire real shift — this is the same bug shape for the roster's "off"
+// dimming), just answering "at all today" instead of "at this specific
+// time".
 function rosterOnShiftDay(schedule, dow) {
-  return schedule.some(s => {
-    if (s.day === dow) return true;
-    const [sh, sm] = s.start.split(":").map(Number);
-    const [eh, em] = s.end.split(":").map(Number);
-    const crossesMidnight = eh * 60 + em < sh * 60 + sm;
-    return crossesMidnight && (s.day + 1) % 7 === dow;
-  });
+  return schedule.some(s => s.day === dow || (slotWrapsPastMidnight(s) && (s.day + 1) % 7 === dow));
 }
 
 // Pure model for the roster grid: 7 dates from mondaySlash, each driver's
 // on-shift flag + assigned-trip load per day, and the unassigned bookings
 // ("gaps") per day. Seat math matches getDriverLoad (passengers on the
-// driver's active trips that date).
-export function buildRosterWeek(state, mondaySlash) {
+// driver's active trips that date). `usersById` is optional — pass the
+// caller's own (e.g. AdminRoster's, which needs the same map for gap-chip
+// labels) to avoid building an identical id->user Map twice.
+export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(state.users || [])) {
   const dates = Array.from({ length: 7 }, (_, i) => rosterAddDays(mondaySlash, i));
   const dateSet = new Set(dates);
-  const usersById = usersByIdMap(state.users || []);
   const ACTIVE = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
 
   const byDriverDate = new Map();
@@ -8813,23 +8817,50 @@ function EscalationRulesPanel({ rules, users, dispatch }) {
 // for the same day to dispatch. Read-only apart from that one assign
 // action — deeper edits stay in Dispatch / the driver shift editor.
 const ROSTER_DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+// Add/remove one value from a Set, immutably (for the two in-flight Sets
+// below — plain state, not refs, since their whole purpose is to drive
+// re-renders of every chip/cell that might be showing "busy").
+function withSetToggle(prevSet, value, present) {
+  const next = new Set(prevSet);
+  if (present) next.add(value); else next.delete(value);
+  return next;
+}
+
 function AdminRoster({ state, dispatch }) {
   const [monday, setMonday] = useState(() => rosterMondayOf(sastTodaySlashStr()));
   const [pending, setPending] = useState(null);    // { trip_id, date } picked to place by tap
   const [dragging, setDragging] = useState(null);  // { trip_id, date } during a drag
-  const [assigningCell, setAssigningCell] = useState(null); // `${driver_id}|${date}` in flight
-  const [busyTripId, setBusyTripId] = useState(null); // gap chip currently being assigned
+  // Sets, not single values — an admin can have MORE THAN ONE assign in
+  // flight at once (drag booking A onto driver X, then immediately drag
+  // B onto driver Y before A resolves); a single "current busy" value
+  // would make A's chip/cell look idle again the moment B starts.
+  const [assigningCells, setAssigningCells] = useState(() => new Set()); // `${driver_id}|${date}` keys in flight
+  const [busyTripIds, setBusyTripIds] = useState(() => new Set());       // gap-chip trip ids in flight
   const [msg, setMsg] = useState(null);
   // Synchronous guard (mutated immediately, not via setState) against
   // assigning the SAME booking twice from a rapid double-tap/drop before
   // the first request resolves — same shape as Dispatch's own
   // dispatchingRef, needed for the identical reason: React state updates
   // aren't visible to a second invocation that starts before the first
-  // one's setAssigningCell has committed.
+  // one's setAssigningCells has committed.
   const assigningTripIdsRef = useRef(new Set());
 
-  const week = React.useMemo(() => buildRosterWeek(state, monday), [state, monday]);
+  // Switching weeks invalidates any in-progress pick/drag (its date
+  // belongs to the week just left, and no cell in the new week can ever
+  // match it) — clear both so the "drop on a driver's ___ cell" hint and
+  // the picked-chip highlight don't get stuck pointing at a date that's
+  // no longer on screen.
+  const changeWeek = (next) => { setMonday(next); setPending(null); setDragging(null); };
+
   const usersById = React.useMemo(() => usersByIdMap(state.users || []), [state.users]);
+  // Deliberately narrowed to what buildRosterWeek actually reads (trips,
+  // driver_status, users via usersById) — not the whole `state` object,
+  // which gets a new identity on every unrelated poll/realtime update
+  // (a GPS ping, a new notification) and would otherwise force a full
+  // O(trips + drivers×7) recompute of this grid on every one of them
+  // while the tab is open.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const week = React.useMemo(() => buildRosterWeek(state, monday, usersById), [state.trips, state.driver_status, usersById, monday]);
 
   const activePlace = dragging || pending;
 
@@ -8838,7 +8869,9 @@ function AdminRoster({ state, dispatch }) {
     if (assigningTripIdsRef.current.has(booking.trip_id)) return;
     assigningTripIdsRef.current.add(booking.trip_id);
     const cellKey = `${driver_id}|${date}`;
-    setAssigningCell(cellKey); setBusyTripId(booking.trip_id); setMsg(null);
+    setAssigningCells(prev => withSetToggle(prev, cellKey, true));
+    setBusyTripIds(prev => withSetToggle(prev, booking.trip_id, true));
+    setMsg(null);
     try {
       await dispatch({ type: "TRIP/ASSIGN_DRIVER", trip_id: booking.trip_id, driver_id });
       setMsg(`✓ Assigned ${(booking.agent_ids || []).map(id => usersById.get(String(id))?.name).filter(Boolean).join(", ") || "booking"} to ${usersById.get(String(driver_id))?.name || "driver"}`);
@@ -8846,7 +8879,12 @@ function AdminRoster({ state, dispatch }) {
       setMsg(`✗ ${e.message || "Couldn't assign — try again."}`);
     } finally {
       assigningTripIdsRef.current.delete(booking.trip_id);
-      setAssigningCell(null); setBusyTripId(null); setPending(null); setDragging(null);
+      setAssigningCells(prev => withSetToggle(prev, cellKey, false));
+      setBusyTripIds(prev => withSetToggle(prev, booking.trip_id, false));
+      // Only clear the pick/drag if THIS assign was the one active — a
+      // second pick made while this one was still in flight must survive.
+      setPending(p => (p?.trip_id === booking.trip_id ? null : p));
+      setDragging(d => (d?.trip_id === booking.trip_id ? null : d));
       setTimeout(() => setMsg(null), 4000);
     }
   };
@@ -8865,9 +8903,9 @@ function AdminRoster({ state, dispatch }) {
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
         <SectionHeader label="Roster" />
         <div style={{ flex: 1 }} />
-        <Button size="sm" variant="ghost" title="‹ PREV" onClick={() => setMonday(m => rosterAddDays(m, -7))} />
-        <Button size="sm" variant="ghost" title="THIS WEEK" onClick={() => setMonday(rosterMondayOf(sastTodaySlashStr()))} />
-        <Button size="sm" variant="ghost" title="NEXT ›" onClick={() => setMonday(m => rosterAddDays(m, 7))} />
+        <Button size="sm" variant="ghost" title="‹ PREV" onClick={() => changeWeek(rosterAddDays(monday, -7))} />
+        <Button size="sm" variant="ghost" title="THIS WEEK" onClick={() => changeWeek(rosterMondayOf(sastTodaySlashStr()))} />
+        <Button size="sm" variant="ghost" title="NEXT ›" onClick={() => changeWeek(rosterAddDays(monday, 7))} />
       </div>
       <div style={{ fontSize: 10, color: COLORS.ghost, marginBottom: 8 }}>
         Week of {week.dates[0]} — {week.dates[6]}
@@ -8890,7 +8928,7 @@ function AdminRoster({ state, dispatch }) {
               </span>
               {g.bookings.map(b => {
                 const picked = pending?.trip_id === b.trip_id;
-                const busy = busyTripId === b.trip_id;
+                const busy = busyTripIds.has(b.trip_id);
                 return (
                   <span key={b.trip_id}
                     draggable={!busy}
@@ -8940,7 +8978,7 @@ function AdminRoster({ state, dispatch }) {
               {driver.days.map(day => {
                 const cellKey = `${driver.driver_id}|${day.date}`;
                 const isDropTarget = activePlace && activePlace.date === day.date;
-                const inFlight = assigningCell === cellKey;
+                const inFlight = assigningCells.has(cellKey);
                 return (
                   <div key={day.date}
                     onDragOver={e => { if (isDropTarget) e.preventDefault(); }}
