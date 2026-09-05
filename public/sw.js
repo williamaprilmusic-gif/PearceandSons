@@ -4,16 +4,27 @@ const CACHE = 'transitos-v1';
 const PRECACHE = ['/', '/index.html'];
 
 self.addEventListener('install', e => {
-  // Deliberately keep addAll's fail-safe semantics: if a precache URL
-  // can't be fetched (mid-deploy 5xx, a blip right after load), the whole
-  // install rejects, NO worker activates, the browser handles the page
-  // normally, and the full precache is retried on the next load. The
-  // alternative (install anyway with a half-empty cache) lets the worker
-  // claim the page while the navigate handler's offline fallback has
-  // nothing to serve — a worse failure than "no worker yet".
-  e.waitUntil(
-    caches.open(CACHE).then(c => c.addAll(PRECACHE)).then(() => self.skipWaiting())
-  );
+  // addAll is kept fail-safe: if precache can't complete, install
+  // rejects, NO worker activates, the browser handles the page normally,
+  // and the whole precache is retried on the next load. Installing anyway
+  // with a half-empty cache (an earlier attempt at this) is worse — the
+  // worker claims the page while its offline navigate fallback has
+  // nothing to serve.
+  //
+  // But a single transient blip on '/' or '/index.html' during a deploy
+  // shouldn't cost the first-ever worker its install, so addAll gets a
+  // short bounded retry first. Only if every attempt fails does install
+  // fail (intended).
+  const precacheWithRetry = async () => {
+    const c = await caches.open(CACHE);
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 400 * attempt));
+      try { await c.addAll(PRECACHE); return; } catch (err) { lastErr = err; }
+    }
+    throw lastErr;
+  };
+  e.waitUntil(precacheWithRetry().then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {

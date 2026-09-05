@@ -8858,18 +8858,22 @@ function AdminStatus() {
         // at page load (network blip, a deploy mid-load).
         if (!reg) {
           const bootErr = typeof window !== "undefined" ? window.__swRegistrationError : null;
+          let regErrMsg = null;
           try {
-            // register() per spec resolves to a ServiceWorkerRegistration
-            // or rejects — never a falsy value — so no null-check after.
             reg = await navigator.serviceWorker.register("/sw.js");
           } catch (regErr) {
-            // Kept as "warn", not "down": a browser/context that refuses
-            // SW registration (private window, enterprise policy, non-
-            // HTTPS host) is a degraded PWA, not an app outage — the
-            // header shouldn't read "problem detected" when DB/realtime/
-            // cron are all healthy.
-            const msg = regErr?.message || bootErr || "registration rejected";
-            return { status: "warn", detail: `not registered — ${msg}` };
+            regErrMsg = regErr?.message || null;
+          }
+          if (!reg) {
+            const msg = regErrMsg || bootErr || "registration rejected";
+            // Distinguish a genuinely broken deploy of sw.js (404, wrong
+            // MIME type, script syntax/eval error) — which really does
+            // mean the offline/push layer is down in production and the
+            // header SHOULD go red — from a browser/context that just
+            // refuses SW registration (private window, enterprise policy,
+            // non-HTTPS host), which is a degraded PWA, not an outage.
+            const brokenScript = /mime type|unsupported|bad http|404|script evaluation failed|failed to fetch/i.test(msg);
+            return { status: brokenScript ? "down" : "warn", detail: `not registered — ${msg}` };
           }
         }
         if (reg.waiting) return { status: "warn", detail: "update downloaded — pending a reload to activate" };
