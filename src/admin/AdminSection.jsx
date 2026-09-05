@@ -8845,13 +8845,32 @@ function AdminStatus() {
     // 4. Service worker
     const swP = (async () => {
       try {
-        if (!("serviceWorker" in navigator)) return { status: "warn", detail: "not supported in this browser" };
-        const reg = await navigator.serviceWorker.getRegistration();
-        if (!reg) return { status: "warn", detail: "not registered" };
+        if (!("serviceWorker" in navigator)) {
+          return { status: "warn", detail: "not supported in this browser/context (needs HTTPS or localhost; blocked in private windows on some browsers)" };
+        }
+        let reg = await navigator.serviceWorker.getRegistration();
+        // No registration for this scope. The bootstrap registration in
+        // index.html records why it failed on window.__swRegistrationError;
+        // surface that real reason instead of a bare "not registered".
+        // Then try registering again right here — register() is
+        // idempotent (returns the existing registration if there is one),
+        // so this doubles as a one-tap self-heal for a transient failure
+        // at page load (network blip, a deploy mid-load).
+        if (!reg) {
+          const bootErr = typeof window !== "undefined" ? window.__swRegistrationError : null;
+          try {
+            reg = await navigator.serviceWorker.register("/sw.js");
+          } catch (regErr) {
+            const msg = regErr?.message || bootErr || "registration rejected";
+            return { status: "down", detail: `not registered — ${msg}` };
+          }
+          if (!reg) return { status: "down", detail: `not registered${bootErr ? ` — ${bootErr}` : ""}` };
+        }
         if (reg.waiting) return { status: "warn", detail: "update downloaded — pending a reload to activate" };
         if (reg.active && navigator.serviceWorker.controller) return { status: "ok", detail: "active and controlling this page" };
-        if (reg.active) return { status: "warn", detail: "active but not yet controlling this page (first load)" };
-        return { status: "warn", detail: "registered, no active worker" };
+        if (reg.active) return { status: "warn", detail: "active but not yet controlling this page — reload to let it take over" };
+        if (reg.installing) return { status: "warn", detail: "installing now — recheck in a few seconds" };
+        return { status: "warn", detail: "registered, no active worker yet" };
       } catch (e) {
         return { status: "warn", detail: e?.message || "check failed" };
       }

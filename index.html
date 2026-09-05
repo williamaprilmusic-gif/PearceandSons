@@ -36,10 +36,25 @@
     </script>
     <script type="module" src="/src/main.jsx"></script>
     <script>
+      // Register the offline/push service worker after load so it never
+      // competes with first render. The outcome is stashed on window so
+      // the admin System Health panel can report the ACTUAL failure
+      // reason (MIME type, 404, policy block, importScripts throw, ...)
+      // instead of a bare "not registered" — the old silent
+      // .catch(() => {}) threw away the one useful diagnostic.
+      window.__swRegistration = null;
+      window.__swRegistrationError = null;
       if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js').catch(() => {});
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('/sw.js').then(function (reg) {
+            window.__swRegistration = reg;
+          }).catch(function (err) {
+            window.__swRegistrationError = (err && err.message) || String(err);
+            console.warn('[PWA] service worker registration failed:', err);
+          });
         });
+      } else {
+        window.__swRegistrationError = 'serviceWorker not supported in this browser/context';
       }
     </script>
   </body>
