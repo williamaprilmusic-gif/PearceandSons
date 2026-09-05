@@ -486,7 +486,9 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
               <div style={{
                 position: "absolute", bottom: "calc(100% + 8px)", right: 0,
                 background: "rgba(10,10,10,.96)", border: `1px solid ${COLORS.wire}`, borderRadius: 10,
-                padding: 8, display: "flex", gap: 4, boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 700,
+                padding: 8, display: "flex", gap: 4, flexWrap: "wrap", justifyContent: "flex-end",
+                width: "min(300px, calc(100vw - 24px))",
+                boxShadow: "0 4px 16px rgba(0,0,0,.5)", zIndex: 700,
               }}>
                 {HAZARD_CATEGORIES.map(c => (
                   <button

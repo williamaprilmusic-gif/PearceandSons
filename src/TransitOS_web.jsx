@@ -3355,14 +3355,20 @@ const TRAFFIC_INCIDENT_LABEL = {
 
 // Driver peer-to-peer hazard report categories — the one-tap icon picker
 // matching Waze's own report flow (tap the report button, then tap a
-// category icon), per explicit request. Kept to Waze's canonical
-// categories, adapted since real Waze incident data itself has no
+// category icon), per explicit request. Modeled on Waze's own top-level
+// report grid, adapted since real Waze incident data itself has no
 // accessible API (see project memory) — this is the in-house stand-in.
+// hazard_reports.category has no DB CHECK constraint (verified), so new
+// keys are safe to add; DRIVER/REPORT_HAZARD stores whatever key is sent.
 export const HAZARD_CATEGORIES = [
   { key: "police", icon: "👮", label: "Police" },
-  { key: "accident", icon: "💥", label: "Accident" },
-  { key: "traffic_jam", icon: "🐢", label: "Traffic Jam" },
+  { key: "speed_camera", icon: "📷", label: "Camera" },
+  { key: "accident", icon: "💥", label: "Crash" },
+  { key: "traffic_jam", icon: "🐢", label: "Traffic" },
   { key: "hazard", icon: "⚠️", label: "Hazard" },
+  { key: "vehicle_stopped", icon: "🚗", label: "Car Stopped" },
+  { key: "roadworks", icon: "🚧", label: "Roadworks" },
+  { key: "bad_weather", icon: "🌧️", label: "Weather" },
   { key: "road_closed", icon: "⛔", label: "Closure" },
 ];
 export const HAZARD_CATEGORY_ICON = Object.fromEntries(HAZARD_CATEGORIES.map(c => [c.key, c.icon]));

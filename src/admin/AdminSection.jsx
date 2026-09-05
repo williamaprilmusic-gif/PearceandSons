@@ -5264,9 +5264,11 @@ const QUICK_ADVISORIES = [
   { key: "road_closed", icon: "⛔", label: "Closed", message: "Road closed here — use an alternate route." },
   { key: "protest", icon: "✊", label: "Protest", message: "Protest / demonstration here — avoid the area." },
   { key: "traffic", icon: "🐢", label: "Traffic", message: "Heavy traffic here — expect delays." },
+  { key: "accident", icon: "💥", label: "Crash", message: "Crash reported here — expect delays." },
   { key: "roadworks", icon: "🚧", label: "Roadworks", message: "Roadworks here — expect delays." },
-  { key: "flooding", icon: "🌊", label: "Flooding", message: "Flooding here — avoid if possible." },
+  { key: "speed_camera", icon: "📷", label: "Camera", message: "Speed camera here." },
   { key: "police", icon: "👮", label: "Police", message: "Police checkpoint here." },
+  { key: "bad_weather", icon: "🌧️", label: "Weather", message: "Poor road conditions / weather here — drive with caution." },
 ];
 
 function RouteAdvisoryPanel({ state, dispatch, onClose }) {
