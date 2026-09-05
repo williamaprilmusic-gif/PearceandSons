@@ -1270,6 +1270,21 @@ describe("computeDriverShiftIntervals — merges ONLINE/OFFLINE presence history
     expect(result["1"]).toEqual([[DAY0, DAY0 + H]]);
     expect(result["2"]).toEqual([[DAY0 + 5 * H, DAY0 + 6 * H]]);
   });
+
+  it("caps a stuck-open ONLINE from a crashed session, so a week-old dangling row doesn't claim the whole report window", () => {
+    // No OFFLINE ever recorded (isonline stuck true) — started 5 days before the window.
+    const rows = [{ driver_id: "1", event: "ONLINE", ts: DAY0 - 5 * 24 * H }];
+    const result = computeDriverShiftIntervals(rows, DAY0, DAY0 + 24 * H);
+    // Trusted only through openStart + 24h, which is still 4 days before fromMs -> no interval survives clipping.
+    expect(result["1"]).toBeUndefined();
+  });
+
+  it("still credits a legitimately-open shift that started just before the window, capped at a plausible single-shift length", () => {
+    const rows = [{ driver_id: "1", event: "ONLINE", ts: DAY0 - 2 * H }]; // started 2h before the window, still open
+    const result = computeDriverShiftIntervals(rows, DAY0, DAY0 + 24 * H);
+    // Trusted through openStart + 24h = DAY0 + 22h, clipped to the window.
+    expect(result["1"]).toEqual([[DAY0, DAY0 + 22 * H]]);
+  });
 });
 
 describe("computeFleetUtilization — real idle time from presence history, with a proxy fallback", () => {
@@ -1316,5 +1331,26 @@ describe("computeFleetUtilization — real idle time from presence history, with
     const row = rows.find(r => r.driver_id === "2");
     expect(row.gap_is_real).toBe(false);
     expect(row.gap_ms).toBe(2 * H);
+  });
+
+  it("clips driving/loading to the report window too, keeping driving_ms + loading_ms + gap_ms consistent with onlineMs", () => {
+    // Loading starts 1h before the window and ends exactly at its start (0ms actually inside the window).
+    // Driving runs 2h, fully inside the window.
+    const trips = [{
+      driver_id: "1", confirmed_at_epoch: DAY0 - H, in_transit_at_epoch: DAY0, completed_at_epoch: DAY0 + 2 * H,
+    }];
+    const statusHistory = [
+      { driver_id: "1", event: "ONLINE", ts: DAY0 - 3 * H },
+      { driver_id: "1", event: "OFFLINE", ts: DAY0 + 10 * H },
+    ];
+    const rows = computeFleetUtilization(trips, users, { statusHistory, fromMs: DAY0, toMs: DAY0 + 24 * H });
+    const row = rows.find(r => r.driver_id === "1");
+    expect(row.loading_ms).toBe(0); // entirely before the window
+    expect(row.driving_ms).toBe(2 * H); // entirely inside the window
+    // Online interval clipped to [DAY0, DAY0+10h] = 10h. Idle = 10h - 2h driving - 0h loading = 8h.
+    expect(row.gap_ms).toBe(8 * H);
+    // The invariant a boundary-straddling trip used to break: these three
+    // figures should sum to exactly the driver's real online time in the window.
+    expect(row.driving_ms + row.loading_ms + row.gap_ms).toBe(10 * H);
   });
 });

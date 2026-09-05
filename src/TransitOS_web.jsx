@@ -2940,8 +2940,9 @@ export function computeDriverHoursThisWeek(driverId, trips, nowMs = Date.now()) 
 //     right after this feature shipped) is ignored, not treated as a
 //     negative-length interval;
 //   - a shift still open at the end of the queried rows runs through
-//     toMs, not real-world "now" — a report for a past date range
-//     shouldn't count presence beyond the range being reported.
+//     toMs, capped at MAX_TRUSTED_OPEN_SHIFT_MS past its own start rather
+//     than the real-world "now" OR the full report window — see the
+//     dedicated comment on that constant below for why.
 // KNOWN, ACCEPTED LIMITATION (FOUND VIA /code-review, not fixed — fixing
 // it needs per-device session tracking, a much bigger change than this
 // feature's scope): this treats ONLINE/OFFLINE as one flat timeline per
@@ -2955,6 +2956,23 @@ export function computeDriverHoursThisWeek(driverId, trips, nowMs = Date.now()) 
 // logins aren't an expected normal workflow in this app, so this is
 // treated as a rare, minor undercount rather than something worth a
 // larger redesign right now.
+//
+// FOUND VIA /code-review, 2nd pass: fetchDriverStatusHistory's lookback
+// widened from 1 day to 7 (to catch a shift that legitimately started
+// before fromMs and is still open) made a DIFFERENT, worse failure mode
+// 7x more likely — a driver whose session crashed without ever writing an
+// OFFLINE (isonline stuck true, a known real occurrence per
+// DRIVER/CHECK_SHIFT_DURATION's own advisory elsewhere in this file) now
+// has that dangling ONLINE pulled in from up to a week back, and "still
+// open, runs through toMs" would then claim the driver was online for the
+// driver's ENTIRE report window with gap_is_real:true — a confidently
+// WRONG number (0h idle) replacing what used to be an honest "Estimated"
+// fallback. No open interval is trusted for longer than a plausible
+// single shift; one that would need to be trusted longer is capped at
+// that point instead of running to toMs, and if the capped end doesn't
+// even reach fromMs, the interval contributes nothing to this report,
+// correctly leaving the driver to fall back to the honest proxy.
+const MAX_TRUSTED_OPEN_SHIFT_MS = 24 * 60 * 60 * 1000; // generously above MAX_DRIVER_HOURS_PER_DAY (12h)
 export function computeDriverShiftIntervals(historyRows, fromMs, toMs) {
   const byDriver = {};
   for (const r of historyRows || []) {
@@ -2974,7 +2992,7 @@ export function computeDriverShiftIntervals(historyRows, fromMs, toMs) {
         openStart = null;
       }
     }
-    if (openStart != null) intervals.push([openStart, toMs]);
+    if (openStart != null) intervals.push([openStart, Math.min(toMs, openStart + MAX_TRUSTED_OPEN_SHIFT_MS)]);
     const clipped = intervals
       .map(([s, e]) => [Math.max(s, fromMs), Math.min(e, toMs)])
       .filter(([s, e]) => e > s);
@@ -3009,20 +3027,24 @@ export function computeFleetUtilization(trips, users, options = {}) {
   const rows = [];
   for (const driverId of Object.keys(byDriver)) {
     const sorted = [...byDriver[driverId]].sort((a, b) => (a.confirmed_at_epoch || a.booked_at_epoch || 0) - (b.confirmed_at_epoch || b.booked_at_epoch || 0));
+    // FOUND VIA /code-review, 2nd pass: driving/loading need to be measured
+    // on the SAME window as onlineMs (which computeDriverShiftIntervals
+    // clips to [fromMs, toMs]) for the idle subtraction below to be
+    // meaningful — a trip that's in this report only because its
+    // completedat falls inside the range (fetchTripHistory's own filter)
+    // can still have STARTED well before fromMs. A first version of this
+    // fix tracked a SEPARATE clipped accumulator only for the subtraction,
+    // leaving the returned driving_ms/loading_ms unclipped — that broke
+    // the invariant driving_ms + loading_ms + gap_ms == onlineMs that
+    // AdminSection.jsx's percentage bar and CSV export both rely on
+    // (totalMs = r.driving_ms + r.loading_ms + r.gap_ms), producing
+    // percentages/hours that could sum to more than the report's own
+    // window. clipToWindow is now the ONLY accumulation — when no window
+    // is given at all (fromMs/toMs both null) it returns the full
+    // unclipped duration, so a caller that doesn't pass a window (or the
+    // pre-existing v1-only call shape) sees byte-identical figures to
+    // before this feature existed.
     let drivingMs = 0, loadingMs = 0, gapMs = 0;
-    // FOUND VIA /code-review: the real-idle subtraction below needs
-    // driving/loading time measured on the SAME window as onlineMs (which
-    // computeDriverShiftIntervals clips to [fromMs, toMs]) — a trip that's
-    // IN this report only because its completedat falls inside the range
-    // (fetchTripHistory's own filter) can still have STARTED well before
-    // fromMs, so its full drivingMs/loadingMs would otherwise be measured
-    // on a wider window than onlineMs and could exceed it, going negative
-    // and silently clamping to 0 — understating a driver's real idle time
-    // for any report whose boundary falls mid-shift/mid-trip, not an
-    // exotic case. Tracked separately from the unclipped drivingMs/
-    // loadingMs below (which still feed the DRIVING/LOADING display
-    // figures exactly as before — only the idle subtraction changes).
-    let drivingMsInWindow = 0, loadingMsInWindow = 0;
     const clipToWindow = (s, e) => {
       if (fromMs == null || toMs == null) return e - s;
       const cs = Math.max(s, fromMs), ce = Math.min(e, toMs);
@@ -3031,14 +3053,8 @@ export function computeFleetUtilization(trips, users, options = {}) {
     for (let i = 0; i < sorted.length; i++) {
       const t = sorted[i];
       const { confirmed_at_epoch: confirmedAt, in_transit_at_epoch: inTransitAt, completed_at_epoch: completedAt } = t;
-      if (confirmedAt && inTransitAt && inTransitAt > confirmedAt) {
-        loadingMs += inTransitAt - confirmedAt;
-        loadingMsInWindow += clipToWindow(confirmedAt, inTransitAt);
-      }
-      if (inTransitAt && completedAt && completedAt > inTransitAt) {
-        drivingMs += completedAt - inTransitAt;
-        drivingMsInWindow += clipToWindow(inTransitAt, completedAt);
-      }
+      if (confirmedAt && inTransitAt && inTransitAt > confirmedAt) loadingMs += clipToWindow(confirmedAt, inTransitAt);
+      if (inTransitAt && completedAt && completedAt > inTransitAt) drivingMs += clipToWindow(inTransitAt, completedAt);
       const next = sorted[i + 1];
       if (next && completedAt) {
         const nextStart = next.confirmed_at_epoch || next.booked_at_epoch;
@@ -3052,7 +3068,7 @@ export function computeFleetUtilization(trips, users, options = {}) {
     let idleMs = gapMs, idleIsReal = false;
     if (shiftIntervals && shiftIntervals.length) {
       const onlineMs = shiftIntervals.reduce((sum, [s, e]) => sum + (e - s), 0);
-      idleMs = Math.max(0, onlineMs - drivingMsInWindow - loadingMsInWindow);
+      idleMs = Math.max(0, onlineMs - drivingMs - loadingMs);
       idleIsReal = true;
     }
     rows.push({ driver_id: driverId, driver_name: u?.name || driverId, trips: sorted.length, driving_ms: drivingMs, loading_ms: loadingMs, gap_ms: idleMs, gap_is_real: idleIsReal });
@@ -6712,8 +6728,31 @@ export async function fetchDriverStatusHistory({ fromMs, toMs, driverId } = {}) 
   // real scale (~1800 agents per project memory; tens of thousands of
   // ONLINE/OFFLINE rows over a 30-day report), which would drop OFFLINE
   // events specifically and corrupt the merge rather than just showing
-  // fewer rows. Paginates until a page comes back short of PAGE_SIZE,
-  // rather than trusting one unbounded select to return everything.
+  // fewer rows. Paginates rather than trusting one unbounded select to
+  // return everything.
+  //
+  // FOUND VIA /code-review, 2nd pass, two more things wrong with the
+  // first version of this pagination:
+  //   1. It stopped as soon as a page came back shorter than PAGE_SIZE —
+  //      which assumes the server always honors the FULL range requested.
+  //      If this project's PostgREST max-rows setting is ever below
+  //      PAGE_SIZE (not visible/verifiable from this file, could change
+  //      independently of this code), every page would silently come back
+  //      short and the loop would stop after page 1, reproducing the
+  //      exact truncation bug this rewrite exists to fix. Now the ONLY
+  //      stop condition is a genuinely EMPTY page, and the offset always
+  //      advances by however many rows actually came back (not the
+  //      requested PAGE_SIZE) — correct regardless of what the server's
+  //      real per-request cap turns out to be, at the cost of one
+  //      possible extra round trip when the true count lands exactly on
+  //      a PAGE_SIZE multiple.
+  //   2. Ordering by `ts` alone has no tiebreaker, and this table can
+  //      receive concurrent inserts from other drivers logging in/out
+  //      while this report is running — OFFSET pagination over a live,
+  //      untied sort order can skip or duplicate rows sitting at a page
+  //      boundary. Added `id` (this table's own bigserial PK) as a
+  //      secondary sort key, same fix already applied to the notifications
+  //      query for the identical reason (see fetchAllFromSupabase).
   const PAGE_SIZE = 1000;
   // 7 days, not 1 — a shift can be left open well past its real end (e.g.
   // isonline stuck true from a crashed session, the same known failure
@@ -6721,23 +6760,25 @@ export async function fetchDriverStatusHistory({ fromMs, toMs, driverId } = {}) 
   // file) and still needs its ONLINE row pulled in so
   // computeDriverShiftIntervals can close it against an OFFLINE landing
   // inside the report window, instead of seeing a stray OFFLINE with
-  // nothing to match and dropping that chunk of real online time. A shift
-  // still open past 7 days would itself be a bigger anomaly than this
-  // report can fix — an accepted residual limitation beyond that point.
+  // nothing to match and dropping that chunk of real online time. Safe to
+  // widen this far specifically because computeDriverShiftIntervals now
+  // also caps how long a still-open interval is trusted for (see
+  // MAX_TRUSTED_OPEN_SHIFT_MS) — pulling in a dangling week-old ONLINE no
+  // longer risks claiming a driver was online for the whole report window.
   const LOOKBACK_MS = 7 * 24 * 3600 * 1000;
   const rows = [];
   let offset = 0;
   for (;;) {
     let q = supabase.from("driver_status_history").select("driverid, event, ts")
-      .order("ts", { ascending: true }).range(offset, offset + PAGE_SIZE - 1);
+      .order("ts", { ascending: true }).order("id", { ascending: true }).range(offset, offset + PAGE_SIZE - 1);
     if (fromMs != null) q = q.gte("ts", fromMs - LOOKBACK_MS);
     if (toMs != null) q = q.lte("ts", toMs);
     if (driverId != null) q = q.eq("driverid", driverId);
     const { data, error } = await q;
     if (error) throw error;
-    rows.push(...(data || []));
-    if (!data || data.length < PAGE_SIZE) break;
-    offset += PAGE_SIZE;
+    if (!data || data.length === 0) break;
+    rows.push(...data);
+    offset += data.length;
   }
   return rows.map(r => ({ driver_id: sid(r.driverid), event: r.event, ts: r.ts }));
 }
