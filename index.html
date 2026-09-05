@@ -18,6 +18,22 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Capture beforeinstallprompt BEFORE the app bundle loads. Chrome
+      // fires it once, early, and does not re-fire — if the React listener
+      // isn't attached yet (lazy chunks still loading) the event is lost
+      // and the in-app "Install App" button never appears. Stash it on
+      // window here; AppInner reads window.__deferredInstallPrompt on mount.
+      window.__deferredInstallPrompt = null;
+      window.addEventListener('beforeinstallprompt', function (e) {
+        e.preventDefault();
+        window.__deferredInstallPrompt = e;
+        window.dispatchEvent(new Event('transitos:installpromptready'));
+      });
+      window.addEventListener('appinstalled', function () {
+        window.__deferredInstallPrompt = null;
+      });
+    </script>
     <script type="module" src="/src/main.jsx"></script>
     <script>
       if ('serviceWorker' in navigator) {

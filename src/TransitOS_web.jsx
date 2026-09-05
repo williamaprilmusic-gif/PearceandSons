@@ -7362,7 +7362,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // device's row now; the next login on this device recreates it.
         try {
           if ("serviceWorker" in navigator && "PushManager" in window) {
-            const loggedOutReg = await navigator.serviceWorker.ready;
+            // navigator.serviceWorker.ready NEVER rejects and waits
+            // INDEFINITELY if no SW ever becomes active (registration
+            // failed silently — index.html's register() .catch()es and
+            // swallows, a privacy-restricted context, an embedded webview
+            // that blocks SW). This await sits directly in the logout
+            // path, so an un-timed-out hang here means logout itself
+            // never completes and the UI never returns to the login
+            // screen — a real "logout doesn't work" report. Race it
+            // against a short timeout; the push-subscription cleanup is
+            // best-effort anyway.
+            const loggedOutReg = await Promise.race([
+              navigator.serviceWorker.ready,
+              new Promise((_, rej) => setTimeout(() => rej(new Error("serviceWorker.ready timed out")), 3000)),
+            ]);
             const loggedOutSub = await loggedOutReg.pushManager.getSubscription();
             if (loggedOutSub) {
               await supabase.from("push_subscriptions").delete().eq("endpoint", loggedOutSub.endpoint).eq("userid", loggedOutUserId);
@@ -11754,7 +11767,21 @@ function useAppStore() {
       return;
     }
     try {
-      return await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports, fetchEscalationRules });
+      const supaResult = await handleSupabaseAction(action, activeUserRef, refetch, { fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports, fetchEscalationRules });
+      // Guarantee the UI returns to the login screen on logout. The
+      // handler already clears activeUserRef + the persisted id/token and
+      // calls refetch() to fold `active_user_id: null` into supaState —
+      // but that refetch does a full network fetchAllFromSupabase, and if
+      // it fails or is slow (patchy signal, the exact condition this app
+      // runs in), refetch's own catch KEEPS the last-known-good supaState,
+      // which still has the old active_user_id set — so logout silently
+      // appears to do nothing. Clear it here synchronously and
+      // unconditionally, independent of any network call. (Fallback/demo
+      // path handles its own clear in appReducer's AUTH/LOGOUT case.)
+      if (action.type === "AUTH/LOGOUT") {
+        setSupaState(s => (s ? { ...s, active_user_id: null } : s));
+      }
+      return supaResult;
     } catch (e) {
       // Still recorded for the global _error banner (unchanged), but now
       // ALSO re-thrown — previously this only set state, meaning every
@@ -11764,6 +11791,19 @@ function useAppStore() {
       // themselves; that's an explicit choice at the call site now,
       // not an accidental one baked into dispatch itself.
       setSupaError(e.message);
+      // A logout must ALWAYS take effect, even if the handler threw partway
+      // through its server-side cleanup (a hung/failed isonline update,
+      // push-subscription delete, etc.) — the buttons that dispatch it all
+      // `.catch(() => {})`, so a swallowed throw here would otherwise leave
+      // the user apparently still logged in. Clear the session locally
+      // regardless.
+      if (action.type === "AUTH/LOGOUT") {
+        activeUserRef.current = null;
+        persistActiveUserId(null);
+        _cachedSessionToken = null;
+        persistSessionToken(null);
+        setSupaState(s => (s ? { ...s, active_user_id: null } : s));
+      }
       // Dispatch failures (RLS denials, network errors, bad server
       // responses) never reach AppErrorBoundary — they're caught right
       // here, not thrown during render — so they need their own report.
@@ -18423,15 +18463,25 @@ function AppInner() {
   // iOS Safari — there, installation only happens via the Share menu, so
   // this button simply never appears there, which is expected.
   useEffect(() => {
+    // index.html captures beforeinstallprompt before this bundle loads
+    // (Chrome fires it once, early, and never again) and stashes it on
+    // window — pick it up if it already fired, then keep listening in
+    // case it fires later (e.g. installability criteria met after mount).
+    if (window.__deferredInstallPrompt) setInstallPromptEvent(window.__deferredInstallPrompt);
     const handler = (e) => {
       e.preventDefault();
       setInstallPromptEvent(e);
     };
+    const onEarlyCapture = () => {
+      if (window.__deferredInstallPrompt) setInstallPromptEvent(window.__deferredInstallPrompt);
+    };
     window.addEventListener("beforeinstallprompt", handler);
-    const onInstalled = () => setInstallPromptEvent(null);
+    window.addEventListener("transitos:installpromptready", onEarlyCapture);
+    const onInstalled = () => { window.__deferredInstallPrompt = null; setInstallPromptEvent(null); };
     window.addEventListener("appinstalled", onInstalled);
     return () => {
       window.removeEventListener("beforeinstallprompt", handler);
+      window.removeEventListener("transitos:installpromptready", onEarlyCapture);
       window.removeEventListener("appinstalled", onInstalled);
     };
   }, []);
@@ -18440,6 +18490,7 @@ function AppInner() {
     if (!installPromptEvent) return;
     installPromptEvent.prompt();
     await installPromptEvent.userChoice;
+    window.__deferredInstallPrompt = null;
     setInstallPromptEvent(null); // the prompt can only be used once
   };
 
@@ -18735,8 +18786,11 @@ function AppInner() {
         ))}
       </div>
 
-      {/* ── Install banner: Chrome/Edge (beforeinstallprompt) ── */}
-      {installPromptEvent && activeUser && (
+      {/* ── Install banner: Chrome/Edge (beforeinstallprompt) ──
+          Shown whenever the browser says the app is installable and it
+          isn't already running installed — including on the login screen,
+          so a first-time user can install before signing in. */}
+      {installPromptEvent && !isStandalone && (
         <button
           onClick={promptInstall}
           style={{
