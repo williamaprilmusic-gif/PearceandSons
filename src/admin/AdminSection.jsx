@@ -5803,6 +5803,20 @@ function AdminLiveMap({ state, user, dispatch }) {
           <svg
             ref={svgRef}
             viewBox={`0 0 ${W} ${H}`}
+            // FOUND VIA USER REPORT ("markers in the wrong place"): without
+            // this the SVG defaults to xMidYMid meet, which LETTERBOXES the
+            // viewBox whenever the rendered element's aspect ratio differs
+            // from W:H (e.g. the expanded/fullscreen view — the non-
+            // expanded container is aspect-locked, so it was fine there).
+            // The pan/zoom handlers scale a screen-pixel drag by
+            // W / rect.width assuming the content fills the whole element;
+            // under letterboxing rect.width includes the empty bands, so
+            // every pan lands short/long and pins drift off the roads.
+            // "none" makes the viewBox always fill the element 1:1 with
+            // what getBoundingClientRect measures — the tile <image>s
+            // already assume exactly this — so tiles, pins and pointer
+            // math finally share one coordinate space in every view.
+            preserveAspectRatio="none"
             style={{ position: "absolute", inset: 0, width: "100%", height: "100%", display: "block",
               cursor: dragRef.current ? "grabbing" : "grab",
               touchAction: "none" /* prevent browser scroll-hijack during map pan */ }}
@@ -6542,7 +6556,13 @@ function GpsTrailModal({ trail: rawTrail, tripId, direction, stops = [], pickupT
       </div>
       <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
         <svg
-          ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", touchAction: "none", cursor: "grab" }}
+          ref={svgRef} width="100%" height="100%" viewBox={`0 0 ${W} ${H}`}
+          // Same fix as AdminLiveMap: this preview lives in a flex:1 box with
+          // no aspect-ratio lock, so the default xMidYMid meet always
+          // letterboxes the viewBox and the W/rect.width pan math drifts the
+          // trail/stop pins off the tiles. "none" fills the box 1:1.
+          preserveAspectRatio="none"
+          style={{ display: "block", touchAction: "none", cursor: "grab" }}
           onMouseDown={handlePointerDown} onMouseMove={handlePointerMove} onMouseUp={handlePointerUp} onMouseLeave={handlePointerUp}
           onTouchStart={handlePointerDown} onTouchMove={handlePointerMove} onTouchEnd={handlePointerUp}
         >
