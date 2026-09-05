@@ -8859,12 +8859,18 @@ function AdminStatus() {
         if (!reg) {
           const bootErr = typeof window !== "undefined" ? window.__swRegistrationError : null;
           try {
+            // register() per spec resolves to a ServiceWorkerRegistration
+            // or rejects — never a falsy value — so no null-check after.
             reg = await navigator.serviceWorker.register("/sw.js");
           } catch (regErr) {
+            // Kept as "warn", not "down": a browser/context that refuses
+            // SW registration (private window, enterprise policy, non-
+            // HTTPS host) is a degraded PWA, not an app outage — the
+            // header shouldn't read "problem detected" when DB/realtime/
+            // cron are all healthy.
             const msg = regErr?.message || bootErr || "registration rejected";
-            return { status: "down", detail: `not registered — ${msg}` };
+            return { status: "warn", detail: `not registered — ${msg}` };
           }
-          if (!reg) return { status: "down", detail: `not registered${bootErr ? ` — ${bootErr}` : ""}` };
         }
         if (reg.waiting) return { status: "warn", detail: "update downloaded — pending a reload to activate" };
         if (reg.active && navigator.serviceWorker.controller) return { status: "ok", detail: "active and controlling this page" };

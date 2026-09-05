@@ -4,20 +4,15 @@ const CACHE = 'transitos-v1';
 const PRECACHE = ['/', '/index.html'];
 
 self.addEventListener('install', e => {
+  // Deliberately keep addAll's fail-safe semantics: if a precache URL
+  // can't be fetched (mid-deploy 5xx, a blip right after load), the whole
+  // install rejects, NO worker activates, the browser handles the page
+  // normally, and the full precache is retried on the next load. The
+  // alternative (install anyway with a half-empty cache) lets the worker
+  // claim the page while the navigate handler's offline fallback has
+  // nothing to serve — a worse failure than "no worker yet".
   e.waitUntil(
-    // Precache is best-effort, NOT a gate on install. c.addAll() is
-    // atomic — a single transient 404/network blip on any one URL
-    // rejects the whole promise, which aborts install, which leaves the
-    // registration "redundant" and the app with NO service worker at
-    // all (this is a real way the admin health panel ends up reporting
-    // "not registered"). allSettled + individual add() means the worker
-    // still installs and controls the page even if a precache fetch
-    // momentarily fails; the network-first fetch handler re-fills the
-    // cache on the next successful load anyway.
-    caches.open(CACHE)
-      .then(c => Promise.allSettled(PRECACHE.map(u => c.add(u))))
-      .then(() => self.skipWaiting())
-      .catch(() => self.skipWaiting())
+    caches.open(CACHE).then(c => c.addAll(PRECACHE)).then(() => self.skipWaiting())
   );
 });
 
