@@ -5906,18 +5906,21 @@ function AdminLiveMap({ state, user, dispatch }) {
           {visibleAgentPoints.map(u => {
             const p = projectToSvg(u.home_address.lat, u.home_address.lng, W, H, viewport);
             return (
-              // Small Bolt/Uber-style location pin (teardrop + person dot +
-              // ground shadow) instead of a bare dot, per explicit request
-              // to match those apps' rider/pickup markers. Teal keeps it
+              // Bolt/Uber-style rider/pickup pin: a teardrop marker with a
+              // person glyph (head + shoulders) in a white lens, plus a
+              // ground shadow — reads as "a person is here" at a glance,
+              // unlike the earlier bare teardrop + dot. Teal keeps it
               // distinct from the driver pins (green/amber) and hazard
               // markers (red). Kept compact — this toggle can put ~1800 of
               // these on screen at once.
               <g key={u.id} transform={`translate(${p.x},${p.y})`}>
                 <title>{`${u.name}${u.home_address.label ? ` — ${u.home_address.label}` : ""}`}</title>
-                <ellipse cx={0} cy={0.5} rx={3.5} ry={1.4} fill="rgba(0,0,0,.4)" />
-                <path d="M0,-11 C4,-11 6.5,-8.2 6.5,-5 C6.5,-1 0,0 0,0 C0,0 -6.5,-1 -6.5,-5 C-6.5,-8.2 -4,-11 0,-11 Z"
-                  fill={COLORS.teal || "#1fb6c9"} stroke={COLORS.panel} strokeWidth={1.2} />
-                <circle cx={0} cy={-5.5} r={2.1} fill={COLORS.panel} />
+                <ellipse cx={0} cy={1} rx={3.4} ry={1.35} fill="rgba(0,0,0,.35)" />
+                <path d="M0,-13 C4.2,-13 7,-10.1 7,-6.4 C7,-2.5 1.5,-0.7 0,1.6 C-1.5,-0.7 -7,-2.5 -7,-6.4 C-7,-10.1 -4.2,-13 0,-13 Z"
+                  fill={COLORS.teal || "#00BCD4"} stroke={COLORS.panel} strokeWidth={1.3} />
+                <circle cx={0} cy={-6.7} r={3.5} fill={COLORS.panel} />
+                <circle cx={0} cy={-8.1} r={1.5} fill={COLORS.teal || "#00BCD4"} />
+                <path d="M-2.7,-4.2 C-2.7,-7.2 2.7,-7.2 2.7,-4.2 Z" fill={COLORS.teal || "#00BCD4"} />
               </g>
             );
           })}

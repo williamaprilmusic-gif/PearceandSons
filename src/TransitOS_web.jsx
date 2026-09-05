@@ -9967,13 +9967,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // driver's own report (same category icon, same anonymous-reporter
       // treatment, same shorter relevance window) rather than an admin's
       // longer-lived, name-attributed advisory.
-      const { data: reportingDriver } = await supabase.from("users").select("id, name").eq("id", activeUserRef.current).maybeSingle();
-      if (!reportingDriver) throw new Error("Driver not found.");
+      // The real users table has no "name" column — the display name is
+      // `fullname` (see userRowToApp). Selecting a non-existent column
+      // makes PostgREST 400, leaving data null, which this case then
+      // mis-reported as "Driver not found." — so BOTH driver and agent
+      // hazard/road-delay reports failed on the live path. Select the
+      // real column and surface a real error if the lookup genuinely
+      // fails.
+      const { data: reportingDriver, error: reportingDriverErr } = await supabase.from("users").select("id, fullname").eq("id", activeUserRef.current).maybeSingle();
+      if (reportingDriverErr) throw new Error(`Couldn't load your account for the report — ${reportingDriverErr.message}`);
+      if (!reportingDriver) throw new Error("Your account couldn't be found — sign out and back in, then try again.");
       if (action.lat == null || action.lng == null || !isValidCoord({ lat: action.lat, lng: action.lng })) {
         throw new Error("Invalid location for hazard report.");
       }
       must(await supabase.from("hazard_reports").insert({
-        driverid: reportingDriver.id, drivername: reportingDriver.name, source: action.source === "agent" ? "agent" : "driver",
+        driverid: reportingDriver.id, drivername: reportingDriver.fullname, source: action.source === "agent" ? "agent" : "driver",
         category: action.category || "hazard", lat: action.lat, lng: action.lng,
         note: action.note || null, tripid: action.trip_id ?? null, createdat: nowEpoch(),
       }));
