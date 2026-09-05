@@ -35,6 +35,7 @@ import {
   TRAFFIC_INCIDENT_ICON,
   HAZARD_CATEGORIES,
   HAZARD_CATEGORY_ICON,
+  alertIconFor,
   TRIP_STATE,
   TextField,
   _cachedSessionToken,
@@ -5260,10 +5261,12 @@ function AnnouncementPanel({ dispatch }) {
 // typing a message or searching an address. Message is canned per icon;
 // the poster can still use the full form below for a custom note / a
 // location that isn't where they physically are.
+// key matches HAZARD_CATEGORIES / ADVISORY_EXTRA_ICON so the map marker
+// renders the same icon that was tapped (alertIconFor).
 const QUICK_ADVISORIES = [
   { key: "road_closed", icon: "⛔", label: "Closed", message: "Road closed here — use an alternate route." },
   { key: "protest", icon: "✊", label: "Protest", message: "Protest / demonstration here — avoid the area." },
-  { key: "traffic", icon: "🐢", label: "Traffic", message: "Heavy traffic here — expect delays." },
+  { key: "traffic_jam", icon: "🐢", label: "Traffic", message: "Heavy traffic here — expect delays." },
   { key: "accident", icon: "💥", label: "Crash", message: "Crash reported here — expect delays." },
   { key: "roadworks", icon: "🚧", label: "Roadworks", message: "Roadworks here — expect delays." },
   { key: "speed_camera", icon: "📷", label: "Camera", message: "Speed camera here." },
@@ -5321,7 +5324,7 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
         setError("Couldn't get your location — allow location access, or search a spot in the field below and tap the icon again.");
         return;
       }
-      await dispatch({ type: "ADMIN/POST_ROUTE_ADVISORY", note: preset.message, lat, lng });
+      await dispatch({ type: "ADMIN/POST_ROUTE_ADVISORY", note: preset.message, category: preset.key, lat, lng });
       setQuickDoneKey(preset.key);
       setTimeout(() => setQuickDoneKey(null), 4000);
     } catch (e) {
@@ -5400,7 +5403,7 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
           <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>ACTIVE ADVISORIES ({activeAdvisories.length})</span>
           {activeAdvisories.map(h => (
             <div key={h.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: 10, border: `1px solid ${COLORS.wire}`, borderRadius: 4 }}>
-              <span style={{ fontSize: 11, flex: 1 }}>{h.note}</span>
+              <span style={{ fontSize: 11, flex: 1 }}>{alertIconFor(h.category)} {h.note}</span>
               <Button title={clearingId === h.id ? "…" : "🗑 CLEAR"} variant="ghost" size="sm" onClick={() => clearAdvisory(h.id)} disabled={clearingId === h.id} />
             </div>
           ))}
@@ -5845,7 +5848,9 @@ function AdminLiveMap({ state, user, dispatch }) {
           {(state.hazard_reports || []).filter(h => h.lat != null && h.lng != null).map(h => {
             const p = projectToSvg(h.lat, h.lng, W, H, viewport);
             const isAdvisory = h.source === "admin";
-            const icon = isAdvisory ? "📢" : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
+            // Advisory markers show the icon that was tapped to post them
+            // (📷/⛔/👮/…), not a generic 📢.
+            const icon = isAdvisory ? alertIconFor(h.category) : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
             const catLabel = HAZARD_CATEGORIES.find(c => c.key === h.category)?.label || "Hazard";
             const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
             const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;

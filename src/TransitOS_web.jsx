@@ -2057,13 +2057,18 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
 }
 
 // ── Session timeout ───────────────────────────────────────────────────────
-// 30-minute inactivity auto-logout for admin and agent roles.
+// 30-minute inactivity auto-logout. Applies to admin, agent AND driver
+// roles per explicit request — EXCEPT a driver who currently has an
+// active trip (ASSIGNED/DRIVER_CONFIRMED/IN_TRANSIT): a driver mid-run
+// who isn't tapping the screen is still driving, and logging them out
+// would kill GPS tracking / geofence auto-confirm mid-trip. That carve-
+// out is decided by the caller and passed in as `enabled`.
 // Resets on any mouse move, key press, or touch event.
 // Shows a warning modal at 5 minutes remaining.
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;   // 30 min total
 const SESSION_WARN_MS    =  5 * 60 * 1000;   // warn at 5 min remaining
 
-function useSessionTimeout(user, onLogout) {
+function useSessionTimeout(user, onLogout, { enabled = true } = {}) {
   const [warningVisible, setWarningVisible] = React.useState(false);
   const [secondsLeft, setSecondsLeft] = React.useState(null);
   const timerRef = React.useRef(null);
@@ -2111,7 +2116,14 @@ function useSessionTimeout(user, onLogout) {
   }, []); // stable — no deps that change
 
   React.useEffect(() => {
-    if (!user || user.role === ROLE.DRIVER) return;
+    if (!user || !enabled) {
+      // Disabled (e.g. a driver just went on an active trip) — make sure
+      // a warning modal that happened to be up gets dismissed.
+      warningVisibleRef.current = false;
+      setWarningVisible(false);
+      setSecondsLeft(null);
+      return;
+    }
 
     // Activity events — use pointer events (covers both mouse and touch),
     // plus keydown and scroll. 'pointerdown' fires reliably on iOS Safari
@@ -2160,7 +2172,7 @@ function useSessionTimeout(user, onLogout) {
       clearTimeout(warnTimerRef.current);
       clearInterval(countdownRef.current);
     };
-  }, [user?.id, resetTimer]); // resetTimer is now stable (no deps)
+  }, [user?.id, enabled, resetTimer]); // resetTimer is now stable (no deps)
 
   return { warningVisible, secondsLeft, resetTimer };
 }
@@ -3372,6 +3384,16 @@ export const HAZARD_CATEGORIES = [
   { key: "road_closed", icon: "⛔", label: "Closure" },
 ];
 export const HAZARD_CATEGORY_ICON = Object.fromEntries(HAZARD_CATEGORIES.map(c => [c.key, c.icon]));
+
+// Admin route-advisory quick-post categories that aren't in the driver
+// hazard picker above — so a map marker can show the SAME icon the admin
+// tapped to post it, not a generic 📢. "advisory" is the fallback key for
+// a custom-message advisory (no category chosen).
+export const ADVISORY_EXTRA_ICON = { protest: "✊", advisory: "📢" };
+// Resolve any alert category (driver hazard OR admin advisory) to its icon.
+export function alertIconFor(category) {
+  return HAZARD_CATEGORY_ICON[category] || ADVISORY_EXTRA_ICON[category] || "📢";
+}
 
 // Live traffic incidents (accidents/closures/jams/roadworks) within a
 // bounding box — the TomTom Traffic Incidents API v5, LIVE-VERIFIED
@@ -9972,9 +9994,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (action.lat == null || action.lng == null || !isValidCoord({ lat: action.lat, lng: action.lng })) {
         throw new Error("Invalid location for route advisory.");
       }
+      // category carries the quick-post preset key (road_closed, police,
+      // speed_camera, …) so the map marker can show the exact icon the
+      // admin tapped; "advisory" is the fallback for the custom-message
+      // form which has no category picker.
       must(await supabase.from("hazard_reports").insert({
         driverid: actingAdvisory.id, drivername: actingAdvisory.name, source: "admin",
-        category: "advisory", lat: action.lat, lng: action.lng,
+        category: (typeof action.category === "string" && action.category.trim()) || "advisory",
+        lat: action.lat, lng: action.lng,
         note: action.note.trim(), tripid: null, createdat: nowEpoch(),
       }));
       await logAuditAction({
@@ -18638,8 +18665,20 @@ function AppInner() {
   const handleLogout8 = React.useCallback(() => {
     dispatchWithToast({ type: "AUTH/LOGOUT", system_initiated: true });
   }, [dispatchWithToast]);
+  // The 30-min idle logout now covers drivers too (per explicit request) —
+  // but NOT a driver who's mid-trip: an ASSIGNED/DRIVER_CONFIRMED/
+  // IN_TRANSIT trip means they're actively driving even if they haven't
+  // touched the screen, and logging them out would kill GPS tracking /
+  // geofence auto-confirm for that run.
+  const driverOnActiveTrip = React.useMemo(() => {
+    if (activeUser?.role !== ROLE.DRIVER) return false;
+    return (state.trips || []).some(t =>
+      String(t.driver_id) === String(activeUser.id) &&
+      (t.state === TRIP_STATE.ASSIGNED || t.state === TRIP_STATE.DRIVER_CONFIRMED || t.state === TRIP_STATE.IN_TRANSIT)
+    );
+  }, [activeUser?.role, activeUser?.id, state.trips]);
   const { warningVisible: sessionWarning, secondsLeft: sessionSecondsLeft, resetTimer: resetSessionTimer } =
-    useSessionTimeout(activeUser, handleLogout8);
+    useSessionTimeout(activeUser, handleLogout8, { enabled: !!activeUser && !driverOnActiveTrip });
 
   // Session token went bad (expired, or rejected server-side for any other
   // reason) and every write this device makes is now silently failing RLS

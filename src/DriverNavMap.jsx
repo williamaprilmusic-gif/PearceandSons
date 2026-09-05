@@ -12,7 +12,7 @@ import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import {
   COLORS, haversineKm, TOMTOM_API_KEY, TRAFFIC_INCIDENT_ICON, tomtomTrafficIncidents,
-  tomtomNavRoute, HAZARD_CATEGORIES, HAZARD_CATEGORY_ICON,
+  tomtomNavRoute, HAZARD_CATEGORIES, HAZARD_CATEGORY_ICON, alertIconFor,
 } from "./TransitOS_web.jsx";
 
 // Embedded in-app navigation — replaces the external Waze handoff for the
@@ -248,7 +248,9 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
       const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
       const isAdvisory = h.source === "admin";
       const catMeta = HAZARD_CATEGORIES.find(c => c.key === h.category);
-      const markerIcon = isAdvisory ? "📢" : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
+      // Advisory markers show the icon the admin tapped to post them
+      // (📷/⛔/👮/…), not a generic 📢.
+      const markerIcon = isAdvisory ? alertIconFor(h.category) : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
       L.marker([h.lat, h.lng], {
         icon: L.divIcon({
           className: "", iconSize: [26, 26],
@@ -262,7 +264,7 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
       // DRIVER/REPORT_HAZARD / ADMIN/POST_ROUTE_ADVISORY) for
       // accountability if ever needed, just not surfaced here.
       }).bindPopup(isAdvisory
-        ? `<b>📢 Route Advisory</b><br>${h.note ? h.note.replace(/</g, "&lt;") : ""}<br><span style="opacity:.7">${ageLabel}</span>`
+        ? `<b>${markerIcon} Route Advisory</b><br>${h.note ? h.note.replace(/</g, "&lt;") : ""}<br><span style="opacity:.7">${ageLabel}</span>`
         : `<b>${markerIcon} ${catMeta?.label || "Hazard"} reported</b><br>${ageLabel}`
       ).addTo(group);
     });
