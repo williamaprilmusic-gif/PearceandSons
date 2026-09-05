@@ -208,7 +208,12 @@ function useDispatchPresence(user, selectedTripIds) {
   selectedTripIdsRef.current = selectedTripIds;
 
   useEffect(() => {
-    if (!user?.id) return;
+    // `supabase` is null in pure demo/offline mode (no backend configured)
+    // — demo mode has a real admin account that can reach the Dispatch tab,
+    // and without this guard `supabase.channel(...)` throws a TypeError and
+    // crashes the whole tab to the error boundary. Matches the same guard
+    // the driver-position channel effect in this file already has.
+    if (!user?.id || !supabase) return;
     readyRef.current = false;
     const channel = supabase.channel("dispatch-selection-presence", { config: { presence: { key: String(user.id) } } });
     channelRef.current = channel;
