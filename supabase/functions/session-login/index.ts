@@ -153,13 +153,26 @@ async function login(username: string, password: string) {
   // (revoke_anon_select_on_password_columns_v2, Supabase migration
   // history) revoked anon/authenticated SELECT on them outright.
   let valid: boolean;
-  if (user.passwordsalt) {
+  if (user.passwordsalt && typeof user.passwordhash === 'string' && user.passwordhash.length > 0) {
     valid = timingSafeEqualHex(await hashPasswordServer(password, user.passwordsalt), user.passwordhash);
-  } else {
+  } else if (!user.passwordsalt && typeof user.passwordhash === 'string' && user.passwordhash.length > 0) {
     // Legacy plaintext path — both sides are hashed first purely to
     // normalize length before the constant-time compare (raw plaintext
     // strings would otherwise leak their length trivially).
+    //
+    // FOUND VIA /code-review: this branch used to run unconditionally
+    // whenever passwordsalt was falsy. If passwordhash was also SQL NULL
+    // (a DB-seeded / dashboard-created / imported row that never had
+    // either column populated), supabase-js hands it back as JS null,
+    // sha256Hex(null) hashes the STRING "null" (TextEncoder coerces), and
+    // the literal password "null" then validated against ANY such account
+    // — a full auth bypass, and webauthn/index.ts had the identical
+    // branch so a biometric credential could then be enrolled against it.
+    // Now every path requires a real, non-empty passwordhash; anything
+    // else falls through to invalid credentials below.
     valid = timingSafeEqualHex(await sha256Hex(password), await sha256Hex(user.passwordhash));
+  } else {
+    valid = false;
   }
   if (!valid) { await recordFailure(supabase, attemptKey); return err('Invalid credentials'); }
   // Reaching here required the correct password — clear any accumulated

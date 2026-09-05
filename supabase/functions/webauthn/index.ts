@@ -297,7 +297,16 @@ async function verifyPassword(supabase: ReturnType<typeof createClient>, userId:
 
   const { data: user } = await supabase.from('users')
     .select('passwordhash, passwordsalt, status').eq('id', userId).maybeSingle();
-  const valid = !!user && user.status === 'ACTIVE' && (
+  // FOUND VIA /code-review: `user.passwordhash` MUST be a real, non-empty
+  // string before either compare. If it's SQL NULL (a DB-seeded /
+  // dashboard-created / imported row that never had the columns
+  // populated), supabase-js returns JS null, sha256Hex(null) hashes the
+  // STRING "null" (TextEncoder coerces), and the literal password "null"
+  // then validated against that account — letting a caller enrol their own
+  // biometric credential against it. session-login/index.ts had the
+  // identical branch and got the same guard.
+  const hasRealHash = typeof user?.passwordhash === 'string' && user.passwordhash.length > 0;
+  const valid = !!user && user.status === 'ACTIVE' && hasRealHash && (
     user.passwordsalt
       ? timingSafeEqualHex(await hashPasswordServer(password, user.passwordsalt), user.passwordhash)
       // Legacy plaintext path — both sides hashed first purely to
