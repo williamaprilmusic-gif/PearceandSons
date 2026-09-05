@@ -76,11 +76,28 @@ Deno.serve(async (req) => {
       if (age < STALE_MS) continue;
       const lastNotified = t.dispute.stale_notified_at || 0;
       if (nowMs - lastNotified < STALE_MS) continue;
+      // FOUND VIA /code-review: `disputedTrips` was read once at the top of
+      // this run, and `update({ dispute: { ...t.dispute, ... } })`
+      // overwrites the WHOLE dispute JSONB blob with that stale snapshot.
+      // Dispute resolution is exactly the concurrent action here — an
+      // admin resolving it, or a driver responding, in the window between
+      // the read and this write would be silently reverted (state back to
+      // OPEN/DRIVER_RESPONDED, resolution/response fields wiped) and the
+      // dispute would reappear on the exceptions board. Re-read the
+      // current dispute for THIS trip right before writing: if it's no
+      // longer OPEN/DRIVER_RESPONDED, someone just handled it — skip both
+      // the flag write and the "still stale" notification. Otherwise merge
+      // stale_notified_at onto the FRESH object. This shrinks the
+      // read-modify-write window from the whole run to one round trip.
+      const { data: fresh } = await supabase.from("trips").select("dispute").eq("id", t.id).maybeSingle();
+      const cur = fresh?.dispute;
+      if (!cur || (cur.state !== "OPEN" && cur.state !== "DRIVER_RESPONDED")) continue;
+      if (nowMs - (cur.stale_notified_at || 0) < STALE_MS) continue; // another run beat us to it
       disputesFlagged++;
-      await supabase.from("trips").update({ dispute: { ...t.dispute, stale_notified_at: nowMs } }).eq("id", t.id);
+      await supabase.from("trips").update({ dispute: { ...cur, stale_notified_at: nowMs } }).eq("id", t.id);
       await supabase.from("notifications").insert([{
         title: "DISPUTE STALE", type: "DISPUTE_STALE", forroles: ["ADMIN"], userid: null,
-        message: `⚠ Dispute on trip ${t.id} (${t.dispute.category}) has been unresolved for ${Math.round(age / 3600000)}h.`,
+        message: `⚠ Dispute on trip ${t.id} (${cur.category ?? t.dispute.category}) has been unresolved for ${Math.round(age / 3600000)}h.`,
         tripid: t.id, timestamp: nowMs, isread: false,
       }]);
     }
