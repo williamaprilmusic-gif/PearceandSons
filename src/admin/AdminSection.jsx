@@ -5255,6 +5255,20 @@ function AnnouncementPanel({ dispatch }) {
   );
 }
 
+// One-tap advisory presets — a Waze-style icon row so an advisory can be
+// posted in a single tap (at the poster's current GPS location) without
+// typing a message or searching an address. Message is canned per icon;
+// the poster can still use the full form below for a custom note / a
+// location that isn't where they physically are.
+const QUICK_ADVISORIES = [
+  { key: "road_closed", icon: "⛔", label: "Closed", message: "Road closed here — use an alternate route." },
+  { key: "protest", icon: "✊", label: "Protest", message: "Protest / demonstration here — avoid the area." },
+  { key: "traffic", icon: "🐢", label: "Traffic", message: "Heavy traffic here — expect delays." },
+  { key: "roadworks", icon: "🚧", label: "Roadworks", message: "Roadworks here — expect delays." },
+  { key: "flooding", icon: "🌊", label: "Flooding", message: "Flooding here — avoid if possible." },
+  { key: "police", icon: "👮", label: "Police", message: "Police checkpoint here." },
+];
+
 function RouteAdvisoryPanel({ state, dispatch, onClose }) {
   const [note, setNote] = useState("");
   const [street, setStreet] = useState("");
@@ -5262,6 +5276,8 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
   const [posting, setPosting] = useState(false);
   const [error, setError] = useState(null);
   const [clearingId, setClearingId] = useState(null);
+  const [quickBusyKey, setQuickBusyKey] = useState(null);
+  const [quickDoneKey, setQuickDoneKey] = useState(null);
 
   const activeAdvisories = (state.hazard_reports || []).filter(h => h.source === "admin");
 
@@ -5277,6 +5293,39 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
       setError(e.message || "Couldn't post the advisory — please try again.");
     } finally {
       setPosting(false);
+    }
+  };
+
+  // One tap: current GPS position + canned message for that icon.
+  // Falls back to a location already picked in the form below if GPS is
+  // denied/unavailable, so a desk admin can still one-tap after searching
+  // a spot once.
+  const postQuick = async (preset) => {
+    setError(null);
+    setQuickBusyKey(preset.key);
+    try {
+      let lat, lng;
+      const gps = await new Promise((resolve) => {
+        if (!navigator.geolocation) return resolve(null);
+        navigator.geolocation.getCurrentPosition(
+          (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          () => resolve(null),
+          { enableHighAccuracy: true, timeout: 8000, maximumAge: 30000 },
+        );
+      });
+      if (gps) { lat = gps.lat; lng = gps.lng; }
+      else if (coord) { lat = coord.lat; lng = coord.lng; }
+      else {
+        setError("Couldn't get your location — allow location access, or search a spot in the field below and tap the icon again.");
+        return;
+      }
+      await dispatch({ type: "ADMIN/POST_ROUTE_ADVISORY", note: preset.message, lat, lng });
+      setQuickDoneKey(preset.key);
+      setTimeout(() => setQuickDoneKey(null), 4000);
+    } catch (e) {
+      setError(e.message || "Couldn't post the advisory — please try again.");
+    } finally {
+      setQuickBusyKey(null);
     }
   };
 
@@ -5303,6 +5352,37 @@ function RouteAdvisoryPanel({ state, dispatch, onClose }) {
         source (radio, a driver's call, local knowledge) that TomTom/formal traffic data wouldn't catch. Stays live
         for {ADMIN_ADVISORY_WINDOW_HOURS}h or until you clear it below.
       </div>
+
+      {/* One-tap quick post — icon + canned message, dropped at your
+          current GPS location. For posting fast (e.g. from a vehicle)
+          without typing or searching an address. */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>QUICK POST (AT MY LOCATION)</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {QUICK_ADVISORIES.map(q => {
+            const busy = quickBusyKey === q.key;
+            const done = quickDoneKey === q.key;
+            return (
+              <button key={q.key} onClick={() => postQuick(q)} disabled={!!quickBusyKey}
+                title={q.message}
+                style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 2,
+                  background: done ? "rgba(29,185,84,.15)" : busy ? "rgba(245,166,35,.15)" : COLORS.card,
+                  border: `1px solid ${done ? COLORS.green : busy ? COLORS.amber : COLORS.wire}`,
+                  borderRadius: 8, padding: "8px 10px", minWidth: 56,
+                  cursor: quickBusyKey ? "default" : "pointer",
+                }}>
+                <span style={{ fontSize: 20, lineHeight: 1 }}>{done ? "✓" : q.icon}</span>
+                <span style={{ fontSize: 8, fontWeight: 700, color: done ? COLORS.green : COLORS.ghost, whiteSpace: "nowrap" }}>
+                  {busy ? "…" : done ? "POSTED" : q.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5, marginTop: 4 }}>OR — CUSTOM MESSAGE + LOCATION</span>
       <TextField label="Advisory Message" value={note} onChange={e => setNote(e.target.value)} placeholder="e.g. N2 closed near Mitchells Plain — protest, use M5" />
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: .5 }}>LOCATION</span>
