@@ -5265,12 +5265,14 @@ function AnnouncementPanel({ dispatch }) {
 // renders the same icon that was tapped (alertIconFor).
 const QUICK_ADVISORIES = [
   { key: "road_closed", icon: "⛔", label: "Closed", message: "Road closed here — use an alternate route." },
+  { key: "blocked_lane", icon: "🛑", label: "Lane Blocked", message: "Lane blocked here — expect delays." },
   { key: "protest", icon: "✊", label: "Protest", message: "Protest / demonstration here — avoid the area." },
   { key: "traffic_jam", icon: "🐢", label: "Traffic", message: "Heavy traffic here — expect delays." },
   { key: "accident", icon: "💥", label: "Crash", message: "Crash reported here — expect delays." },
   { key: "roadworks", icon: "🚧", label: "Roadworks", message: "Roadworks here — expect delays." },
   { key: "speed_camera", icon: "📷", label: "Camera", message: "Speed camera here." },
   { key: "police", icon: "👮", label: "Police", message: "Police checkpoint here." },
+  { key: "animal", icon: "🦌", label: "Animal", message: "Animals on / near the road here — drive with caution." },
   { key: "bad_weather", icon: "🌧️", label: "Weather", message: "Poor road conditions / weather here — drive with caution." },
 ];
 
@@ -5890,9 +5892,18 @@ function AdminLiveMap({ state, user, dispatch }) {
           {visibleAgentPoints.map(u => {
             const p = projectToSvg(u.home_address.lat, u.home_address.lng, W, H, viewport);
             return (
-              <g key={u.id}>
+              // Small Bolt/Uber-style location pin (teardrop + person dot +
+              // ground shadow) instead of a bare dot, per explicit request
+              // to match those apps' rider/pickup markers. Teal keeps it
+              // distinct from the driver pins (green/amber) and hazard
+              // markers (red). Kept compact — this toggle can put ~1800 of
+              // these on screen at once.
+              <g key={u.id} transform={`translate(${p.x},${p.y})`}>
                 <title>{`${u.name}${u.home_address.label ? ` — ${u.home_address.label}` : ""}`}</title>
-                <circle cx={p.x} cy={p.y} r={4} fill={COLORS.red} stroke={COLORS.panel} strokeWidth={1} opacity={0.85} />
+                <ellipse cx={0} cy={0.5} rx={3.5} ry={1.4} fill="rgba(0,0,0,.4)" />
+                <path d="M0,-11 C4,-11 6.5,-8.2 6.5,-5 C6.5,-1 0,0 0,0 C0,0 -6.5,-1 -6.5,-5 C-6.5,-8.2 -4,-11 0,-11 Z"
+                  fill={COLORS.teal || "#1fb6c9"} stroke={COLORS.panel} strokeWidth={1.2} />
+                <circle cx={0} cy={-5.5} r={2.1} fill={COLORS.panel} />
               </g>
             );
           })}

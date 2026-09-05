@@ -3355,9 +3355,12 @@ export async function tomtomNavRoute(fromCoord, toCoord) {
 // responses, not assumed) — there is genuinely no "police"/"speed camera"
 // category anywhere in this data, matching what was already established
 // when the Traffic product was account-blocked (see project memory).
+// Icons deliberately reuse the same vocabulary as HAZARD_CATEGORIES below
+// so a TomTom incident and a peer-reported hazard of the same kind look
+// identical on the map (per explicit request).
 export const TRAFFIC_INCIDENT_ICON = {
-  1: "🚨", 2: "🌫", 3: "⚠️", 4: "🌧", 5: "🧊", 6: "🐌",
-  7: "🚧", 8: "⛔", 9: "🚧", 10: "💨", 11: "🌊", 14: "🔧",
+  1: "💥", 2: "🌧️", 3: "⚠️", 4: "🌧️", 5: "🌧️", 6: "🐢",
+  7: "🛑", 8: "⛔", 9: "🚧", 10: "🌧️", 11: "🌧️", 14: "🚗",
 };
 const TRAFFIC_INCIDENT_LABEL = {
   1: "Accident", 2: "Fog", 3: "Dangerous conditions", 4: "Rain", 5: "Ice",
@@ -3379,6 +3382,8 @@ export const HAZARD_CATEGORIES = [
   { key: "traffic_jam", icon: "🐢", label: "Traffic" },
   { key: "hazard", icon: "⚠️", label: "Hazard" },
   { key: "vehicle_stopped", icon: "🚗", label: "Car Stopped" },
+  { key: "animal", icon: "🦌", label: "Animal" },
+  { key: "blocked_lane", icon: "🛑", label: "Blocked Lane" },
   { key: "roadworks", icon: "🚧", label: "Roadworks" },
   { key: "bad_weather", icon: "🌧️", label: "Weather" },
   { key: "road_closed", icon: "⛔", label: "Closure" },
