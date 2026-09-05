@@ -159,9 +159,28 @@ Deno.serve(async (req) => {
     }
     webpush.setVapidDetails(`mailto:${VAPID_CONTACT_EMAIL}`, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
-    const { user_ids, title, message, type, trip_id, ts } = await req.json();
+    // FOUND VIA /code-review: `title`, `type` and `trip_id` are
+    // deliberately NOT destructured from the body any more — they used to
+    // flow straight into the delivered push while the anti-forgery check
+    // below only validated userid+message+timestamp. A co-passenger on a
+    // shared trip knows a sibling notification's message+ts from their own
+    // copy, so they could POST that (passing the row-match check) with
+    // type:'INCOMING_CALL' / 'SOS_ALERT' and an arbitrary title, and
+    // push-handler.js would render it as a sticky notification that opens
+    // the ringing/incoming-call screen on tap. type and trip_id are now
+    // read from the matched notifications row itself (see below); title is
+    // derived from that authoritative type.
+    const { user_ids, message, ts } = await req.json();
     if (!user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
       return json({ ok: true, sent: 0, note: "No target users provided" });
+    }
+    // FOUND VIA /code-review: cap the attacker-influenced array so it
+    // can't drive a huge IN(...) query + a long sequential send loop.
+    // insertNotification fans out one logical notification per user id —
+    // even a company-wide broadcast is on the order of dozens, not
+    // hundreds — so 500 is comfortably above any legitimate call.
+    if (user_ids.length > 500) {
+      return json({ ok: false, error: "Too many target users in one call" }, 400);
     }
     if (!message) {
       return json({ ok: true, sent: 0, note: "No message provided" });
@@ -183,7 +202,7 @@ Deno.serve(async (req) => {
     const windowEnd = Number.isFinite(tsNum) ? tsNum + 5000 : Date.now() + 1000;
     const { data: matchedNotifs, error: matchError } = await supabase
       .from("notifications")
-      .select("userid")
+      .select("userid, type, tripid")
       .in("userid", user_ids)
       .eq("message", message)
       .gte("timestamp", windowStart)
@@ -194,6 +213,13 @@ Deno.serve(async (req) => {
     if (targetIds.length === 0) {
       return json({ ok: true, sent: 0, note: "No matching notification found for any target user — nothing sent" });
     }
+    // type / trip_id for the delivered push come from the matched row the
+    // app's own insertNotification() wrote — NOT the request body. A
+    // single insertNotification() fan-out writes identical type/tripid to
+    // every target's row, so any matched row is authoritative here.
+    const authRow = (matchedNotifs || []).find((r: { userid: unknown }) => targetIds.includes(String(r.userid))) || (matchedNotifs || [])[0];
+    const authType: string | null = authRow?.type ?? null;
+    const authTripId = authRow?.tripid ?? null;
 
     const { data: subs, error: subsError } = await supabase
       .from("push_subscriptions")
@@ -202,10 +228,13 @@ Deno.serve(async (req) => {
     if (subsError) throw subsError;
 
     const payload = JSON.stringify({
-      title: title || "Pearce & Sons",
+      // Title derived from the authoritative type (mirrors the client's own
+      // `type.replace(/_/g, " ")` fallback in insertNotification) rather
+      // than trusting a request-body title.
+      title: authType ? authType.replace(/_/g, " ") : "Pearce & Sons",
       body: message || "",
-      type: type || null,
-      trip_id: trip_id ?? null,
+      type: authType,
+      trip_id: authTripId,
       // Used by the service worker's push-event handler to open the
       // right screen when the user taps the notification, rather than
       // just opening the app to whatever tab it last had open.
