@@ -42,6 +42,10 @@ Deno.serve(async (req) => {
 
     const nowMs = Date.now();
     const twoMonthsAgo = new Date(nowMs);
+    // FOUND VIA /code-review: setUTCMonth alone rolls forward on a
+    // month-end date (31 Aug -> "June 31" -> 1 July). Snap to the 1st
+    // before shifting — see trip-history-retention for the full rationale.
+    twoMonthsAgo.setUTCDate(1);
     twoMonthsAgo.setUTCMonth(twoMonthsAgo.getUTCMonth() - 2);
     const ninetyDaysAgo = nowMs - 90 * 24 * 60 * 60 * 1000;
 

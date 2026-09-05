@@ -64,6 +64,11 @@ Deno.serve(async (req) => {
 
   const now = new Date();
   const cutoffMs = new Date(now.getTime());
+  // FOUND VIA /code-review: setUTCMonth alone rolls forward on a month-end
+  // date (31 Aug -> "June 31" -> 1 July), sweeping up to ~2 extra days of
+  // audit trail. Snap to the 1st before shifting — see the identical fix
+  // and rationale in trip-history-retention.
+  cutoffMs.setUTCDate(1);
   cutoffMs.setUTCMonth(cutoffMs.getUTCMonth() - 2);
 
   console.log("audit-log-retention: sweeping audit_logs before", cutoffMs.toISOString());

@@ -101,6 +101,16 @@ Deno.serve(async (req) => {
   };
   const now = new Date();
   const cutoffDate = new Date(now.getTime());
+  // FOUND VIA /code-review: setUTCMonth alone rolls FORWARD on a month-end
+  // date whose target month is shorter — on 31 Aug, setUTCMonth(month-2)
+  // targets June with day 31, which JS normalizes to 1 July, so the "2
+  // months" cutoff silently sweeps up to ~2 extra days of data. Same
+  // setMonth-clamp bug the test suite already regression-tests for
+  // shiftDateStr. Snapping to the 1st of the month BEFORE shifting removes
+  // the overflow; the boundary becomes the 1st of the month two months
+  // back, i.e. very slightly MORE conservative (keeps a little extra), the
+  // safe direction for a deletion policy.
+  cutoffDate.setUTCDate(1);
   cutoffDate.setUTCMonth(cutoffDate.getUTCMonth() - 2);
   const cutoffStr = fmt(cutoffDate);
 
