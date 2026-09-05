@@ -33,6 +33,8 @@ import {
   StateBadge,
   TOMTOM_API_KEY,
   TRAFFIC_INCIDENT_ICON,
+  HAZARD_CATEGORIES,
+  HAZARD_CATEGORY_ICON,
   TRIP_STATE,
   TextField,
   _cachedSessionToken,
@@ -5750,6 +5752,35 @@ function AdminLiveMap({ state, user, dispatch }) {
               </g>
             );
           })}
+          {/* Route advisories (📢, admin-posted) + peer hazard reports
+              (⚠️ etc., driver/agent-posted) — the in-house stand-in for
+              Waze's crowd alerts, from state.hazard_reports. Previously
+              these only ever rendered on the driver's own DriverNavMap;
+              an admin who posted an advisory had no way to see it on this
+              map at all. Always shown (no toggle) — an advisory is
+              deliberately high-signal and short-lived (see
+              ADMIN_ADVISORY_WINDOW_HOURS). */}
+          {(state.hazard_reports || []).filter(h => h.lat != null && h.lng != null).map(h => {
+            const p = projectToSvg(h.lat, h.lng, W, H, viewport);
+            const isAdvisory = h.source === "admin";
+            const icon = isAdvisory ? "📢" : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
+            const catLabel = HAZARD_CATEGORIES.find(c => c.key === h.category)?.label || "Hazard";
+            const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
+            const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
+            return (
+              <g key={`hz-${h.id}`} className="marker-pop" style={{ transformOrigin: `${p.x}px ${p.y}px` }}>
+                <title>{isAdvisory
+                  ? `📢 Route Advisory — ${h.note || ""} (${ageLabel})`
+                  : `${catLabel} reported (${ageLabel})`}</title>
+                <circle cx={p.x} cy={p.y} r={isAdvisory ? 11 : 9} fill={COLORS.panel}
+                  stroke={isAdvisory ? COLORS.amber : COLORS.red} strokeWidth={1.5} opacity={0.95} />
+                <text x={p.x} y={p.y} fontSize={isAdvisory ? 13 : 11} textAnchor="middle" dominantBaseline="central" style={{ pointerEvents: "none" }}>
+                  {icon}
+                </text>
+              </g>
+            );
+          })}
+
           {/* Company location reference points */}
           {(state.companies || []).filter(co => co.address?.lat != null).map(co => {
             const p = projectToSvg(co.address.lat, co.address.lng, W, H, viewport);
