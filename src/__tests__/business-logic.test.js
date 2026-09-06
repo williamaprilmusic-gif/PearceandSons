@@ -52,6 +52,8 @@ import {
   buildRosterWeek,
   computeStaffingForecast,
   computeAutoAssignPlan,
+  computeCancellationRisk,
+  cancelRiskLevelOf,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1690,5 +1692,95 @@ describe("computeAutoAssignPlan — best-fit driver per unassigned booking", () 
     };
     const plan = computeAutoAssignPlan(state, { nowMs: Date.UTC(2026, 1, 2, 21, 0, 0) });
     expect(plan.assignments).toEqual([expect.objectContaining({ trip_id: "b1", driver_id: "d3" })]);
+  });
+});
+
+describe("computeCancellationRisk — per-booking late-cancel / no-show likelihood", () => {
+  const NOW = Date.UTC(2026, 0, 19, 6, 0, 0); // Mon
+  const future = (h) => NOW + h * 3600000;
+
+  const mkTrip = (over) => ({
+    trip_id: "x", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: ["a1"],
+    scheduled_time_epoch: future(24), scheduled_time: "09:00",
+    booked_at_epoch: future(24) - 3 * 24 * 3600000, // 3 days lead = sweet spot
+    no_shows: [], ...over,
+  });
+
+  it("rates an agent with no history at the neutral floor (low)", () => {
+    const r = computeCancellationRisk({ trips: [mkTrip()] }, { now: NOW });
+    expect(r.x.level).toBe("low");
+    expect(r.x.score).toBeLessThan(25);
+    expect(r.x.reasons).toEqual([]);
+  });
+
+  const past = (n, state, noShow) => Array.from({ length: n }, (_, i) => ({
+    trip_id: `p${state}${noShow ? "n" : ""}${i}`, state, agent_ids: ["a1"],
+    no_shows: noShow ? [{ agent_id: "a1" }] : [],
+  }));
+
+  it("lifts a light adverse history (2 late cancels + 1 no-show / 9) to elevated, with reasons", () => {
+    const trips = [
+      mkTrip(),
+      ...past(2, TRIP_STATE.ARCHIVED_CANCELLED),
+      ...past(1, TRIP_STATE.ARCHIVED_COMPLETED, true),
+      ...past(5, TRIP_STATE.ARCHIVED_COMPLETED),
+    ];
+    const r = computeCancellationRisk({ trips }, { now: NOW });
+    expect(r.x.level).toBe("elevated");
+    expect(r.x.reasons).toEqual(expect.arrayContaining([expect.stringContaining("late cancels"), expect.stringContaining("no-shows")]));
+  });
+
+  it("rates a chronic history (4 late cancels + 2 no-shows / 8) as high", () => {
+    const trips = [
+      mkTrip(),
+      ...past(4, TRIP_STATE.ARCHIVED_CANCELLED),
+      ...past(2, TRIP_STATE.ARCHIVED_COMPLETED, true),
+      ...past(1, TRIP_STATE.ARCHIVED_COMPLETED),
+    ];
+    const r = computeCancellationRisk({ trips }, { now: NOW });
+    expect(r.x.level).toBe("high");
+  });
+
+  it("adds lead-time risk for a very-short-lead booking and a pre-dawn pickup", () => {
+    const r = computeCancellationRisk({
+      trips: [mkTrip({ booked_at_epoch: future(24) - 1 * 3600000, scheduled_time: "04:30" })],
+    }, { now: NOW });
+    expect(r.x.reasons).toEqual(expect.arrayContaining(["very short lead time", "pre-dawn pickup"]));
+    expect(r.x.score).toBeGreaterThanOrEqual(25);
+  });
+
+  it("honours late_booking_flag even without booked_at_epoch", () => {
+    const r = computeCancellationRisk({ trips: [mkTrip({ booked_at_epoch: null, late_booking_flag: true })] }, { now: NOW });
+    expect(r.x.reasons).toContain("very short lead time");
+  });
+
+  it("skips trips whose slot is already in the past, and non-scorable states", () => {
+    const r = computeCancellationRisk({
+      trips: [
+        mkTrip({ trip_id: "past", scheduled_time_epoch: NOW - 3600000 }),
+        mkTrip({ trip_id: "intransit", state: TRIP_STATE.IN_TRANSIT }),
+        mkTrip({ trip_id: "done", state: TRIP_STATE.ARCHIVED_COMPLETED }),
+      ],
+    }, { now: NOW });
+    expect(Object.keys(r)).toEqual([]);
+  });
+
+  it("takes the WORST agent's risk for a multi-agent trip", () => {
+    const trips = [
+      { trip_id: "x", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: ["clean", "flaky"], scheduled_time_epoch: future(24), scheduled_time: "09:00", no_shows: [] },
+      ...Array.from({ length: 8 }, (_, i) => ({ trip_id: `c${i}`, state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["clean"], no_shows: [] })),
+      ...Array.from({ length: 4 }, (_, i) => ({ trip_id: `f${i}`, state: TRIP_STATE.ARCHIVED_CANCELLED, agent_ids: ["flaky"], no_shows: [] })),
+    ];
+    const r = computeCancellationRisk({ trips }, { now: NOW });
+    expect(r.x.level).toBe("high");
+    expect(r.x.reasons.some(s => s.includes("late cancels"))).toBe(true);
+  });
+
+  it("cancelRiskLevelOf maps score bands", () => {
+    expect(cancelRiskLevelOf(0)).toBe("low");
+    expect(cancelRiskLevelOf(24)).toBe("low");
+    expect(cancelRiskLevelOf(25)).toBe("elevated");
+    expect(cancelRiskLevelOf(54)).toBe("elevated");
+    expect(cancelRiskLevelOf(55)).toBe("high");
   });
 });

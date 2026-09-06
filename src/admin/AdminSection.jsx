@@ -89,7 +89,6 @@ import {
   tomtomTrafficIncidents,
   tripDriverPayment,
   tripTotalFeeAmount,
-  tripNoShowRisk,
   tripNoun,
   tripNounCap,
   unifiedAddressSearch,
@@ -1816,6 +1815,106 @@ export function computeAutoAssignPlan(state, options = {}) {
     });
   }
   return { assignments, skipped, total: unassigned.length, skippedPastCount };
+}
+
+// ── Cancellation-risk scoring ──────────────────────────────────────────
+// Pure: score each not-yet-started booking by how likely an agent on it
+// is to cancel late / no-show, so dispatch can confirm proactively or
+// hold a seat back. Every signal comes from state already in memory:
+//   - the agent's own late-cancel + no-show history over the loaded
+//     trips. NOTE only LATE cancellations are archived (an on-time
+//     cancel deletes the row outright), so this is a late-cancel rate,
+//     not a total cancel rate — which is the rate that actually costs a
+//     wasted dispatch anyway.
+//   - lead time: a booking made < LEAD_SHORT_H before departure
+//     (late_booking_flag is the app's own version of this) OR more than
+//     LEAD_LONG_D ahead — both cancel more than the sweet spot in the
+//     middle.
+//   - a pre-dawn pickup (before PREDAWN_HOUR), historically flakier.
+//   - the trip already carrying an exception flag.
+// A trip's score is the WORST among its agents (one unreliable agent is
+// enough reason to hold the seat). 0–100, capped.
+//   options: { now = Date.now(), minHistory = 4 }
+const CANCEL_RISK_LEVELS = [
+  { key: "high", min: 55 },
+  { key: "elevated", min: 25 },
+  { key: "low", min: 0 },
+];
+const CANCEL_RISK_NEUTRAL = 8;   // base score for an agent with too little history to judge
+const LEAD_SHORT_H = 3;
+const LEAD_LONG_D = 14;
+const PREDAWN_HOUR = 6;
+export const cancelRiskLevelOf = (score) => CANCEL_RISK_LEVELS.find(l => score >= l.min).key;
+
+export function computeCancellationRisk(state, options = {}) {
+  const { now = Date.now(), minHistory = 4 } = options;
+  const trips = state.trips || [];
+
+  // Per-agent history tally over every loaded trip the agent appears on.
+  const hist = new Map(); // agentId -> { total, lateCancels, noShows }
+  for (const t of trips) {
+    const noShowIds = new Set((t.no_shows || []).map(ns => String(ns.agent_id)));
+    for (const aid of (t.agent_ids || []).map(String)) {
+      const s = hist.get(aid) || { total: 0, lateCancels: 0, noShows: 0 };
+      s.total++;
+      if (t.state === TRIP_STATE.ARCHIVED_CANCELLED) s.lateCancels++;
+      if (noShowIds.has(aid)) s.noShows++;
+      hist.set(aid, s);
+    }
+  }
+
+  // Per-agent base risk (0–100) from history — trusted only once the
+  // agent has minHistory prior trips; below that everyone sits at the
+  // neutral floor so a first-timer isn't branded high-risk by one bad
+  // early trip.
+  const agentBase = new Map();
+  for (const [aid, s] of hist) {
+    if (s.total < minHistory) { agentBase.set(aid, CANCEL_RISK_NEUTRAL); continue; }
+    // a no-show wastes the whole run; a late cancel at least frees the
+    // seat — so it's weighted a little lighter.
+    const score = (s.lateCancels / s.total) * 70 + (s.noShows / s.total) * 90;
+    agentBase.set(aid, Math.min(100, Math.round(score)));
+  }
+
+  const out = {};
+  const SCORABLE = [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED];
+  for (const t of trips) {
+    if (!SCORABLE.includes(t.state)) continue;
+    const sched = t.scheduled_time_epoch != null ? Number(t.scheduled_time_epoch) : null;
+    if (sched != null && sched < now) continue; // slot already gone — not actionable
+
+    // lead-time contribution (trip-wide, not per-agent)
+    let lead = 0, leadReason = null;
+    if (t.late_booking_flag) { lead = 18; leadReason = "very short lead time"; }
+    else if (sched != null && t.booked_at_epoch != null) {
+      const leadH = (sched - Number(t.booked_at_epoch)) / 3600000;
+      if (leadH < LEAD_SHORT_H) { lead = 18; leadReason = "very short lead time"; }
+      else if (leadH > LEAD_LONG_D * 24) { lead = 10; leadReason = "booked far ahead"; }
+    }
+    let predawn = 0;
+    const hm = /^(\d{1,2}):(\d{2})/.exec(String(t.scheduled_time || ""));
+    if (hm && Number(hm[1]) < PREDAWN_HOUR) predawn = 6;
+    const exc = t.is_exception ? 8 : 0;
+
+    const agentIds = (t.agent_ids || []).map(String);
+    let worst = -1, worstAgent = null;
+    for (const aid of agentIds) {
+      const s = Math.min(100, (agentBase.get(aid) ?? CANCEL_RISK_NEUTRAL) + lead + predawn + exc);
+      if (s > worst) { worst = s; worstAgent = aid; }
+    }
+    if (worst < 0) worst = Math.min(100, CANCEL_RISK_NEUTRAL + lead + predawn + exc); // no agents on the row
+
+    const reasons = [];
+    const ws = worstAgent ? hist.get(worstAgent) : null;
+    if (ws && ws.total >= minHistory && ws.lateCancels > 0) reasons.push(`${ws.lateCancels}/${ws.total} late cancels`);
+    if (ws && ws.total >= minHistory && ws.noShows > 0) reasons.push(`${ws.noShows}/${ws.total} no-shows`);
+    if (leadReason) reasons.push(leadReason);
+    if (predawn) reasons.push("pre-dawn pickup");
+    if (exc) reasons.push("flagged exception");
+
+    out[t.trip_id] = { score: worst, level: cancelRiskLevelOf(worst), reasons };
+  }
+  return out;
 }
 
 // "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
@@ -4959,6 +5058,16 @@ function AdminDispatch({ state, dispatch, user }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.trips, state.users, state.driver_status, dayFilter, directionFilter, areaFilter, selectedTripIds]);
 
+  // Cancellation-risk score per not-yet-started booking (late-cancel +
+  // no-show history + lead time + pre-dawn + exception flag). One O(trips)
+  // pass, memoised — the per-card badge below reads it by trip_id. Richer
+  // than the agent-facing tripNoShowRisk (no-show only) on purpose: this
+  // is the dispatch desk deciding whether to hold a seat.
+  const cancelRiskByTrip = React.useMemo(
+    () => computeCancellationRisk({ trips: state.trips }, { now: nowTick }),
+    [state.trips, nowTick]
+  );
+
   const toggleTrip = (tripId) => {
     setSelectedTripIds(prev => {
       const next = new Set(prev);
@@ -5314,13 +5423,14 @@ function AdminDispatch({ state, dispatch, user }) {
               <span style={{ fontSize: 9, color: COLORS.ghost }}>{t.trip_type}</span>
             </div>
             {(() => {
-                const risk = tripNoShowRisk(t, state.trips);
-                if (!risk) return null;
-                const isHigh = risk === 'HIGH';
+                const risk = cancelRiskByTrip[t.trip_id];
+                if (!risk || risk.level === "low") return null;
+                const isHigh = risk.level === "high";
                 return (
                   <span style={{ fontSize: 9, fontWeight: 700, color: isHigh ? COLORS.red : COLORS.amber,
                     border: `1px solid ${isHigh ? COLORS.red : COLORS.amber}`, padding: "2px 6px", borderRadius: 2, width: "fit-content" }}>
-                    {isHigh ? "🚨 HIGH NO-SHOW RISK" : "⚠ ELEVATED NO-SHOW RISK"} — check history before dispatching
+                    {isHigh ? "🚨 HIGH CANCEL RISK" : "⚠ ELEVATED CANCEL RISK"}
+                    {risk.reasons.length > 0 ? ` — ${risk.reasons.join(", ")}` : " — confirm before dispatching"}
                   </span>
                 );
               })()}
