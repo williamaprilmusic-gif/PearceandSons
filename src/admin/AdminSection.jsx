@@ -1124,6 +1124,72 @@ function ClientSlaPanel({ state }) {
   );
 }
 
+// The "read this first" panel for an admin coming on shift —
+// computeShiftHandover packaged into scannable groups + a copy-for-
+// handover button. Its own 60s ticker: the in-transit "N min in" and
+// "unassigned in N min" figures should stay roughly live without the
+// panel forcing a recompute on every unrelated state change.
+function ShiftHandoverPanel({ state }) {
+  const [copied, setCopied] = React.useState(false);
+  const tick = useTicker(60 * 1000);
+  const h = React.useMemo(
+    () => computeShiftHandover(
+      { trips: state.trips, users: state.users, driver_status: state.driver_status, hazard_reports: state.hazard_reports },
+      { now: tick, lookaheadHours: 6 }
+    ),
+    [state.trips, state.users, state.driver_status, state.hazard_reports, tick]
+  );
+  const copy = () => navigator.clipboard.writeText(formatShiftHandoverText(h))
+    .then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
+
+  const Group = ({ label, count, tone, children }) => (
+    <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px" }}>
+      <div style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.6, color: count > 0 ? (tone || COLORS.chalk) : COLORS.ghost, marginBottom: count > 0 ? 5 : 0 }}>
+        {label} ({count})
+      </div>
+      {count > 0 && <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>{children}</div>}
+    </div>
+  );
+  const line = (k, txt) => <div key={k} style={{ fontSize: 10, color: COLORS.mist }}>{txt}</div>;
+  const ex = h.openExceptions;
+  const exRows = [
+    ...ex.lateStart.map(e => ["ls" + e.id, `⏱ ${e.detail}`]),
+    ...ex.stuck.map(e => ["st" + e.id, `🛑 ${e.detail}`]),
+    ...ex.disputes.map(e => ["dp" + e.id, `⚖ ${e.title} — ${e.detail}`]),
+    ...ex.noShows.map(e => ["ns" + e.id, `👤 ${e.title}`]),
+    ...ex.driverHours.map(e => ["hr" + e.id, `🕐 ${e.title}`]),
+    ...ex.expiringDocs.map(e => ["dc" + e.id, `📄 ${e.title}`]),
+  ];
+
+  return (
+    <div style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: 14, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>
+          🔁 SHIFT HANDOVER
+          {h.counts.urgentExceptions > 0 && <span style={{ color: COLORS.red, marginLeft: 8 }}>{h.counts.urgentExceptions} urgent</span>}
+        </span>
+        <Button title={copied ? "✓ COPIED" : "📋 COPY FOR HANDOVER"} variant="ghost" size="sm"
+          style={{ borderColor: copied ? COLORS.green : COLORS.wire, color: copied ? COLORS.green : COLORS.ghost }} onClick={copy} />
+      </div>
+      <Group label="IN TRANSIT NOW" count={h.counts.inTransit} tone={COLORS.amber}>
+        {h.inTransit.map(x => line(x.trip_id, `${x.trip_id} — ${x.driver}${x.startedMinAgo != null ? `, ${x.startedMinAgo} min in` : ""} — ${x.pickup || "?"} → ${x.dropoff || "?"}`))}
+      </Group>
+      <Group label="UNASSIGNED, NEXT 6H" count={h.counts.upcomingUnassigned} tone={COLORS.red}>
+        {h.upcomingUnassigned.map(x => line(x.trip_id, `${x.trip_id} — in ${x.inMin} min (${x.at}) — ${x.pax} pax: ${x.agents.join(", ")}`))}
+      </Group>
+      <Group label="HIGH CANCEL RISK (24h)" count={h.counts.highCancelRisk} tone={COLORS.amber}>
+        {h.highCancelRisk.map(x => line(x.trip_id, `${x.trip_id} — ${x.at} — ${x.agents.join(", ")} — ${x.reasons.join(", ") || "history"}`))}
+      </Group>
+      <Group label="HAZARDS / ADVISORIES" count={h.counts.hazards} tone={COLORS.amber}>
+        {h.hazards.map(x => line(x.id, `[${x.kind}] ${x.category}${x.note ? `: ${x.note}` : ""} — ${x.minAgo} min ago`))}
+      </Group>
+      <Group label="OPEN EXCEPTIONS" count={exRows.length} tone={COLORS.red}>
+        {exRows.map(([k, txt]) => line(k, txt))}
+      </Group>
+    </div>
+  );
+}
+
 // Time: candidate bookings' scheduled_time must be within this many
 // minutes of the anchor booking's scheduled_time. A booking missing
 // scheduled_time is treated as compatible (mirrors isDriverOnShift's
@@ -2117,6 +2183,127 @@ export function formatClientSlaText(rows, lookbackDays = 30) {
   return lines.join("\n");
 }
 
+// ── Shift handover report ─────────────────────────────────────────────
+// Pure: the one screen an incoming admin should read at shift change.
+// Almost entirely a REPACKAGING of computeOpsExceptions (late starts /
+// stuck trips / disputes / no-shows / driver hours / doc expiry) plus a
+// few forward-looking cuts it doesn't cover: what's mid-run right now,
+// what's unassigned in the next few hours, which upcoming bookings are
+// high cancel-risk, and any live hazard / advisory. Nothing here
+// re-derives what that sweep already produces.
+//   options: { now = Date.now(), lookaheadHours = 6, opsExceptions }
+// Pass `opsExceptions` (a computeOpsExceptions result the caller already
+// has) to avoid running that O(trips × drivers) sweep twice.
+export function computeShiftHandover(state, options = {}) {
+  const { now = Date.now(), lookaheadHours = 6 } = options;
+  const exc = options.opsExceptions || computeOpsExceptions(state, { now });
+  const trips = state.trips || [];
+  const usersById = usersByIdMap(state.users || []);
+  const nameFor = (id) => id == null ? "Unassigned" : (usersById.get(String(id))?.name || `#${id}`);
+  const horizon = now + lookaheadHours * 3600000;
+
+  const inTransit = trips
+    .filter(t => t.state === TRIP_STATE.IN_TRANSIT)
+    .map(t => ({
+      trip_id: t.trip_id, driver: nameFor(t.driver_id),
+      startedMinAgo: t.in_transit_at_epoch != null ? Math.round((now - Number(t.in_transit_at_epoch)) / 60000) : null,
+      pickup: t.custom_pickup, dropoff: t.custom_dropoff,
+    }))
+    .sort((a, b) => (b.startedMinAgo ?? 0) - (a.startedMinAgo ?? 0));
+
+  const upcomingUnassigned = trips
+    .filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING && t.scheduled_time_epoch != null
+      && Number(t.scheduled_time_epoch) >= now && Number(t.scheduled_time_epoch) <= horizon)
+    .map(t => ({
+      trip_id: t.trip_id, at: t.scheduled_time, date: t.scheduled_date,
+      inMin: Math.round((Number(t.scheduled_time_epoch) - now) / 60000),
+      pax: (t.agent_ids || []).length, agents: (t.agent_ids || []).map(nameFor),
+    }))
+    .sort((a, b) => a.inMin - b.inMin);
+
+  // High cancel-risk bookings departing within the next 24h.
+  const risk = computeCancellationRisk(state, { now });
+  const highCancelRisk = trips
+    .filter(t => risk[t.trip_id]?.level === "high"
+      && t.scheduled_time_epoch != null && Number(t.scheduled_time_epoch) <= now + 24 * 3600000)
+    .map(t => ({
+      trip_id: t.trip_id, at: t.scheduled_time, date: t.scheduled_date,
+      reasons: risk[t.trip_id].reasons, agents: (t.agent_ids || []).map(nameFor),
+    }))
+    .sort((a, b) => Number(a.at > b.at) - Number(a.at < b.at));
+
+  // Live hazards: admin advisories within their own display window, peer
+  // hazards within the lookahead.
+  const advWindowMs = (ADMIN_ADVISORY_WINDOW_HOURS || 12) * 3600000;
+  const hazards = (state.hazard_reports || [])
+    .filter(h => {
+      const age = now - Number(h.created_at || 0);
+      return h.source === "admin" ? age <= advWindowMs : age <= lookaheadHours * 3600000;
+    })
+    .map(h => ({
+      id: h.id, kind: h.source === "admin" ? "advisory" : "peer hazard",
+      category: h.category, note: h.note, by: h.driver_name,
+      minAgo: Math.round((now - Number(h.created_at || now)) / 60000),
+    }))
+    .sort((a, b) => a.minAgo - b.minAgo);
+
+  const byKind = (k) => exc.filter(e => e.kind === k);
+  const openExceptions = {
+    lateStart: byKind("late_start"),
+    stuck: byKind("stuck"),
+    disputes: byKind("dispute"),
+    noShows: byKind("no_show"),
+    driverHours: byKind("hours"),
+    expiringDocs: byKind("doc"),
+  };
+
+  return {
+    generatedAt: now,
+    lookaheadHours,
+    inTransit,
+    upcomingUnassigned,
+    highCancelRisk,
+    hazards,
+    openExceptions,
+    counts: {
+      inTransit: inTransit.length,
+      upcomingUnassigned: upcomingUnassigned.length,
+      highCancelRisk: highCancelRisk.length,
+      hazards: hazards.length,
+      urgentExceptions: exc.filter(e => e.severity === "high").length,
+    },
+  };
+}
+
+export function formatShiftHandoverText(h) {
+  const when = new Date(h.generatedAt).toLocaleString("en-ZA", { timeZone: "Africa/Johannesburg" });
+  const L = [`Pearce & Sons — Shift Handover — ${when} SAST`, "=".repeat(52)];
+  const section = (title, rows) => {
+    L.push("", `${title} (${rows.length})`);
+    if (rows.length === 0) L.push("  — none");
+    else rows.forEach(r => L.push(`  ${r}`));
+  };
+  section("IN TRANSIT NOW", h.inTransit.map(x =>
+    `${x.trip_id} — ${x.driver}${x.startedMinAgo != null ? `, ${x.startedMinAgo} min in` : ""} — ${x.pickup || "?"} → ${x.dropoff || "?"}`));
+  section(`UNASSIGNED, NEXT ${h.lookaheadHours}H`, h.upcomingUnassigned.map(x =>
+    `${x.trip_id} — in ${x.inMin} min (${x.date} ${x.at}) — ${x.pax} pax: ${x.agents.join(", ")}`));
+  section("HIGH CANCEL RISK (next 24h)", h.highCancelRisk.map(x =>
+    `${x.trip_id} — ${x.date} ${x.at} — ${x.agents.join(", ")} — ${x.reasons.join(", ") || "history"}`));
+  section("HAZARDS / ADVISORIES", h.hazards.map(x =>
+    `[${x.kind}] ${x.category}${x.note ? `: ${x.note}` : ""} — ${x.by || "?"}, ${x.minAgo} min ago`));
+  const ex = h.openExceptions;
+  section("OPEN EXCEPTIONS", [
+    ...ex.lateStart.map(e => `Late start: ${e.detail}`),
+    ...ex.stuck.map(e => `Stuck: ${e.detail}`),
+    ...ex.disputes.map(e => `Dispute: ${e.title} — ${e.detail}`),
+    ...ex.noShows.map(e => `No-show: ${e.title}`),
+    ...ex.driverHours.map(e => `Hours: ${e.title} — ${e.detail}`),
+    ...ex.expiringDocs.map(e => `Doc: ${e.title}`),
+  ]);
+  L.push("", `Generated ${new Date().toLocaleDateString("en-ZA")}`);
+  return L.join("\n");
+}
+
 // "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
 // the outcome the admin is about to commit, matching how handleDispatch
 // actually routes the selection:
@@ -3019,6 +3206,8 @@ function AdminDashboard({ state, user, dispatch }) {
           </div>
         ))}
       </div>
+      <SectionHeader label="Shift Handover" collapsed={collapsedSections.has("handover")} onToggle={() => toggleSection("handover")} />
+      {!collapsedSections.has("handover") && (() => { try { return <ShiftHandoverPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>ShiftHandover error: {e.message}</div>; } })()}
       <SectionHeader label="Driver Fleet" collapsed={collapsedSections.has("fleet")} onToggle={() => toggleSection("fleet")} />
       {!collapsedSections.has("fleet") && state.driver_status.map(ds => {
         const u = state.users.find(x => String(x.id) === String(ds.driver_id));

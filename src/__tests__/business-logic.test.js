@@ -56,6 +56,8 @@ import {
   cancelRiskLevelOf,
   computeClientSlaReport,
   formatClientSlaText,
+  computeShiftHandover,
+  formatShiftHandoverText,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1888,5 +1890,54 @@ describe("computeClientSlaReport — per-client-company service quality", () => 
     expect(txt).toContain("Acme Corp");
     expect(txt).toContain("On-time:      67%");
     expect(txt).toContain("Cancel rate:  25%");
+  });
+});
+
+describe("computeShiftHandover — incoming-admin snapshot", () => {
+  const NOW = Date.UTC(2026, 0, 19, 8, 0, 0);
+  const min = (m) => NOW + m * 60000;
+  const users = [{ id: 9, role: ROLE.DRIVER, name: "Driver Nine" }, { id: 1, role: ROLE.AGENT, name: "Agent One" }];
+  const state = {
+    users, driver_status: [],
+    hazard_reports: [
+      { id: "h1", source: "admin", category: "road_closed", note: "N2 blocked", driver_name: "Dispatch", created_at: min(-30) },
+      { id: "h2", source: "driver", category: "police", note: "", driver_name: "Driver Nine", created_at: min(-90) },
+      { id: "hOld", source: "driver", category: "pothole", created_at: min(-600) }, // >6h — dropped
+    ],
+    trips: [
+      { trip_id: "run1", state: TRIP_STATE.IN_TRANSIT, driver_id: 9, agent_ids: [1], in_transit_at_epoch: min(-40), custom_pickup: "Home", custom_dropoff: "Office", no_shows: [] },
+      { trip_id: "soon1", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: [1], scheduled_time_epoch: min(90), scheduled_time: "09:30", scheduled_date: "2026/01/19", no_shows: [] },
+      { trip_id: "later", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: [1], scheduled_time_epoch: min(600), scheduled_time: "18:00", scheduled_date: "2026/01/19", no_shows: [] }, // beyond 6h
+      // a chronic-history agent → high cancel risk on a booking in 3h
+      { trip_id: "risky", state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: 9, agent_ids: ["flaky"], scheduled_time_epoch: min(180), scheduled_time: "11:00", scheduled_date: "2026/01/19", no_shows: [] },
+      ...Array.from({ length: 5 }, (_, i) => ({ trip_id: `fc${i}`, state: TRIP_STATE.ARCHIVED_CANCELLED, agent_ids: ["flaky"], no_shows: [] })),
+    ],
+  };
+
+  it("packages in-transit, near-term unassigned, high cancel-risk and live hazards", () => {
+    const h = computeShiftHandover(state, { now: NOW, lookaheadHours: 6 });
+    expect(h.counts.inTransit).toBe(1);
+    expect(h.inTransit[0]).toMatchObject({ trip_id: "run1", driver: "Driver Nine", startedMinAgo: 40 });
+    expect(h.upcomingUnassigned.map(x => x.trip_id)).toEqual(["soon1"]);   // "later" is beyond 6h
+    expect(h.highCancelRisk.map(x => x.trip_id)).toEqual(["risky"]);
+    expect(h.hazards.map(x => x.id)).toEqual(["h1", "h2"]);                // hOld dropped
+    expect(h.hazards[0].kind).toBe("advisory");
+  });
+
+  it("reuses a passed-in computeOpsExceptions result instead of re-sweeping", () => {
+    const sentinel = [{ id: "x", kind: "stuck", severity: "high", title: "Trip X stuck", detail: "3h" }];
+    const h = computeShiftHandover(state, { now: NOW, opsExceptions: sentinel });
+    expect(h.openExceptions.stuck).toEqual(sentinel);
+    expect(h.counts.urgentExceptions).toBe(1);
+  });
+
+  it("formatShiftHandoverText renders every section with a count", () => {
+    const h = computeShiftHandover(state, { now: NOW });
+    const txt = formatShiftHandoverText(h);
+    expect(txt).toContain("IN TRANSIT NOW (1)");
+    expect(txt).toContain("UNASSIGNED, NEXT 6H (1)");
+    expect(txt).toContain("HIGH CANCEL RISK (next 24h) (1)");
+    expect(txt).toContain("HAZARDS / ADVISORIES (2)");
+    expect(txt).toContain("run1 — Driver Nine, 40 min in — Home → Office");
   });
 });
