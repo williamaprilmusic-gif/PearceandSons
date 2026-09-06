@@ -25,7 +25,7 @@ import {
 // simpler than caching state across mounts, avoids Leaflet's known
 // zero-height-container gotcha from mounting behind display:none, and gets
 // a genuinely fresh route/ETA each time rather than a stale cached one.
-export function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onReportHazard }) {
+export function DriverNavMap({ destination, driverPosition, onExit, hazardReports, onReportHazard, onVoteHazard, myUserId }) {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
   const routeLayerRef = useRef(null);
@@ -49,6 +49,13 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
   const [showTraffic, setShowTraffic] = useState(true);
   const [trafficIncidents, setTrafficIncidents] = useState([]);
   const lastRouteFetchAtRef = useRef(0);
+  // onVoteHazard is an inline arrow from the caller (like onReportHazard),
+  // so it gets a fresh identity every render. Hold it in a ref so the
+  // hazard-marker effect below doesn't have to list it as a dep and
+  // rebuild every marker on every unrelated re-render (route/ETA/position
+  // ticks fire often).
+  const onVoteHazardRef = useRef(onVoteHazard);
+  useEffect(() => { onVoteHazardRef.current = onVoteHazard; }, [onVoteHazard]);
 
   // Returns whether the fetch actually produced a route — the caller
   // (the effect below) needs this to know whether it's safe to leave
@@ -242,16 +249,28 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
     if (!map) return;
     if (hazardLayerRef.current) map.removeLayer(hazardLayerRef.current);
     const group = L.layerGroup();
+    const esc = s => String(s).replace(/</g, "&lt;");
     (hazardReports || []).forEach(h => {
       if (h.lat == null || h.lng == null) return;
-      const ageMin = Math.max(0, Math.round((Date.now() - h.created_at) / 60000));
+      const stamp = Math.max(h.created_at || 0, h.last_confirmed_at || 0);
+      const ageMin = Math.max(0, Math.round((Date.now() - stamp) / 60000));
       const ageLabel = ageMin < 60 ? `${ageMin}m ago` : `${Math.round(ageMin / 60)}h ago`;
       const isAdvisory = h.source === "admin";
       const catMeta = HAZARD_CATEGORIES.find(c => c.key === h.category);
       // Advisory markers show the icon the admin tapped to post them
       // (📷/⛔/👮/…), not a generic 📢.
       const markerIcon = isAdvisory ? alertIconFor(h.category) : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
-      L.marker([h.lat, h.lng], {
+      // Waze-style "is it still there?" crowd feedback. Hidden on your own
+      // report (you can't vote on it) and when no handler is wired.
+      const canVote = !!onVoteHazardRef.current && String(h.driver_id) !== String(myUserId ?? "");
+      const btn = (v, label, count, on) =>
+        `<button data-vote="${v}" style="flex:1;padding:5px 4px;border-radius:6px;border:1px solid ${on ? "#1db954" : "rgba(255,255,255,.25)"};background:${on ? "rgba(29,185,84,.18)" : "rgba(255,255,255,.06)"};color:#fff;font-size:11px;font-weight:700;cursor:pointer">${label}${count ? ` ${count}` : ""}</button>`;
+      const voteRow = canVote
+        ? `<div class="hz-vote" style="display:flex;gap:6px;margin-top:7px">${btn("confirm", "👍 Still here", h.confirm_count, h.my_vote === "confirm")}${btn("dismiss", "👎 Gone", h.dismiss_count, h.my_vote === "dismiss")}</div>`
+        : (h.confirm_count || h.dismiss_count)
+          ? `<div style="opacity:.7;margin-top:5px;font-size:11px">👍 ${h.confirm_count || 0} · 👎 ${h.dismiss_count || 0}</div>`
+          : "";
+      const marker = L.marker([h.lat, h.lng], {
         icon: L.divIcon({
           className: "", iconSize: [26, 26],
           html: `<div class="marker-pop" style="font-size:20px;line-height:26px;text-align:center;filter:drop-shadow(0 1px 3px rgba(0,0,0,.6))">${markerIcon}</div>`,
@@ -263,14 +282,33 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
       // driver_name still get stored server-side either way (see
       // DRIVER/REPORT_HAZARD / ADMIN/POST_ROUTE_ADVISORY) for
       // accountability if ever needed, just not surfaced here.
-      }).bindPopup(isAdvisory
-        ? `<b>${markerIcon} Route Advisory</b><br>${h.note ? h.note.replace(/</g, "&lt;") : ""}<br><span style="opacity:.7">${ageLabel}</span>`
-        : `<b>${markerIcon} ${catMeta?.label || "Hazard"} reported</b><br>${ageLabel}`
-      ).addTo(group);
+      }).bindPopup((isAdvisory
+        ? `<b>${markerIcon} Route Advisory</b><br>${h.note ? esc(h.note) : ""}<br><span style="opacity:.7">${ageLabel}</span>`
+        : `<b>${markerIcon} ${catMeta?.label || "Hazard"} reported</b><br>${ageLabel}`) + voteRow);
+      marker._hazardId = h.id;
+      marker.addTo(group);
     });
     group.addTo(map);
     hazardLayerRef.current = group;
-  }, [hazardReports]);
+
+    // The popup HTML is a string, so wire the vote buttons on open. One
+    // delegated listener for the whole layer; cleaned up on re-run.
+    const onPopupOpen = (e) => {
+      const src = e.popup?._source;
+      const vote = onVoteHazardRef.current;
+      if (!src || src._hazardId == null || !vote) return;
+      const el = e.popup.getElement();
+      if (!el) return;
+      el.querySelectorAll('.hz-vote button[data-vote]').forEach(b => {
+        b.addEventListener('click', () => {
+          vote(src._hazardId, b.getAttribute('data-vote'));
+          map.closePopup();
+        }, { once: true });
+      });
+    };
+    map.on('popupopen', onPopupOpen);
+    return () => { map.off('popupopen', onPopupOpen); };
+  }, [hazardReports, myUserId]);
 
   // Draw/redraw the route line + destination pin whenever a route arrives.
   useEffect(() => {

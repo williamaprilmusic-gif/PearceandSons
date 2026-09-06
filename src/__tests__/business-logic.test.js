@@ -40,6 +40,8 @@ import {
   ESCALATION_KIND_MAX_MINUTES,
   computeDriverShiftIntervals,
   computeFleetUtilization,
+  tallyHazardVotes,
+  HAZARD_CLEAR_NET_DISMISS,
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
@@ -1352,5 +1354,49 @@ describe("computeFleetUtilization — real idle time from presence history, with
     // The invariant a boundary-straddling trip used to break: these three
     // figures should sum to exactly the driver's real online time in the window.
     expect(row.driving_ms + row.loading_ms + row.gap_ms).toBe(10 * H);
+  });
+});
+
+describe("tallyHazardVotes — Waze-style crowd confirm/dismiss", () => {
+  it("counts confirm and dismiss votes", () => {
+    const r = tallyHazardVotes(
+      [{ vote: "confirm" }, { vote: "confirm" }, { vote: "dismiss" }],
+      "driver"
+    );
+    expect(r.confirm_count).toBe(2);
+    expect(r.dismiss_count).toBe(1);
+  });
+
+  it("clears a peer report once net dismiss reaches the quorum", () => {
+    const votes = Array.from({ length: HAZARD_CLEAR_NET_DISMISS }, () => ({ vote: "dismiss" }));
+    expect(tallyHazardVotes(votes, "driver").cleared).toBe(true);
+    expect(tallyHazardVotes(votes, "agent").cleared).toBe(true);
+  });
+
+  it("does NOT clear while confirms offset the dismisses below quorum", () => {
+    // 3 dismiss, 2 confirm => net 1, below the quorum of 2
+    const votes = [
+      { vote: "dismiss" }, { vote: "dismiss" }, { vote: "dismiss" },
+      { vote: "confirm" }, { vote: "confirm" },
+    ];
+    expect(tallyHazardVotes(votes, "driver").cleared).toBe(false);
+  });
+
+  it("never crowd-clears an admin advisory, no matter how many dismisses", () => {
+    const votes = Array.from({ length: HAZARD_CLEAR_NET_DISMISS + 5 }, () => ({ vote: "dismiss" }));
+    const r = tallyHazardVotes(votes, "admin");
+    expect(r.dismiss_count).toBe(HAZARD_CLEAR_NET_DISMISS + 5);
+    expect(r.cleared).toBe(false);
+  });
+
+  it("handles empty / missing vote lists", () => {
+    expect(tallyHazardVotes([], "driver")).toEqual({ confirm_count: 0, dismiss_count: 0, cleared: false });
+    expect(tallyHazardVotes(undefined, "driver")).toEqual({ confirm_count: 0, dismiss_count: 0, cleared: false });
+  });
+
+  it("ignores unrecognised vote values", () => {
+    const r = tallyHazardVotes([{ vote: "confirm" }, { vote: "maybe" }, { vote: null }], "driver");
+    expect(r.confirm_count).toBe(1);
+    expect(r.dismiss_count).toBe(0);
   });
 });

@@ -18,6 +18,12 @@
 //     own .limit(500)), so anything past that is already invisible in the
 //     live app — a 90-day cutoff is generous relative to that existing
 //     cap, not a new restriction on what admins can actually see today.
+//   - hazard_reports (+ its hazard_report_votes, FK ON DELETE CASCADE):
+//     Waze-style peer hazard notes / admin route advisories. The LONGEST
+//     any row stays visible in the app is ADMIN_ADVISORY_WINDOW_HOURS
+//     (24h) from its create/last-confirm time; a 7-day cutoff is 7x that
+//     and well past any "still here" confirm chain. Pure operational
+//     ephemera, no reporting value once stale — simple delete, no export.
 //
 // Unlike trip-history-retention, this does NOT export before deleting —
 // per explicit scope decision: these aren't billing/compliance records
@@ -48,24 +54,35 @@ Deno.serve(async (req) => {
     twoMonthsAgo.setUTCDate(1);
     twoMonthsAgo.setUTCMonth(twoMonthsAgo.getUTCMonth() - 2);
     const ninetyDaysAgo = nowMs - 90 * 24 * 60 * 60 * 1000;
+    const sevenDaysAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
 
-    // Two independent deletes against unrelated tables — FOUND VIA AUDIT:
+    // Independent deletes against unrelated tables — FOUND VIA AUDIT:
     // these were awaited one after another; Promise.all cuts this run's
     // DB-wait time to roughly the slowest single delete instead of the sum
-    // of both, same pattern as weekly-ops-digest's own fix.
+    // of all, same pattern as weekly-ops-digest's own fix.
     const [
       { error: posErr, count: posCount },
       { error: notifErr, count: notifCount },
+      { error: hazErr, count: hazCount },
     ] = await Promise.all([
       supabase.from("driver_position_log").delete({ count: "exact" }).lt("recordedat", twoMonthsAgo.getTime()),
       supabase.from("notifications").delete({ count: "exact" }).lt("timestamp", ninetyDaysAgo),
+      // Old by BOTH create time and last-confirm time — a row still being
+      // confirmed "still here" this week is kept.
+      supabase.from("hazard_reports").delete({ count: "exact" })
+        .lt("createdat", sevenDaysAgo)
+        .or(`last_confirmed_at.is.null,last_confirmed_at.lt.${sevenDaysAgo}`),
     ]);
     if (posErr) throw posErr;
     if (notifErr) throw notifErr;
+    if (hazErr) throw hazErr;
 
-    return new Response(JSON.stringify({ ok: true, purgedPositionLog: posCount ?? 0, purgedNotifications: notifCount ?? 0 }), {
-      headers: { "Content-Type": "application/json" },
-    });
+    return new Response(JSON.stringify({
+      ok: true,
+      purgedPositionLog: posCount ?? 0,
+      purgedNotifications: notifCount ?? 0,
+      purgedHazardReports: hazCount ?? 0,
+    }), { headers: { "Content-Type": "application/json" } });
   } catch (e) {
     console.error("stale-data-retention failed:", e.message);
     return new Response(JSON.stringify({ ok: false, error: "Internal error — please try again." }), {

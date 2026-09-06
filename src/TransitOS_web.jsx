@@ -3521,9 +3521,35 @@ async function tomtomBestOrderOnce(anchorCoord, freeStops, pinnedEnd, departAtEp
 const CT_BOUNDS = { minLat: -35.0, maxLat: -33.0, minLng: 17.5, maxLng: 19.5 };
 
 // How long a driver-reported hazard stays visible to other drivers before
-// it's treated as stale — there's no upvote/confirm mechanism (unlike
-// Waze) to otherwise judge whether a report is still relevant.
+// it's treated as stale. A "still here" confirm from another driver
+// pushes the clock forward (last_confirmed_at) so a genuinely persistent
+// hazard doesn't vanish at 3h; a "gone" dismiss quorum clears it early
+// (see tallyHazardVotes / HAZARD_CLEAR_NET_DISMISS).
 const HAZARD_REPORT_WINDOW_HOURS = 3;
+
+// Net "gone" votes (dismiss minus confirm) at which a peer hazard report
+// (source driver/agent) is auto-cleared. Deliberately low — two other
+// drivers passing the spot and saying it's clear is a strong signal, and
+// the report still ages out on its own anyway. Admin advisories are
+// NEVER crowd-cleared (an official closure isn't a peer's to overrule) —
+// they only clear via ADMIN/CLEAR_ROUTE_ADVISORY or the 7-day sweep.
+export const HAZARD_CLEAR_NET_DISMISS = 2;
+
+// Pure: fold a report's vote rows into display counts + a clear decision.
+// votes: array of { user_id, vote }. source: the report's source string.
+// Returns { confirm_count, dismiss_count, cleared } — cleared is true
+// only for a peer report that has reached the net-dismiss quorum.
+export function tallyHazardVotes(votes, source) {
+  let confirm_count = 0;
+  let dismiss_count = 0;
+  for (const v of votes || []) {
+    if (v.vote === "confirm") confirm_count++;
+    else if (v.vote === "dismiss") dismiss_count++;
+  }
+  const isPeer = source !== "admin";
+  const cleared = isPeer && dismiss_count - confirm_count >= HAZARD_CLEAR_NET_DISMISS;
+  return { confirm_count, dismiss_count, cleared };
+}
 
 // Admin-posted route advisories (real-world knowledge relayed by an
 // admin — a protest, a known closure) stay relevant far longer than a
@@ -6074,6 +6100,71 @@ function appReducer(state, action) {
         trip_id: action.trip_id, ts: now(), read: false,
       };
       return { ...state, notifications: [sosNotif, ...state.notifications], _error: null };
+    }
+
+    // ── Route advisories / peer hazard reports (demo/offline mode) ──
+    // In Supabase mode these live in hazard_reports and are overlaid onto
+    // state by the store (see useAppStore). Demo mode is single-user, so
+    // there's no cross-device sync to fake — just keep the array in
+    // reducer state so an advisory the admin posts shows on their own map
+    // preview instead of erroring. Shape matches fetchHazardReports' map.
+    case "DRIVER/REPORT_HAZARD": {
+      const reporter = state.users.find(u => String(u.id) === String(state.active_user_id));
+      const row = {
+        id: mkId(), driver_id: state.active_user_id, driver_name: reporter?.name || null,
+        category: action.category || "hazard", source: action.source === "agent" ? "agent" : "driver",
+        lat: action.lat, lng: action.lng, note: action.note || null, trip_id: action.trip_id || null,
+        created_at: now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
+      };
+      return { ...state, hazard_reports: [row, ...(state.hazard_reports || [])], _error: null };
+    }
+
+    case "ADMIN/POST_ROUTE_ADVISORY": {
+      if (!action.note?.trim()) return { ...state, _error: "Advisory message can't be empty." };
+      const actor = state.users.find(u => String(u.id) === String(state.active_user_id));
+      const row = {
+        id: mkId(), driver_id: state.active_user_id, driver_name: actor?.name || null,
+        category: (typeof action.category === "string" && action.category.trim()) || "advisory",
+        source: "admin", lat: action.lat, lng: action.lng, note: action.note.trim(), trip_id: null,
+        created_at: now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
+      };
+      return { ...state, hazard_reports: [row, ...(state.hazard_reports || [])], _error: null };
+    }
+
+    case "ADMIN/CLEAR_ROUTE_ADVISORY":
+      return {
+        ...state,
+        hazard_reports: (state.hazard_reports || []).filter(
+          h => !(String(h.id) === String(action.report_id) && h.source === "admin")
+        ),
+        _error: null,
+      };
+
+    case "HAZARD/VOTE": {
+      const vote = action.vote === "confirm" ? "confirm" : action.vote === "dismiss" ? "dismiss" : null;
+      if (!vote) return { ...state, _error: "Invalid vote." };
+      const nowTs = now();
+      const hazard_reports = (state.hazard_reports || []).flatMap(h => {
+        if (String(h.id) !== String(action.report_id)) return [h];
+        if (String(h.driver_id) === String(state.active_user_id)) return [h]; // no self-vote
+        const prev = h.my_vote;
+        // one row per user: replaying a vote is a no-op; switching flips it
+        let confirm_count = h.confirm_count || 0;
+        let dismiss_count = h.dismiss_count || 0;
+        if (prev !== vote) {
+          if (prev === "confirm") confirm_count--;
+          if (prev === "dismiss") dismiss_count--;
+          if (vote === "confirm") confirm_count++;
+          else dismiss_count++;
+        }
+        const cleared = h.source !== "admin" && dismiss_count - confirm_count >= HAZARD_CLEAR_NET_DISMISS;
+        if (cleared) return []; // drop it, same as the server soft-clear hiding it
+        return [{
+          ...h, confirm_count, dismiss_count, my_vote: vote,
+          last_confirmed_at: vote === "confirm" ? nowTs : h.last_confirmed_at,
+        }];
+      });
+      return { ...state, hazard_reports, _error: null };
     }
 
     case "_CLEAR_ERROR":
@@ -10064,6 +10155,40 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return;
     }
 
+    case "HAZARD/VOTE": {
+      // Waze-style "still here" / "gone" crowd feedback on a hazard or
+      // advisory marker. Identity is the verified caller, never trusted
+      // from the payload — same rule as DRIVER/REPORT_HAZARD.
+      if (activeUserRef.current == null) throw new Error("Not logged in.");
+      const vote = action.vote === "confirm" ? "confirm" : action.vote === "dismiss" ? "dismiss" : null;
+      if (!vote) throw new Error("Invalid vote.");
+      const { data: report, error: reportErr } = await supabase.from("hazard_reports")
+        .select("id, source, driverid, last_confirmed_at, cleared_at").eq("id", action.report_id).maybeSingle();
+      if (reportErr) throw new Error(`Couldn't load that report — ${reportErr.message}`);
+      if (!report) throw new Error("That report is no longer available.");
+      if (report.cleared_at != null) return; // already cleared — nothing to vote on
+      // You can't vote on your own report (matches Waze; also stops a
+      // reporter from self-confirming to keep a stale report alive).
+      if (String(report.driverid) === String(activeUserRef.current)) {
+        throw new Error("You can't vote on your own report.");
+      }
+      const nowTs = nowEpoch();
+      must(await supabase.from("hazard_report_votes").upsert({
+        report_id: report.id, user_id: activeUserRef.current, vote, created_at: nowTs,
+      }, { onConflict: "report_id,user_id" }));
+      // Re-tally from the authoritative vote rows (never increment a
+      // counter — a vote switch or a re-vote would drift it).
+      const { data: allVotes } = await supabase.from("hazard_report_votes").select("user_id, vote").eq("report_id", report.id);
+      const { confirm_count, dismiss_count, cleared } = tallyHazardVotes(allVotes || [], report.source);
+      const patch = { confirm_count, dismiss_count };
+      if (vote === "confirm") patch.last_confirmed_at = nowTs;
+      if (cleared) patch.cleared_at = nowTs;
+      must(await supabase.from("hazard_reports").update(patch).eq("id", report.id));
+      if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
+      else refetch();
+      return;
+    }
+
     case "DRIVER/SET_SHIFT_SCHEDULE": {
       const actingShift = await assertAdminPermission(activeUserRef, "manageDispatch");
       must(await supabase.from("driver_status").update({
@@ -11446,16 +11571,34 @@ function useAppStore() {
   const fetchHazardReports = useCallback(async () => {
     if (!supabase) return;
     const widestCutoff = Date.now() - Math.max(HAZARD_REPORT_WINDOW_HOURS, ADMIN_ADVISORY_WINDOW_HOURS) * 60 * 60 * 1000;
-    const { data, error } = await supabase.from("hazard_reports").select("*").gte("createdat", widestCutoff).order("createdat", { ascending: false });
+    // A "still here" confirm bumps last_confirmed_at, which can outlive
+    // createdat's window — so a row qualifies on EITHER timestamp. cleared
+    // rows (dismiss quorum, or an admin clear) are excluded outright.
+    const { data, error } = await supabase.from("hazard_reports").select("*")
+      .is("cleared_at", null)
+      .or(`createdat.gte.${widestCutoff},last_confirmed_at.gte.${widestCutoff}`)
+      .order("createdat", { ascending: false });
     if (error) return;
     const now = Date.now();
     const fresh = (data || []).filter(r => {
       const windowHours = r.source === "admin" ? ADMIN_ADVISORY_WINDOW_HOURS : HAZARD_REPORT_WINDOW_HOURS;
-      return now - r.createdat <= windowHours * 60 * 60 * 1000;
+      const effTs = Math.max(r.createdat || 0, r.last_confirmed_at || 0);
+      return now - effTs <= windowHours * 60 * 60 * 1000;
     });
+    // This user's own vote per fresh report, so the popup can show which
+    // way they already voted (and let them switch).
+    let myVoteByReport = {};
+    const myId = activeUserRef.current;
+    if (myId != null && fresh.length) {
+      const { data: myVotes } = await supabase.from("hazard_report_votes")
+        .select("report_id, vote").eq("user_id", myId).in("report_id", fresh.map(r => r.id));
+      for (const v of myVotes || []) myVoteByReport[sid(v.report_id)] = v.vote;
+    }
     setHazardReports(fresh.map(r => ({
       id: sid(r.id), driver_id: sid(r.driverid), driver_name: r.drivername, category: r.category,
       source: r.source || "driver", lat: r.lat, lng: r.lng, note: r.note, trip_id: sid(r.tripid), created_at: r.createdat,
+      confirm_count: r.confirm_count || 0, dismiss_count: r.dismiss_count || 0,
+      last_confirmed_at: r.last_confirmed_at || null, my_vote: myVoteByReport[sid(r.id)] || null,
     })));
   }, []);
 
@@ -16457,6 +16600,8 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
           <LazyDriverNavMap
             destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)}
             hazardReports={state.hazard_reports}
+            myUserId={state.active_user_id}
+            onVoteHazard={(reportId, vote) => dispatch({ type: "HAZARD/VOTE", report_id: reportId, vote }).catch(() => {})}
             onReportHazard={(category) => dispatch({
               type: "DRIVER/REPORT_HAZARD", category: category || "hazard",
               lat: driverPosition?.lat, lng: driverPosition?.lng,
