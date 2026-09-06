@@ -58,8 +58,10 @@
 //      is a flat estimate (not per-route), so a genuinely long pickup run
 //      can nudge the next trips — deliberately warn-leaning. But EITHER
 //      kind of source stops propagating once it's STALE_SOURCE_MIN past
-//      its slot and still open: that's a forgotten status / stuck trip,
-//      which checks #1 and #4 own (and #4 alerts a human) — not a live
+//      its reference point — a not-yet-started trip past its slot, an
+//      IN_TRANSIT trip past intransitat (the same clock check #4 uses, so
+//      #5 goes quiet exactly as #4 starts alerting a human) — that's a
+//      forgotten status / stuck trip, checks #1 and #4 own it, not a live
 //      delay to keep pushing at downstream agents.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -77,7 +79,7 @@ const PROPAGATE_MIN_DELAY_MIN = 20;      // ignore a driver less than this behin
 const PROPAGATE_HORIZON_MS = 4 * 60 * 60 * 1000; // only warn trips within 4h after the late one
 const PROPAGATE_REFIRE_STEP_MIN = 20;    // re-notify only once the estimate grows this much
 const MAX_CREDIBLE_DELAY_MIN = 90;       // clamp: a bigger figure isn't a credible knock-on and stops re-fires
-const STALE_SOURCE_MIN = 180;            // a not-yet-started trip >3h past departure is a forgotten status, not a live delay — don't propagate from it (check #1 owns that alert)
+const STALE_SOURCE_MIN = 180;            // a source trip this far past its reference point (not-yet-started: past its slot; IN_TRANSIT: since it started, matching check #4's msStuck clock) is a forgotten / stuck status, not a live delay — stop propagating from it (checks #1/#4 own that regime)
 const IN_TRANSIT_TYPICAL_MIN = 90;       // how long a pickup run is expected to take; an IN_TRANSIT trip past scheduled + this is genuinely overrunning
 
 // A trip's scheduled departure as an epoch ms. Prefer the stored
@@ -142,26 +144,31 @@ Deno.serve(async (req) => {
       // ── check #5 data-gathering (acts after the loop) ──────────────
       //   IN_TRANSIT      -> max(start-lateness, overrun past a typical run)
       //   not-yet-started -> how long it's sat past its slot unstarted
-      // Either way: a trip still open STALE_SOURCE_MIN past its slot is a
-      // forgotten status / stuck trip (checks #1 and #4 own that regime,
-      // and #4 alerts a human who can intervene) — NOT a live delay, so
-      // it stops being a propagation source entirely. Both branches gate
-      // on that identically. Independent of the notified flags above — we
-      // want the live slip every run, not just the first.
+      // Either way: once a source trip is STALE_SOURCE_MIN past its
+      // reference point it's a forgotten status / stuck trip (checks #1
+      // and #4 own that regime, and #4 alerts a human) — NOT a live
+      // delay — so it stops being a propagation source. The reference
+      // point differs so the hand-off has no gap: not-yet-started
+      // measures from the scheduled slot (check #1 covers it); IN_TRANSIT
+      // measures from intransitat, the SAME clock check #4's msStuck
+      // uses, so #5 goes quiet exactly as #4 starts alerting even for a
+      // trip that departed late. Independent of the notified flags above
+      // — we want the live slip every run, not just the first.
       if (t.driverid && (t.status === "DRIVER_CONFIRMED" || t.status === "ASSIGNED" || t.status === "IN_TRANSIT")) {
         const sMs = schedMs(t);
         if (sMs != null) {
           const elapsed = Math.floor((nowMs - sMs) / 60000);
-          if (elapsed <= STALE_SOURCE_MIN) {
-            if (t.status === "IN_TRANSIT") {
+          if (t.status === "IN_TRANSIT") {
+            const sinceStart = t.intransitat ? Math.floor((nowMs - t.intransitat) / 60000) : elapsed;
+            if (sinceStart <= STALE_SOURCE_MIN) {
               // WORSE of: how late it STARTED (intransitat vs scheduled)
               // and how far it's overrunning a typical run.
               const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
               const overrun = elapsed - IN_TRANSIT_TYPICAL_MIN;
               noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
-            } else {
-              noteDelay(t.driverid, elapsed, sMs);
             }
+          } else if (elapsed <= STALE_SOURCE_MIN) {
+            noteDelay(t.driverid, elapsed, sMs);
           }
         }
       }
