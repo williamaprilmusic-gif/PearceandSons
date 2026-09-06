@@ -50,6 +50,7 @@ import {
   computeEscalations,
   buildEscalationItems,
   buildRosterWeek,
+  computeStaffingForecast,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1398,5 +1399,84 @@ describe("tallyHazardVotes — Waze-style crowd confirm/dismiss", () => {
     const r = tallyHazardVotes([{ vote: "confirm" }, { vote: "maybe" }, { vote: null }], "driver");
     expect(r.confirm_count).toBe(1);
     expect(r.dismiss_count).toBe(0);
+  });
+});
+
+describe("computeStaffingForecast — drivers rostered vs. historically needed", () => {
+  // 2026/01/19 is a Monday. Use noon UTC on that day as "now" so the
+  // three prior Mondays fall strictly in the past within the 4-wk window.
+  const NOW = Date.UTC(2026, 0, 19, 12, 0, 0);
+  const MONDAY = "2026/01/19";
+
+  const trip = (date, time, driver_id, agents = 1) => ({
+    scheduled_date: date, scheduled_time: time, driver_id,
+    state: TRIP_STATE.ARCHIVED_COMPLETED,
+    agent_ids: Array.from({ length: agents }, (_, i) => `a${i}`),
+  });
+
+  const baseState = {
+    trips: [
+      // prior Mondays, EARLY window (08:00): distinct-driver counts 3, 2, 1 -> avg 2
+      trip("2026/01/12", "08:00", "d1"), trip("2026/01/12", "08:05", "d2"), trip("2026/01/12", "08:10", "d3"),
+      trip("2026/01/05", "08:00", "d1"), trip("2026/01/05", "08:20", "d2"),
+      trip("2025/12/29", "08:00", "d1"),
+      // a future Monday trip must be ignored (not history)
+      trip("2026/01/19", "08:00", "d9"),
+      // a Monday trip older than the 4-wk lookback must be ignored
+      trip("2025/12/01", "08:00", "d1"),
+    ],
+    driver_status: [
+      { driver_id: "d1", availability_schedule: [{ day: 1, start: "06:00", end: "14:00" }] }, // Mon early -> rostered
+      { driver_id: "d2", availability_schedule: [] },                                          // no schedule -> not rostered
+      { driver_id: "d3", availability_schedule: [{ day: 2, start: "06:00", end: "14:00" }] },  // Tue only -> not Mon
+      { driver_id: "d4", availability_schedule: [{ day: 1, start: "06:00", end: "14:00" }], is_unavailable: true }, // out
+    ],
+  };
+
+  it("projects need from the average distinct-driver count over the lookback weeks", () => {
+    const f = computeStaffingForecast(baseState, MONDAY, { now: NOW });
+    const monEarly = f.cells.find(c => c.date === MONDAY && c.window === "EARLY");
+    expect(monEarly.hasHistory).toBe(true);
+    expect(monEarly.weeksSeen).toBe(3);
+    expect(monEarly.need).toBe(2);       // (3 + 2 + 1) / 3
+    expect(monEarly.rostered).toBe(1);   // only d1 (d2 no schedule, d3 Tue, d4 unavailable)
+    expect(monEarly.short).toBe(1);
+  });
+
+  it("flags the shortfall and totals it", () => {
+    const f = computeStaffingForecast(baseState, MONDAY, { now: NOW });
+    expect(f.shortfalls.some(c => c.date === MONDAY && c.window === "EARLY" && c.short === 1)).toBe(true);
+    expect(f.totalShort).toBeGreaterThanOrEqual(1);
+  });
+
+  it("marks a window with no history and never flags it short", () => {
+    const f = computeStaffingForecast(baseState, MONDAY, { now: NOW });
+    const monLate = f.cells.find(c => c.date === MONDAY && c.window === "LATE");
+    expect(monLate.hasHistory).toBe(false);
+    expect(monLate.need).toBe(0);
+    expect(monLate.short).toBe(0);
+  });
+
+  it("buckets trip times into EARLY / MID / LATE (LATE wraps past midnight)", () => {
+    const s = {
+      trips: [
+        trip("2026/01/12", "16:00", "d1"), // MID
+        trip("2026/01/05", "16:00", "d1"),
+        trip("2026/01/12", "23:00", "d2"), // LATE
+        trip("2026/01/12", "02:00", "d3"), // LATE (wrap)
+      ],
+      driver_status: [],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "MID").hasHistory).toBe(true);
+    const late = f.cells.find(c => c.date === MONDAY && c.window === "LATE");
+    expect(late.hasHistory).toBe(true);
+    expect(late.need).toBe(2); // d2 + d3 in one week
+  });
+
+  it("returns 7 dates x 3 windows of cells", () => {
+    const f = computeStaffingForecast(baseState, MONDAY, { now: NOW });
+    expect(f.cells).toHaveLength(21);
+    expect(f.windows).toHaveLength(3);
   });
 });

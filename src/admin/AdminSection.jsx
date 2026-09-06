@@ -1535,6 +1535,100 @@ export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(sta
   return { dates, drivers, gaps, totalGaps: gaps.reduce((n, g) => n + g.bookings.length, 0) };
 }
 
+// ── Staffing forecast ────────────────────────────────────────────────
+// Three coarse shift windows keyed off a trip's scheduled_time hour.
+// LATE wraps past midnight (endMin < startMin). `mid` is a representative
+// time inside the window, fed to isDriverOnShift for the supply count so
+// this shares that one vetted (night-shift-aware) rule.
+export const STAFFING_WINDOWS = [
+  { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60, mid: "08:00" },
+  { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60, mid: "16:00" },
+  { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60, mid: "00:00" },
+];
+function staffingWindowOf(timeStr) {
+  const [h, m] = String(timeStr || "").split(":").map(Number);
+  if (Number.isNaN(h)) return null;
+  const mins = h * 60 + (m || 0);
+  return STAFFING_WINDOWS.find(w =>
+    w.endMin > w.startMin ? (mins >= w.startMin && mins < w.endMin) : (mins >= w.startMin || mins < w.endMin)
+  )?.key || null;
+}
+
+// Pure: project drivers-needed vs. drivers-rostered per upcoming shift
+// window, from trip history (demand) + availability_schedule (supply).
+// Demand for a (weekday, window) cell = the average, over the last
+// `lookbackWeeks` occurrences of that weekday, of how many DISTINCT
+// drivers actually ran a trip in that window — i.e. how many drivers the
+// operation historically needed for that slot. Supply = drivers whose
+// schedule covers the window that weekday and who aren't marked
+// unavailable. `short` = round(demand) − supply, floored at 0.
+//   options: { lookbackWeeks = 4, now = Date.now(), statusHistory = [] }
+//   statusHistory is accepted for a future "rostered but didn't come
+//   online" discount; unused in v1 (documented in the pending queue).
+export function computeStaffingForecast(state, mondaySlash, options = {}) {
+  const { lookbackWeeks = 4, now = Date.now() } = options;
+  const dates = Array.from({ length: 7 }, (_, i) => rosterAddDays(mondaySlash, i));
+  const ACTIVE_OR_DONE = new Set([
+    TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED,
+  ]);
+  const MS_DAY = 24 * 60 * 60 * 1000;
+  const nowDayStart = (() => { const d = new Date(now); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); })();
+  const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
+  const slashToMs = (s) => { const [y, m, d] = s.split("/").map(Number); return Date.UTC(y, m - 1, d); };
+
+  // history[dow][window] -> Map<weekBucket, Set<driverId>>  (+ trip/seat tallies)
+  const hist = {};
+  for (const t of state.trips || []) {
+    if (!t.scheduled_date || t.driver_id == null || !ACTIVE_OR_DONE.has(t.state)) continue;
+    const ms = slashToMs(t.scheduled_date);
+    if (Number.isNaN(ms) || ms < oldestMs || ms >= nowDayStart) continue; // strictly past, within lookback
+    const win = staffingWindowOf(t.scheduled_time);
+    if (!win) continue;
+    const dow = rosterDow(t.scheduled_date);
+    const wk = Math.floor((nowDayStart - ms) / (7 * MS_DAY)); // 0..lookbackWeeks-1
+    ((hist[dow] ||= {})[win] ||= { weeks: new Map(), trips: 0, seats: 0 });
+    const cell = hist[dow][win];
+    if (!cell.weeks.has(wk)) cell.weeks.set(wk, new Set());
+    cell.weeks.get(wk).add(String(t.driver_id));
+    cell.trips++;
+    cell.seats += Math.max(1, t.agent_ids?.length || 0);
+  }
+
+  const rosterDrivers = (state.driver_status || []).filter(ds => !ds.is_unavailable);
+
+  const cells = [];
+  for (const date of dates) {
+    const dow = rosterDow(date);
+    for (const w of STAFFING_WINDOWS) {
+      const cell = hist[dow]?.[w.key];
+      let demand = 0, weeksSeen = 0, avgTrips = 0;
+      if (cell && cell.weeks.size > 0) {
+        weeksSeen = cell.weeks.size;
+        demand = [...cell.weeks.values()].reduce((n, set) => n + set.size, 0) / weeksSeen;
+        avgTrips = cell.trips / weeksSeen;
+      }
+      const rostered = rosterDrivers.filter(ds => {
+        const sched = ds.availability_schedule;
+        if (!sched || sched.length === 0) return false; // unscheduled drivers aren't "rostered" for a slot
+        return isDriverOnShift(ds, date, w.mid);
+      }).length;
+      const need = Math.round(demand);
+      cells.push({
+        date, dow, window: w.key, windowLabel: w.label, windowRange: w.range,
+        demand, need, avgTrips, weeksSeen, rostered,
+        short: Math.max(0, need - rostered),
+        hasHistory: weeksSeen > 0,
+      });
+    }
+  }
+  const shortfalls = cells.filter(c => c.short > 0).sort((a, b) => b.short - a.short || a.date.localeCompare(b.date));
+  return {
+    dates, windows: STAFFING_WINDOWS, cells, shortfalls,
+    totalShort: shortfalls.reduce((n, c) => n + c.short, 0),
+    lookbackWeeks,
+  };
+}
+
 function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   let score = 0;
   const proxScore = distKm != null ? Math.max(0, 40 - (distKm / 30) * 40) : 0;
@@ -9448,6 +9542,11 @@ function AdminRoster({ state, dispatch }) {
   // while the tab is open.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const week = React.useMemo(() => buildRosterWeek(state, monday, usersById), [state.trips, state.driver_status, usersById, monday]);
+  const [showForecast, setShowForecast] = useState(false);
+  // Same narrow deps as `week` — demand comes from trips, supply from
+  // driver_status.availability_schedule.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const forecast = React.useMemo(() => computeStaffingForecast(state, monday), [state.trips, state.driver_status, monday]);
 
   const activePlace = dragging || pending;
 
@@ -9504,6 +9603,75 @@ function AdminRoster({ state, dispatch }) {
       {msg && (
         <div style={{ fontSize: 11, fontWeight: 700, color: msg.startsWith("✗") ? COLORS.red : COLORS.green, marginBottom: 8 }}>{msg}</div>
       )}
+
+      {/* Staffing forecast — drivers rostered vs. historically needed per
+          shift window, from the last {forecast.lookbackWeeks} weeks of
+          trips. Collapsed by default; the header always shows the total
+          shortfall so it's visible without opening. */}
+      <div style={{ border: `1px solid ${forecast.totalShort > 0 ? "rgba(232,58,58,.35)" : COLORS.wire}`, borderRadius: 4, marginBottom: 12, overflow: "hidden" }}>
+        <div
+          onClick={() => setShowForecast(v => !v)}
+          style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", cursor: "pointer", background: forecast.totalShort > 0 ? "rgba(232,58,58,.06)" : COLORS.surface }}
+        >
+          <span style={{ fontSize: 10, color: COLORS.ghost }}>{showForecast ? "▾" : "▸"}</span>
+          <span style={{ fontSize: 11, fontWeight: 800, color: COLORS.chalk }}>STAFFING FORECAST</span>
+          {forecast.totalShort > 0 ? (
+            <span style={{ fontSize: 10, fontWeight: 700, color: COLORS.red }}>
+              ~{forecast.totalShort} driver-slot{forecast.totalShort !== 1 ? "s" : ""} short this week
+            </span>
+          ) : (
+            <span style={{ fontSize: 10, color: COLORS.green }}>rostered coverage meets recent demand</span>
+          )}
+          <div style={{ flex: 1 }} />
+          <span style={{ fontSize: 9, color: COLORS.ghost }}>vs. last {forecast.lookbackWeeks} wk</span>
+        </div>
+        {showForecast && (
+          <div style={{ padding: 10, overflowX: "auto" }}>
+            <table style={{ borderCollapse: "collapse", fontSize: 9, width: "100%", minWidth: 520 }}>
+              <thead>
+                <tr>
+                  <th style={{ textAlign: "left", padding: "2px 6px", color: COLORS.ghost, fontWeight: 700 }}>Window</th>
+                  {forecast.dates.map(d => (
+                    <th key={d} style={{ padding: "2px 4px", color: d === todaySlash ? COLORS.amber : COLORS.ghost, fontWeight: 700 }}>
+                      {ROSTER_DAY_LABELS[rosterDow(d)]}<br />{d.slice(5)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {forecast.windows.map(w => (
+                  <tr key={w.key}>
+                    <td style={{ padding: "3px 6px", color: COLORS.mist, whiteSpace: "nowrap" }}>
+                      {w.label}<br /><span style={{ color: COLORS.ghost }}>{w.range}</span>
+                    </td>
+                    {forecast.dates.map(d => {
+                      const c = forecast.cells.find(x => x.date === d && x.window === w.key);
+                      const short = c.short > 0;
+                      return (
+                        <td key={d} title={c.hasHistory
+                          ? `${c.rostered} rostered · ~${c.need} typically needed (avg ${c.avgTrips.toFixed(1)} trips over ${c.weeksSeen} wk)`
+                          : "no history for this slot"}
+                          style={{
+                            textAlign: "center", padding: "3px 4px",
+                            color: short ? COLORS.red : c.hasHistory ? COLORS.chalk : COLORS.ghost,
+                            fontWeight: short ? 800 : 500,
+                            background: short ? "rgba(232,58,58,.10)" : "transparent",
+                          }}>
+                          {c.hasHistory ? `${c.rostered}/${c.need}` : "—"}
+                          {short && <div style={{ fontSize: 8 }}>−{c.short}</div>}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ fontSize: 8, color: COLORS.ghost, marginTop: 6 }}>
+              rostered / typically-needed per window. “needed” = avg distinct drivers who ran a trip in that window on that weekday over the last {forecast.lookbackWeeks} weeks. Drivers with no shift schedule set aren’t counted as rostered for any window.
+            </div>
+          </div>
+        )}
+      </div>
 
       {/* Gaps to place */}
       {week.totalGaps > 0 && (
