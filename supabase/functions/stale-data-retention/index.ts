@@ -26,6 +26,16 @@
 //     ephemera, no reporting value once stale — simple delete, no export.
 //     (Column names follow the table's no-underscore house style:
 //     createdat, lastconfirmedat.)
+//   - login_attempts: one row per distinct attempted username, only ever
+//     deleted on that username's next SUCCESSFUL login — so a typo'd or
+//     probed username that never logs in sits forever (flagged in a
+//     security review as unbounded under a distinct-username flood). Drop
+//     rows untouched for 30 days that AREN'T currently locked
+//     (locked_until in the future) — an active lockout is the one thing
+//     here that must survive the sweep.
+//   - crash_alert_log: per-message dedupe rows for crash-alert. Keep the
+//     '__global__' ceiling row; drop per-message keys not hit in 7 days
+//     (matches that function's cooldown horizon many times over).
 //
 // Unlike trip-history-retention, this does NOT export before deleting —
 // per explicit scope decision: these aren't billing/compliance records
@@ -56,6 +66,7 @@ Deno.serve(async (req) => {
     twoMonthsAgo.setUTCDate(1);
     twoMonthsAgo.setUTCMonth(twoMonthsAgo.getUTCMonth() - 2);
     const ninetyDaysAgo = nowMs - 90 * 24 * 60 * 60 * 1000;
+    const thirtyDaysAgo = nowMs - 30 * 24 * 60 * 60 * 1000;
     const sevenDaysAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
 
     // Independent deletes against unrelated tables — FOUND VIA AUDIT:
@@ -66,6 +77,8 @@ Deno.serve(async (req) => {
       { error: posErr, count: posCount },
       { error: notifErr, count: notifCount },
       { error: hazErr, count: hazCount },
+      { error: loginErr, count: loginCount },
+      { error: calErr, count: calCount },
     ] = await Promise.all([
       supabase.from("driver_position_log").delete({ count: "exact" }).lt("recordedat", twoMonthsAgo.getTime()),
       supabase.from("notifications").delete({ count: "exact" }).lt("timestamp", ninetyDaysAgo),
@@ -74,16 +87,28 @@ Deno.serve(async (req) => {
       supabase.from("hazard_reports").delete({ count: "exact" })
         .lt("createdat", sevenDaysAgo)
         .or(`lastconfirmedat.is.null,lastconfirmedat.lt.${sevenDaysAgo}`),
+      // Stale login-attempt counters — but NEVER an active lockout.
+      supabase.from("login_attempts").delete({ count: "exact" })
+        .lt("updated_at", thirtyDaysAgo)
+        .or(`locked_until.is.null,locked_until.lt.${nowMs}`),
+      // Per-message crash-alert dedupe rows; keep the global ceiling row.
+      supabase.from("crash_alert_log").delete({ count: "exact" })
+        .lt("last_sent_at", sevenDaysAgo)
+        .neq("message_key", "__global__"),
     ]);
     if (posErr) throw posErr;
     if (notifErr) throw notifErr;
     if (hazErr) throw hazErr;
+    if (loginErr) throw loginErr;
+    if (calErr) throw calErr;
 
     return new Response(JSON.stringify({
       ok: true,
       purgedPositionLog: posCount ?? 0,
       purgedNotifications: notifCount ?? 0,
       purgedHazardReports: hazCount ?? 0,
+      purgedLoginAttempts: loginCount ?? 0,
+      purgedCrashAlertLog: calCount ?? 0,
     }), { headers: { "Content-Type": "application/json" } });
   } catch (e) {
     console.error("stale-data-retention failed:", e.message);

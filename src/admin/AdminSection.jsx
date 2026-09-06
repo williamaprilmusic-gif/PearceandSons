@@ -8887,28 +8887,63 @@ function AdminStatus() {
     })();
 
     // 5. Recent client crashes — exact counts via head:true (not derived
-    // from a capped list), plus a short list for display.
+    // from a capped list), plus the top recurring messages (grouped) so a
+    // repeating crash is actionable, not just a number.
     const errP = (async () => {
       try {
         const weekAgo = nowMs - 7 * 24 * 60 * 60 * 1000;
         const dayAgo = nowMs - 24 * 60 * 60 * 1000;
-        const [wk, day, recent] = await Promise.all([
+        const [wk, day, sample] = await Promise.all([
           supabase.from("client_errors").select("id", { count: "exact", head: true }).gte("createdat", weekAgo),
           supabase.from("client_errors").select("id", { count: "exact", head: true }).gte("createdat", dayAgo),
-          supabase.from("client_errors").select("id, message, createdat").gte("createdat", weekAgo).order("createdat", { ascending: false }).limit(5),
+          // a bounded sample to group locally — enough to surface a loop,
+          // not the whole table
+          supabase.from("client_errors").select("message, userid, createdat").gte("createdat", weekAgo).order("createdat", { ascending: false }).limit(300),
         ]);
         if (wk.error || day.error) throw wk.error || day.error;
         const last24 = day.count ?? 0;
         const last7d = wk.count ?? 0;
         const status = last24 === 0 ? "ok" : last24 <= 3 ? "warn" : "down";
-        return {
-          status,
-          detail: `${last24} in last 24h · ${last7d} in last 7d`,
-          // recent list is best-effort — a failure there doesn't invalidate the counts
-          recent: (recent.data || []).map((r) => ({ id: r.id, message: r.message, ago: relTimeLabel(nowMs - r.createdat) })),
-        };
+        const byMsg = new Map();
+        for (const r of sample.data || []) {
+          const key = (r.message || "(no message)").slice(0, 140);
+          const g = byMsg.get(key) || { message: key, count: 0, users: new Set(), lastAt: 0 };
+          g.count++;
+          if (r.userid != null) g.users.add(String(r.userid));
+          if (r.createdat > g.lastAt) g.lastAt = r.createdat;
+          byMsg.set(key, g);
+        }
+        const top = [...byMsg.values()]
+          .sort((a, b) => b.count - a.count)
+          .slice(0, 5)
+          .map((g) => ({ message: g.message, count: g.count, users: g.users.size, ago: relTimeLabel(nowMs - g.lastAt) }));
+        return { status, detail: `${last24} in last 24h · ${last7d} in last 7d`, top };
       } catch (e) {
-        return { status: "warn", detail: e?.message || "query failed", recent: [] };
+        return { status: "warn", detail: e?.message || "query failed", top: [] };
+      }
+    })();
+
+    // 6. Login security — currently-locked accounts + recent failed-attempt
+    // volume. login_attempts has RLS on with no policies (service-role
+    // only), so this goes through the admin-gated get_login_security_
+    // summary() SECURITY DEFINER RPC, same shape as get_cron_job_status.
+    const loginP = (async () => {
+      try {
+        const { data, error } = await supabase.rpc("get_login_security_summary");
+        if (error) throw error;
+        const locked = (data?.locked || []).map((r) => ({
+          name: r.name, fails: r.fails || 0,
+          unlockIn: relTimeLabel(r.locked_until - nowMs, true),
+        }));
+        const offenders = (data?.offenders || []).map((r) => ({
+          name: r.name, fails: r.fails, ago: relTimeLabel(nowMs - r.updated_at),
+        }));
+        const failsTotal = data?.fails_total || 0;
+        const status = locked.length > 0 || offenders.length > 0 ? "warn" : "ok";
+        const detail = `${locked.length} locked now · ${failsTotal} failed attempt${failsTotal === 1 ? "" : "s"} / 7d`;
+        return { status, detail, locked, offenders };
+      } catch (e) {
+        return { status: "warn", detail: e?.message || "query failed", locked: [], offenders: [] };
       }
     })();
 
@@ -8922,8 +8957,8 @@ function AdminStatus() {
     }
 
     try {
-      const [db, rt, cron, sw, errs] = await Promise.all([dbP, rtP, cronP, swP, errP]);
-      setChecks({ db, rt, cron, sw, errs, queue: queueRes, online: navigator.onLine });
+      const [db, rt, cron, sw, errs, login] = await Promise.all([dbP, rtP, cronP, swP, errP, loginP]);
+      setChecks({ db, rt, cron, sw, errs, login, queue: queueRes, online: navigator.onLine });
     } catch (e) {
       setChecks({ fatal: e?.message || "checks failed to run" });
     } finally {
@@ -8935,7 +8970,7 @@ function AdminStatus() {
   useEffect(() => { runChecks(); }, [runChecks]);
 
   const overall = checks && !checks.noBackend && !checks.fatal
-    ? worstStatus([checks.db.status, checks.rt.status, checks.cron.status, checks.sw.status, checks.errs.status, checks.queue.status])
+    ? worstStatus([checks.db.status, checks.rt.status, checks.cron.status, checks.sw.status, checks.errs.status, checks.login.status, checks.queue.status])
     : "checking";
 
   const Row = StatusRow;
@@ -8982,11 +9017,33 @@ function AdminStatus() {
           </Row>
           <Row s={checks.sw.status} title="Service worker (offline / updates)" detail={checks.sw.detail} />
           <Row s={checks.errs.status} title="Client crashes" detail={checks.errs.detail}>
-            {checks.errs.recent && checks.errs.recent.length > 0 && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                {checks.errs.recent.map((r) => (
-                  <div key={r.id} style={{ fontSize: 9, color: COLORS.ghost, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    <span style={{ color: COLORS.mist }}>{r.ago}</span> — {r.message}
+            {checks.errs.top && checks.errs.top.length > 0 && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {checks.errs.top.map((r, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 9, color: COLORS.ghost }}>
+                    <span style={{ color: r.count >= 5 ? COLORS.red : COLORS.amber, fontWeight: 700, minWidth: 24, textAlign: "right" }}>×{r.count}</span>
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.message}</span>
+                    <span style={{ color: COLORS.mist, flexShrink: 0 }}>{r.users} user{r.users === 1 ? "" : "s"} · {r.ago}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Row>
+          <Row s={checks.login.status} title="Login security" detail={checks.login.detail}>
+            {(checks.login.locked.length > 0 || checks.login.offenders.length > 0) && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                {checks.login.locked.map((r, i) => (
+                  <div key={`l${i}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 9 }}>
+                    <span style={{ color: COLORS.red, fontWeight: 700 }}>🔒 LOCKED</span>
+                    <span style={{ color: COLORS.mist, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
+                    <span style={{ color: COLORS.ghost, flexShrink: 0 }}>{r.fails} fails · unlocks {r.unlockIn}</span>
+                  </div>
+                ))}
+                {checks.login.offenders.filter(o => !checks.login.locked.some(l => l.name === o.name)).map((r, i) => (
+                  <div key={`o${i}`} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 9, color: COLORS.ghost }}>
+                    <span style={{ color: COLORS.amber, fontWeight: 700, minWidth: 24, textAlign: "right" }}>{r.fails}×</span>
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</span>
+                    <span style={{ color: COLORS.mist, flexShrink: 0 }}>{r.ago}</span>
                   </div>
                 ))}
               </div>
