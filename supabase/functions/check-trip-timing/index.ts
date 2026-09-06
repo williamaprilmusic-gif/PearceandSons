@@ -51,11 +51,13 @@
 //      delaypropagatednotified / delaypropagatedmins dedupe it, re-firing
 //      only while the estimate is still climbing and below the credible
 //      ceiling. The slip that propagates is: a not-yet-started trip's
-//      time sat past its slot; an IN_TRANSIT trip's WORSE of start-
-//      lateness (intransitat vs scheduled) and overrun past scheduled +
-//      IN_TRANSIT_TYPICAL_MIN — so a trip that departed on time but is
-//      badly overrunning still drags the next trips. IN_TRANSIT_TYPICAL_MIN
-//      is a flat estimate (not per-route), so a genuinely long pickup run
+//      time sat past its slot; an IN_TRANSIT trip's minutes behind its
+//      expected-free time (now vs scheduled + IN_TRANSIT_TYPICAL_MIN,
+//      which already folds in a late departure), floored at the
+//      departure slip — so a trip that departed on time but is badly
+//      overrunning still drags the next trips, and a late-departed one
+//      drags them by at least its head start. IN_TRANSIT_TYPICAL_MIN is
+//      a flat estimate (not per-route), so a genuinely long pickup run
 //      can nudge the next trips — deliberately warn-leaning. But EITHER
 //      kind of source stops propagating once it's STALE_SOURCE_MIN past
 //      its reference point — a not-yet-started trip past its slot, an
@@ -79,7 +81,14 @@ const PROPAGATE_MIN_DELAY_MIN = 20;      // ignore a driver less than this behin
 const PROPAGATE_HORIZON_MS = 4 * 60 * 60 * 1000; // only warn trips within 4h after the late one
 const PROPAGATE_REFIRE_STEP_MIN = 20;    // re-notify only once the estimate grows this much
 const MAX_CREDIBLE_DELAY_MIN = 90;       // clamp: a bigger figure isn't a credible knock-on and stops re-fires
-const STALE_SOURCE_MIN = 180;            // a source trip this far past its reference point (not-yet-started: past its slot; IN_TRANSIT: since it started, matching check #4's msStuck clock) is a forgotten / stuck status, not a live delay — stop propagating from it (checks #1/#4 own that regime)
+// A source trip this far past its reference point (not-yet-started: past
+// its slot; IN_TRANSIT: since it started) is a forgotten / stuck status,
+// not a live delay — stop propagating from it (checks #1/#4 own that
+// regime). DERIVED from check #4's stuck threshold, not a second literal:
+// for an IN_TRANSIT trip #5's gate and #4's `msStuck >= THREE_HOURS_MS`
+// share one clock, so #5 goes quiet exactly as #4 starts alerting a
+// human — keep them tied so a change to one can't reopen that gap.
+const STALE_SOURCE_MIN = THREE_HOURS_MS / 60000;  // = 180 min
 const IN_TRANSIT_TYPICAL_MIN = 90;       // how long a pickup run is expected to take; an IN_TRANSIT trip past scheduled + this is genuinely overrunning
 
 // A trip's scheduled departure as an epoch ms. Prefer the stored
@@ -142,7 +151,8 @@ Deno.serve(async (req) => {
 
     for (const t of trips || []) {
       // ── check #5 data-gathering (acts after the loop) ──────────────
-      //   IN_TRANSIT      -> max(start-lateness, overrun past a typical run)
+      //   IN_TRANSIT      -> minutes behind expected-free (scheduled + a
+      //                      typical run), floored at the departure slip
       //   not-yet-started -> how long it's sat past its slot unstarted
       // Either way: once a source trip is STALE_SOURCE_MIN past its
       // reference point it's a forgotten status / stuck trip (checks #1
@@ -161,8 +171,13 @@ Deno.serve(async (req) => {
           if (t.status === "IN_TRANSIT") {
             const sinceStart = t.intransitat ? Math.floor((nowMs - t.intransitat) / 60000) : elapsed;
             if (sinceStart <= STALE_SOURCE_MIN) {
-              // WORSE of: how late it STARTED (intransitat vs scheduled)
-              // and how far it's overrunning a typical run.
+              // Minutes the driver is behind their expected-free time
+              // (scheduled + a typical run): `overrun` = now vs
+              // scheduled+typical measures exactly that, and since
+              // elapsed = startSlip + sinceStart it already folds in a
+              // late departure. The max() with startSlip is just a floor
+              // for the pre-typical stretch, where overrun is still
+              // negative but a late departure is already a known delay.
               const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
               const overrun = elapsed - IN_TRANSIT_TYPICAL_MIN;
               noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
