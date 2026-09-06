@@ -6584,13 +6584,18 @@ function AdminLiveMap({ state, user, dispatch }) {
       const incidents = await tomtomTrafficIncidents(bounds);
       if (!cancelled) setTrafficIncidents(incidents);
     };
+    const INCIDENTS_CADENCE_MS = 3 * 60 * 1000;
+    let lastIncidentsAt = Date.now();
+    const pollIncidents = () => { lastIncidentsAt = Date.now(); fetchIncidents(); };
     fetchIncidents();
     // Skip the poll while the tab is hidden — this hits the (metered)
     // TomTom traffic API, and a backgrounded admin tab isn't showing the
-    // map. One catch-up fetch on foreground so the overlay isn't up to
-    // 3 min stale after the admin returns.
-    const interval = pollWhileVisible(fetchIncidents, 3 * 60 * 1000);
-    const onVisible = () => { if (document.visibilityState === "visible") fetchIncidents(); };
+    // map. Foreground catch-up is THROTTLED to the cadence so rapid
+    // alt-tabbing can't burst metered requests.
+    const interval = pollWhileVisible(pollIncidents, INCIDENTS_CADENCE_MS);
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && Date.now() - lastIncidentsAt >= INCIDENTS_CADENCE_MS) pollIncidents();
+    };
     document.addEventListener("visibilitychange", onVisible);
     return () => { cancelled = true; clearInterval(interval); document.removeEventListener("visibilitychange", onVisible); };
   }, [showTraffic]);
@@ -10804,42 +10809,19 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // feedback rather than waiting up to 10 minutes for the cron.
   useEffect(() => {
     if (!supabase) return;
-    dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
-    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    // Document expiry is a fleet-wide compliance sweep (checks every
-    // driver, not just the current session's own trips), so it belongs
-    // here alongside the other admin-triggered periodic checks rather
-    // than in every driver's own polling effect.
-    dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
-    dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
-    // Continuous-shift-duration compliance — see MAX_CONTINUOUS_SHIFT_HOURS'
-    // own comment (TransitOS_web.jsx) for why this is a separate signal
-    // from CHECK_HOURS_COMPLIANCE's cumulative trip-driving hours.
-    dispatch({ type: "DRIVER/CHECK_SHIFT_DURATION" }).catch(() => {});
-    // Same shape as CHECK_LATE_START — catches a booking that never even
-    // got a driver, not just one whose confirmed driver hasn't started.
-    dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
-    // The other end of what CHECK_LATE_START covers — a trip that started
-    // and never got marked complete.
-    dispatch({ type: "TRIP/CHECK_STUCK_IN_TRANSIT" }).catch(() => {});
-    // Re-escalation for tickets/disputes left open with no admin action —
-    // previously fired one notification on open and never resurfaced.
-    dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
-    dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
-    // Escalation engine — same cadence, folded into this one interval
-    // (not a second timer). Reads current data via the ref so this
-    // effect keeps its []-deps.
-    runEscalationsRef.current();
-    // This whole batch is a client-side fallback for jobs the pg_cron
-    // functions (check-trip-timing, check-document-expiry,
-    // check-hours-compliance) already run server-side, plus the
-    // escalation engine (which has NO server-side equivalent). A
-    // backgrounded admin tab — routine on an overnight shift — doesn't
-    // need to re-run 8 whole-fleet DB sweeps every 10 min while nobody's
-    // looking; pollWhileVisible skips those ticks, and the
-    // visibilitychange handler runs the batch immediately on return so
-    // there's no up-to-10-min blind spot after foregrounding.
+    const BATCH_CADENCE_MS = 10 * 60 * 1000;
+    let lastBatchAt = 0;
+    // One source of truth for the recurring batch — a fleet-wide
+    // compliance/escalation sweep. Members:
+    //  - CHECK_LATE_START / CHECK_UNASSIGNED_APPROACHING /
+    //    CHECK_STUCK_IN_TRANSIT — also covered by the check-trip-timing
+    //    pg_cron; this is the "admin has the app open" instant path.
+    //  - CHECK_DOCUMENT_EXPIRY / CHECK_HOURS_COMPLIANCE /
+    //    CHECK_SHIFT_DURATION — fleet-wide, also server-cron'd.
+    //  - TICKET/CHECK_STALE / TRIP/CHECK_STALE_DISPUTES + the escalation
+    //    engine — NO server equivalent, so keeping this alive matters.
     const runBatch = () => {
+      lastBatchAt = Date.now();
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
@@ -10850,8 +10832,23 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
       runEscalationsRef.current();
     };
-    const intervalId = pollWhileVisible(runBatch, 10 * 60 * 1000);
-    const onVisibleBatch = () => { if (document.visibilityState === "visible") runBatch(); };
+    runBatch();
+    // TRIP/CHECK_UPCOMING_REMINDERS is one-shot only (NOT in runBatch) —
+    // a dedicated audit found every agent/driver/admin session was
+    // re-running it every 5 min; it's a server cron now, this stays only
+    // so an admin who just watched an agent enable REMIND sees instant
+    // feedback.
+    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+    // Skip ticks while the tab is hidden (an overnight-backgrounded admin
+    // tab doesn't need 8 whole-fleet sweeps every 10 min for nobody).
+    const intervalId = pollWhileVisible(runBatch, BATCH_CADENCE_MS);
+    // Foreground catch-up, but THROTTLED — visibilitychange fires on
+    // every alt-tab / screen unlock, so only re-run if a full cadence
+    // has actually elapsed with no run (i.e. we genuinely missed ticks
+    // while hidden), not on every flicker.
+    const onVisibleBatch = () => {
+      if (document.visibilityState === "visible" && Date.now() - lastBatchAt >= BATCH_CADENCE_MS) runBatch();
+    };
     document.addEventListener("visibilitychange", onVisibleBatch);
     return () => { clearInterval(intervalId); document.removeEventListener("visibilitychange", onVisibleBatch); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
