@@ -1559,14 +1559,18 @@ describe("computeStaffingForecast — presence adjustment (statusHistory)", () =
   const NOW = Date.UTC(2026, 0, 19, 12, 0, 0); // Monday
   const MONDAY = "2026/01/19";
   const trip = (date, time, d) => ({ scheduled_date: date, scheduled_time: time, driver_id: d, state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"] });
-  // ONLINE/OFFLINE pair (app-shaped: driver_id + ts) around a Monday-EARLY window
+  // ONLINE/OFFLINE pair (app-shaped: driver_id + ts). Times are SAST
+  // hours-of-day on `dateMs` (a UTC-midnight-of-SAST-date marker); the
+  // helper shifts by -2h so an "08:00" SAST spell lands in EARLY.
+  const SAST = 2 * 3600000;
   const onlineSpell = (d, startH, endH, dateMs) => ([
-    { driver_id: d, event: "ONLINE", ts: dateMs + startH * 3600000 },
-    { driver_id: d, event: "OFFLINE", ts: dateMs + endH * 3600000 },
+    { driver_id: d, event: "ONLINE", ts: dateMs - SAST + startH * 3600000 },
+    { driver_id: d, event: "OFFLINE", ts: dateMs - SAST + endH * 3600000 },
   ]);
   const mon12 = Date.UTC(2026, 0, 12); // previous Monday
+  const mon05 = Date.UTC(2026, 0, 5);  // Monday before that
 
-  it("discounts effective supply to typically-online when fewer drivers came online than rostered", () => {
+  it("discounts effective supply to typically-online when fewer drivers came online than rostered (>= MIN_PRESENCE_WEEKS)", () => {
     const s = {
       // demand: 2 distinct drivers in Monday EARLY (1 wk history)
       trips: [trip("2026/01/12", "08:00", "d1"), trip("2026/01/12", "08:30", "d2")],
@@ -1577,8 +1581,8 @@ describe("computeStaffingForecast — presence adjustment (statusHistory)", () =
         { driver_id: "r3", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
       ],
     };
-    // but historically only r1 was actually ONLINE during Monday EARLY
-    const statusHistory = onlineSpell("r1", 6, 11, mon12);
+    // 2 prior Mondays with presence data — only r1 was ONLINE in EARLY each time
+    const statusHistory = [...onlineSpell("r1", 6, 11, mon12), ...onlineSpell("r1", 6, 11, mon05)];
     const f = computeStaffingForecast(s, MONDAY, { now: NOW, statusHistory });
     const c = f.cells.find(x => x.date === MONDAY && x.window === "EARLY");
     expect(c.rostered).toBe(3);
@@ -1587,6 +1591,23 @@ describe("computeStaffingForecast — presence adjustment (statusHistory)", () =
     expect(c.presenceDiscounted).toBe(true);
     expect(c.short).toBe(1);                 // need 2 - effective 1
     expect(f.presenceAdjusted).toBe(true);
+  });
+
+  it("does NOT discount on a single thin week of presence data", () => {
+    const s = {
+      trips: [trip("2026/01/12", "08:00", "d1"), trip("2026/01/12", "08:30", "d2")],
+      driver_status: [
+        { driver_id: "r1", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r2", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r3", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+      ],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW, statusHistory: onlineSpell("r1", 6, 11, mon12) });
+    const c = f.cells.find(x => x.date === MONDAY && x.window === "EARLY");
+    expect(c.presenceWeeks).toBe(1);
+    expect(c.effectiveSupply).toBe(3);       // rostered, not discounted
+    expect(c.presenceDiscounted).toBe(false);
+    expect(c.short).toBe(0);
   });
 
   it("without statusHistory, effective supply is just rostered (no discount)", () => {

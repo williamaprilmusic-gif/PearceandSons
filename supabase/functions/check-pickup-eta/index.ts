@@ -17,10 +17,11 @@
 //
 // The client hook (useAgentShuttleStatus) fires the same in-app alerts
 // in real time WHILE the agent's app session is alive. To avoid a double
-// for an agent who's actively tracking, this also skips a threshold when
-// a DRIVER_ETA notification for that agent+trip already landed in the
-// last RECENT_CLIENT_NOTIF_MS — the client got there first, so the
-// server only needs to cover the agent who has the app closed.
+// for an agent who's actively tracking, a threshold whose DRIVER_ETA
+// notification already landed in the last RECENT_CLIENT_NOTIF_MS is
+// skipped for THIS cron run and left un-marked, so it's re-evaluated
+// later once that window clears — the server still covers the agent who
+// has since closed the app, just a cycle behind.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -35,10 +36,12 @@ const ARRIVE_MIN = 2;
 const MAX_POSITION_AGE_MS = 5 * 60 * 1000;   // a staler fix gives a bogus ETA — skip
 const HORIZON_MS = 3 * 60 * 60 * 1000;       // don't alert for a DRIVER_CONFIRMED trip whose slot is >3h out
 // If a DRIVER_ETA notif for this agent+trip already landed within this
-// window, another one is a dup — but keep it short (roughly one cron
-// cycle) so it suppresses a same-threshold repeat, NOT the next
-// threshold ("arriving now" a few minutes after "5 min away").
-const RECENT_CLIENT_NOTIF_MS = 4 * 60 * 1000;
+// window, another one THIS cycle is a dup — skipped, but NOT persisted
+// as done, so the next threshold ("arriving now" after "5 min away") is
+// still re-evaluated on a later cron run once the window clears. Kept
+// well under one 3-min cron cycle so a genuine next-threshold alert to
+// an app-closed agent is at most ~1 cycle late, never lost.
+const RECENT_CLIENT_NOTIF_MS = 2.5 * 60 * 1000;
 
 function haversineKm(la1: number, lo1: number, la2: number, lo2: number): number {
   const R = 6371, toRad = (d: number) => (d * Math.PI) / 180;
@@ -120,14 +123,16 @@ Deno.serve(async (req) => {
 
       const alerts: Array<{ agentId: number; message: string }> = [];
       for (const p of pending) {
-        // still record the dedupe mark even if we skip the send — the
-        // client covered this threshold, no need to revisit it
+        // Skip (and DON'T persist the mark) when the client just alerted
+        // this agent — a later cron cycle re-checks once the window
+        // clears, so an app-closed agent still gets the next threshold.
+        if (recentlyAlerted.has(p.agentIdStr)) continue;
         notified[p.agentIdStr] = p.mark;
-        if (!recentlyAlerted.has(p.agentIdStr)) alerts.push({ agentId: p.agentId, message: p.message });
+        alerts.push({ agentId: p.agentId, message: p.message });
       }
 
-      await supabase.from("trips").update({ pickup_eta_notified: notified }).eq("id", t.id);
       if (alerts.length === 0) continue;
+      await supabase.from("trips").update({ pickup_eta_notified: notified }).eq("id", t.id);
       await supabase.from("notifications").insert(alerts.map(a => ({
         title: "DRIVER ETA", type: "DRIVER_ETA", forroles: ["AGENT"], userid: a.agentId,
         message: a.message, tripid: t.id, timestamp: nowMs, isread: false,

@@ -1537,19 +1537,18 @@ export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(sta
 }
 
 // ── Staffing forecast ────────────────────────────────────────────────
-// Three coarse shift windows keyed off a trip's scheduled_time hour.
-// LATE wraps past midnight (endMin < startMin). `samples` are several
-// representative times spanning the window — a driver counts as rostered
-// for the window if isDriverOnShift is true at ANY of them (a single
-// sample can't represent a midnight-wrapping interval: for LATE, 21:00/
-// 23:00 catch the evening crew and 01:00/03:00 catch the drivers whose
-// shift wraps into the small hours of that date).
-// LATE wraps past midnight (endMin < startMin).
+// Three coarse shift windows keyed off a trip's scheduled_time hour, in
+// SAST minutes-of-day. LATE wraps past midnight (endMin < startMin). A
+// driver's availability_schedule slot counts toward a window via
+// slotCoversWindow (exact wrap-aware interval overlap, no sampling).
 export const STAFFING_WINDOWS = [
   { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60 },
   { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60 },
   { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60 },
 ];
+// Weeks of driver_status_history for a (weekday, window) cell before its
+// online-presence figure is trusted to discount rostered supply.
+const MIN_PRESENCE_WEEKS = 2;
 function staffingWindowOf(timeStr) {
   const mm = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
   if (!mm) return null;
@@ -1632,21 +1631,27 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
 
   // Optional presence layer: distinct drivers actually ONLINE per
   // (weekday, window) over the same lookback, from driver_status_history.
-  // A pre-04:00 online spell is attributed to that calendar date's LATE
-  // cell — same convention the demand side uses for a pre-04:00 trip.
+  // Windows are SAST wall-clock (like the demand side): `base` is the
+  // real SAST midnight of the date, so EARLY is 04:00–12:00 SAST, not
+  // UTC. A pre-04:00 SAST spell falls in that date's LATE cell — same
+  // convention the demand side uses for a pre-04:00 trip.
+  const SAST_OFFSET_MS = 2 * 60 * 60 * 1000;
   if (Array.isArray(statusHistory) && statusHistory.length) {
-    const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
+    const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY - SAST_OFFSET_MS;
     const intervalsByDriver = computeDriverShiftIntervals(statusHistory, oldestMs, nowDayStart);
     for (const [driverId, intervals] of Object.entries(intervalsByDriver)) {
       for (const [s, e] of intervals) {
-        for (let dayMs = Math.floor((s - nowDayStart) / MS_DAY) * MS_DAY + nowDayStart; dayMs < e; dayMs += MS_DAY) {
+        const first = new Date(s + SAST_OFFSET_MS);
+        const firstDayMs = Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), first.getUTCDate());
+        for (let dayMs = firstDayMs; dayMs - SAST_OFFSET_MS < e; dayMs += MS_DAY) {
           const wk = Math.floor((nowDayStart - dayMs) / (7 * MS_DAY));
           if (wk < 0 || wk >= lookbackWeeks) continue;
-          const dow = new Date(dayMs).getUTCDay();
+          const dow = new Date(dayMs).getUTCDay(); // dayMs is Date.UTC(sastY,M,D) -> SAST weekday
+          const base = dayMs - SAST_OFFSET_MS;     // real SAST midnight of this date
           for (const w of STAFFING_WINDOWS) {
             const winRanges = w.endMin > w.startMin
-              ? [[dayMs + w.startMin * 60000, dayMs + w.endMin * 60000]]
-              : [[dayMs, dayMs + w.endMin * 60000], [dayMs + w.startMin * 60000, dayMs + MS_DAY]];
+              ? [[base + w.startMin * 60000, base + w.endMin * 60000]]
+              : [[base, base + w.endMin * 60000], [base + w.startMin * 60000, base + MS_DAY]];
             if (!winRanges.some(([r1, r2]) => s < r2 && r1 < e)) continue;
             ((hist[dow] ||= {})[w.key] ||= { weeks: new Map(), trips: 0, seats: 0 });
             const c = hist[dow][w.key];
@@ -1678,17 +1683,23 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
         if (!sched || sched.length === 0) return false; // unscheduled drivers aren't "rostered" for a slot
         return sched.some(slot => slotCoversWindow(slot, dow, w));
       }).length;
-      let onlineTypical = null;
+      // Only discount supply on presence data with enough weeks behind it
+      // — one thin week (right after the presence table starts filling, or
+      // after a collection gap) would otherwise flip whole rows to a false
+      // shortfall. onlineTypical is still reported below for context.
+      let onlineTypical = null, presenceWeeks = 0;
       if (hasPresence && cell?.online && cell.online.size > 0) {
-        onlineTypical = [...cell.online.values()].reduce((n, set) => n + set.size, 0) / cell.online.size;
+        presenceWeeks = cell.online.size;
+        onlineTypical = [...cell.online.values()].reduce((n, set) => n + set.size, 0) / presenceWeeks;
       }
-      const effectiveSupply = onlineTypical != null ? Math.min(rostered, Math.round(onlineTypical)) : rostered;
+      const discount = onlineTypical != null && presenceWeeks >= MIN_PRESENCE_WEEKS;
+      const effectiveSupply = discount ? Math.min(rostered, Math.round(onlineTypical)) : rostered;
       const need = Math.round(demand);
       cells.push({
         date, dow, window: w.key, windowLabel: w.label, windowRange: w.range,
         demand, need, avgTrips, weeksSeen, rostered,
-        onlineTypical, effectiveSupply,
-        presenceDiscounted: onlineTypical != null && Math.round(onlineTypical) < rostered,
+        onlineTypical, presenceWeeks, effectiveSupply,
+        presenceDiscounted: discount && Math.round(onlineTypical) < rostered,
         short: Math.max(0, need - effectiveSupply),
         hasHistory: weeksSeen > 0,
       });
@@ -1727,13 +1738,15 @@ function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   return { score: Math.round(Math.max(0, Math.min(100, score))), proxScore: Math.round(proxScore), load, acceptRate, prevDeclinedThisAgent };
 }
 
-// Pure: for every currently-unassigned booking, pick the best-fit
-// on-shift driver with room — the plan behind the Dispatch "auto-assign
-// all" button. Same candidate rules and scoring the manual dispatch UI
-// uses (isDriverOnShift + per-day seat capacity + scoreDriverForTrip),
-// but run booking-by-booking. Bookings are handled earliest-first so the
-// most urgent get first pick, and each pick provisionally loads the
-// chosen driver so the batch can't over-fill one driver.
+// Pure: for every currently-unassigned booking on today or later, pick
+// the best-fit on-shift driver with room — the plan behind the Dispatch
+// "auto-assign all" button. Same candidate rules and scoring the manual
+// dispatch UI uses (isDriverOnShift + per-day seat capacity +
+// scoreDriverForTrip), run booking-by-booking, earliest first so the
+// most urgent get first pick. Each pick is folded into a synthetic
+// trip list fed to scoreDriverForTrip, so the load component of the
+// score rises as a driver takes bookings this batch — the run spreads
+// across drivers instead of piling onto whoever scores highest first.
 // Returns { assignments: [{ trip_id, driver_id, driver_name, score }],
 //           skipped: [{ trip_id, reason }], total }.
 // Document-currency is enforced server-side by TRIP/ASSIGN_DRIVER at
@@ -1742,13 +1755,22 @@ function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
 export function computeAutoAssignPlan(state, options = {}) {
   const { nowMs = Date.now() } = options;
   const usersById = usersByIdMap(state.users || []);
-  const unassigned = (state.trips || [])
-    .filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING)
+  // "today" pinned to SAST, like sastTodaySlashStr / the roster — a past-
+  // dated booking (its slot already gone) shouldn't be auto-dispatched.
+  const sastNow = new Date(nowMs + 2 * 60 * 60 * 1000);
+  const todaySlash = `${sastNow.getUTCFullYear()}/${String(sastNow.getUTCMonth() + 1).padStart(2, "0")}/${String(sastNow.getUTCDate()).padStart(2, "0")}`;
+  const allUnassigned = (state.trips || []).filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING);
+  const unassigned = allUnassigned
+    .filter(t => !t.scheduled_date || t.scheduled_date >= todaySlash)
     .sort((a, b) => `${a.scheduled_date} ${a.scheduled_time || ""}`.localeCompare(`${b.scheduled_date} ${b.scheduled_time || ""}`));
 
   const provisional = new Map(); // `${driver_id}|${date}` -> seats added by this plan
+  // Synthetic trips appended per assignment so scoreDriverForTrip's
+  // load term reflects what this batch has already handed each driver.
+  const scoringTrips = [...(state.trips || [])];
   const assignments = [];
   const skipped = [];
+  const skippedPastCount = allUnassigned.length - unassigned.length;
 
   for (const trip of unassigned) {
     const date = trip.scheduled_date;
@@ -1772,7 +1794,7 @@ export function computeAutoAssignPlan(state, options = {}) {
       const distKm = (rankCoord?.lat != null && origin?.lat != null)
         ? haversineKm(rankCoord.lat, rankCoord.lng, origin.lat, origin.lng) * ROAD_FACTOR
         : null;
-      const { score } = scoreDriverForTrip(ds, u, distKm, tripAgentIds, state.trips);
+      const { score } = scoreDriverForTrip(ds, u, distKm, tripAgentIds, scoringTrips);
       if (!best || score > best.score) best = { ds, u, score };
     }
 
@@ -1782,12 +1804,16 @@ export function computeAutoAssignPlan(state, options = {}) {
     }
     const key = `${best.ds.driver_id}|${date}`;
     provisional.set(key, (provisional.get(key) || 0) + seats);
+    scoringTrips.push({
+      trip_id: `_auto_${trip.trip_id}`, driver_id: best.ds.driver_id,
+      state: TRIP_STATE.ASSIGNED, agent_ids: tripAgentIds.length ? tripAgentIds : ["_"],
+    });
     assignments.push({
       trip_id: trip.trip_id, driver_id: best.ds.driver_id,
       driver_name: best.u?.name || `#${best.ds.driver_id}`, score: best.score,
     });
   }
-  return { assignments, skipped, total: unassigned.length };
+  return { assignments, skipped, total: unassigned.length, skippedPastCount };
 }
 
 // "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
@@ -5141,12 +5167,16 @@ function AdminDispatch({ state, dispatch, user }) {
         autoPlan ? (
           <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
             {autoPlan.assignments.length === 0 ? (
-              <span style={{ fontSize: 11, color: COLORS.amber }}>No booking has an on-shift driver with room right now — nothing to auto-assign.</span>
+              <span style={{ fontSize: 11, color: COLORS.amber }}>
+                No upcoming booking has an on-shift driver with room right now — nothing to auto-assign.
+                {autoPlan.skippedPastCount > 0 && ` (${autoPlan.skippedPastCount} past-dated booking${autoPlan.skippedPastCount !== 1 ? "s" : ""} left alone.)`}
+              </span>
             ) : (
               <>
                 <span style={{ fontSize: 11, color: COLORS.chalk, fontWeight: 700 }}>
                   Assign {autoPlan.assignments.length} booking{autoPlan.assignments.length !== 1 ? "s" : ""} to the best-fit on-shift driver?
                   {autoPlan.skipped.length > 0 && <span style={{ color: COLORS.amber, fontWeight: 500 }}> {autoPlan.skipped.length} can't be placed (no driver with room).</span>}
+                  {autoPlan.skippedPastCount > 0 && <span style={{ color: COLORS.ghost, fontWeight: 500 }}> {autoPlan.skippedPastCount} past-dated booking{autoPlan.skippedPastCount !== 1 ? "s" : ""} left alone.</span>}
                 </span>
                 <div style={{ maxHeight: 140, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
                   {autoPlan.assignments.slice(0, 40).map(a => (
