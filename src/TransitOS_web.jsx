@@ -6153,6 +6153,54 @@ function appReducer(state, action) {
       return { ...workingState, _error: null, _lastBulkCancelResults: results };
     }
 
+    case "TRIP/BULK_MESSAGE": {
+      // One targeted broadcast to the agents and/or drivers of a
+      // selected set of trips — a single notification per role carrying
+      // every distinct recipient (not one per trip), so nobody gets the
+      // same message N times for N of their trips in the selection.
+      const bmMsg = String(action.message || "").trim();
+      if (!bmMsg) return { ...state, _error: "Message can't be empty." };
+      const bmAudience = action.audience || "agents"; // "agents" | "drivers" | "both"
+      const bmIds = new Set((action.trip_ids || []).map(String));
+      const bmSelected = state.trips.filter(t => bmIds.has(String(t.trip_id)));
+      const bmAgents = new Set(), bmDrivers = new Set();
+      for (const t of bmSelected) {
+        if (bmAudience !== "drivers") (t.agent_ids || []).forEach(a => bmAgents.add(String(a)));
+        if (bmAudience !== "agents" && t.driver_id) bmDrivers.add(String(t.driver_id));
+      }
+      const bmTs = now();
+      const bmNotifs = [];
+      if (bmAgents.size > 0) bmNotifs.push({ id: mkId(), type: "ADMIN_MESSAGE", for_roles: [ROLE.AGENT], for_user_ids: [...bmAgents], message: bmMsg, trip_id: null, ts: bmTs, read: false });
+      if (bmDrivers.size > 0) bmNotifs.push({ id: mkId(), type: "ADMIN_MESSAGE", for_roles: [ROLE.DRIVER], for_user_ids: [...bmDrivers], message: bmMsg, trip_id: null, ts: bmTs, read: false });
+      return {
+        ...state,
+        notifications: [...bmNotifs, ...state.notifications],
+        _error: null,
+        _lastBulkMessageResults: { delivered: bmAgents.size + bmDrivers.size, agents: bmAgents.size, drivers: bmDrivers.size, trips: bmSelected.length },
+      };
+    }
+
+    case "TRIP/BULK_SEND_REMINDER": {
+      // Enable recurring reminders on several upcoming trips at once
+      // (e.g. "nudge everyone about tomorrow's early runs"). Loops the
+      // real per-trip TRIP/SEND_REMINDER; `after === before` is its
+      // no-op path (already active, or trip not found).
+      const brResults = [];
+      let brState = state;
+      for (const tripId of action.trip_ids || []) {
+        const before = brState;
+        const after = appReducer(brState, { type: "TRIP/SEND_REMINDER", trip_id: tripId });
+        if (after._error || after === before) {
+          brResults.push({ trip_id: tripId, ok: false, reason: after._error || "reminders already active or trip not found" });
+          brState = { ...before, _error: null };
+        } else {
+          brResults.push({ trip_id: tripId, ok: true });
+          brState = { ...after, _error: null };
+        }
+      }
+      return { ...brState, _error: null, _lastBulkReminderResults: brResults };
+    }
+
     case "TRIP/ADMIN_CANCEL": {
       // Admin-initiated cancellation of any not-yet-completed trip —
       // distinct from TRIP/CANCEL (the agent-facing rollback primitive,
@@ -9563,6 +9611,68 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return bulkCancelResults;
     }
 
+    case "TRIP/BULK_MESSAGE": {
+      // One targeted broadcast to the agents and/or drivers of a set of
+      // trips. insertNotification already fans out per user_id AND fires
+      // Web Push, so this just gathers the distinct recipients and calls
+      // it once per role — nobody gets the message once per trip.
+      const actingBm = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const bmMsg = String(action.message || "").trim();
+      if (!bmMsg) throw new Error("Message can't be empty.");
+      const bmAudience = action.audience || "agents"; // "agents" | "drivers" | "both"
+      const { data: bmRows } = await supabase.from("trips")
+        .select("id, agentid, extraagentids, driverid").in("id", action.trip_ids || []);
+      const bmAgents = new Set(), bmDrivers = new Set();
+      for (const r of bmRows || []) {
+        if (bmAudience !== "drivers") [r.agentid, ...(r.extraagentids || [])].filter(Boolean).forEach(a => bmAgents.add(String(a)));
+        if (bmAudience !== "agents" && r.driverid) bmDrivers.add(String(r.driverid));
+      }
+      const bmTs = nowEpoch();
+      if (bmAgents.size > 0) await insertNotification({ type: "ADMIN_MESSAGE", for_roles: [ROLE.AGENT], for_user_ids: [...bmAgents], message: bmMsg, trip_id: null, ts: bmTs, read: false });
+      if (bmDrivers.size > 0) await insertNotification({ type: "ADMIN_MESSAGE", for_roles: [ROLE.DRIVER], for_user_ids: [...bmDrivers], message: bmMsg, trip_id: null, ts: bmTs, read: false });
+      await logAuditAction({
+        actorId: actingBm.id, actorName: actingBm.name, actionType: "TRIP/BULK_MESSAGE",
+        details: `Messaged ${bmAgents.size} agent(s) + ${bmDrivers.size} driver(s) across ${(bmRows || []).length} trip(s): "${bmMsg.slice(0, 80)}"`,
+      });
+      refetch();
+      return { delivered: bmAgents.size + bmDrivers.size, agents: bmAgents.size, drivers: bmDrivers.size, trips: (bmRows || []).length };
+    }
+
+    case "TRIP/BULK_SEND_REMINDER": {
+      // Enable recurring reminders on several upcoming trips at once.
+      // Can't loop the per-trip TRIP/SEND_REMINDER — that one is
+      // deliberately gated to an agent ON the trip — so the
+      // enable-and-notify step is inlined here under the admin gate.
+      // Mirrors TRIP/SEND_REMINDER's own comments (lastreminderat = now,
+      // not null; the notification here IS the first reminder).
+      const actingBr = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const brResults = [];
+      const brTs = nowEpoch();
+      for (const tripId of action.trip_ids || []) {
+        try {
+          const { data: r } = await supabase.from("trips").select("*").eq("id", tripId).single();
+          if (!r) { brResults.push({ trip_id: tripId, ok: false, reason: "trip not found" }); continue; }
+          if (r.remindersent) { brResults.push({ trip_id: tripId, ok: false, reason: "reminders already active" }); continue; }
+          must(await supabase.from("trips").update({ remindersent: true, lastreminderat: brTs }).eq("id", tripId));
+          const brAgentIds = [r.agentid, ...(r.extraagentids || [])].filter(Boolean);
+          await insertNotification({
+            type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT], for_user_ids: brAgentIds,
+            message: `Reminder: your trip from ${r.pickuplocation} departs at ${r.scheduledtimestr || r.scheduledtime}.`,
+            trip_id: tripId, ts: brTs, read: false,
+          });
+          brResults.push({ trip_id: tripId, ok: true });
+        } catch (e) {
+          brResults.push({ trip_id: tripId, ok: false, reason: e.message || "Failed" });
+        }
+      }
+      await logAuditAction({
+        actorId: actingBr.id, actorName: actingBr.name, actionType: "TRIP/BULK_SEND_REMINDER",
+        details: `Enabled reminders on ${brResults.filter(x => x.ok).length} of ${brResults.length} trip(s)`,
+      });
+      refetch();
+      return brResults;
+    }
+
     case "TRIP/ASSIGN_DRIVER": {
       const actingAdminAssign = await assertAdminPermission(activeUserRef, "manageDispatch");
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
@@ -12377,6 +12487,8 @@ function useAppStore() {
       // which trips went through.
       if (action.type === "TRIP/BULK_ADMIN_CANCEL") return result._lastBulkCancelResults;
       if (action.type === "TRIP/BULK_REASSIGN_DRIVER") return result._lastBulkReassignResults;
+      if (action.type === "TRIP/BULK_MESSAGE") return result._lastBulkMessageResults;
+      if (action.type === "TRIP/BULK_SEND_REMINDER") return result._lastBulkReminderResults;
       return;
     }
     try {
@@ -13535,7 +13647,7 @@ function AlertsTab({ state, user, dispatch }) {
   // isNotificationForUser and fired once, but the notification then had
   // nowhere to persist/be re-read, since this is the actual list render.
   const myNotifs = state.notifications.filter(n => isNotificationForUser(n, user));
-  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TRIP_DELAY_PROPAGATED: "⏱", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠", ESCALATION: "🔺" };
+  const ICONS = { TRIP_BOOKED: "✅", DRIVER_ASSIGNED: "🚗", TRIP_CONFIRMED: "🔔", IN_TRANSIT: "🚦", TRIP_COMPLETED: "🏁", TRIP_ACCEPTED: "✅", UPCOMING_TRIP: "⏰", TRIP_CANCELLED: "✕", TICKET_UPDATED: "🎫", DRIVER_REMOVED: "🔄", TRIP_DELAY: "⏱", DRIVER_ETA: "🚗", ROUTE_DEVIATION: "📍", COMPLIANCE_DISTANCE: "📏", COMPLIANCE_OVERLOAD: "⚠", SOS_ALERT: "🚨", SPEED_ANOMALY: "⚡", TRIP_DISPUTE: "⚠", DISPUTE_RESOLVED: "⚖", TRIP_UPDATED: "✎", ROUTE_EXCEEDS_POLICY: "📏", NO_SHOW: "🚫", TRIP_LATE_START: "⏰", LATE_CANCELLATION: "✕", DIRECT_MESSAGE: "💬", DRIVER_DOCUMENT_EXPIRY: "📄", COMPANY_ANNOUNCEMENT: "📢", ADMIN_MESSAGE: "📣", DRIVER_HOURS_WARNING: "⏳", DRIVER_SHIFT_DURATION_WARNING: "🛌", TRIP_UNASSIGNED_APPROACHING: "🚫", TRIP_STUCK_IN_TRANSIT: "🚦", TRIP_DELAY_PROPAGATED: "⏱", TICKET_STALE: "🎫", DISPUTE_STALE: "⚠", ESCALATION: "🔺" };
   // Multi-select delete — genuinely new feature, per explicit request
   // (distinct from CLEAR, which only ever marks read). Same pattern as
   // AdminNotifs' identical feature.

@@ -3935,6 +3935,12 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   const [bulkMode, setBulkMode] = useState(null);
   const [reassignDriverId, setReassignDriverId] = useState("");
   const [bulkActing, setBulkActing] = useState(false);
+  // Bulk message / bulk reminder — works on ANY selected trips, not just
+  // dispatched ones. commsMode: null | "message" | "remind".
+  const [commsMode, setCommsMode] = useState(null);
+  const [msgAudience, setMsgAudience] = useState("agents"); // "agents" | "drivers" | "both"
+  const [msgText, setMsgText] = useState("");
+  const [commsActing, setCommsActing] = useState(false);
 
   // Jump-to-trip from a notification tap — per the scan finding, an
   // admin notification previously only marked itself read with no way
@@ -4123,6 +4129,36 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
     }
   };
 
+  // Bulk message / bulk reminder over the current selection (any state).
+  const runBulkComms = async (kind) => {
+    const ids = [...selectedTripIds];
+    if (ids.length === 0) return;
+    if (kind === "message" && !msgText.trim()) return;
+    setCommsActing(true);
+    try {
+      if (kind === "message") {
+        const res = (await dispatch({ type: "TRIP/BULK_MESSAGE", trip_ids: ids, audience: msgAudience, message: msgText.trim() })) || {};
+        setBulkMsg(res.delivered > 0
+          ? `✓ Message sent — ${res.agents} agent${res.agents !== 1 ? "s" : ""}${msgAudience !== "agents" ? `, ${res.drivers} driver${res.drivers !== 1 ? "s" : ""}` : ""} across ${res.trips} trip${res.trips !== 1 ? "s" : ""}`
+          : "⚠ Nobody to message in that selection");
+        setMsgText("");
+      } else {
+        const results = (await dispatch({ type: "TRIP/BULK_SEND_REMINDER", trip_ids: ids })) || [];
+        const ok = results.filter(r => r.ok).length;
+        const fails = results.filter(r => !r.ok);
+        setBulkMsg(fails.length === 0
+          ? `✓ Reminders enabled on ${ok} trip${ok !== 1 ? "s" : ""}`
+          : `⚠ ${ok} enabled, ${fails.length} skipped — ${[...new Set(fails.map(r => r.reason))].join("; ")}`);
+      }
+      setSelectedTripIds(new Set());
+      setCommsMode(null);
+    } catch (e) {
+      setBulkMsg(`✗ ${e.message || "Bulk action failed — please try again."}`);
+    } finally {
+      setCommsActing(false);
+    }
+  };
+
   // Group by driver_id — trips with no driver assigned yet land in their
   // own "Unassigned" group rather than being dropped from the view.
   const groups = {};
@@ -4182,6 +4218,14 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
       setReassignDriverId("");
     }
   }, [selectedActiveIds.length, bulkMode, reassignDriverId]);
+
+  // Same for the comms bar — fold it away once nothing is selected.
+  useEffect(() => {
+    if (selectedTripIds.size === 0 && commsMode !== null) {
+      setCommsMode(null);
+      setMsgText("");
+    }
+  }, [selectedTripIds, commsMode]);
 
   return (
     <div className="pad">
@@ -4404,6 +4448,50 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
               <div style={{ display: "flex", gap: 8 }}>
                 <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setBulkMode(null); setReassignDriverId(""); }} disabled={bulkActing} />
                 <Button title={bulkActing ? "REASSIGNING…" : `REASSIGN ${selectedReassignableIds.length}`} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkTripAction("reassign")} disabled={bulkActing || !reassignDriverId || selectedReassignableIds.length === 0} loading={bulkActing} />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Bulk message / reminder — works on ANY selected trips. */}
+      {canEditTrips && selectedTripIds.size > 0 && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+          <span style={{ fontSize: 11, color: COLORS.chalk, fontWeight: 700 }}>
+            {selectedTripIds.size} trip{selectedTripIds.size !== 1 ? "s" : ""} selected — communicate
+          </span>
+          {commsMode === null && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Button title="📣 MESSAGE" variant="ghost" size="sm" onClick={() => setCommsMode("message")} />
+              <Button title="⏰ REMIND" variant="ghost" size="sm" onClick={() => setCommsMode("remind")} />
+            </div>
+          )}
+          {commsMode === "message" && (
+            <>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {[["agents", "Agents"], ["drivers", "Drivers"], ["both", "Both"]].map(([v, l]) => (
+                  <Button key={v} title={l} size="sm" variant={msgAudience === v ? "amber" : "ghost"} onClick={() => setMsgAudience(v)} />
+                ))}
+              </div>
+              <textarea
+                value={msgText} onChange={(e) => setMsgText(e.target.value)} rows={2} maxLength={400}
+                placeholder="Message to the selected trips' people (in-app + push)…"
+                style={{ background: COLORS.ink, color: COLORS.chalk, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "6px 8px", fontSize: 11, resize: "vertical" }}
+              />
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setCommsMode(null); setMsgText(""); }} disabled={commsActing} />
+                <Button title={commsActing ? "SENDING…" : "SEND"} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkComms("message")} disabled={commsActing || !msgText.trim()} loading={commsActing} />
+              </div>
+            </>
+          )}
+          {commsMode === "remind" && (
+            <>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>
+                Turn on recurring reminders for {selectedTripIds.size} selected trip{selectedTripIds.size !== 1 ? "s" : ""} — agents get a nudge now and hourly from 2h before departure. Trips already reminding are skipped.
+              </span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setCommsMode(null)} disabled={commsActing} />
+                <Button title={commsActing ? "ENABLING…" : `REMIND ${selectedTripIds.size}`} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkComms("remind")} disabled={commsActing} loading={commsActing} />
               </div>
             </>
           )}
