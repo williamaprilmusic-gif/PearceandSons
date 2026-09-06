@@ -4988,8 +4988,13 @@ function appReducer(state, action) {
         return { ...state, _error: `New driver doesn't have room — ${newLoad}/${newCap} seats taken, this trip needs ${incomingSeats}.` };
       }
 
+      // Same-date only — driver_route_km / cap / exceeds are per-driver-
+      // per-DATE values (see the live handler's newDriverSameDay filter);
+      // folding in other days' trips inflates the distance and the policy
+      // badge. Mirrors the old-driver block below.
       const newDriverExisting = state.trips.filter(
-        t => String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.trip_id !== action.trip_id
+        t => String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)
+          && t.trip_id !== action.trip_id && t.scheduled_date === trip.scheduled_date
       );
       const allForNew = [...newDriverExisting, { ...trip, driver_id: action.driver_id }];
       const anchor = defaultCompanyAnchor(state);
@@ -5031,7 +5036,8 @@ function appReducer(state, action) {
             driver_route_km: routeKm, driver_route_cap_km: capKm, driver_route_exceeds_policy: exceeds,
           };
         }
-        if (String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) {
+        if (String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)
+          && t.scheduled_date === trip.scheduled_date) {
           return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeKm, driver_route_cap_km: capKm, driver_route_exceeds_policy: exceeds };
         }
         if (oldRemainingTrips.length > 0 && String(t.driver_id) === String(oldDriverId) && t.trip_id !== action.trip_id

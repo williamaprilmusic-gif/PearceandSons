@@ -19,12 +19,14 @@
 // loop, and every iteration inserts a client_errors row AND calls this
 // function. Without a cap that's an unbounded flood of identical emails +
 // Resend quota burn (flagged in a security review). Two DB functions over
-// crash_alert_log: crash_alert_should_send (read-only DECIDE) is checked
-// first; crash_alert_record (atomic `count = count + 1` — no JS
-// read-modify-write) is called ONLY after Resend actually accepts the
-// email, so a Resend outage during a crash storm never burns the cooldown
-// or the ceiling with nothing delivered. Both fail OPEN — a DB error on
-// the check still sends.
+// crash_alert_log: crash_alert_reserve does the WHOLE decision (per-key
+// cooldown + global-window ceiling) AND stamps the reservation atomically
+// under one xact advisory lock, BEFORE this function calls Resend — so
+// concurrent invocations in a storm see the bump and are gated, no race.
+// crash_alert_release is called ONLY when the Resend call fails, and
+// rolls that reservation back (clears the key's cooldown, hands the
+// global window its slot back) so an outage never burns the quota with
+// nothing delivered. reserve fails OPEN — a DB error still sends.
 //   - per-message cooldown: at most one email per distinct message every
 //     PER_KEY_COOLDOWN_MS.
 //   - global ceiling: at most GLOBAL_MAX emails per GLOBAL_WINDOW_MS across
@@ -82,22 +84,25 @@ serve(async (req) => {
     return json({ error: "No matching crash record found" }, 403);
   }
 
-  // ── Dedupe / rate-limit — DECIDE (see header) ──────────────────────
+  // ── Dedupe / rate-limit — RESERVE (see header) ────────────────────
   const msgKey = message.slice(0, 200);
+  let reserved = false;
   try {
-    const { data: shouldSend, error: gateErr } = await sb.rpc("crash_alert_should_send", {
+    const { data: ok, error: gateErr } = await sb.rpc("crash_alert_reserve", {
       p_msg_key: msgKey,
       p_per_key_cooldown_ms: PER_KEY_COOLDOWN_MS,
       p_global_window_ms: GLOBAL_WINDOW_MS,
       p_global_max: GLOBAL_MAX,
     });
     if (gateErr) throw gateErr;
-    if (shouldSend === false) {
+    if (ok === false) {
       return json({ ok: true, deduped: true });
     }
+    reserved = true;
   } catch (e) {
     // Fail open: a dedupe-store problem must not suppress a real alert.
-    console.warn("crash-alert: dedupe check failed, sending anyway:", (e as Error).message);
+    // We never reserved, so there's nothing to release if Resend fails.
+    console.warn("crash-alert: reserve failed, sending anyway:", (e as Error).message);
   }
 
   const esc = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c => (
@@ -134,18 +139,20 @@ serve(async (req) => {
   if (!resendRes.ok) {
     const resendBody = await resendRes.text();
     console.error("crash-alert: Resend failed:", resendRes.status, resendBody);
-    // Deliberately NOT recorded — a failed send must not burn the
-    // cooldown/ceiling, so the next crash can retry immediately.
+    // Roll the reservation back so a Resend outage doesn't burn the
+    // cooldown/ceiling — the next crash can retry immediately.
+    if (reserved) {
+      try {
+        const { error: relErr } = await sb.rpc("crash_alert_release", { p_msg_key: msgKey });
+        if (relErr) console.warn("crash-alert: reservation release failed:", relErr.message);
+      } catch (e) {
+        console.warn("crash-alert: reservation release threw:", (e as Error).message);
+      }
+    }
     return json({ error: "Internal error — please try again." }, 500);
   }
 
-  // RECORD only now that Resend accepted the email (atomic increment).
-  try {
-    const { error: recErr } = await sb.rpc("crash_alert_record", { p_msg_key: msgKey, p_global_window_ms: GLOBAL_WINDOW_MS });
-    if (recErr) console.warn("crash-alert: dedupe record failed:", recErr.message);
-  } catch (e) {
-    console.warn("crash-alert: dedupe record threw:", (e as Error).message);
-  }
+  // Resend accepted it — the reservation stands as the recorded send.
   return json({ ok: true });
 });
 

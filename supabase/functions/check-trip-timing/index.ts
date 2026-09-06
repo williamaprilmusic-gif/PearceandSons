@@ -52,10 +52,15 @@
 //      only while the estimate is still climbing and below the credible
 //      ceiling. The slip that propagates is: a not-yet-started trip's
 //      time sat past its slot; an IN_TRANSIT trip's WORSE of start-
-//      lateness (intransitat vs scheduled) and overrun (now vs scheduled
-//      + a typical run length) — so a trip that departed on time but is
-//      badly overrunning still drags the next trips, without a normal
-//      long trip in progress flagging itself.
+//      lateness (intransitat vs scheduled) and overrun past scheduled +
+//      IN_TRANSIT_TYPICAL_MIN — so a trip that departed on time but is
+//      badly overrunning still drags the next trips. The overrun term is
+//      dropped once the trip is STALE_SOURCE_MIN past its slot (that's a
+//      forgotten status / stuck trip, check #4's job, not a live delay).
+//      IN_TRANSIT_TYPICAL_MIN is a flat estimate, not per-route, so an
+//      unusually long legitimate pickup run (> typical + the propagation
+//      floor) can still nudge the next trips — deliberately erring toward
+//      warning agents.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -144,12 +149,17 @@ Deno.serve(async (req) => {
         if (sMs != null) {
           if (t.status === "IN_TRANSIT") {
             // The slip a running trip carries is the WORSE of: how late it
-            // started (intransitat vs scheduled) and how far it's now
-            // overrunning a typical run (now vs scheduled + typical). A
-            // trip that started on time but is stuck in traffic 2h past
-            // its slot still drags the driver's next trips.
+            // STARTED (intransitat vs scheduled — a fixed fact) and how far
+            // it's now overrunning a typical run. The overrun term grows
+            // unbounded with wall-clock time, so once a trip is
+            // STALE_SOURCE_MIN past its slot and still IN_TRANSIT it's the
+            // forgot-to-tap-COMPLETE / stuck case (check #4 owns that) — not
+            // a live delay — so drop the overrun term there and keep only
+            // the start-slip, exactly as the not-yet-started branch caps
+            // its own slip below.
+            const elapsed = Math.floor((nowMs - sMs) / 60000);
             const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
-            const overrun = Math.floor((nowMs - sMs) / 60000) - IN_TRANSIT_TYPICAL_MIN;
+            const overrun = elapsed <= STALE_SOURCE_MIN ? elapsed - IN_TRANSIT_TYPICAL_MIN : 0;
             noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
           } else {
             const slip = Math.floor((nowMs - sMs) / 60000);
