@@ -3182,12 +3182,10 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [bulkMsg, setBulkMsg] = useState(null);
-  // Bulk cancel of already-dispatched trips (Bulk dispatch actions
-  // feature). (Bulk REASSIGN is deliberately not here yet — doing it as a
-  // REMOVE_DRIVER+ASSIGN_DRIVER loop triggers ASSIGN_DRIVER's auto-merge
-  // and spurious "trip dispatched" notifications; it needs a dedicated
-  // in-place TRIP/REASSIGN_DRIVER primitive. See the pending-queue memo.)
-  const [confirmingBulkCancel, setConfirmingBulkCancel] = useState(false);
+  // Bulk cancel / reassign of already-dispatched trips (Bulk dispatch
+  // actions feature). bulkMode: null | "cancel" | "reassign".
+  const [bulkMode, setBulkMode] = useState(null);
+  const [reassignDriverId, setReassignDriverId] = useState("");
   const [bulkActing, setBulkActing] = useState(false);
 
   // Jump-to-trip from a notification tap — per the scan finding, an
@@ -3283,6 +3281,10 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // cancel action operates on (Bulk dispatch actions feature).
   const ACTIVE_TRIP_STATES = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
   const selectedActiveIds = [...selectedTripIds].filter(id => ACTIVE_TRIP_STATES.includes(state.trips.find(t => t.trip_id === id)?.state));
+  // Bulk reassign is a strict subset — never IN_TRANSIT (driver is
+  // physically mid-route with the passengers).
+  const REASSIGNABLE_TRIP_STATES = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED];
+  const selectedReassignableIds = [...selectedTripIds].filter(id => REASSIGNABLE_TRIP_STATES.includes(state.trips.find(t => t.trip_id === id)?.state));
   // Every completed trip CURRENTLY VISIBLE on screen — respects
   // whatever filters are active (state filter, date filter), same as
   // displayTrips itself, per explicit decision: "select all" means all
@@ -3339,25 +3341,35 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
     }
   };
 
-  // Bulk cancel — thin orchestration over the real per-trip
-  // TRIP/ADMIN_CANCEL handler (each keeps its own concurrency guard,
-  // notifications, driver-freeing, route recompute), so this UI just
-  // collects the per-trip results.
-  const runBulkCancel = async () => {
-    if (selectedActiveIds.length === 0) return;
+  // Bulk cancel / reassign — thin orchestration over the real per-trip
+  // handlers (TRIP/ADMIN_CANCEL; the in-place TRIP/REASSIGN_DRIVER
+  // primitive), each keeping its own concurrency guard + notifications +
+  // route recompute. This UI just collects the per-trip results.
+  const runBulkTripAction = async (kind) => {
+    const ids = kind === "cancel" ? selectedActiveIds : selectedReassignableIds;
+    if (ids.length === 0) return;
+    if (kind === "reassign" && !reassignDriverId) return;
     setBulkActing(true);
     try {
-      const results = (await dispatch({ type: "TRIP/BULK_ADMIN_CANCEL", trip_ids: selectedActiveIds })) || [];
+      const action = kind === "cancel"
+        ? { type: "TRIP/BULK_ADMIN_CANCEL", trip_ids: ids }
+        : { type: "TRIP/BULK_REASSIGN_DRIVER", trip_ids: ids, driver_id: reassignDriverId };
+      const results = (await dispatch(action)) || [];
       const okCount = results.filter(r => r.ok).length;
       const fails = results.filter(r => !r.ok);
+      const verb = kind === "cancel" ? "Cancelled" : "Reassigned";
       setBulkMsg(fails.length === 0
-        ? `✓ Cancelled ${okCount} trip${okCount !== 1 ? "s" : ""}`
-        : `⚠ Cancelled ${okCount}, ${fails.length} skipped — ${fails.map(r => r.reason).join("; ")}`);
-      setLocallyHiddenTripIds(prev => new Set([...prev, ...results.filter(r => r.ok).map(r => r.trip_id)]));
+        ? `✓ ${verb} ${okCount} trip${okCount !== 1 ? "s" : ""}`
+        : `⚠ ${verb} ${okCount}, ${fails.length} skipped — ${fails.map(r => r.reason).join("; ")}`);
+      // Cancelled trips vanish; reassigned ones just move driver group.
+      if (kind === "cancel") {
+        setLocallyHiddenTripIds(prev => new Set([...prev, ...results.filter(r => r.ok).map(r => r.trip_id)]));
+      }
       setSelectedTripIds(new Set());
-      setConfirmingBulkCancel(false);
+      setBulkMode(null);
+      setReassignDriverId("");
     } catch (e) {
-      setBulkMsg(`✗ ${e.message || "Bulk cancel failed — please try again."}`);
+      setBulkMsg(`✗ ${e.message || "Bulk action failed — please try again."}`);
     } finally {
       setBulkActing(false);
     }
@@ -3413,11 +3425,15 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [displayTrips, selectedDriverId]);
 
-  // Drop the bulk-cancel confirmation if its trips are gone (deselected,
-  // filtered out, or the action finished) so it never re-shows stale.
+  // Reset the bulk cancel/reassign mode once its trips are gone
+  // (deselected, filtered out, or the action finished) so it never
+  // re-shows stale.
   useEffect(() => {
-    if (selectedActiveIds.length === 0 && confirmingBulkCancel) setConfirmingBulkCancel(false);
-  }, [selectedActiveIds.length, confirmingBulkCancel]);
+    if (selectedActiveIds.length === 0 && (bulkMode !== null || reassignDriverId !== "")) {
+      setBulkMode(null);
+      setReassignDriverId("");
+    }
+  }, [selectedActiveIds.length, bulkMode, reassignDriverId]);
 
   return (
     <div className="pad">
@@ -3588,21 +3604,58 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         );
       })()}
 
-      {/* Bulk cancel — for selected already-dispatched trips. Non-sticky
-          so it stacks below (not over) the bulk-delete bar when a
-          selection spans both unassigned/completed and active trips. */}
+      {/* Bulk cancel / reassign — for selected already-dispatched trips.
+          Non-sticky so it stacks below (not over) the bulk-delete bar
+          when a selection spans both unassigned/completed and active
+          trips. */}
       {canEditTrips && selectedActiveIds.length > 0 && (
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-          {!confirmingBulkCancel ? (
-            <Button title={`✕ CANCEL ${selectedActiveIds.length} DISPATCHED TRIP${selectedActiveIds.length !== 1 ? "S" : ""}`} variant="ghost" size="sm" style={{ alignSelf: "flex-start" }} onClick={() => setConfirmingBulkCancel(true)} />
-          ) : (
+          <span style={{ fontSize: 11, color: COLORS.chalk, fontWeight: 700 }}>
+            {selectedActiveIds.length} dispatched trip{selectedActiveIds.length !== 1 ? "s" : ""} selected
+          </span>
+          {bulkMode === null && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Button
+                title={`🔄 REASSIGN${selectedReassignableIds.length !== selectedActiveIds.length ? ` ${selectedReassignableIds.length}` : ""} DRIVER`}
+                variant="ghost" size="sm"
+                disabled={selectedReassignableIds.length === 0}
+                onClick={() => setBulkMode("reassign")}
+              />
+              <Button title={`✕ CANCEL ${selectedActiveIds.length} TRIP${selectedActiveIds.length !== 1 ? "S" : ""}`} variant="danger" size="sm" onClick={() => setBulkMode("cancel")} />
+            </div>
+          )}
+          {bulkMode === "cancel" && (
             <>
               <span style={{ fontSize: 10, color: COLORS.red }}>
                 Cancel {selectedActiveIds.length} dispatched trip{selectedActiveIds.length !== 1 ? "s" : ""}? Assigned drivers are freed and every passenger + driver is notified. This can't be undone.
               </span>
               <div style={{ display: "flex", gap: 8 }}>
-                <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingBulkCancel(false)} disabled={bulkActing} />
-                <Button title={bulkActing ? "CANCELLING…" : `CANCEL ${selectedActiveIds.length}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={runBulkCancel} disabled={bulkActing} loading={bulkActing} />
+                <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setBulkMode(null)} disabled={bulkActing} />
+                <Button title={bulkActing ? "CANCELLING…" : `CANCEL ${selectedActiveIds.length}`} variant="danger" size="sm" style={{ flex: 1 }} onClick={() => runBulkTripAction("cancel")} disabled={bulkActing} loading={bulkActing} />
+              </div>
+            </>
+          )}
+          {bulkMode === "reassign" && (
+            <>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>
+                Move {selectedReassignableIds.length} trip{selectedReassignableIds.length !== 1 ? "s" : ""} to another driver — each is swapped in place (per-trip capacity + document checks still apply; the new driver must accept).
+                {selectedReassignableIds.length !== selectedActiveIds.length && (
+                  <span style={{ color: COLORS.amber }}> {selectedActiveIds.length - selectedReassignableIds.length} in-transit trip{selectedActiveIds.length - selectedReassignableIds.length !== 1 ? "s" : ""} can't be reassigned mid-route — cancel {selectedActiveIds.length - selectedReassignableIds.length !== 1 ? "those" : "it"} separately.</span>
+                )}
+              </span>
+              <select
+                value={reassignDriverId}
+                onChange={(e) => setReassignDriverId(e.target.value)}
+                style={{ background: COLORS.ink, color: COLORS.chalk, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "6px 8px", fontSize: 11 }}
+              >
+                <option value="">Select a driver…</option>
+                {state.users.filter(u => u.role === ROLE.DRIVER).sort((a, b) => (a.name || "").localeCompare(b.name || "")).map(d => (
+                  <option key={d.id} value={d.id}>{d.name}</option>
+                ))}
+              </select>
+              <div style={{ display: "flex", gap: 8 }}>
+                <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => { setBulkMode(null); setReassignDriverId(""); }} disabled={bulkActing} />
+                <Button title={bulkActing ? "REASSIGNING…" : `REASSIGN ${selectedReassignableIds.length}`} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkTripAction("reassign")} disabled={bulkActing || !reassignDriverId || selectedReassignableIds.length === 0} loading={bulkActing} />
               </div>
             </>
           )}

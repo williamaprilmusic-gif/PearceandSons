@@ -4942,6 +4942,91 @@ function appReducer(state, action) {
       return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [notif, notifAdmin, ...state.notifications], _error: null };
     }
 
+    case "TRIP/REASSIGN_DRIVER": {
+      // In-place driver swap (demo-mode parity). Not REMOVE + ASSIGN —
+      // that would trip ASSIGN_DRIVER's UNASSIGNED-only auto-merge.
+      const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
+      if (!trip) return { ...state, _error: "Trip not found" };
+      if (!trip.driver_id) return { ...state, _error: "This trip has no driver yet — use Assign, not Reassign." };
+      if (![TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED].includes(trip.state)) {
+        return { ...state, _error: "Only a not-yet-started (assigned / confirmed) trip can be reassigned." };
+      }
+      const oldDriverId = trip.driver_id;
+      if (String(oldDriverId) === String(action.driver_id)) return { ...state, _error: "That's already this trip's driver." };
+      const newDrv = state.driver_status.find(d => String(d.driver_id) === String(action.driver_id));
+      if (!newDrv) return { ...state, _error: "New driver not found." };
+
+      const newLoad = getDriverLoad(state, action.driver_id, trip.scheduled_date);
+      const incomingSeats = Math.max(1, trip.agent_ids?.length || 0);
+      const newCap = newDrv.capacity || DRIVER_CAPACITY;
+      if (newLoad + incomingSeats > newCap) {
+        return { ...state, _error: `New driver doesn't have room — ${newLoad}/${newCap} seats taken, this trip needs ${incomingSeats}.` };
+      }
+
+      const newDriverExisting = state.trips.filter(
+        t => String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.trip_id !== action.trip_id
+      );
+      const allForNew = [...newDriverExisting, { ...trip, driver_id: action.driver_id }];
+      const anchor = defaultCompanyAnchor(state);
+      const ordered = buildPickupSequence(allForNew, anchor);
+      const dropOrdered = buildDropoffSequence(allForNew, dropoffAnchor(allForNew, ordered, anchor));
+      const seqMap = {}, dropMap = {};
+      ordered.forEach((o, i) => { seqMap[o.trip.trip_id] = i + 1; });
+      dropOrdered.forEach((t, i) => { dropMap[t.trip_id] = i + 1; });
+      const totalAgentCount = allForNew.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+      const routeKm = computeDriverRouteDistanceKm(anchor, ordered, dropOrdered);
+      const capKm = companyPolicyDistanceCapKm(totalAgentCount);
+      const exceeds = routeKm > capKm;
+
+      const newTrips = state.trips.map(t => {
+        if (String(t.trip_id) === String(action.trip_id)) {
+          return {
+            ...t, state: TRIP_STATE.ASSIGNED, driver_id: action.driver_id,
+            pickup_order_num: seqMap[action.trip_id], drop_sequence_num: dropMap[action.trip_id],
+            driverAccepted: false, acceptedAt: null, confirmed_at: null, tripStartedAt: null,
+            driver_route_km: routeKm, driver_route_cap_km: capKm, driver_route_exceeds_policy: exceeds,
+          };
+        }
+        if (String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) {
+          return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeKm, driver_route_cap_km: capKm, driver_route_exceeds_policy: exceeds };
+        }
+        return t;
+      });
+      const oldStillActive = newTrips.filter(t => String(t.driver_id) === String(oldDriverId) && [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
+      const newDriverStatus = state.driver_status.map(d => {
+        if (String(d.driver_id) === String(action.driver_id)) return { ...d, state: DRIVER_STATE.BUSY, current_trip_id: action.trip_id };
+        if (String(d.driver_id) === String(oldDriverId)) {
+          return oldStillActive.length === 0
+            ? { ...d, state: DRIVER_STATE.AVAILABLE, current_trip_id: null }
+            : (String(d.current_trip_id) === String(action.trip_id) ? { ...d, current_trip_id: oldStillActive[0].trip_id } : d);
+        }
+        return d;
+      });
+      const newUser = state.users.find(u => String(u.id) === String(action.driver_id));
+      const nOld = { id: mkId(), type: "DRIVER_REMOVED", for_roles: [ROLE.DRIVER], for_user_ids: [oldDriverId], message: `Trip ${action.trip_id} was reassigned to another driver by an admin and removed from your route.`, trip_id: action.trip_id, ts: now(), read: false };
+      const nAgents = { id: mkId(), type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: [...trip.agent_ids], message: `Your trip's driver was changed to ${newUser?.name || action.driver_id} (${newDrv.vehicle}), who is reviewing it. Pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`, trip_id: action.trip_id, ts: now(), read: false };
+      return { ...state, trips: newTrips, driver_status: newDriverStatus, notifications: [nOld, nAgents, ...state.notifications], _error: null };
+    }
+
+    case "TRIP/BULK_REASSIGN_DRIVER": {
+      // Loops the in-place TRIP/REASSIGN_DRIVER above — chained appReducer
+      // sub-calls, same pattern as TRIP/BULK_ADMIN_CANCEL.
+      const results = [];
+      let workingState = state;
+      for (const tripId of action.trip_ids || []) {
+        const before = workingState;
+        const after = appReducer(workingState, { type: "TRIP/REASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id });
+        if (after._error) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error });
+          workingState = { ...before, _error: null };
+        } else {
+          results.push({ trip_id: tripId, ok: true });
+          workingState = { ...after, _error: null };
+        }
+      }
+      return { ...workingState, _error: null, _lastBulkReassignResults: results };
+    }
+
     case "TRIP/REPORT_DELAY": {
       // Driver-facing delay report (demo-mode parity). No trip_delays
       // table in the in-memory model, so this just raises the admin +
@@ -10404,6 +10489,163 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
+
+    case "TRIP/REASSIGN_DRIVER": {
+      // In-place driver swap on an already-assigned trip — the "original
+      // driver called in sick" workflow. Deliberately NOT
+      // REMOVE_DRIVER + ASSIGN_DRIVER: that round-trips through
+      // UNASSIGNED_BOOKING, which makes ASSIGN_DRIVER's auto-merge fold
+      // sibling same-hour trips together and re-notify agents as if newly
+      // dispatched. This keeps the trip a distinct trip the whole time.
+      const actingReassign = await assertAdminPermission(activeUserRef, "manageDispatch");
+      const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
+      if (!tripRow) throw new Error("Trip not found");
+      if (!tripRow.driverid) throw new Error("This trip has no driver yet — use Assign, not Reassign.");
+      // IN_TRANSIT is excluded on purpose: the driver is physically
+      // carrying the passengers. Archived trips too.
+      if (![TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED].includes(tripRow.status)) {
+        throw new Error("Only a not-yet-started (assigned / confirmed) trip can be reassigned.");
+      }
+      const oldDriverId = tripRow.driverid;
+      if (String(oldDriverId) === String(action.driver_id)) throw new Error("That's already this trip's driver.");
+      const { data: newDriverRow } = await supabase.from("driver_status").select("*").eq("driverid", action.driver_id).single();
+      if (!newDriverRow) throw new Error("New driver not found.");
+      await assertDriverDocsCurrent(action.driver_id);
+
+      // Per-day seat capacity for the NEW driver — same date-scoped rule
+      // as ASSIGN_DRIVER (trips on different days never share a vehicle).
+      const { data: newDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id)
+        .neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
+      const newDriverSameDay = (newDriverTripsRaw || []).filter(t => t.scheduleddate === tripRow.scheduleddate && String(t.id) !== String(action.trip_id));
+      const seatsOf = (r) => Math.max(1, 1 + (r.extraagentids?.length || 0));
+      const newCurrentLoad = newDriverSameDay.reduce((s, r) => s + seatsOf(r), 0);
+      const incomingSeats = seatsOf(tripRow);
+      const newDriverCapacity = newDriverRow.capacity || DRIVER_CAPACITY;
+      if (newCurrentLoad + incomingSeats > newDriverCapacity) {
+        throw new Error(`New driver doesn't have room — ${newCurrentLoad}/${newDriverCapacity} seats taken, this trip needs ${incomingSeats}.`);
+      }
+
+      // Recompute the NEW driver's same-date route with this trip folded
+      // in (same coord-array shape ASSIGN_DRIVER builds).
+      const toCoordRows = (rows) => rows.map(r => {
+        const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+        const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
+        const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+        const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+        return {
+          trip_id: r.id, pickup_sequence_coords: [...first, ...extra],
+          dropoff_sequence_coords: ed.length > 0 ? [...fd, ...ed] : fd,
+          scheduled_time: r.scheduledtimestr, direction: r.direction,
+        };
+      });
+      const allForNewDriver = toCoordRows([...newDriverSameDay, { ...tripRow, driverid: action.driver_id }]);
+      const reassignAnchor = await fetchCompanyAnchor();
+      const departEpochReassign = earliestScheduledTime([...newDriverSameDay, tripRow]);
+      const {
+        seqMap: rSeqMap, dropMap: rDropMap, totalAgentCount: rAgentCount,
+        routeDistanceKm: rRouteKm, policyCapKm: rPolicyCap, exceedsPolicy: rExceeds,
+      } = await recomputeDriverRouteAndCompliance(allForNewDriver, reassignAnchor, departEpochReassign);
+
+      const nowTs = nowEpoch();
+      // The swap itself, optimistic-concurrency guarded on the trip we
+      // read. Back to ASSIGNED + driveraccepted:false — the new driver
+      // must accept, exactly like a fresh assignment.
+      const { data: reassignWrite, error: reassignErr } = await withUpdatedAtGuard(
+        supabase.from("trips").update({
+          status: TRIP_STATE.ASSIGNED, driverid: action.driver_id,
+          pickupordernum: rSeqMap[action.trip_id], dropsequencenum: rDropMap[action.trip_id],
+          driveraccepted: false, acceptedat: null, confirmedat: null, updatedat: nowTs,
+          driverroutekm: rRouteKm, driverroutecapkm: rPolicyCap, driverrouteexceedspolicy: rExceeds,
+        }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id");
+      if (reassignErr) throw reassignErr;
+      if (!reassignWrite || reassignWrite.length === 0) {
+        throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
+      // Re-sequence the NEW driver's other same-date trips too.
+      for (const t of newDriverSameDay) {
+        await supabase.from("trips").update({
+          pickupordernum: rSeqMap[t.id] ?? t.pickupordernum,
+          dropsequencenum: rDropMap[t.id] ?? t.dropsequencenum,
+          driverroutekm: rRouteKm, driverroutecapkm: rPolicyCap, driverrouteexceedspolicy: rExceeds,
+        }).eq("id", t.id);
+      }
+
+      // NEW driver status -> BUSY.
+      const reassignBusyRes = must(await supabase.from("driver_status").update({
+        state: DRIVER_STATE.BUSY, currenttripid: action.trip_id, updatedat: new Date(nowTs).toISOString(),
+      }).eq("driverid", action.driver_id).select("driverid"));
+      if (!reassignBusyRes.data || reassignBusyRes.data.length === 0) {
+        throw new Error("Trip reassigned, but couldn't update the new driver's status — please refresh and check manually.");
+      }
+
+      // OLD driver — free them if this was their only active trip (same
+      // rule as REMOVE_DRIVER; their other trips' individual routes are
+      // unchanged by losing this one).
+      const { data: oldRemaining } = await supabase.from("trips").select("id").eq("driverid", oldDriverId)
+        .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+      if (!oldRemaining || oldRemaining.length === 0) {
+        await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", oldDriverId);
+      } else {
+        // keep BUSY but don't leave currenttripid dangling at the moved trip
+        await supabase.from("driver_status").update({ currenttripid: oldRemaining[0].id, updatedat: new Date(nowTs).toISOString() }).eq("driverid", oldDriverId).eq("currenttripid", action.trip_id);
+      }
+
+      const [{ data: oldDriverUser }, { data: newDriverUser }] = await Promise.all([
+        supabase.from("users").select("fullname").eq("id", oldDriverId).maybeSingle(),
+        supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle(),
+      ]);
+      const reassignAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      await insertNotification({
+        type: "DRIVER_REMOVED", for_roles: [ROLE.DRIVER], for_user_ids: [oldDriverId],
+        message: `Trip ${action.trip_id} was reassigned to another driver by an admin and removed from your route.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      await insertNotification({
+        type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: reassignAgentIds,
+        message: `Your trip's driver was changed to ${newDriverUser?.fullname || action.driver_id} (${newDriverRow.vehicle}), who is reviewing it. Pickup #${rSeqMap[action.trip_id]}, drop-off #${rDropMap[action.trip_id]}.`,
+        trip_id: action.trip_id, ts: nowTs, read: false,
+      });
+      // Compliance re-check for the new driver, same as ASSIGN_DRIVER.
+      const reassignCompliance = checkComplianceTriggers({ name: newDriverUser?.fullname }, newDriverRow, rRouteKm, rAgentCount);
+      for (const issue of reassignCompliance) {
+        await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false });
+      }
+      if (rExceeds) {
+        await insertNotification({
+          type: "ROUTE_EXCEEDS_POLICY", for_roles: [ROLE.ADMIN],
+          message: `⚠ Driver ${newDriverUser?.fullname}'s total route is ${rRouteKm.toFixed(1)} km — exceeds the ${rPolicyCap} km policy cap for ${rAgentCount} agent${rAgentCount !== 1 ? "s" : ""}.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        });
+      }
+      await logAuditAction({
+        actorId: actingReassign.id, actorName: actingReassign.name, actionType: "TRIP/REASSIGN_DRIVER",
+        tripId: action.trip_id, targetUserId: action.driver_id,
+        details: `Reassigned trip from ${oldDriverUser?.fullname || oldDriverId} to ${newDriverUser?.fullname || action.driver_id}`,
+      });
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
+    }
+
+    case "TRIP/BULK_REASSIGN_DRIVER": {
+      // Loops the in-place TRIP/REASSIGN_DRIVER primitive above — no
+      // UNASSIGNED intermediate, no auto-merge, per-trip guards +
+      // notifications intact. One that another admin just touched is
+      // skipped, not fatal. One trailing refetch.
+      const bulkReassignResults = [];
+      for (const tripId of action.trip_ids || []) {
+        try {
+          await handleSupabaseAction({ type: "TRIP/REASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id }, activeUserRef, async () => {});
+          bulkReassignResults.push({ trip_id: tripId, ok: true });
+        } catch (e) {
+          bulkReassignResults.push({ trip_id: tripId, ok: false, reason: e.message || "Reassign failed" });
+        }
+      }
+      refetch();
+      return bulkReassignResults;
+    }
+
     case "TRIP/REPORT_DELAY": {
       // Driver-facing — no admin permission gate. Only makes sense on a
       // trip the reporting driver actually owns and that's genuinely
@@ -12025,6 +12267,7 @@ function useAppStore() {
       // actions feature): per-trip pass/fail so the UI can say exactly
       // which trips went through.
       if (action.type === "TRIP/BULK_ADMIN_CANCEL") return result._lastBulkCancelResults;
+      if (action.type === "TRIP/BULK_REASSIGN_DRIVER") return result._lastBulkReassignResults;
       return;
     }
     try {
