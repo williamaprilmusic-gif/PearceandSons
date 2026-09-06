@@ -54,36 +54,42 @@ export function pollWhileVisible(fn, intervalMs) {
   }, intervalMs);
 }
 
-// pollWhileVisible + a THROTTLED foreground catch-up, as one unit — for
-// sweeps that shouldn't run in the background AND have no server-side
-// cron backstop (the admin escalation/stale-ticket batch, the driver
-// late-start fallback, the metered TomTom traffic fetch), so a long
-// hidden stretch must be caught up on return. `visibilitychange` fires
-// on every screen unlock / alt-tab, so the catch-up only runs if a full
-// `intervalMs` has actually elapsed with no run. `fn` may return a
-// promise; the last-run clock is stamped only once it RESOLVES, so a
-// run that fails on a flaky-connection foreground doesn't arm the
-// throttle against the next retry. Returns a single cleanup function.
-export function pollWhileVisibleWithCatchup(fn, intervalMs) {
-  // Seed to "now" — every caller runs fn() once at mount, so the
-  // throttle is armed from the start (a 0 seed would leave every
-  // foreground unthrottled until the first run's promise resolved,
-  // which on a hung/slow connection is never).
+// pollWhileVisible + a throttled foreground catch-up, as one unit — for
+// anything that shouldn't run in the background but DOES need catching
+// up on return: the admin escalation/stale-ticket batch, the driver
+// late-start fallback, the metered TomTom traffic fetch, the stale-
+// bundle check. `visibilitychange` fires on every screen unlock /
+// alt-tab, so the catch-up only runs if `catchupThrottleMs` has elapsed
+// with no run (default: `intervalMs`, so a sweep catches up at most
+// once per its own cadence; a smaller value for a cheap check that
+// wants faster foreground recovery).
+//
+// `lastRunAt` tracks the start time of the most recent run that hasn't
+// been superseded and hasn't failed. Seeded to now (every caller runs
+// fn() once at mount) so the throttle is armed from the start — a 0
+// seed would leave every foreground unthrottled until the first
+// promise settled, which on a hung connection is never. Each run stamps
+// it synchronously (a slow/hung fn still can't reopen the throttle),
+// then on settle: re-stamp if it succeeded and nothing newer has
+// stamped since, or roll back if it failed and is still the current
+// run — so a flaky-foreground failure retries on the next return.
+// `fn` may return a promise. Returns a single cleanup function.
+export function pollWhileVisibleWithCatchup(fn, intervalMs, { catchupThrottleMs = intervalMs } = {}) {
   let lastRunAt = Date.now();
   const run = () => {
     const startedAt = Date.now();
     const prev = lastRunAt;
     lastRunAt = startedAt; // arm the throttle immediately, even mid-flight
     Promise.resolve().then(fn).then(
-      () => {},
-      () => { if (lastRunAt === startedAt) lastRunAt = prev; }, // failed → roll back so the next foreground retries
+      () => { if (lastRunAt < startedAt) lastRunAt = startedAt; }, // rolled back then succeeded → re-stamp
+      () => { if (lastRunAt === startedAt) lastRunAt = prev; },    // failed & still current → roll back for the next foreground
     );
   };
   const id = setInterval(() => {
     if (typeof document === "undefined" || document.visibilityState !== "hidden") run();
   }, intervalMs);
   const onVisible = () => {
-    if (document.visibilityState === "visible" && Date.now() - lastRunAt >= intervalMs) run();
+    if (document.visibilityState === "visible" && Date.now() - lastRunAt >= catchupThrottleMs) run();
   };
   if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisible);
   return () => {
@@ -19504,27 +19510,29 @@ function AppInner() {
   useEffect(() => {
     const currentSrc = document.querySelector('script[type="module"]')?.getAttribute("src");
     if (!currentSrc) return;
+    let staleHandled = false; // fire the toast + reload exactly once
     const check = async () => {
+      if (staleHandled) return;
       try {
         const res = await fetch("/index.html", { cache: "no-store" });
         if (!res.ok) return;
         const doc = new DOMParser().parseFromString(await res.text(), "text/html");
         const freshSrc = doc.querySelector('script[type="module"]')?.getAttribute("src");
         if (freshSrc && freshSrc !== currentSrc) {
+          staleHandled = true;
           pushToast("UPDATING", "A new version is available — reloading…", COLORS.blue);
           setTimeout(() => window.location.reload(), 2000);
         }
       } catch (e) { /* offline or network hiccup — try again next interval */ }
     };
     const t = setTimeout(check, 20000);
-    // Background ticks skipped, but re-check on EVERY foreground (not
-    // throttled) — this is a single cheap fetch("/index.html"), not a
-    // fleet sweep or a metered API, and its whole point is catching a
-    // stale bundle fast (a stale bundle silently fails every RLS write).
-    const iv = pollWhileVisible(check, 300000);
-    const onVisible = () => { if (document.visibilityState === "visible") check(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => { clearTimeout(t); clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); };
+    // Skip background ticks; foreground catch-up throttled to 45s — fast
+    // enough to catch a stale bundle soon after the user returns (a
+    // stale bundle silently fails every RLS write), without a
+    // fetch("/index.html") on every single screen unlock across the
+    // fleet. Longer 5-min base interval for a still-foregrounded tab.
+    const stopPoll = pollWhileVisibleWithCatchup(check, 300000, { catchupThrottleMs: 45000 });
+    return () => { clearTimeout(t); stopPoll(); };
   }, [pushToast]);
 
   useEffect(() => {
