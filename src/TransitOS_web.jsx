@@ -4707,8 +4707,11 @@ function appReducer(state, action) {
       for (const tripId of action.trip_ids || []) {
         const before = workingState;
         const after = appReducer(workingState, { type: "TRIP/ASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id });
-        if (after._error) {
-          results.push({ trip_id: tripId, ok: false, reason: after._error });
+        // `after === before` is the sub-reducer's no-op path (trip or
+        // driver not found) — it returns state verbatim with no _error;
+        // treat it as a failure, not a silent success.
+        if (after._error || after === before) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error || "trip or driver not found" });
           // Don't adopt the errored attempt's state — keep going from
           // the last known-good state so one bad day doesn't poison the
           // rest of the batch.
@@ -4732,8 +4735,8 @@ function appReducer(state, action) {
       for (const a of action.assignments || []) {
         const before = workingState;
         const after = appReducer(workingState, { type: "TRIP/ASSIGN_DRIVER", trip_id: a.trip_id, driver_id: a.driver_id });
-        if (after._error) {
-          results.push({ trip_id: a.trip_id, ok: false, reason: after._error });
+        if (after._error || after === before) {
+          results.push({ trip_id: a.trip_id, ok: false, reason: after._error || "trip or driver not found" });
           workingState = { ...before, _error: null };
         } else {
           results.push({ trip_id: a.trip_id, ok: true });
@@ -5000,6 +5003,25 @@ function appReducer(state, action) {
       const capKm = companyPolicyDistanceCapKm(totalAgentCount);
       const exceeds = routeKm > capKm;
 
+      // Re-route the OLD driver's remaining trips on this date too — their
+      // driver_route_km etc. still count the moved trip's legs otherwise.
+      const oldRemainingTrips = state.trips.filter(
+        t => String(t.driver_id) === String(oldDriverId) && t.trip_id !== action.trip_id
+          && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)
+          && t.scheduled_date === trip.scheduled_date
+      );
+      let oSeqMap = {}, oDropMap = {}, oRouteKm = 0, oCapKm = 0, oExceeds = false;
+      if (oldRemainingTrips.length > 0) {
+        const oOrdered = buildPickupSequence(oldRemainingTrips, anchor);
+        const oDropOrdered = buildDropoffSequence(oldRemainingTrips, dropoffAnchor(oldRemainingTrips, oOrdered, anchor));
+        oOrdered.forEach((o, i) => { oSeqMap[o.trip.trip_id] = i + 1; });
+        oDropOrdered.forEach((t, i) => { oDropMap[t.trip_id] = i + 1; });
+        const oAgentCount = oldRemainingTrips.reduce((n, t) => n + (t.agent_ids?.length || 0), 0);
+        oRouteKm = computeDriverRouteDistanceKm(anchor, oOrdered, oDropOrdered);
+        oCapKm = companyPolicyDistanceCapKm(oAgentCount);
+        oExceeds = oRouteKm > oCapKm;
+      }
+
       const newTrips = state.trips.map(t => {
         if (String(t.trip_id) === String(action.trip_id)) {
           return {
@@ -5011,6 +5033,10 @@ function appReducer(state, action) {
         }
         if (String(t.driver_id) === String(action.driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state)) {
           return { ...t, pickup_order_num: seqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: dropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: routeKm, driver_route_cap_km: capKm, driver_route_exceeds_policy: exceeds };
+        }
+        if (oldRemainingTrips.length > 0 && String(t.driver_id) === String(oldDriverId) && t.trip_id !== action.trip_id
+          && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.scheduled_date === trip.scheduled_date) {
+          return { ...t, pickup_order_num: oSeqMap[t.trip_id] ?? t.pickup_order_num, drop_sequence_num: oDropMap[t.trip_id] ?? t.drop_sequence_num, driver_route_km: oRouteKm, driver_route_cap_km: oCapKm, driver_route_exceeds_policy: oExceeds };
         }
         return t;
       });
@@ -5038,8 +5064,8 @@ function appReducer(state, action) {
       for (const tripId of action.trip_ids || []) {
         const before = workingState;
         const after = appReducer(workingState, { type: "TRIP/REASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id });
-        if (after._error) {
-          results.push({ trip_id: tripId, ok: false, reason: after._error });
+        if (after._error || after === before) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error || "no change" });
           workingState = { ...before, _error: null };
         } else {
           results.push({ trip_id: tripId, ok: true });
@@ -6110,8 +6136,8 @@ function appReducer(state, action) {
       for (const tripId of action.trip_ids || []) {
         const before = workingState;
         const after = appReducer(workingState, { type: "TRIP/ADMIN_CANCEL", trip_id: tripId });
-        if (after._error) {
-          results.push({ trip_id: tripId, ok: false, reason: after._error });
+        if (after._error || after === before) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error || "no change" });
           workingState = { ...before, _error: null };
         } else {
           results.push({ trip_id: tripId, ok: true });
@@ -10500,6 +10526,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         supabase.from("trips").update({
           status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
           driveraccepted: false, updatedat: nowTs,
+          // Whoever gets assigned next is a fresh approach — clear the
+          // removed driver's pickup-ETA flags.
+          pickup_eta_notified: {},
         }).eq("id", action.trip_id),
         tripRow.updatedat
       ).select("id");
@@ -10598,6 +10627,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           pickupordernum: rSeqMap[action.trip_id], dropsequencenum: rDropMap[action.trip_id],
           driveraccepted: false, acceptedat: null, confirmedat: null, updatedat: nowTs,
           driverroutekm: rRouteKm, driverroutecapkm: rPolicyCap, driverrouteexceedspolicy: rExceeds,
+          // New driver = a fresh approach — clear the old driver's
+          // pickup-ETA flags so check-pickup-eta re-alerts the agents.
+          pickup_eta_notified: {},
         }).eq("id", action.trip_id),
         tripRow.updatedat
       ).select("id");
@@ -10622,9 +10654,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         throw new Error("Trip reassigned, but couldn't update the new driver's status — please refresh and check manually.");
       }
 
-      // OLD driver — free them if this was their only active trip (same
-      // rule as REMOVE_DRIVER; their other trips' individual routes are
-      // unchanged by losing this one).
+      // OLD driver — free them if this was their only active trip.
       const { data: oldRemaining } = await supabase.from("trips").select("id").eq("driverid", oldDriverId)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       if (!oldRemaining || oldRemaining.length === 0) {
@@ -10632,6 +10662,35 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       } else {
         // keep BUSY but don't leave currenttripid dangling at the moved trip
         await supabase.from("driver_status").update({ currenttripid: oldRemaining[0].id, updatedat: new Date(nowTs).toISOString() }).eq("driverid", oldDriverId).eq("currenttripid", action.trip_id);
+        // Re-sequence + re-route the old driver's remaining SAME-DATE
+        // trips — driverroutekm/capkm/exceedspolicy are driver-wide
+        // values stamped on every one of their trips, so leaving them
+        // would show A & C an inflated distance (still counting the moved
+        // trip's legs) + a possibly-false policy badge, with a gap in
+        // pickupordernum. Same recompute block as TRIP/ADMIN_CANCEL.
+        const { data: oldDriverSameDate } = await supabase.from("trips").select("*").eq("driverid", oldDriverId)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+          .eq("scheduleddate", tripRow.scheduleddate);
+        if (oldDriverSameDate && oldDriverSameDate.length > 0) {
+          const allForOld = oldDriverSameDate.map(r => {
+            const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+            const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
+            const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+            const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+            return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: ed.length > 0 ? [...fd, ...ed] : fd, direction: r.direction };
+          });
+          const oldAnchor = await fetchCompanyAnchor();
+          const {
+            seqMap: oSeqMap, dropMap: oDropMap, routeDistanceKm: oRouteKm, policyCapKm: oPolicyCap, exceedsPolicy: oExceeds,
+          } = await recomputeDriverRouteAndCompliance(allForOld, oldAnchor, earliestScheduledTime(oldDriverSameDate));
+          for (const r of oldDriverSameDate) {
+            await supabase.from("trips").update({
+              pickupordernum: oSeqMap[r.id] ?? r.pickupordernum,
+              dropsequencenum: oDropMap[r.id] ?? r.dropsequencenum,
+              driverroutekm: oRouteKm, driverroutecapkm: oPolicyCap, driverrouteexceedspolicy: oExceeds,
+            }).eq("id", r.id);
+          }
+        }
       }
 
       const [{ data: oldDriverUser }, { data: newDriverUser }] = await Promise.all([

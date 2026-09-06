@@ -18,11 +18,13 @@
 // deploy or a data-shape bug puts a client into a remount→crash→remount
 // loop, and every iteration inserts a client_errors row AND calls this
 // function. Without a cap that's an unbounded flood of identical emails +
-// Resend quota burn (flagged in a security review). The whole decision —
-// per-message cooldown + global-window ceiling + recording the send — is
-// one atomic, xact-advisory-locked DB function (crash_alert_gate over
-// crash_alert_log), so concurrent crash invocations can't race the
-// counter. It fails OPEN: if the gate RPC errors, the email still goes.
+// Resend quota burn (flagged in a security review). Two DB functions over
+// crash_alert_log: crash_alert_should_send (read-only DECIDE) is checked
+// first; crash_alert_record (atomic `count = count + 1` — no JS
+// read-modify-write) is called ONLY after Resend actually accepts the
+// email, so a Resend outage during a crash storm never burns the cooldown
+// or the ceiling with nothing delivered. Both fail OPEN — a DB error on
+// the check still sends.
 //   - per-message cooldown: at most one email per distinct message every
 //     PER_KEY_COOLDOWN_MS.
 //   - global ceiling: at most GLOBAL_MAX emails per GLOBAL_WINDOW_MS across
@@ -80,10 +82,10 @@ serve(async (req) => {
     return json({ error: "No matching crash record found" }, 403);
   }
 
-  // ── Dedupe / rate-limit gate (atomic; see header) ──────────────────
+  // ── Dedupe / rate-limit — DECIDE (see header) ──────────────────────
   const msgKey = message.slice(0, 200);
   try {
-    const { data: shouldSend, error: gateErr } = await sb.rpc("crash_alert_gate", {
+    const { data: shouldSend, error: gateErr } = await sb.rpc("crash_alert_should_send", {
       p_msg_key: msgKey,
       p_per_key_cooldown_ms: PER_KEY_COOLDOWN_MS,
       p_global_window_ms: GLOBAL_WINDOW_MS,
@@ -95,7 +97,7 @@ serve(async (req) => {
     }
   } catch (e) {
     // Fail open: a dedupe-store problem must not suppress a real alert.
-    console.warn("crash-alert: dedupe gate failed, sending anyway:", (e as Error).message);
+    console.warn("crash-alert: dedupe check failed, sending anyway:", (e as Error).message);
   }
 
   const esc = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c => (
@@ -132,11 +134,18 @@ serve(async (req) => {
   if (!resendRes.ok) {
     const resendBody = await resendRes.text();
     console.error("crash-alert: Resend failed:", resendRes.status, resendBody);
+    // Deliberately NOT recorded — a failed send must not burn the
+    // cooldown/ceiling, so the next crash can retry immediately.
     return json({ error: "Internal error — please try again." }, 500);
   }
 
-  // No post-send write needed — crash_alert_gate already recorded this
-  // send atomically when it returned true.
+  // RECORD only now that Resend accepted the email (atomic increment).
+  try {
+    const { error: recErr } = await sb.rpc("crash_alert_record", { p_msg_key: msgKey, p_global_window_ms: GLOBAL_WINDOW_MS });
+    if (recErr) console.warn("crash-alert: dedupe record failed:", recErr.message);
+  } catch (e) {
+    console.warn("crash-alert: dedupe record threw:", (e as Error).message);
+  }
   return json({ ok: true });
 });
 

@@ -50,10 +50,12 @@
 //      get one "your ride may be ~N min late" heads-up + push.
 //      delaypropagatednotified / delaypropagatedmins dedupe it, re-firing
 //      only while the estimate is still climbing and below the credible
-//      ceiling. A "delay" here is strictly a SCHEDULE SLIP — how late a
-//      trip started (IN_TRANSIT: intransitat vs scheduled) or how long a
-//      trip has sat past its departure without starting — never elapsed
-//      trip duration, which is expected and not a delay.
+//      ceiling. The slip that propagates is: a not-yet-started trip's
+//      time sat past its slot; an IN_TRANSIT trip's WORSE of start-
+//      lateness (intransitat vs scheduled) and overrun (now vs scheduled
+//      + a typical run length) — so a trip that departed on time but is
+//      badly overrunning still drags the next trips, without a normal
+//      long trip in progress flagging itself.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -71,6 +73,7 @@ const PROPAGATE_HORIZON_MS = 4 * 60 * 60 * 1000; // only warn trips within 4h af
 const PROPAGATE_REFIRE_STEP_MIN = 20;    // re-notify only once the estimate grows this much
 const MAX_CREDIBLE_DELAY_MIN = 90;       // clamp: a bigger figure isn't a credible knock-on and stops re-fires
 const STALE_SOURCE_MIN = 180;            // a not-yet-started trip >3h past departure is a forgotten status, not a live delay — don't propagate from it (check #1 owns that alert)
+const IN_TRANSIT_TYPICAL_MIN = 90;       // how long a pickup run is expected to take; an IN_TRANSIT trip past scheduled + this is genuinely overrunning
 
 // A trip's scheduled departure as an epoch ms. Prefer the stored
 // scheduledtime; fall back to parsing scheduleddate (YYYY/MM/DD) +
@@ -132,8 +135,7 @@ Deno.serve(async (req) => {
 
     for (const t of trips || []) {
       // ── check #5 data-gathering (acts after the loop) ──────────────
-      // Schedule slip only — never elapsed trip time:
-      //   IN_TRANSIT      -> how late it STARTED (intransitat vs scheduled)
+      //   IN_TRANSIT      -> max(start-lateness, overrun past a typical run)
       //   not-yet-started -> how long it's sat past its slot unstarted
       // Independent of the notified flags above — we want the live slip
       // every run, not just the first.
@@ -141,10 +143,14 @@ Deno.serve(async (req) => {
         const sMs = schedMs(t);
         if (sMs != null) {
           if (t.status === "IN_TRANSIT") {
-            // intransitat proves they actually started — the slip is
-            // real even if large, so just record it (the propagation
-            // loop clamps to MAX_CREDIBLE_DELAY_MIN).
-            if (t.intransitat) noteDelay(t.driverid, Math.floor((t.intransitat - sMs) / 60000), sMs);
+            // The slip a running trip carries is the WORSE of: how late it
+            // started (intransitat vs scheduled) and how far it's now
+            // overrunning a typical run (now vs scheduled + typical). A
+            // trip that started on time but is stuck in traffic 2h past
+            // its slot still drags the driver's next trips.
+            const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
+            const overrun = Math.floor((nowMs - sMs) / 60000) - IN_TRANSIT_TYPICAL_MIN;
+            noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
           } else {
             const slip = Math.floor((nowMs - sMs) / 60000);
             // a not-yet-started trip >3h past its slot is a forgotten
