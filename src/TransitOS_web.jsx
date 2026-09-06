@@ -19215,17 +19215,26 @@ class AppErrorBoundary extends React.Component {
 // 'default')" in the split-second before window.location.reload()
 // actually navigates (observed once in client_errors, 2026-09-06).
 //
-// __vitePreload only fulfills-empty AFTER preventDefault(), and the
-// handler only calls preventDefault() on a path where a reload is
-// already in flight — so an EMPTY (null/undefined) module here always
-// means "a reload is coming": hang forever so Suspense holds its
-// fallback until it navigates. Anything else falls through untouched:
-// a genuine persistent rejection (handler chose NOT to preventDefault,
-// e.g. "already reloaded once, still broken") still reaches
+// Why this catches the crash and not a rejection: verified against the
+// actual build output — rolldown keeps the `.then(m => ({default: ...}))`
+// INSIDE __vitePreload's baseModule arg
+//   lazy(guardLazyChunk(() => i(() => import("chunk").then(m => ({default: m.X})), deps)))
+// so a stale-chunk `import()` REJECTION never reaches that `.then`'s
+// success callback — it flows to __vitePreload's own `.catch`
+// (node_modules/vite .../node.js: `baseModule().catch(handlePreloadError)`),
+// which, once our vite:preloadError handler has called preventDefault(),
+// returns `undefined` WITHOUT re-throwing. So the outer factory FULFILLS
+// with undefined. React.lazy would then read `.default` off it and throw
+// "reading 'default'" in the ~1 frame before location.reload() navigates
+// (client_errors #61). __vitePreload only fulfills-empty after
+// preventDefault(), which the handler only does with a reload in flight
+// — so an EMPTY module here always means "a reload is coming": hang so
+// Suspense holds its fallback until it navigates. Everything else falls
+// through: a genuine persistent rejection (handler chose NOT to
+// preventDefault — "already reloaded once, still broken") still reaches
 // AppErrorBoundary, and a module that loaded but is missing its export
-// (renamed/truncated build) still renders <undefined/> → React's
-// "Element type is invalid" → AppErrorBoundary + telemetry, rather than
-// a silent infinite spinner.
+// (renamed/truncated build) renders <undefined/> → React's "Element type
+// is invalid" → AppErrorBoundary + telemetry, not a silent spinner.
 const guardLazyChunk = (loader) => () =>
   Promise.resolve(loader()).then(m => (m == null ? new Promise(() => {}) : m));
 const LazyViewerPortal = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.ViewerPortal }))));
