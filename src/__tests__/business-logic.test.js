@@ -1778,12 +1778,42 @@ describe("computeCancellationRisk — per-booking late-cancel / no-show likeliho
     expect(r.x.reasons.some(s => s.includes("late cancels"))).toBe(true);
   });
 
-  it("cancelRiskLevelOf maps score bands", () => {
+  it("cancelRiskLevelOf maps score bands, and is total over NaN/negative", () => {
     expect(cancelRiskLevelOf(0)).toBe("low");
     expect(cancelRiskLevelOf(24)).toBe("low");
     expect(cancelRiskLevelOf(25)).toBe("elevated");
     expect(cancelRiskLevelOf(54)).toBe("elevated");
     expect(cancelRiskLevelOf(55)).toBe("high");
+    expect(cancelRiskLevelOf(NaN)).toBe("low");
+    expect(cancelRiskLevelOf(-5)).toBe("low");
+  });
+
+  it("does not dilute an agent's rate with their own pending/future bookings", () => {
+    const trips = [
+      { trip_id: "x", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: ["a1"], scheduled_time_epoch: future(24), scheduled_time: "09:00", no_shows: [] },
+      ...past(3, TRIP_STATE.ARCHIVED_CANCELLED),                 // 3 late cancels
+      ...past(3, TRIP_STATE.ARCHIVED_COMPLETED),                 // 3 clean → true rate 50% over 6 archived
+      // 15 upcoming bookings for the same agent that must NOT count
+      ...Array.from({ length: 15 }, (_, i) => ({ trip_id: `u${i}`, state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: ["a1"], scheduled_time_epoch: future(48), scheduled_time: "09:00", no_shows: [] })),
+    ];
+    const r = computeCancellationRisk({ trips }, { now: NOW });
+    expect(r.x.reasons[0]).toBe("3/6 late cancels");   // denominator is archived count, not 6+16
+    expect(r.x.level).toBe("high");
+  });
+
+  it("does not double-count a <2h booking via both late_booking_flag and is_exception", () => {
+    const r = computeCancellationRisk({
+      trips: [mkTrip({ booked_at_epoch: null, late_booking_flag: true, is_exception: true })],
+    }, { now: NOW });
+    expect(r.x.reasons).toEqual(["very short lead time"]);  // no separate "flagged exception"
+    expect(r.x.score).toBe(8 + 18);                          // neutral + lead only
+  });
+
+  it("skips a stale booking that has no scheduled_time_epoch but a past scheduled_date", () => {
+    const r = computeCancellationRisk({
+      trips: [{ trip_id: "stale", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: ["a1"], scheduled_date: "2020/01/01", scheduled_time: "09:00", no_shows: [] }],
+    }, { now: NOW });
+    expect(r.stale).toBeUndefined();
   });
 });
 

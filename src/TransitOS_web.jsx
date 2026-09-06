@@ -5273,7 +5273,7 @@ function appReducer(state, action) {
             // baking in an estimate that every display site now treats
             // as always-exact. tripDriverPayment still protects driver
             // pay via its own independent fallback to est_distance_km.
-            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: null,
+            ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, completed_at_epoch: completeNowTs, actual_distance_km: null,
                 completed_dropoffs: newCompletedDropoffs, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations }
             : t
         );
@@ -5435,7 +5435,7 @@ function appReducer(state, action) {
               // Left null — see the identical fix/comment on this same
               // field a few cases above (TRIP/CONFIRM_AGENT_DROPOFF's
               // completion branch).
-              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, actual_distance_km: null,
+              ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, completed_at_epoch: Date.now(), actual_distance_km: null,
               completed_dropoffs: [...t.agent_ids], dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations,
             }
           : t
@@ -5849,7 +5849,7 @@ function appReducer(state, action) {
         if (isLate) {
           try { assertTripTransition(trip.state, TRIP_STATE.ARCHIVED_CANCELLED); }
           catch (e) { return { ...state, _error: e.message }; }
-          newTrips = state.trips.map(t => String(t.trip_id) === String(action.trip_id) ? { ...t, state: TRIP_STATE.ARCHIVED_CANCELLED, cancelled_at: cancelNowTs, is_exception: true } : t);
+          newTrips = state.trips.map(t => String(t.trip_id) === String(action.trip_id) ? { ...t, state: TRIP_STATE.ARCHIVED_CANCELLED, cancelled_at: cancelNowTs, cancelled_at_epoch: Date.now(), is_exception: true } : t);
         } else {
           newTrips = state.trips.filter(t => String(t.trip_id) !== String(action.trip_id));
         }
@@ -6454,7 +6454,8 @@ export function tripRowToApp(row, chatByTrip) {
     booked_at: epochToDisplay(row.bookedat), confirmed_at: epochToDisplay(row.confirmedat),
     booked_at_epoch: row.bookedat || null, confirmed_at_epoch: row.confirmedat || null,
     in_transit_at: epochToDisplay(row.intransitat), completed_at: epochToDisplay(row.completedat),
-    in_transit_at_epoch: row.intransitat || null, completed_at_epoch: row.completedat || null, cancelled_at: epochToDisplay(row.cancelledat),
+    in_transit_at_epoch: row.intransitat || null, completed_at_epoch: row.completedat || null,
+    cancelled_at: epochToDisplay(row.cancelledat), cancelled_at_epoch: row.cancelledat || null,
     late_booking_flag: row.latebookingflag || false,
     agent_name: row.agentname, phone: row.phone, pickup_order_num: row.pickupordernum, drop_sequence_num: row.dropsequencenum,
     est_distance_km: row.estdistancekm, actual_distance_km: row.actualdistancekm,

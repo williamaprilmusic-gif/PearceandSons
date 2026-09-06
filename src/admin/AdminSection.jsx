@@ -1071,11 +1071,11 @@ function ClientSlaPanel({ state }) {
   const nowTick = useTicker(30 * 60 * 1000);
   const LOOKBACK = 30;
   const rows = React.useMemo(
-    () => computeClientSlaReport(state, { now: nowTick, lookbackDays: LOOKBACK }),
-    [state, nowTick]
+    () => computeClientSlaReport({ trips: state.trips, companies: state.companies }, { now: nowTick, lookbackDays: LOOKBACK }),
+    [state.trips, state.companies, nowTick]
   );
-  const text = formatClientSlaText(rows, LOOKBACK);
-  const copy = () => navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
+  const copy = () => navigator.clipboard.writeText(formatClientSlaText(rows, LOOKBACK))
+    .then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
   const pct = (v) => v == null ? "—" : Math.round(v * 100) + "%";
   const maxWk = Math.max(1, ...rows.flatMap(r => r.weekly));
 
@@ -1883,19 +1883,28 @@ export function computeAutoAssignPlan(state, options = {}) {
 // Pure: score each not-yet-started booking by how likely an agent on it
 // is to cancel late / no-show, so dispatch can confirm proactively or
 // hold a seat back. Every signal comes from state already in memory:
-//   - the agent's own late-cancel + no-show history over the loaded
-//     trips. NOTE only LATE cancellations are archived (an on-time
-//     cancel deletes the row outright), so this is a late-cancel rate,
-//     not a total cancel rate — which is the rate that actually costs a
-//     wasted dispatch anyway.
+//   - the agent's late-cancel + no-show history over the loaded trips,
+//     counted ONLY over ARCHIVED (completed / cancelled) trips — the
+//     same population computeNoShowRisk (TransitOS_web.jsx) uses, so the
+//     rate isn't diluted by the agent's own pending/future bookings.
+//     NOTE only LATE cancellations are archived (an on-time cancel
+//     deletes the row), so this is a late-cancel rate, not a total one —
+//     which is the rate that actually costs a wasted dispatch anyway.
 //   - lead time: a booking made < LEAD_SHORT_H before departure
 //     (late_booking_flag is the app's own version of this) OR more than
-//     LEAD_LONG_D ahead — both cancel more than the sweet spot in the
-//     middle.
+//     LEAD_LONG_D ahead — both cancel more than the sweet spot.
 //   - a pre-dawn pickup (before PREDAWN_HOUR), historically flakier.
-//   - the trip already carrying an exception flag.
+//   - an exception flag that is NOT just the late-booking flag's twin
+//     (the reducer sets both together for a <2h booking — don't score
+//     the same event twice).
 // A trip's score is the WORST among its agents (one unreliable agent is
 // enough reason to hold the seat). 0–100, capped.
+//
+// This is the DISPATCH-DESK scorer. The agent-facing tripNoShowRisk /
+// computeNoShowRisk (TransitOS_web.jsx, still used in the agent view)
+// stay no-show-only and coarse on purpose — an agent shouldn't be shown
+// a full cancel-risk breakdown. The no-show tally here matches theirs
+// (archived-only, worst-of-agents) so the two don't disagree.
 //   options: { now = Date.now(), minHistory = 4 }
 const CANCEL_RISK_LEVELS = [
   { key: "high", min: 55 },
@@ -1906,15 +1915,24 @@ const CANCEL_RISK_NEUTRAL = 8;   // base score for an agent with too little hist
 const LEAD_SHORT_H = 3;
 const LEAD_LONG_D = 14;
 const PREDAWN_HOUR = 6;
-export const cancelRiskLevelOf = (score) => CANCEL_RISK_LEVELS.find(l => score >= l.min).key;
+const CANCEL_RISK_ARCHIVED = [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED];
+// Total over undefined/NaN/negative: `.find` can miss, so fall back to
+// the lowest band rather than throwing on `.key`.
+export const cancelRiskLevelOf = (score) =>
+  (CANCEL_RISK_LEVELS.find(l => score >= l.min) || CANCEL_RISK_LEVELS[CANCEL_RISK_LEVELS.length - 1]).key;
 
 export function computeCancellationRisk(state, options = {}) {
   const { now = Date.now(), minHistory = 4 } = options;
   const trips = state.trips || [];
+  // SAST calendar date of `now` (not the real clock) — same derivation
+  // as computeAutoAssignPlan's todaySlash.
+  const sastNow = new Date(now + 2 * 60 * 60 * 1000);
+  const todaySlash = `${sastNow.getUTCFullYear()}/${String(sastNow.getUTCMonth() + 1).padStart(2, "0")}/${String(sastNow.getUTCDate()).padStart(2, "0")}`;
 
-  // Per-agent history tally over every loaded trip the agent appears on.
+  // Per-agent history tally — ARCHIVED trips only (see header).
   const hist = new Map(); // agentId -> { total, lateCancels, noShows }
   for (const t of trips) {
+    if (!CANCEL_RISK_ARCHIVED.includes(t.state)) continue;
     const noShowIds = new Set((t.no_shows || []).map(ns => String(ns.agent_id)));
     for (const aid of (t.agent_ids || []).map(String)) {
       const s = hist.get(aid) || { total: 0, lateCancels: 0, noShows: 0 };
@@ -1926,15 +1944,16 @@ export function computeCancellationRisk(state, options = {}) {
   }
 
   // Per-agent base risk (0–100) from history — trusted only once the
-  // agent has minHistory prior trips; below that everyone sits at the
-  // neutral floor so a first-timer isn't branded high-risk by one bad
-  // early trip.
+  // agent has minHistory prior ARCHIVED trips; below that everyone sits
+  // at the neutral floor so a first-timer isn't branded by one bad trip.
   const agentBase = new Map();
   for (const [aid, s] of hist) {
     if (s.total < minHistory) { agentBase.set(aid, CANCEL_RISK_NEUTRAL); continue; }
-    // a no-show wastes the whole run; a late cancel at least frees the
-    // seat — so it's weighted a little lighter.
-    const score = (s.lateCancels / s.total) * 70 + (s.noShows / s.total) * 90;
+    // Decisive on purpose: a ~50% late-cancel history should read "high"
+    // to a dispatcher, not "keep an eye on it". A no-show wastes the
+    // whole run so it's weighted a notch above a late cancel (which at
+    // least frees the seat).
+    const score = (s.lateCancels / s.total) * 110 + (s.noShows / s.total) * 130;
     agentBase.set(aid, Math.min(100, Math.round(score)));
   }
 
@@ -1943,7 +1962,8 @@ export function computeCancellationRisk(state, options = {}) {
   for (const t of trips) {
     if (!SCORABLE.includes(t.state)) continue;
     const sched = t.scheduled_time_epoch != null ? Number(t.scheduled_time_epoch) : null;
-    if (sched != null && sched < now) continue; // slot already gone — not actionable
+    if (sched != null && sched < now) continue;                    // slot already gone
+    if (sched == null && t.scheduled_date && t.scheduled_date < todaySlash) continue; // stale booking with no epoch
 
     // lead-time contribution (trip-wide, not per-agent)
     let lead = 0, leadReason = null;
@@ -1956,7 +1976,9 @@ export function computeCancellationRisk(state, options = {}) {
     let predawn = 0;
     const hm = /^(\d{1,2}):(\d{2})/.exec(String(t.scheduled_time || ""));
     if (hm && Number(hm[1]) < PREDAWN_HOUR) predawn = 6;
-    const exc = t.is_exception ? 8 : 0;
+    // don't also count is_exception when late_booking_flag already did —
+    // the reducer sets both for the same <2h booking.
+    const exc = (t.is_exception && !t.late_booking_flag) ? 8 : 0;
 
     const agentIds = (t.agent_ids || []).map(String);
     let worst = -1, worstAgent = null;
@@ -2016,8 +2038,12 @@ export function computeClientSlaReport(state, options = {}) {
   });
 
   for (const t of state.trips || []) {
-    // window: use the same "when did this trip happen" fallback chain as
-    // computeWeeklySummary — a live/unstarted trip is out of scope here.
+    // window: "when did this trip resolve" — completion/cancellation
+    // epoch first (a late cancel of an advance booking belongs in the
+    // week it was cancelled, not booked), falling back through
+    // in_transit → booked. Richer than computeWeeklySummary's
+    // booked_at || in_transit_at chain because this report is keyed on
+    // the resolution date, not the booking date.
     const when = Number(t.completed_at_epoch || t.cancelled_at_epoch || t.in_transit_at_epoch || t.booked_at_epoch || 0);
     if (!when || when < windowStart || when > now) continue;
     const isCompleted = t.state === TRIP_STATE.ARCHIVED_COMPLETED;
@@ -5238,10 +5264,13 @@ function AdminDispatch({ state, dispatch, user }) {
   // no-show history + lead time + pre-dawn + exception flag). One O(trips)
   // pass, memoised — the per-card badge below reads it by trip_id. Richer
   // than the agent-facing tripNoShowRisk (no-show only) on purpose: this
-  // is the dispatch desk deciding whether to hold a seat.
+  // is the dispatch desk deciding whether to hold a seat. `now` only
+  // gates the past-slot filter, so a 30-min ticker (not the 10s
+  // driver-position one) is plenty — matches the other aggregate memos.
+  const riskTick = useTicker(30 * 60 * 1000);
   const cancelRiskByTrip = React.useMemo(
-    () => computeCancellationRisk({ trips: state.trips }, { now: nowTick }),
-    [state.trips, nowTick]
+    () => computeCancellationRisk({ trips: state.trips }, { now: riskTick }),
+    [state.trips, riskTick]
   );
 
   const toggleTrip = (tripId) => {
