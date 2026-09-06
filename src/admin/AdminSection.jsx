@@ -1062,6 +1062,68 @@ function WeeklyOpsSummaryPanel({ state }) {
   );
 }
 
+// Per client-company on-time / cancellation / policy scorecard over a
+// 30-day window (computeClientSlaReport). `state` here is already
+// company-scoped for a scoped admin — same as WeeklyOpsSummaryPanel —
+// so the report naturally only shows that admin's own clients.
+function ClientSlaPanel({ state }) {
+  const [copied, setCopied] = React.useState(false);
+  const nowTick = useTicker(30 * 60 * 1000);
+  const LOOKBACK = 30;
+  const rows = React.useMemo(
+    () => computeClientSlaReport(state, { now: nowTick, lookbackDays: LOOKBACK }),
+    [state, nowTick]
+  );
+  const text = formatClientSlaText(rows, LOOKBACK);
+  const copy = () => navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
+  const pct = (v) => v == null ? "—" : Math.round(v * 100) + "%";
+  const maxWk = Math.max(1, ...rows.flatMap(r => r.weekly));
+
+  return (
+    <div style={{ background: COLORS.card, border: `1px solid ${COLORS.wire}`, borderRadius: 6, padding: 14, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>🏢 CLIENT SERVICE — LAST {LOOKBACK} DAYS</span>
+        <Button title={copied ? "✓ COPIED" : "📋 COPY FOR EMAIL"} variant="ghost" size="sm"
+          style={{ borderColor: copied ? COLORS.green : COLORS.wire, color: copied ? COLORS.green : COLORS.ghost }} onClick={copy} />
+      </div>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 10, color: COLORS.ghost }}>No completed or cancelled trips in the last {LOOKBACK} days.</div>
+      ) : rows.map(r => {
+        const otColor = r.onTimeStartPct == null ? COLORS.ghost : r.onTimeStartPct >= 0.9 ? COLORS.green : r.onTimeStartPct >= 0.75 ? COLORS.amber : COLORS.red;
+        return (
+          <div key={r.companyId || "_adhoc"} style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+              <span style={{ fontSize: 11, fontWeight: 700, color: COLORS.chalk }}>{r.companyName}</span>
+              <span style={{ fontSize: 9, color: COLORS.ghost }}>{r.trips} trip{r.trips !== 1 ? "s" : ""}</span>
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {[
+                ["ON-TIME", pct(r.onTimeStartPct), otColor],
+                ["CANCEL RATE", pct(r.cancelRate), r.cancelRate > 0.1 ? COLORS.red : COLORS.ghost],
+                ["NO-SHOWS", r.noShows, r.noShows > 0 ? COLORS.amber : COLORS.ghost],
+                ["OVER-CAP TRIPS", r.policyBreaches, r.policyBreaches > 0 ? COLORS.amber : COLORS.ghost],
+              ].map(([label, val, color]) => (
+                <div key={label} style={{ minWidth: 74 }}>
+                  <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.6 }}>{label}</div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color, fontFamily: FONTS.head }}>{val}</div>
+                </div>
+              ))}
+            </div>
+            {r.avgLateStartMin > 0 && (
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>Avg {r.avgLateStartMin} min late when a start ran late.</div>
+            )}
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 2, height: 22 }} title="Weekly trip volume, oldest → newest">
+              {r.weekly.map((n, i) => (
+                <div key={i} style={{ flex: 1, background: COLORS.wire, height: `${Math.max(6, (n / maxWk) * 100)}%`, borderRadius: 1 }} />
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // Time: candidate bookings' scheduled_time must be within this many
 // minutes of the anchor booking's scheduled_time. A booking missing
 // scheduled_time is treated as compatible (mirrors isDriverOnShift's
@@ -1915,6 +1977,118 @@ export function computeCancellationRisk(state, options = {}) {
     out[t.trip_id] = { score: worst, level: cancelRiskLevelOf(worst), reasons };
   }
   return out;
+}
+
+// ── Client on-time / SLA report ───────────────────────────────────────
+// Pure: per client-company service quality over a lookback window, for
+// account reviews / contract renewals. Complements the per-DRIVER
+// computeSlaReport in TransitOS_web.jsx (same on-time definition, a
+// different cut). "Client" = the company at the office end of the
+// shuttle: pickup_company_id for an OUTBOUND leg, dropoff_company_id for
+// an INBOUND one — in practice whichever of the two is set. Trips with
+// neither bucket under "Ad-hoc / no company".
+//   options: { now = Date.now(), lookbackDays = 30, companyIds }
+// `companyIds`, when given, restricts the report to those companies (a
+// company-scoped admin passes their own set); master admins pass none.
+const CLIENT_SLA_GRACE_MIN = 10;   // matches SLA_GRACE_MINUTES (TransitOS_web.jsx) — a start within 10 min of the slot is "on time"
+const CLIENT_SLA_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function computeClientSlaReport(state, options = {}) {
+  const { now = Date.now(), lookbackDays = 30, companyIds = null } = options;
+  const windowStart = now - lookbackDays * 24 * 60 * 60 * 1000;
+  const allowSet = companyIds ? new Set(companyIds.map(String)) : null;
+  const weekCount = Math.max(1, Math.ceil(lookbackDays / 7));
+
+  const clientOf = (t) => {
+    const id = t.direction === "OUTBOUND"
+      ? (t.pickup_company_id ?? t.dropoff_company_id)
+      : (t.dropoff_company_id ?? t.pickup_company_id);
+    return id != null ? String(id) : null;
+  };
+
+  const byClient = new Map();
+  const blank = (id) => ({
+    companyId: id,
+    companyName: id ? (companyById(state, id)?.label || `#${id}`) : "Ad-hoc / no company",
+    trips: 0, completed: 0, cancelled: 0, noShows: 0, policyBreaches: 0,
+    onTimeStarts: 0, timedStarts: 0, lateStartMins: [],
+    weekly: Array(weekCount).fill(0),
+  });
+
+  for (const t of state.trips || []) {
+    // window: use the same "when did this trip happen" fallback chain as
+    // computeWeeklySummary — a live/unstarted trip is out of scope here.
+    const when = Number(t.completed_at_epoch || t.cancelled_at_epoch || t.in_transit_at_epoch || t.booked_at_epoch || 0);
+    if (!when || when < windowStart || when > now) continue;
+    const isCompleted = t.state === TRIP_STATE.ARCHIVED_COMPLETED;
+    const isCancelled = t.state === TRIP_STATE.ARCHIVED_CANCELLED;
+    if (!isCompleted && !isCancelled) continue;
+
+    const cid = clientOf(t);
+    if (allowSet && !(cid && allowSet.has(cid))) continue;
+    if (!byClient.has(cid)) byClient.set(cid, blank(cid));
+    const c = byClient.get(cid);
+
+    c.trips++;
+    const wkIdx = weekCount - 1 - Math.min(weekCount - 1, Math.floor((now - when) / CLIENT_SLA_WEEK_MS));
+    c.weekly[wkIdx]++;
+
+    if (isCancelled) { c.cancelled++; continue; }
+    c.completed++;
+    if ((t.no_shows || []).length > 0) c.noShows++;
+    if (t.driver_route_exceeds_policy) c.policyBreaches++;
+
+    const sched = t.scheduled_time_epoch != null ? Number(t.scheduled_time_epoch) : null;
+    const started = t.in_transit_at_epoch != null ? Number(t.in_transit_at_epoch) : null;
+    if (sched && started) {
+      c.timedStarts++;
+      const lateMin = (started - sched) / 60000;
+      if (lateMin <= CLIENT_SLA_GRACE_MIN) c.onTimeStarts++;
+      else c.lateStartMins.push(Math.round(lateMin));
+    }
+  }
+
+  return [...byClient.values()].map(c => ({
+    companyId: c.companyId,
+    companyName: c.companyName,
+    trips: c.trips,
+    completed: c.completed,
+    cancelled: c.cancelled,
+    // every archived cancellation IS a late cancellation (an on-time one
+    // deletes the row), so this rate is specifically the costly kind.
+    cancelRate: c.trips > 0 ? c.cancelled / c.trips : null,
+    noShows: c.noShows,
+    policyBreaches: c.policyBreaches,
+    onTimeStartPct: c.timedStarts > 0 ? c.onTimeStarts / c.timedStarts : null,
+    avgLateStartMin: c.lateStartMins.length > 0
+      ? Math.round(c.lateStartMins.reduce((a, b) => a + b, 0) / c.lateStartMins.length) : 0,
+    timedStarts: c.timedStarts,
+    weekly: c.weekly,
+  })).sort((a, b) =>
+    (a.onTimeStartPct ?? 2) - (b.onTimeStartPct ?? 2) || b.trips - a.trips
+  );
+}
+
+export function formatClientSlaText(rows, lookbackDays = 30) {
+  const pct = (v) => v == null ? "—" : Math.round(v * 100) + "%";
+  const lines = [
+    `Pearce & Sons — Client Service Report (last ${lookbackDays} days)`,
+    "=".repeat(56),
+  ];
+  if (rows.length === 0) lines.push("No completed or cancelled trips in this window.");
+  for (const r of rows) {
+    lines.push(
+      "",
+      r.companyName,
+      `  Trips:        ${r.trips}  (${r.completed} completed, ${r.cancelled} cancelled)`,
+      `  On-time:      ${pct(r.onTimeStartPct)}${r.avgLateStartMin ? `  (avg ${r.avgLateStartMin} min late when late)` : ""}`,
+      `  Cancel rate:  ${pct(r.cancelRate)}`,
+      `  No-shows:     ${r.noShows}`,
+      `  Policy trips: ${r.policyBreaches}  (route over the distance cap)`,
+    );
+  }
+  lines.push("", `Generated ${new Date().toLocaleDateString("en-ZA")}`);
+  return lines.join("\n");
 }
 
 // "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
@@ -2845,6 +3019,8 @@ function AdminDashboard({ state, user, dispatch }) {
       )}
       <SectionHeader label="Weekly Ops Summary" collapsed={collapsedSections.has("weeklyOps")} onToggle={() => toggleSection("weeklyOps")} />
       {!collapsedSections.has("weeklyOps") && (() => { try { return <WeeklyOpsSummaryPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>WeeklyOps error: {e.message}</div>; } })()}
+      <SectionHeader label="Client Service (30-Day SLA)" collapsed={collapsedSections.has("clientSla")} onToggle={() => toggleSection("clientSla")} />
+      {!collapsedSections.has("clientSla") && (() => { try { return <ClientSlaPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>ClientSla error: {e.message}</div>; } })()}
       <SectionHeader label="7-Day Demand Forecast" collapsed={collapsedSections.has("forecast")} onToggle={() => toggleSection("forecast")} />
       {!collapsedSections.has("forecast") && (() => { try { return <CapacityForecastPanel state={state} />; } catch(e) { return <div style={{color:'red',fontSize:10}}>CapacityForecast error: {e.message}</div>; } })()}
       <SectionHeader label="Staffing Gaps (Next 7 Days)" collapsed={collapsedSections.has("gaps")} onToggle={() => toggleSection("gaps")} />

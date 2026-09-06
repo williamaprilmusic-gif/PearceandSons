@@ -54,6 +54,8 @@ import {
   computeAutoAssignPlan,
   computeCancellationRisk,
   cancelRiskLevelOf,
+  computeClientSlaReport,
+  formatClientSlaText,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1782,5 +1784,79 @@ describe("computeCancellationRisk — per-booking late-cancel / no-show likeliho
     expect(cancelRiskLevelOf(25)).toBe("elevated");
     expect(cancelRiskLevelOf(54)).toBe("elevated");
     expect(cancelRiskLevelOf(55)).toBe("high");
+  });
+});
+
+describe("computeClientSlaReport — per-client-company service quality", () => {
+  const NOW = Date.UTC(2026, 2, 1, 12, 0, 0);
+  const daysAgo = (d) => NOW - d * 24 * 3600000;
+  const state = {
+    companies: [{ id: "co1", name: "Acme Corp", address: {} }, { id: "co2", name: "Globex", address: {} }],
+    trips: [
+      // Acme: 3 completed (2 on-time, 1 late 30m), 1 late-cancel, 1 no-show, 1 policy breach
+      { trip_id: "a1", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "INBOUND", dropoff_company_id: "co1",
+        completed_at_epoch: daysAgo(3), scheduled_time_epoch: daysAgo(3), in_transit_at_epoch: daysAgo(3) + 5 * 60000, no_shows: [] },
+      { trip_id: "a2", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "OUTBOUND", pickup_company_id: "co1",
+        completed_at_epoch: daysAgo(10), scheduled_time_epoch: daysAgo(10), in_transit_at_epoch: daysAgo(10) + 2 * 60000,
+        no_shows: [{ agent_id: "x" }] },
+      { trip_id: "a3", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "INBOUND", dropoff_company_id: "co1",
+        completed_at_epoch: daysAgo(20), scheduled_time_epoch: daysAgo(20), in_transit_at_epoch: daysAgo(20) + 30 * 60000,
+        no_shows: [], driver_route_exceeds_policy: true },
+      { trip_id: "a4", state: TRIP_STATE.ARCHIVED_CANCELLED, direction: "INBOUND", dropoff_company_id: "co1",
+        cancelled_at_epoch: daysAgo(5), no_shows: [] },
+      // Globex: 1 completed on-time
+      { trip_id: "g1", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "OUTBOUND", pickup_company_id: "co2",
+        completed_at_epoch: daysAgo(2), scheduled_time_epoch: daysAgo(2), in_transit_at_epoch: daysAgo(2), no_shows: [] },
+      // out of window (40 days) — ignored
+      { trip_id: "old", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "OUTBOUND", pickup_company_id: "co1",
+        completed_at_epoch: daysAgo(40), scheduled_time_epoch: daysAgo(40), in_transit_at_epoch: daysAgo(40), no_shows: [] },
+      // live trip — ignored (not completed/cancelled)
+      { trip_id: "live", state: TRIP_STATE.IN_TRANSIT, direction: "INBOUND", dropoff_company_id: "co1", in_transit_at_epoch: daysAgo(0), no_shows: [] },
+    ],
+  };
+
+  it("aggregates completed + cancelled trips per client within the lookback", () => {
+    const rows = computeClientSlaReport(state, { now: NOW, lookbackDays: 30 });
+    const acme = rows.find(r => r.companyId === "co1");
+    expect(acme.companyName).toBe("Acme Corp");
+    expect(acme.trips).toBe(4);          // a1..a4 (not old, not live)
+    expect(acme.completed).toBe(3);
+    expect(acme.cancelled).toBe(1);
+    expect(acme.cancelRate).toBeCloseTo(0.25);
+    expect(acme.noShows).toBe(1);
+    expect(acme.policyBreaches).toBe(1);
+    expect(acme.onTimeStartPct).toBeCloseTo(2 / 3);  // a1,a2 on-time; a3 late
+    expect(acme.avgLateStartMin).toBe(30);
+  });
+
+  it("sorts worst on-time first and buckets weekly volume oldest→newest", () => {
+    const rows = computeClientSlaReport(state, { now: NOW, lookbackDays: 30 });
+    expect(rows[0].companyId).toBe("co1");   // 66% < Globex 100%
+    expect(rows[1].companyId).toBe("co2");
+    expect(rows[0].weekly).toHaveLength(5);  // ceil(30/7)
+    expect(rows[0].weekly.reduce((a, b) => a + b, 0)).toBe(4);
+    expect(rows[0].weekly[4]).toBeGreaterThan(0); // a1 (3d ago) in the newest bucket
+  });
+
+  it("restricts to companyIds when given (company-scoped admin)", () => {
+    const rows = computeClientSlaReport(state, { now: NOW, lookbackDays: 30, companyIds: ["co2"] });
+    expect(rows.map(r => r.companyId)).toEqual(["co2"]);
+  });
+
+  it("buckets a trip with no company under Ad-hoc", () => {
+    const rows = computeClientSlaReport({
+      companies: [], trips: [{ trip_id: "n1", state: TRIP_STATE.ARCHIVED_COMPLETED, direction: "INBOUND",
+        completed_at_epoch: daysAgo(1), scheduled_time_epoch: daysAgo(1), in_transit_at_epoch: daysAgo(1), no_shows: [] }],
+    }, { now: NOW });
+    expect(rows[0].companyId).toBe(null);
+    expect(rows[0].companyName).toBe("Ad-hoc / no company");
+  });
+
+  it("formatClientSlaText renders per-client blocks", () => {
+    const rows = computeClientSlaReport(state, { now: NOW, lookbackDays: 30 });
+    const txt = formatClientSlaText(rows, 30);
+    expect(txt).toContain("Acme Corp");
+    expect(txt).toContain("On-time:      67%");
+    expect(txt).toContain("Cancel rate:  25%");
   });
 });
