@@ -24,6 +24,8 @@
 //     (24h) from its create/last-confirm time; a 7-day cutoff is 7x that
 //     and well past any "still here" confirm chain. Pure operational
 //     ephemera, no reporting value once stale — simple delete, no export.
+//     (Column names follow the table's no-underscore house style:
+//     createdat, lastconfirmedat.)
 //
 // Unlike trip-history-retention, this does NOT export before deleting —
 // per explicit scope decision: these aren't billing/compliance records
@@ -71,7 +73,7 @@ Deno.serve(async (req) => {
       // confirmed "still here" this week is kept.
       supabase.from("hazard_reports").delete({ count: "exact" })
         .lt("createdat", sevenDaysAgo)
-        .or(`last_confirmed_at.is.null,last_confirmed_at.lt.${sevenDaysAgo}`),
+        .or(`lastconfirmedat.is.null,lastconfirmedat.lt.${sevenDaysAgo}`),
     ]);
     if (posErr) throw posErr;
     if (notifErr) throw notifErr;

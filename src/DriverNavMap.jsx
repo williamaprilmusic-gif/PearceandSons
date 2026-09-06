@@ -260,9 +260,11 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
       // Advisory markers show the icon the admin tapped to post them
       // (📷/⛔/👮/…), not a generic 📢.
       const markerIcon = isAdvisory ? alertIconFor(h.category) : (HAZARD_CATEGORY_ICON[h.category] || "⚠️");
-      // Waze-style "is it still there?" crowd feedback. Hidden on your own
-      // report (you can't vote on it) and when no handler is wired.
-      const canVote = !!onVoteHazardRef.current && String(h.driver_id) !== String(myUserId ?? "");
+      // Waze-style "is it still there?" crowd feedback — PEER reports only
+      // (a driver/agent hazard). Not shown on admin advisories (an
+      // official closure isn't the crowd's to confirm or clear), on your
+      // own report, or when no handler is wired.
+      const canVote = !isAdvisory && !!onVoteHazardRef.current && String(h.driver_id) !== String(myUserId ?? "");
       const btn = (v, label, count, on) =>
         `<button data-vote="${v}" style="flex:1;padding:5px 4px;border-radius:6px;border:1px solid ${on ? "#1db954" : "rgba(255,255,255,.25)"};background:${on ? "rgba(29,185,84,.18)" : "rgba(255,255,255,.06)"};color:#fff;font-size:11px;font-weight:700;cursor:pointer">${label}${count ? ` ${count}` : ""}</button>`;
       const voteRow = canVote
@@ -299,11 +301,20 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
       if (!src || src._hazardId == null || !vote) return;
       const el = e.popup.getElement();
       if (!el) return;
+      let voting = false;
+      const setDisabled = (v) => el.querySelectorAll('.hz-vote button').forEach(x => { x.disabled = v; x.style.opacity = v ? '.5' : ''; });
       el.querySelectorAll('.hz-vote button[data-vote]').forEach(b => {
         b.addEventListener('click', () => {
-          vote(src._hazardId, b.getAttribute('data-vote'));
-          map.closePopup();
-        }, { once: true });
+          if (voting) return;
+          voting = true;
+          setDisabled(true);
+          // Close only if the vote actually took. On failure the dispatch
+          // wrapper surfaces the reason as the app's _error toast — keep
+          // the popup open and re-enable so the driver can retry.
+          Promise.resolve(vote(src._hazardId, b.getAttribute('data-vote')))
+            .then(() => map.closePopup())
+            .catch(() => { voting = false; setDisabled(false); });
+        });
       });
     };
     map.on('popupopen', onPopupOpen);

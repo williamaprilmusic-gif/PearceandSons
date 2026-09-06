@@ -6114,7 +6114,9 @@ function appReducer(state, action) {
         id: mkId(), driver_id: state.active_user_id, driver_name: reporter?.name || null,
         category: action.category || "hazard", source: action.source === "agent" ? "agent" : "driver",
         lat: action.lat, lng: action.lng, note: action.note || null, trip_id: action.trip_id || null,
-        created_at: now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
+        // epoch ms, NOT now() (which is a formatted en-ZA string) — the
+        // nav map does Date.now() arithmetic on this.
+        created_at: Date.now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
       };
       return { ...state, hazard_reports: [row, ...(state.hazard_reports || [])], _error: null };
     }
@@ -6126,7 +6128,7 @@ function appReducer(state, action) {
         id: mkId(), driver_id: state.active_user_id, driver_name: actor?.name || null,
         category: (typeof action.category === "string" && action.category.trim()) || "advisory",
         source: "admin", lat: action.lat, lng: action.lng, note: action.note.trim(), trip_id: null,
-        created_at: now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
+        created_at: Date.now(), confirm_count: 0, dismiss_count: 0, last_confirmed_at: null, my_vote: null,
       };
       return { ...state, hazard_reports: [row, ...(state.hazard_reports || [])], _error: null };
     }
@@ -6143,9 +6145,10 @@ function appReducer(state, action) {
     case "HAZARD/VOTE": {
       const vote = action.vote === "confirm" ? "confirm" : action.vote === "dismiss" ? "dismiss" : null;
       if (!vote) return { ...state, _error: "Invalid vote." };
-      const nowTs = now();
+      const nowTs = Date.now();
       const hazard_reports = (state.hazard_reports || []).flatMap(h => {
         if (String(h.id) !== String(action.report_id)) return [h];
+        if (h.source === "admin") return [h]; // advisories aren't crowd-voted
         if (String(h.driver_id) === String(state.active_user_id)) return [h]; // no self-vote
         const prev = h.my_vote;
         // one row per user: replaying a vote is a no-op; switching flips it
@@ -6157,11 +6160,12 @@ function appReducer(state, action) {
           if (vote === "confirm") confirm_count++;
           else dismiss_count++;
         }
-        const cleared = h.source !== "admin" && dismiss_count - confirm_count >= HAZARD_CLEAR_NET_DISMISS;
+        const cleared = dismiss_count - confirm_count >= HAZARD_CLEAR_NET_DISMISS;
         if (cleared) return []; // drop it, same as the server soft-clear hiding it
         return [{
           ...h, confirm_count, dismiss_count, my_vote: vote,
-          last_confirmed_at: vote === "confirm" ? nowTs : h.last_confirmed_at,
+          // only a genuine transition to confirm bumps the freshness clock
+          last_confirmed_at: (vote === "confirm" && prev !== "confirm") ? nowTs : h.last_confirmed_at,
         }];
       });
       return { ...state, hazard_reports, _error: null };
@@ -10156,33 +10160,48 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
 
     case "HAZARD/VOTE": {
-      // Waze-style "still here" / "gone" crowd feedback on a hazard or
-      // advisory marker. Identity is the verified caller, never trusted
-      // from the payload — same rule as DRIVER/REPORT_HAZARD.
+      // Waze-style "still here" / "gone" crowd feedback on a PEER hazard
+      // report (source driver/agent). Identity is the verified caller,
+      // never trusted from the payload — same rule as DRIVER/REPORT_HAZARD.
       if (activeUserRef.current == null) throw new Error("Not logged in.");
       const vote = action.vote === "confirm" ? "confirm" : action.vote === "dismiss" ? "dismiss" : null;
       if (!vote) throw new Error("Invalid vote.");
       const { data: report, error: reportErr } = await supabase.from("hazard_reports")
-        .select("id, source, driverid, last_confirmed_at, cleared_at").eq("id", action.report_id).maybeSingle();
+        .select("id, source, driverid, clearedat").eq("id", action.report_id).maybeSingle();
       if (reportErr) throw new Error(`Couldn't load that report — ${reportErr.message}`);
       if (!report) throw new Error("That report is no longer available.");
-      if (report.cleared_at != null) return; // already cleared — nothing to vote on
+      if (report.clearedat != null) return; // already cleared — nothing to vote on
+      // Admin advisories are an official company communication, not a
+      // peer report — they're not the crowd's to confirm or clear (that's
+      // ADMIN/CLEAR_ROUTE_ADVISORY). The client hides the buttons for
+      // these; this is the server-side backstop.
+      if (report.source === "admin") throw new Error("Advisories can't be voted on.");
       // You can't vote on your own report (matches Waze; also stops a
-      // reporter from self-confirming to keep a stale report alive).
+      // reporter self-confirming to keep a stale report alive).
       if (String(report.driverid) === String(activeUserRef.current)) {
         throw new Error("You can't vote on your own report.");
       }
+      // Prior vote by this user, so a repeat of the SAME vote is a no-op
+      // for the freshness clock — otherwise one driver re-tapping "still
+      // here" every hour could keep a stale hazard alive indefinitely.
+      const { data: priorVote, error: priorErr } = await supabase.from("hazard_report_votes")
+        .select("vote").eq("report_id", report.id).eq("user_id", activeUserRef.current).maybeSingle();
+      if (priorErr) throw new Error(`Couldn't record your vote — ${priorErr.message}`);
       const nowTs = nowEpoch();
       must(await supabase.from("hazard_report_votes").upsert({
         report_id: report.id, user_id: activeUserRef.current, vote, created_at: nowTs,
       }, { onConflict: "report_id,user_id" }));
       // Re-tally from the authoritative vote rows (never increment a
-      // counter — a vote switch or a re-vote would drift it).
-      const { data: allVotes } = await supabase.from("hazard_report_votes").select("user_id, vote").eq("report_id", report.id);
+      // counter — a vote switch or a re-vote would drift it). A failed
+      // read here must NOT fall through to writing zeroed counts.
+      const { data: allVotes, error: tallyErr } = await supabase.from("hazard_report_votes").select("vote").eq("report_id", report.id);
+      if (tallyErr) throw new Error(`Couldn't tally votes — ${tallyErr.message}`);
       const { confirm_count, dismiss_count, cleared } = tallyHazardVotes(allVotes || [], report.source);
-      const patch = { confirm_count, dismiss_count };
-      if (vote === "confirm") patch.last_confirmed_at = nowTs;
-      if (cleared) patch.cleared_at = nowTs;
+      const patch = { confirmcount: confirm_count, dismisscount: dismiss_count };
+      // Only a genuine transition TO confirm (from none or from dismiss)
+      // pushes the freshness clock forward.
+      if (vote === "confirm" && priorVote?.vote !== "confirm") patch.lastconfirmedat = nowTs;
+      if (cleared) patch.clearedat = nowTs;
       must(await supabase.from("hazard_reports").update(patch).eq("id", report.id));
       if (extraRefetchers.fetchHazardReports) await extraRefetchers.fetchHazardReports();
       else refetch();
@@ -11574,31 +11593,39 @@ function useAppStore() {
     // A "still here" confirm bumps last_confirmed_at, which can outlive
     // createdat's window — so a row qualifies on EITHER timestamp. cleared
     // rows (dismiss quorum, or an admin clear) are excluded outright.
+    // A "still here" confirm bumps lastconfirmedat, which can outlive
+    // createdat's window — so a row qualifies on EITHER timestamp. cleared
+    // rows (dismiss quorum, or an admin clear) are excluded outright.
+    // (Column names follow the table's no-underscore house style —
+    // createdat/driverid/etc. — see the mapper comment above.)
     const { data, error } = await supabase.from("hazard_reports").select("*")
-      .is("cleared_at", null)
-      .or(`createdat.gte.${widestCutoff},last_confirmed_at.gte.${widestCutoff}`)
+      .is("clearedat", null)
+      .or(`createdat.gte.${widestCutoff},lastconfirmedat.gte.${widestCutoff}`)
       .order("createdat", { ascending: false });
     if (error) return;
     const now = Date.now();
     const fresh = (data || []).filter(r => {
       const windowHours = r.source === "admin" ? ADMIN_ADVISORY_WINDOW_HOURS : HAZARD_REPORT_WINDOW_HOURS;
-      const effTs = Math.max(r.createdat || 0, r.last_confirmed_at || 0);
+      const effTs = Math.max(r.createdat || 0, r.lastconfirmedat || 0);
       return now - effTs <= windowHours * 60 * 60 * 1000;
     });
-    // This user's own vote per fresh report, so the popup can show which
-    // way they already voted (and let them switch).
+    // This user's own votes, so the popup can show which way they already
+    // voted. Fetched unfiltered (a user's lifetime vote count is tiny —
+    // bounded by hazards seen in the 7-day retention window) rather than
+    // an .in() over the current fresh-report ids, so it stays one cheap
+    // constant query no matter how the marker set churns.
     let myVoteByReport = {};
     const myId = activeUserRef.current;
-    if (myId != null && fresh.length) {
+    if (myId != null) {
       const { data: myVotes } = await supabase.from("hazard_report_votes")
-        .select("report_id, vote").eq("user_id", myId).in("report_id", fresh.map(r => r.id));
+        .select("report_id, vote").eq("user_id", myId);
       for (const v of myVotes || []) myVoteByReport[sid(v.report_id)] = v.vote;
     }
     setHazardReports(fresh.map(r => ({
       id: sid(r.id), driver_id: sid(r.driverid), driver_name: r.drivername, category: r.category,
       source: r.source || "driver", lat: r.lat, lng: r.lng, note: r.note, trip_id: sid(r.tripid), created_at: r.createdat,
-      confirm_count: r.confirm_count || 0, dismiss_count: r.dismiss_count || 0,
-      last_confirmed_at: r.last_confirmed_at || null, my_vote: myVoteByReport[sid(r.id)] || null,
+      confirm_count: r.confirmcount || 0, dismiss_count: r.dismisscount || 0,
+      last_confirmed_at: r.lastconfirmedat || null, my_vote: myVoteByReport[sid(r.id)] || null,
     })));
   }, []);
 
@@ -16601,7 +16628,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
             destination={navTarget} driverPosition={driverPosition} onExit={() => setNavTarget(null)}
             hazardReports={state.hazard_reports}
             myUserId={state.active_user_id}
-            onVoteHazard={(reportId, vote) => dispatch({ type: "HAZARD/VOTE", report_id: reportId, vote }).catch(() => {})}
+            onVoteHazard={(reportId, vote) => dispatch({ type: "HAZARD/VOTE", report_id: reportId, vote })}
             onReportHazard={(category) => dispatch({
               type: "DRIVER/REPORT_HAZARD", category: category || "hazard",
               lat: driverPosition?.lat, lng: driverPosition?.lng,
