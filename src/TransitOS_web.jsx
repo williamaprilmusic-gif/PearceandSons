@@ -5993,6 +5993,56 @@ function appReducer(state, action) {
       };
     }
 
+    case "TRIP/BULK_ADMIN_CANCEL": {
+      // Cancel several already-dispatched trips at once (a site closure, a
+      // weather event) — each via a real TRIP/ADMIN_CANCEL so driver-
+      // freeing, notifications and the audit trail all happen per trip.
+      // One that another admin just changed doesn't block the rest.
+      const results = [];
+      let workingState = state;
+      for (const tripId of action.trip_ids || []) {
+        const before = workingState;
+        const after = appReducer(workingState, { type: "TRIP/ADMIN_CANCEL", trip_id: tripId });
+        if (after._error) {
+          results.push({ trip_id: tripId, ok: false, reason: after._error });
+          workingState = { ...before, _error: null };
+        } else {
+          results.push({ trip_id: tripId, ok: true });
+          workingState = { ...after, _error: null };
+        }
+      }
+      return { ...workingState, _error: null, _lastBulkCancelResults: results };
+    }
+
+    case "TRIP/BULK_REASSIGN_DRIVER": {
+      // Move several already-assigned trips to a different driver (the
+      // original called in sick). Each trip: free it (TRIP/REMOVE_DRIVER
+      // -> back to UNASSIGNED_BOOKING) then TRIP/ASSIGN_DRIVER to the new
+      // driver. If the free succeeds but the re-assign fails (new driver
+      // full, docs expired), the trip is left UNASSIGNED — a safe state
+      // the admin can re-handle from Dispatch — and the result says so.
+      const results = [];
+      let workingState = state;
+      for (const tripId of action.trip_ids || []) {
+        const before = workingState;
+        const freed = appReducer(workingState, { type: "TRIP/REMOVE_DRIVER", trip_id: tripId });
+        if (freed._error) {
+          results.push({ trip_id: tripId, ok: false, reason: freed._error });
+          workingState = { ...before, _error: null };
+          continue;
+        }
+        const assigned = appReducer({ ...freed, _error: null }, { type: "TRIP/ASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id });
+        if (assigned._error) {
+          results.push({ trip_id: tripId, ok: false, reason: `freed but not reassigned — ${assigned._error}` });
+          workingState = { ...freed, _error: null };
+        } else {
+          results.push({ trip_id: tripId, ok: true });
+          workingState = { ...assigned, _error: null };
+        }
+      }
+      return { ...workingState, _error: null, _lastBulkReassignResults: results };
+    }
+
     case "TRIP/ADMIN_CANCEL": {
       // Admin-initiated cancellation of any not-yet-completed trip —
       // distinct from TRIP/CANCEL (the agent-facing rollback primitive,
@@ -9362,6 +9412,52 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return results;
     }
+
+    case "TRIP/BULK_ADMIN_CANCEL": {
+      // Cancel several already-dispatched trips in one action (site
+      // closure / weather). Each goes through the real TRIP/ADMIN_CANCEL
+      // — driver-freeing, per-trip notifications, audit log, its own
+      // optimistic-concurrency guard — so one trip another admin just
+      // touched doesn't block the rest. One trailing refetch.
+      const bulkCancelResults = [];
+      for (const tripId of action.trip_ids || []) {
+        try {
+          await handleSupabaseAction({ type: "TRIP/ADMIN_CANCEL", trip_id: tripId }, activeUserRef, async () => {});
+          bulkCancelResults.push({ trip_id: tripId, ok: true });
+        } catch (e) {
+          bulkCancelResults.push({ trip_id: tripId, ok: false, reason: e.message || "Cancel failed" });
+        }
+      }
+      refetch();
+      return bulkCancelResults;
+    }
+
+    case "TRIP/BULK_REASSIGN_DRIVER": {
+      // Move several assigned trips to a new driver (original off sick).
+      // Per trip: TRIP/REMOVE_DRIVER (-> UNASSIGNED_BOOKING) then
+      // TRIP/ASSIGN_DRIVER to the new driver, each with its own guards +
+      // notifications + route recompute. A trip that frees but can't be
+      // reassigned (new driver full / docs expired) is left UNASSIGNED —
+      // a safe state, surfaced in the result — rather than rolled back.
+      const bulkReassignResults = [];
+      for (const tripId of action.trip_ids || []) {
+        try {
+          await handleSupabaseAction({ type: "TRIP/REMOVE_DRIVER", trip_id: tripId }, activeUserRef, async () => {});
+        } catch (e) {
+          bulkReassignResults.push({ trip_id: tripId, ok: false, reason: e.message || "Couldn't free the trip" });
+          continue;
+        }
+        try {
+          await handleSupabaseAction({ type: "TRIP/ASSIGN_DRIVER", trip_id: tripId, driver_id: action.driver_id }, activeUserRef, async () => {});
+          bulkReassignResults.push({ trip_id: tripId, ok: true });
+        } catch (e) {
+          bulkReassignResults.push({ trip_id: tripId, ok: false, reason: `freed but not reassigned — ${e.message || "assignment failed"}` });
+        }
+      }
+      refetch();
+      return bulkReassignResults;
+    }
+
     case "TRIP/ASSIGN_DRIVER": {
       const actingAdminAssign = await assertAdminPermission(activeUserRef, "manageDispatch");
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
@@ -11980,6 +12076,11 @@ function useAppStore() {
       // show exactly which selected bookings were deleted and why any
       // others were skipped (e.g. got dispatched in the meantime).
       if (action.type === "TRIP/ADMIN_BULK_DELETE_UNASSIGNED") return result._lastBulkDeleteResults;
+      // Same idea for the bulk cancel / reassign actions (Bulk dispatch
+      // actions feature): per-trip pass/fail so the UI can say exactly
+      // which trips went through.
+      if (action.type === "TRIP/BULK_ADMIN_CANCEL") return result._lastBulkCancelResults;
+      if (action.type === "TRIP/BULK_REASSIGN_DRIVER") return result._lastBulkReassignResults;
       return;
     }
     try {
