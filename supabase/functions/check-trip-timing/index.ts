@@ -41,14 +41,18 @@
 //      closed/crashed-app case a push (not just an in-app row) exists
 //      to reach.
 //   5. NEW — delay propagation: a driver running late on one trip almost
-//      always drags their LATER same-day trips late too. This runs as a
-//      post-loop pass (it needs each driver's worst current delay across
-//      ALL their trips before it can act on the downstream ones): for
-//      every not-yet-started trip whose driver is >= 20 min behind on an
-//      earlier trip today (and within a 4h horizon), the agents on it get
-//      one "your ride may be ~N min late" heads-up + push.
+//      always drags their next trips late too. This runs as a post-loop
+//      pass (it needs each driver's current delay across ALL their trips
+//      before it can act on the downstream ones): for every not-yet-
+//      started trip whose driver is behind on an earlier trip that
+//      departs within PROPAGATE_HORIZON_MS before it, the agents on it
+//      get one "your ride may be ~N min late" heads-up + push.
 //      delaypropagatednotified / delaypropagatedmins dedupe it, re-firing
-//      only if the estimate grows by 20+ min.
+//      only while the estimate is still climbing and below the credible
+//      ceiling. A "delay" here is strictly a SCHEDULE SLIP — how late a
+//      trip started (IN_TRANSIT: intransitat vs scheduled) or how long a
+//      trip has sat past its departure without starting — never elapsed
+//      trip duration, which is expected and not a delay.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -64,7 +68,8 @@ const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
 const PROPAGATE_MIN_DELAY_MIN = 20;      // ignore a driver less than this behind
 const PROPAGATE_HORIZON_MS = 4 * 60 * 60 * 1000; // only warn trips within 4h after the late one
 const PROPAGATE_REFIRE_STEP_MIN = 20;    // re-notify only once the estimate grows this much
-const IN_TRANSIT_GRACE_MIN = 60;         // an IN_TRANSIT trip isn't "late" until this far past departure
+const MAX_CREDIBLE_DELAY_MIN = 90;       // clamp: a bigger figure isn't a credible knock-on and stops re-fires
+const STALE_SOURCE_MIN = 180;            // a not-yet-started trip >3h past departure is a forgotten status, not a live delay — don't propagate from it (check #1 owns that alert)
 
 // A trip's scheduled departure as an epoch ms. Prefer the stored
 // scheduledtime; fall back to parsing scheduleddate (YYYY/MM/DD) +
@@ -113,11 +118,11 @@ Deno.serve(async (req) => {
     const results = { lateStart: 0, upcomingReminders: 0, unassignedApproaching: 0, stuckInTransit: 0, delayPropagated: 0 };
 
     // check #5 input: per driver, every trip they're currently behind on
-    // as { sMs: its scheduled departure, mins: how far behind }. A
-    // downstream trip then inherits the worst delay among this driver's
+    // as { sMs: its scheduled departure, mins: schedule slip }. A
+    // downstream trip then inherits the worst slip among this driver's
     // sources scheduled BEFORE it (not just the single worst overall —
     // an 08:00 trip 25 min late still drags the 10:00 trip even if the
-    // same driver's 14:00 trip is 90 min late).
+    // same driver's 14:00 trip is worse).
     const driverDelays: Record<string, Array<{ sMs: number; mins: number }>> = {};
     const noteDelay = (driverId: unknown, mins: number, sMs: number) => {
       if (driverId == null || mins < PROPAGATE_MIN_DELAY_MIN) return;
@@ -126,18 +131,24 @@ Deno.serve(async (req) => {
 
     for (const t of trips || []) {
       // ── check #5 data-gathering (acts after the loop) ──────────────
-      // A driver is "behind" if a trip they own is either past its
-      // departure and not yet started, or has been IN_TRANSIT well past
-      // departure. Independent of the notified flags above — we want the
-      // live delay every run, not just the first.
+      // Schedule slip only — never elapsed trip time:
+      //   IN_TRANSIT      -> how late it STARTED (intransitat vs scheduled)
+      //   not-yet-started -> how long it's sat past its slot unstarted
+      // Independent of the notified flags above — we want the live slip
+      // every run, not just the first.
       if (t.driverid && (t.status === "DRIVER_CONFIRMED" || t.status === "ASSIGNED" || t.status === "IN_TRANSIT")) {
         const sMs = schedMs(t);
         if (sMs != null) {
-          const pastMin = (nowMs - sMs) / 60000;
           if (t.status === "IN_TRANSIT") {
-            noteDelay(t.driverid, Math.floor(pastMin - IN_TRANSIT_GRACE_MIN), sMs);
+            // intransitat proves they actually started — the slip is
+            // real even if large, so just record it (the propagation
+            // loop clamps to MAX_CREDIBLE_DELAY_MIN).
+            if (t.intransitat) noteDelay(t.driverid, Math.floor((t.intransitat - sMs) / 60000), sMs);
           } else {
-            noteDelay(t.driverid, Math.floor(pastMin), sMs);
+            const slip = Math.floor((nowMs - sMs) / 60000);
+            // a not-yet-started trip >3h past its slot is a forgotten
+            // status, not a live delay — check #1 owns that alert
+            if (slip <= STALE_SOURCE_MIN) noteDelay(t.driverid, slip, sMs);
           }
         }
       }
@@ -257,8 +268,8 @@ Deno.serve(async (req) => {
 
     // ── 5. Delay propagation (post-loop) ────────────────────────────────
     // driverDelays is now fully populated. Warn the agents on each
-    // not-yet-started trip whose driver is behind on an EARLIER trip
-    // today, within the horizon.
+    // not-yet-started trip whose driver is behind on an EARLIER trip that
+    // departs within PROPAGATE_HORIZON_MS before it.
     for (const t of trips || []) {
       if (t.status !== "DRIVER_CONFIRMED" && t.status !== "ASSIGNED") continue;
       if (!t.driverid) continue;
@@ -268,15 +279,20 @@ Deno.serve(async (req) => {
       if (sMs == null) continue;
       // don't warn about a departure that's already well in the past
       if (sMs < nowMs - 30 * 60000) continue;
-      // worst delay among this driver's late trips scheduled before this
-      // one, within a horizon they can't realistically recover across
+      // worst slip among this driver's late trips scheduled before this
+      // one, within a horizon they can't realistically recover across,
+      // clamped to a credible knock-on figure
       let estMin = 0;
       for (const s of sources) {
         if (s.sMs < sMs && sMs - s.sMs <= PROPAGATE_HORIZON_MS && s.mins > estMin) estMin = s.mins;
       }
+      estMin = Math.min(estMin, MAX_CREDIBLE_DELAY_MIN);
       if (estMin < PROPAGATE_MIN_DELAY_MIN) continue;
       const prevMin = t.delaypropagatedmins ?? 0;
-      if (t.delaypropagatednotified && estMin - prevMin < PROPAGATE_REFIRE_STEP_MIN) continue;
+      // Re-fire only while the estimate is still climbing meaningfully AND
+      // hasn't already hit the ceiling — so a stuck source can't drive an
+      // endless "40 / 60 / 80 / 90 / 90 …" notification chain.
+      if (t.delaypropagatednotified && (prevMin >= MAX_CREDIBLE_DELAY_MIN || estMin - prevMin < PROPAGATE_REFIRE_STEP_MIN)) continue;
 
       const agentIds = [t.agentid, ...(t.extraagentids || [])].filter(Boolean);
       if (agentIds.length === 0) {
@@ -287,7 +303,8 @@ Deno.serve(async (req) => {
 
       await supabase.from("trips").update({ delaypropagatednotified: true, delaypropagatedmins: estMin }).eq("id", t.id);
       const whenStr = t.scheduledtimestr || (t.scheduleddate ? `${t.scheduleddate}` : "");
-      const msg = `⚠ Your ride${whenStr ? ` (${whenStr})` : ""} may be about ${estMin} min late — your driver is running behind on an earlier trip. We'll keep you posted.`;
+      const estLabel = estMin >= MAX_CREDIBLE_DELAY_MIN ? `${MAX_CREDIBLE_DELAY_MIN}+` : `${estMin}`;
+      const msg = `⚠ Your ride${whenStr ? ` (${whenStr})` : ""} may be about ${estLabel} min late — your driver is running behind on an earlier trip. We'll keep you posted.`;
       const notifRows = agentIds.map((agentId: number) => ({
         title: "POSSIBLE DELAY", type: "TRIP_DELAY_PROPAGATED", forroles: ["AGENT"], userid: agentId,
         message: msg, tripid: t.id, timestamp: nowMs, isread: false,
