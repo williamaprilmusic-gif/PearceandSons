@@ -19208,18 +19208,26 @@ class AppErrorBoundary extends React.Component {
 // When a client with a STALE index.html (cached from before a later
 // deploy) hits the app, a lazy chunk's dynamic import 404s. main.jsx's
 // `vite:preloadError` handler catches that and reloads to pick up the
-// fresh index.html — but Vite's __vitePreload, once that handler calls
-// event.preventDefault(), RESOLVES ITS PROMISE TO `undefined` instead
-// of rejecting. React.lazy then reads `.default` off that undefined and
-// throws "Cannot read properties of undefined (reading 'default')" in
-// the split-second before window.location.reload() actually navigates
-// (observed once in client_errors, 2026-09-06). guardLazyChunk() turns
-// that empty resolution into a promise that never settles, so Suspense
-// just holds its fallback until the reload wins the race. A genuine,
-// persistent import rejection (the "already reloaded once, still
-// broken" case) still propagates to AppErrorBoundary as before.
+// fresh index.html — but Vite's __vitePreload, once that handler has
+// called event.preventDefault(), FULFILLS its promise with `undefined`
+// instead of rejecting. React.lazy then reads `.default` off that
+// undefined and throws "Cannot read properties of undefined (reading
+// 'default')" in the split-second before window.location.reload()
+// actually navigates (observed once in client_errors, 2026-09-06).
+//
+// __vitePreload only fulfills-empty AFTER preventDefault(), and the
+// handler only calls preventDefault() on a path where a reload is
+// already in flight — so an EMPTY (null/undefined) module here always
+// means "a reload is coming": hang forever so Suspense holds its
+// fallback until it navigates. Anything else falls through untouched:
+// a genuine persistent rejection (handler chose NOT to preventDefault,
+// e.g. "already reloaded once, still broken") still reaches
+// AppErrorBoundary, and a module that loaded but is missing its export
+// (renamed/truncated build) still renders <undefined/> → React's
+// "Element type is invalid" → AppErrorBoundary + telemetry, rather than
+// a silent infinite spinner.
 const guardLazyChunk = (loader) => () =>
-  Promise.resolve(loader()).then(m => (m && m.default != null ? m : new Promise(() => {})));
+  Promise.resolve(loader()).then(m => (m == null ? new Promise(() => {}) : m));
 const LazyViewerPortal = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.ViewerPortal }))));
 const LazyFinancialPortal = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.FinancialPortal }))));
 const LazyAdminApp = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.AdminApp }))));
