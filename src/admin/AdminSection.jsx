@@ -4062,8 +4062,10 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   const canBulkComms = hasAdminPermission(user, "manageDispatch");
   // Bulk reminder only makes sense for a not-yet-started assigned trip
   // (matches the per-trip REMIND button's gate) — the server skips the
-  // rest, this just keeps the button's count honest.
-  const selectedRemindableIds = [...selectedTripIds].filter(id => REASSIGNABLE_TRIP_STATES.includes(state.trips.find(t => t.trip_id === id)?.state));
+  // rest, this just keeps the button's count honest. Same set of states
+  // as reassignable (ASSIGNED / DRIVER_CONFIRMED), so reuse that scan
+  // rather than repeating the O(selection × trips) filter.
+  const selectedRemindableIds = selectedReassignableIds;
   // Every completed trip CURRENTLY VISIBLE on screen — respects
   // whatever filters are active (state filter, date filter), same as
   // displayTrips itself, per explicit decision: "select all" means all
