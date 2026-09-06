@@ -1537,18 +1537,22 @@ export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(sta
 
 // ── Staffing forecast ────────────────────────────────────────────────
 // Three coarse shift windows keyed off a trip's scheduled_time hour.
-// LATE wraps past midnight (endMin < startMin). `mid` is a representative
-// time inside the window, fed to isDriverOnShift for the supply count so
-// this shares that one vetted (night-shift-aware) rule.
+// LATE wraps past midnight (endMin < startMin). `samples` are several
+// representative times spanning the window — a driver counts as rostered
+// for the window if isDriverOnShift is true at ANY of them (a single
+// sample can't represent a midnight-wrapping interval: for LATE, 21:00/
+// 23:00 catch the evening crew and 01:00/03:00 catch the drivers whose
+// shift wraps into the small hours of that date).
 export const STAFFING_WINDOWS = [
-  { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60, mid: "08:00" },
-  { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60, mid: "16:00" },
-  { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60, mid: "00:00" },
+  { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60, samples: ["06:00", "09:00", "11:00"] },
+  { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60, samples: ["13:00", "16:00", "19:00"] },
+  { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60, samples: ["21:00", "23:00", "01:00", "03:00"] },
 ];
 function staffingWindowOf(timeStr) {
-  const [h, m] = String(timeStr || "").split(":").map(Number);
-  if (Number.isNaN(h)) return null;
-  const mins = h * 60 + (m || 0);
+  const mm = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
+  if (!mm) return null;
+  const mins = Number(mm[1]) * 60 + Number(mm[2]);
+  if (!Number.isFinite(mins) || mins < 0 || mins >= 1440) return null;
   return STAFFING_WINDOWS.find(w =>
     w.endMin > w.startMin ? (mins >= w.startMin && mins < w.endMin) : (mins >= w.startMin || mins < w.endMin)
   )?.key || null;
@@ -1572,16 +1576,30 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
     TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED,
   ]);
   const MS_DAY = 24 * 60 * 60 * 1000;
-  const nowDayStart = (() => { const d = new Date(now); return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()); })();
-  const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
   const slashToMs = (s) => { const [y, m, d] = s.split("/").map(Number); return Date.UTC(y, m - 1, d); };
+  const toSlash = (ms) => {
+    const d = new Date(ms);
+    return `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, "0")}/${String(d.getUTCDate()).padStart(2, "0")}`;
+  };
+  // "Today" pinned to SAST (UTC+2), like every other day-boundary in the
+  // app (sastTodaySlashStr / sastMidnightMs) — a bare getUTC* date is the
+  // wrong day for the ~2h after SAST midnight.
+  const sastNow = new Date(now + 2 * 60 * 60 * 1000);
+  const nowDayStart = Date.UTC(sastNow.getUTCFullYear(), sastNow.getUTCMonth(), sastNow.getUTCDate());
+  const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
+  // String bounds so most of the archive is rejected by a cheap "YYYY/MM/DD"
+  // lexical compare before any Date parsing (resource-friendly-by-default —
+  // this memo reruns on every state.trips change during live dispatch).
+  const oldestSlash = toSlash(oldestMs);
+  const todaySlash = toSlash(nowDayStart);
 
   // history[dow][window] -> Map<weekBucket, Set<driverId>>  (+ trip/seat tallies)
   const hist = {};
   for (const t of state.trips || []) {
     if (!t.scheduled_date || t.driver_id == null || !ACTIVE_OR_DONE.has(t.state)) continue;
+    if (t.scheduled_date < oldestSlash || t.scheduled_date >= todaySlash) continue; // strictly past, within lookback (string compare)
     const ms = slashToMs(t.scheduled_date);
-    if (Number.isNaN(ms) || ms < oldestMs || ms >= nowDayStart) continue; // strictly past, within lookback
+    if (Number.isNaN(ms)) continue;
     const win = staffingWindowOf(t.scheduled_time);
     if (!win) continue;
     const dow = rosterDow(t.scheduled_date);
@@ -1610,7 +1628,7 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
       const rostered = rosterDrivers.filter(ds => {
         const sched = ds.availability_schedule;
         if (!sched || sched.length === 0) return false; // unscheduled drivers aren't "rostered" for a slot
-        return isDriverOnShift(ds, date, w.mid);
+        return w.samples.some(t => isDriverOnShift(ds, date, t));
       }).length;
       const need = Math.round(demand);
       cells.push({

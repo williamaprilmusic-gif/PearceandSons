@@ -1480,3 +1480,42 @@ describe("computeStaffingForecast — drivers rostered vs. historically needed",
     expect(f.windows).toHaveLength(3);
   });
 });
+
+describe("computeStaffingForecast — window-edge fixes (code-review)", () => {
+  const NOW = Date.UTC(2026, 0, 19, 12, 0, 0);
+  const MONDAY = "2026/01/19";
+  const trip = (date, time, driver_id) => ({
+    scheduled_date: date, scheduled_time: time, driver_id,
+    state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"],
+  });
+
+  it("counts a Monday-night wrapping shift as LATE supply for Monday (not only Sunday's crew)", () => {
+    const s = {
+      // demand: 2 distinct drivers in Monday LATE over 1 wk
+      trips: [trip("2026/01/12", "22:00", "d1"), trip("2026/01/12", "01:00", "d2")],
+      driver_status: [
+        // rostered Monday 20:00 -> 04:00 (wraps). Must count for Monday LATE.
+        { driver_id: "n1", availability_schedule: [{ day: 1, start: "20:00", end: "04:00" }] },
+        // rostered Monday 20:00 -> 23:59 (evening only). Also counts.
+        { driver_id: "n2", availability_schedule: [{ day: 1, start: "20:00", end: "23:59" }] },
+      ],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    const monLate = f.cells.find(c => c.date === MONDAY && c.window === "LATE");
+    expect(monLate.rostered).toBe(2);
+    expect(monLate.short).toBe(0);
+  });
+
+  it("ignores a trip with a blank/missing scheduled_time instead of bucketing it as LATE", () => {
+    const s = {
+      trips: [
+        { scheduled_date: "2026/01/12", scheduled_time: "", driver_id: "d1", state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"] },
+        { scheduled_date: "2026/01/12", scheduled_time: null, driver_id: "d2", state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"] },
+      ],
+      driver_status: [],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    expect(f.cells.every(c => c.hasHistory === false)).toBe(true);
+    expect(f.totalShort).toBe(0);
+  });
+});
