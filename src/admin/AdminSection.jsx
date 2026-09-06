@@ -93,6 +93,7 @@ import {
   tripNoun,
   tripNounCap,
   pollWhileVisible,
+  pollWhileVisibleWithCatchup,
   unifiedAddressSearch,
   usePersistedTab,
   useSortedDropoffs,
@@ -6584,20 +6585,14 @@ function AdminLiveMap({ state, user, dispatch }) {
       const incidents = await tomtomTrafficIncidents(bounds);
       if (!cancelled) setTrafficIncidents(incidents);
     };
-    const INCIDENTS_CADENCE_MS = 3 * 60 * 1000;
-    let lastIncidentsAt = Date.now();
-    const pollIncidents = () => { lastIncidentsAt = Date.now(); fetchIncidents(); };
-    fetchIncidents();
+    fetchIncidents().catch(() => {});
     // Skip the poll while the tab is hidden — this hits the (metered)
     // TomTom traffic API, and a backgrounded admin tab isn't showing the
-    // map. Foreground catch-up is THROTTLED to the cadence so rapid
-    // alt-tabbing can't burst metered requests.
-    const interval = pollWhileVisible(pollIncidents, INCIDENTS_CADENCE_MS);
-    const onVisible = () => {
-      if (document.visibilityState === "visible" && Date.now() - lastIncidentsAt >= INCIDENTS_CADENCE_MS) pollIncidents();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => { cancelled = true; clearInterval(interval); document.removeEventListener("visibilitychange", onVisible); };
+    // map. The foreground catch-up is throttled to the cadence (see the
+    // helper) so rapid alt-tabbing can't burst metered requests, and a
+    // failed fetch on a flaky connection doesn't block the next retry.
+    const stopPoll = pollWhileVisibleWithCatchup(fetchIncidents, 3 * 60 * 1000);
+    return () => { cancelled = true; stopPoll(); };
   }, [showTraffic]);
 
   // Live positions from the fast broadcast channel — keyed by driver id,
@@ -10809,8 +10804,6 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // feedback rather than waiting up to 10 minutes for the cron.
   useEffect(() => {
     if (!supabase) return;
-    const BATCH_CADENCE_MS = 10 * 60 * 1000;
-    let lastBatchAt = 0;
     // One source of truth for the recurring batch — a fleet-wide
     // compliance/escalation sweep. Members:
     //  - CHECK_LATE_START / CHECK_UNASSIGNED_APPROACHING /
@@ -10819,38 +10812,32 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     //  - CHECK_DOCUMENT_EXPIRY / CHECK_HOURS_COMPLIANCE /
     //    CHECK_SHIFT_DURATION — fleet-wide, also server-cron'd.
     //  - TICKET/CHECK_STALE / TRIP/CHECK_STALE_DISPUTES + the escalation
-    //    engine — NO server equivalent, so keeping this alive matters.
+    //    engine — NO server equivalent, so keeping this alive matters
+    //    (hence the throttled foreground catch-up below).
+    // Returns a promise that rejects if ANY check failed, so the
+    // catch-up helper only arms its throttle on a fully-successful run.
     const runBatch = () => {
-      lastBatchAt = Date.now();
-      dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
-      dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
-      dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
-      dispatch({ type: "DRIVER/CHECK_SHIFT_DURATION" }).catch(() => {});
-      dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }).catch(() => {});
-      dispatch({ type: "TRIP/CHECK_STUCK_IN_TRANSIT" }).catch(() => {});
-      dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
-      dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
+      const ps = [
+        dispatch({ type: "TRIP/CHECK_LATE_START" }),
+        dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }),
+        dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }),
+        dispatch({ type: "DRIVER/CHECK_SHIFT_DURATION" }),
+        dispatch({ type: "TRIP/CHECK_UNASSIGNED_APPROACHING" }),
+        dispatch({ type: "TRIP/CHECK_STUCK_IN_TRANSIT" }),
+        dispatch({ type: "TICKET/CHECK_STALE" }),
+        dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }),
+      ];
       runEscalationsRef.current();
+      return Promise.all(ps);
     };
-    runBatch();
+    runBatch().catch(() => {});
     // TRIP/CHECK_UPCOMING_REMINDERS is one-shot only (NOT in runBatch) —
     // a dedicated audit found every agent/driver/admin session was
     // re-running it every 5 min; it's a server cron now, this stays only
     // so an admin who just watched an agent enable REMIND sees instant
     // feedback.
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    // Skip ticks while the tab is hidden (an overnight-backgrounded admin
-    // tab doesn't need 8 whole-fleet sweeps every 10 min for nobody).
-    const intervalId = pollWhileVisible(runBatch, BATCH_CADENCE_MS);
-    // Foreground catch-up, but THROTTLED — visibilitychange fires on
-    // every alt-tab / screen unlock, so only re-run if a full cadence
-    // has actually elapsed with no run (i.e. we genuinely missed ticks
-    // while hidden), not on every flicker.
-    const onVisibleBatch = () => {
-      if (document.visibilityState === "visible" && Date.now() - lastBatchAt >= BATCH_CADENCE_MS) runBatch();
-    };
-    document.addEventListener("visibilitychange", onVisibleBatch);
-    return () => { clearInterval(intervalId); document.removeEventListener("visibilitychange", onVisibleBatch); };
+    return pollWhileVisibleWithCatchup(runBatch, 10 * 60 * 1000);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Tapping a notification about a specific trip now jumps straight to

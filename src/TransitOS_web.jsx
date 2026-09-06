@@ -54,6 +54,40 @@ export function pollWhileVisible(fn, intervalMs) {
   }, intervalMs);
 }
 
+// pollWhileVisible + a THROTTLED foreground catch-up, as one unit — for
+// sweeps that shouldn't run in the background AND have no server-side
+// cron backstop (the admin escalation/stale-ticket batch, the driver
+// late-start fallback, the metered TomTom traffic fetch), so a long
+// hidden stretch must be caught up on return. `visibilitychange` fires
+// on every screen unlock / alt-tab, so the catch-up only runs if a full
+// `intervalMs` has actually elapsed with no run. `fn` may return a
+// promise; the last-run clock is stamped only once it RESOLVES, so a
+// run that fails on a flaky-connection foreground doesn't arm the
+// throttle against the next retry. Returns a single cleanup function.
+export function pollWhileVisibleWithCatchup(fn, intervalMs) {
+  let lastRunAt = 0;
+  const run = () => {
+    const startedAt = Date.now();
+    try {
+      Promise.resolve(fn()).then(
+        () => { if (startedAt > lastRunAt) lastRunAt = startedAt; },
+        () => {}, // rejected → leave lastRunAt so the next foreground retries
+      );
+    } catch { /* sync throw — same: don't stamp */ }
+  };
+  const id = setInterval(() => {
+    if (typeof document === "undefined" || document.visibilityState !== "hidden") run();
+  }, intervalMs);
+  const onVisible = () => {
+    if (document.visibilityState === "visible" && Date.now() - lastRunAt >= intervalMs) run();
+  };
+  if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisible);
+  return () => {
+    clearInterval(id);
+    if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisible);
+  };
+}
+
 const STATE_BADGE_MAP = {
   UNASSIGNED_BOOKING: { bg: "rgba(78,95,116,0.2)",   fg: COLORS.ghost,  border: COLORS.wire,             label: "UNASSIGNED" },
   ASSIGNED:           { bg: "rgba(245,166,35,0.12)", fg: COLORS.amber,  border: "rgba(245,166,35,0.35)", label: "PENDING ACCEPTANCE" },
@@ -17781,24 +17815,14 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // check every 5 minutes; now a single server-side cron handles it).
   useEffect(() => {
     if (!supabase) return;
-    const CLS_CADENCE_MS = 10 * 60 * 1000;
-    let lastCheckAt = 0;
-    const checkLateStart = () => { lastCheckAt = Date.now(); dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {}); };
-    checkLateStart();
-    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     // Client-side fallback for the check-trip-timing pg_cron job — a
     // backgrounded phone doesn't need to re-run the whole-fleet late-
-    // start sweep while the server cron covers it. pollWhileVisible skips
-    // the hidden ticks; the foreground catch-up is THROTTLED to the
-    // cadence — visibilitychange fires on every screen lock/unlock
-    // through a shift, so an unconditional re-run here would fire this
-    // fleet-wide sweep dozens of times a shift.
-    const intervalId = pollWhileVisible(checkLateStart, CLS_CADENCE_MS);
-    const onVisibleCLS = () => {
-      if (document.visibilityState === "visible" && Date.now() - lastCheckAt >= CLS_CADENCE_MS) checkLateStart();
-    };
-    document.addEventListener("visibilitychange", onVisibleCLS);
-    return () => { clearInterval(intervalId); document.removeEventListener("visibilitychange", onVisibleCLS); };
+    // start sweep while the server cron covers it. Hidden ticks skipped;
+    // one throttled catch-up on foreground (see the helper).
+    const checkLateStart = () => dispatch({ type: "TRIP/CHECK_LATE_START" });
+    checkLateStart().catch(() => {});
+    dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
+    return pollWhileVisibleWithCatchup(checkLateStart, 10 * 60 * 1000);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Progressive reveal for week-trip series: a trip that's part of a
@@ -19489,13 +19513,10 @@ function AppInner() {
       } catch (e) { /* offline or network hiccup — try again next interval */ }
     };
     const t = setTimeout(check, 20000);
-    // Background ticks skipped — the onVisible handler already re-checks
-    // the moment the tab is foregrounded, which is the only time a
-    // reload would actually happen.
-    const iv = pollWhileVisible(check, 300000);
-    const onVisible = () => { if (document.visibilityState === "visible") check(); };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => { clearTimeout(t); clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); };
+    // Background ticks skipped; one throttled re-check on foreground
+    // (the only time a reload would actually happen anyway).
+    const stopPoll = pollWhileVisibleWithCatchup(check, 300000);
+    return () => { clearTimeout(t); stopPoll(); };
   }, [pushToast]);
 
   useEffect(() => {
