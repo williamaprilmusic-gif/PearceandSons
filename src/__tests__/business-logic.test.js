@@ -1553,3 +1553,55 @@ describe("computeStaffingForecast — slotCoversWindow interval overlap", () => 
     expect(f.cells.find(c => c.date === MONDAY && c.window === "EARLY").rostered).toBe(1);
   });
 });
+
+describe("computeStaffingForecast — presence adjustment (statusHistory)", () => {
+  const NOW = Date.UTC(2026, 0, 19, 12, 0, 0); // Monday
+  const MONDAY = "2026/01/19";
+  const trip = (date, time, d) => ({ scheduled_date: date, scheduled_time: time, driver_id: d, state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"] });
+  // ONLINE/OFFLINE pair (app-shaped: driver_id + ts) around a Monday-EARLY window
+  const onlineSpell = (d, startH, endH, dateMs) => ([
+    { driver_id: d, event: "ONLINE", ts: dateMs + startH * 3600000 },
+    { driver_id: d, event: "OFFLINE", ts: dateMs + endH * 3600000 },
+  ]);
+  const mon12 = Date.UTC(2026, 0, 12); // previous Monday
+
+  it("discounts effective supply to typically-online when fewer drivers came online than rostered", () => {
+    const s = {
+      // demand: 2 distinct drivers in Monday EARLY (1 wk history)
+      trips: [trip("2026/01/12", "08:00", "d1"), trip("2026/01/12", "08:30", "d2")],
+      driver_status: [
+        // 3 drivers rostered Monday early
+        { driver_id: "r1", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r2", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r3", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+      ],
+    };
+    // but historically only r1 was actually ONLINE during Monday EARLY
+    const statusHistory = onlineSpell("r1", 6, 11, mon12);
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW, statusHistory });
+    const c = f.cells.find(x => x.date === MONDAY && x.window === "EARLY");
+    expect(c.rostered).toBe(3);
+    expect(Math.round(c.onlineTypical)).toBe(1);
+    expect(c.effectiveSupply).toBe(1);       // min(rostered 3, online 1)
+    expect(c.presenceDiscounted).toBe(true);
+    expect(c.short).toBe(1);                 // need 2 - effective 1
+    expect(f.presenceAdjusted).toBe(true);
+  });
+
+  it("without statusHistory, effective supply is just rostered (no discount)", () => {
+    const s = {
+      trips: [trip("2026/01/12", "08:00", "d1"), trip("2026/01/12", "08:30", "d2")],
+      driver_status: [
+        { driver_id: "r1", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r2", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+        { driver_id: "r3", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+      ],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    const c = f.cells.find(x => x.date === MONDAY && x.window === "EARLY");
+    expect(c.effectiveSupply).toBe(3);
+    expect(c.onlineTypical).toBe(null);
+    expect(c.short).toBe(0);
+    expect(f.presenceAdjusted).toBe(false);
+  });
+});

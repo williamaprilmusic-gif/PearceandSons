@@ -46,6 +46,7 @@ import {
   companyById,
   computeDriverHoursThisWeek,
   computeDriverHoursToday,
+  computeDriverShiftIntervals,
   computeDriverStats,
   computeFleetUtilization,
   copyShareLink,
@@ -1586,12 +1587,17 @@ function slotCoversWindow(slot, dow, win) {
 // drivers actually ran a trip in that window — i.e. how many drivers the
 // operation historically needed for that slot. Supply = drivers whose
 // schedule covers the window that weekday and who aren't marked
-// unavailable. `short` = round(demand) − supply, floored at 0.
-//   options: { lookbackWeeks = 4, now = Date.now(), statusHistory = [] }
-//   statusHistory is accepted for a future "rostered but didn't come
-//   online" discount; unused in v1 (documented in the pending queue).
+// unavailable.
+//   options: { lookbackWeeks = 4, now = Date.now(), statusHistory }
+// When `statusHistory` (driver_status_history rows, app-shaped) is given,
+// each cell also gets `onlineTypical` = the average distinct drivers who
+// were actually ONLINE during that window over the same lookback, and the
+// shortfall is computed against the effective supply = min(rostered,
+// round(onlineTypical)) — "you rostered 8 but only ~6 typically come
+// online". Without it, effective supply is just `rostered`.
+//   `short` = round(demand) − effectiveSupply, floored at 0.
 export function computeStaffingForecast(state, mondaySlash, options = {}) {
-  const { lookbackWeeks = 4, now = Date.now() } = options;
+  const { lookbackWeeks = 4, now = Date.now(), statusHistory } = options;
   const dates = Array.from({ length: 7 }, (_, i) => rosterAddDays(mondaySlash, i));
   const ACTIVE_OR_DONE = new Set([
     TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED,
@@ -1624,7 +1630,37 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
     cell.seats += Math.max(1, t.agent_ids?.length || 0);
   }
 
+  // Optional presence layer: distinct drivers actually ONLINE per
+  // (weekday, window) over the same lookback, from driver_status_history.
+  // A pre-04:00 online spell is attributed to that calendar date's LATE
+  // cell — same convention the demand side uses for a pre-04:00 trip.
+  if (Array.isArray(statusHistory) && statusHistory.length) {
+    const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
+    const intervalsByDriver = computeDriverShiftIntervals(statusHistory, oldestMs, nowDayStart);
+    for (const [driverId, intervals] of Object.entries(intervalsByDriver)) {
+      for (const [s, e] of intervals) {
+        for (let dayMs = Math.floor((s - nowDayStart) / MS_DAY) * MS_DAY + nowDayStart; dayMs < e; dayMs += MS_DAY) {
+          const wk = Math.floor((nowDayStart - dayMs) / (7 * MS_DAY));
+          if (wk < 0 || wk >= lookbackWeeks) continue;
+          const dow = new Date(dayMs).getUTCDay();
+          for (const w of STAFFING_WINDOWS) {
+            const winRanges = w.endMin > w.startMin
+              ? [[dayMs + w.startMin * 60000, dayMs + w.endMin * 60000]]
+              : [[dayMs, dayMs + w.endMin * 60000], [dayMs + w.startMin * 60000, dayMs + MS_DAY]];
+            if (!winRanges.some(([r1, r2]) => s < r2 && r1 < e)) continue;
+            ((hist[dow] ||= {})[w.key] ||= { weeks: new Map(), trips: 0, seats: 0 });
+            const c = hist[dow][w.key];
+            (c.online ||= new Map());
+            if (!c.online.has(wk)) c.online.set(wk, new Set());
+            c.online.get(wk).add(driverId);
+          }
+        }
+      }
+    }
+  }
+
   const rosterDrivers = (state.driver_status || []).filter(ds => !ds.is_unavailable);
+  const hasPresence = Array.isArray(statusHistory) && statusHistory.length > 0;
 
   const cells = [];
   for (const date of dates) {
@@ -1642,11 +1678,18 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
         if (!sched || sched.length === 0) return false; // unscheduled drivers aren't "rostered" for a slot
         return sched.some(slot => slotCoversWindow(slot, dow, w));
       }).length;
+      let onlineTypical = null;
+      if (hasPresence && cell?.online && cell.online.size > 0) {
+        onlineTypical = [...cell.online.values()].reduce((n, set) => n + set.size, 0) / cell.online.size;
+      }
+      const effectiveSupply = onlineTypical != null ? Math.min(rostered, Math.round(onlineTypical)) : rostered;
       const need = Math.round(demand);
       cells.push({
         date, dow, window: w.key, windowLabel: w.label, windowRange: w.range,
         demand, need, avgTrips, weeksSeen, rostered,
-        short: Math.max(0, need - rostered),
+        onlineTypical, effectiveSupply,
+        presenceDiscounted: onlineTypical != null && Math.round(onlineTypical) < rostered,
+        short: Math.max(0, need - effectiveSupply),
         hasHistory: weeksSeen > 0,
       });
     }
@@ -1655,7 +1698,7 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
   return {
     dates, windows: STAFFING_WINDOWS, cells, shortfalls,
     totalShort: shortfalls.reduce((n, c) => n + c.short, 0),
-    lookbackWeeks,
+    lookbackWeeks, presenceAdjusted: hasPresence,
   };
 }
 
@@ -9655,10 +9698,24 @@ function AdminRoster({ state, dispatch }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const week = React.useMemo(() => buildRosterWeek(state, monday, usersById), [state.trips, state.driver_status, usersById, monday]);
   const [showForecast, setShowForecast] = useState(false);
-  // Same narrow deps as `week` — demand comes from trips, supply from
-  // driver_status.availability_schedule.
+  // driver_status_history for the presence-adjustment layer of the
+  // forecast — fetched once when the strip is first opened (like Fleet
+  // Utilization does), not on mount, since most roster visits don't
+  // expand it. 5-week window covers the forecast's 4-wk lookback + the
+  // slack computeDriverShiftIntervals wants for a dangling ONLINE.
+  const [presenceHistory, setPresenceHistory] = useState(null);
+  useEffect(() => {
+    if (!showForecast || presenceHistory !== null || !supabase) return;
+    const toMs = Date.now();
+    const fromMs = toMs - 36 * 24 * 60 * 60 * 1000;
+    fetchDriverStatusHistory({ fromMs, toMs })
+      .then(rows => setPresenceHistory(rows || []))
+      .catch(() => setPresenceHistory([]));
+  }, [showForecast, presenceHistory]);
+  // Same narrow deps as `week` (trips = demand, driver_status =
+  // schedules) plus presenceHistory once loaded.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const forecast = React.useMemo(() => computeStaffingForecast(state, monday), [state.trips, state.driver_status, monday]);
+  const forecast = React.useMemo(() => computeStaffingForecast(state, monday, { statusHistory: presenceHistory || undefined }), [state.trips, state.driver_status, monday, presenceHistory]);
 
   const activePlace = dragging || pending;
 
@@ -9759,9 +9816,10 @@ function AdminRoster({ state, dispatch }) {
                     {forecast.dates.map(d => {
                       const c = forecast.cells.find(x => x.date === d && x.window === w.key);
                       const short = c.short > 0;
+                      const supplyStr = c.presenceDiscounted ? `${c.effectiveSupply}(${c.rostered})` : `${c.rostered}`;
                       return (
                         <td key={d} title={c.hasHistory
-                          ? `${c.rostered} rostered · ~${c.need} typically needed (avg ${c.avgTrips.toFixed(1)} trips over ${c.weeksSeen} wk)`
+                          ? `${c.rostered} rostered${c.presenceDiscounted ? `, ~${Math.round(c.onlineTypical)} typically online` : ""} · ~${c.need} typically needed (avg ${c.avgTrips.toFixed(1)} trips over ${c.weeksSeen} wk)`
                           : "no history for this slot"}
                           style={{
                             textAlign: "center", padding: "3px 4px",
@@ -9769,7 +9827,7 @@ function AdminRoster({ state, dispatch }) {
                             fontWeight: short ? 800 : 500,
                             background: short ? "rgba(232,58,58,.10)" : "transparent",
                           }}>
-                          {c.hasHistory ? `${c.rostered}/${c.need}` : "—"}
+                          {c.hasHistory ? `${supplyStr}/${c.need}` : "—"}
                           {short && <div style={{ fontSize: 8 }}>−{c.short}</div>}
                         </td>
                       );
@@ -9779,7 +9837,7 @@ function AdminRoster({ state, dispatch }) {
               </tbody>
             </table>
             <div style={{ fontSize: 8, color: COLORS.ghost, marginTop: 6 }}>
-              rostered / typically-needed per window. “needed” = avg distinct drivers who ran a trip in that window on that weekday over the last {forecast.lookbackWeeks} weeks. Drivers with no shift schedule set aren’t counted as rostered for any window.
+              supply / typically-needed per window. “needed” = avg distinct drivers who ran a trip in that window on that weekday over the last {forecast.lookbackWeeks} weeks. Supply = rostered drivers (with a shift schedule covering the window){forecast.presenceAdjusted ? ", shown as effective(rostered) where fewer typically come online" : ""}.
             </div>
           </div>
         )}
