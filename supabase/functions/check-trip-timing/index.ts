@@ -54,13 +54,13 @@
 //      time sat past its slot; an IN_TRANSIT trip's WORSE of start-
 //      lateness (intransitat vs scheduled) and overrun past scheduled +
 //      IN_TRANSIT_TYPICAL_MIN — so a trip that departed on time but is
-//      badly overrunning still drags the next trips. The overrun term is
-//      dropped once the trip is STALE_SOURCE_MIN past its slot (that's a
-//      forgotten status / stuck trip, check #4's job, not a live delay).
-//      IN_TRANSIT_TYPICAL_MIN is a flat estimate, not per-route, so an
-//      unusually long legitimate pickup run (> typical + the propagation
-//      floor) can still nudge the next trips — deliberately erring toward
-//      warning agents.
+//      badly overrunning still drags the next trips. IN_TRANSIT_TYPICAL_MIN
+//      is a flat estimate (not per-route), so a genuinely long pickup run
+//      can nudge the next trips — deliberately warn-leaning. But EITHER
+//      kind of source stops propagating once it's STALE_SOURCE_MIN past
+//      its slot and still open: that's a forgotten status / stuck trip,
+//      which checks #1 and #4 own (and #4 alerts a human) — not a live
+//      delay to keep pushing at downstream agents.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -142,30 +142,26 @@ Deno.serve(async (req) => {
       // ── check #5 data-gathering (acts after the loop) ──────────────
       //   IN_TRANSIT      -> max(start-lateness, overrun past a typical run)
       //   not-yet-started -> how long it's sat past its slot unstarted
-      // Independent of the notified flags above — we want the live slip
-      // every run, not just the first.
+      // Either way: a trip still open STALE_SOURCE_MIN past its slot is a
+      // forgotten status / stuck trip (checks #1 and #4 own that regime,
+      // and #4 alerts a human who can intervene) — NOT a live delay, so
+      // it stops being a propagation source entirely. Both branches gate
+      // on that identically. Independent of the notified flags above — we
+      // want the live slip every run, not just the first.
       if (t.driverid && (t.status === "DRIVER_CONFIRMED" || t.status === "ASSIGNED" || t.status === "IN_TRANSIT")) {
         const sMs = schedMs(t);
         if (sMs != null) {
-          if (t.status === "IN_TRANSIT") {
-            // The slip a running trip carries is the WORSE of: how late it
-            // STARTED (intransitat vs scheduled — a fixed fact) and how far
-            // it's now overrunning a typical run. The overrun term grows
-            // unbounded with wall-clock time, so once a trip is
-            // STALE_SOURCE_MIN past its slot and still IN_TRANSIT it's the
-            // forgot-to-tap-COMPLETE / stuck case (check #4 owns that) — not
-            // a live delay — so drop the overrun term there and keep only
-            // the start-slip, exactly as the not-yet-started branch caps
-            // its own slip below.
-            const elapsed = Math.floor((nowMs - sMs) / 60000);
-            const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
-            const overrun = elapsed <= STALE_SOURCE_MIN ? elapsed - IN_TRANSIT_TYPICAL_MIN : 0;
-            noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
-          } else {
-            const slip = Math.floor((nowMs - sMs) / 60000);
-            // a not-yet-started trip >3h past its slot is a forgotten
-            // status, not a live delay — check #1 owns that alert
-            if (slip <= STALE_SOURCE_MIN) noteDelay(t.driverid, slip, sMs);
+          const elapsed = Math.floor((nowMs - sMs) / 60000);
+          if (elapsed <= STALE_SOURCE_MIN) {
+            if (t.status === "IN_TRANSIT") {
+              // WORSE of: how late it STARTED (intransitat vs scheduled)
+              // and how far it's overrunning a typical run.
+              const startSlip = t.intransitat ? Math.floor((t.intransitat - sMs) / 60000) : 0;
+              const overrun = elapsed - IN_TRANSIT_TYPICAL_MIN;
+              noteDelay(t.driverid, Math.max(startSlip, overrun), sMs);
+            } else {
+              noteDelay(t.driverid, elapsed, sMs);
+            }
           }
         }
       }
