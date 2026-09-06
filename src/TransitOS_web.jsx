@@ -17781,16 +17781,19 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // check every 5 minutes; now a single server-side cron handles it).
   useEffect(() => {
     if (!supabase) return;
-    dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
+    const checkLateStart = () => { dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {}); };
+    checkLateStart();
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
     // This is only a client-side fallback for the check-trip-timing
     // pg_cron job — a backgrounded phone doesn't need to re-run the
-    // whole-fleet late-start sweep every 10 min; the server cron covers
-    // it, and this resumes the moment the tab is foregrounded again.
-    const intervalId = pollWhileVisible(() => {
-      dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
-    }, 10 * 60 * 1000);
-    return () => clearInterval(intervalId);
+    // whole-fleet late-start sweep every 10 min while the server cron
+    // covers it. pollWhileVisible skips the hidden ticks; the
+    // visibilitychange handler re-runs it immediately on foreground so
+    // there's no wait for the next 10-min boundary.
+    const intervalId = pollWhileVisible(checkLateStart, 10 * 60 * 1000);
+    const onVisibleCLS = () => { if (document.visibilityState === "visible") checkLateStart(); };
+    document.addEventListener("visibilitychange", onVisibleCLS);
+    return () => { clearInterval(intervalId); document.removeEventListener("visibilitychange", onVisibleCLS); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Progressive reveal for week-trip series: a trip that's part of a

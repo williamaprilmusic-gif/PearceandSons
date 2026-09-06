@@ -6587,9 +6587,12 @@ function AdminLiveMap({ state, user, dispatch }) {
     fetchIncidents();
     // Skip the poll while the tab is hidden — this hits the (metered)
     // TomTom traffic API, and a backgrounded admin tab isn't showing the
-    // map. Resumes on the next tick once foregrounded.
+    // map. One catch-up fetch on foreground so the overlay isn't up to
+    // 3 min stale after the admin returns.
     const interval = pollWhileVisible(fetchIncidents, 3 * 60 * 1000);
-    return () => { cancelled = true; clearInterval(interval); };
+    const onVisible = () => { if (document.visibilityState === "visible") fetchIncidents(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; clearInterval(interval); document.removeEventListener("visibilitychange", onVisible); };
   }, [showTraffic]);
 
   // Live positions from the fast broadcast channel — keyed by driver id,
@@ -10246,7 +10249,12 @@ function AdminExceptions({ state, dispatch, onJumpToTrip, onJumpToDrivers }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const h = pollWhileVisible(() => setNowMs(Date.now()), 30000);
-    return () => clearInterval(h);
+    // Snap to now on foreground (like useTicker) so a trip that crossed
+    // a time threshold while the tab was hidden shows on the board
+    // immediately, not up to 30s later.
+    const onVisible = () => { if (document.visibilityState === "visible") setNowMs(Date.now()); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(h); document.removeEventListener("visibilitychange", onVisible); };
   }, []);
 
   const exceptions = React.useMemo(() => computeOpsExceptions(state, { now: nowMs }), [state, nowMs]);
@@ -10825,10 +10833,13 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // This whole batch is a client-side fallback for jobs the pg_cron
     // functions (check-trip-timing, check-document-expiry,
     // check-hours-compliance) already run server-side, plus the
-    // escalation engine. A backgrounded admin tab — routine on an
-    // overnight shift — doesn't need to re-run 8 whole-fleet DB sweeps
-    // every 10 min; it picks straight back up when foregrounded.
-    const intervalId = pollWhileVisible(() => {
+    // escalation engine (which has NO server-side equivalent). A
+    // backgrounded admin tab — routine on an overnight shift — doesn't
+    // need to re-run 8 whole-fleet DB sweeps every 10 min while nobody's
+    // looking; pollWhileVisible skips those ticks, and the
+    // visibilitychange handler runs the batch immediately on return so
+    // there's no up-to-10-min blind spot after foregrounding.
+    const runBatch = () => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
@@ -10838,8 +10849,11 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       dispatch({ type: "TICKET/CHECK_STALE" }).catch(() => {});
       dispatch({ type: "TRIP/CHECK_STALE_DISPUTES" }).catch(() => {});
       runEscalationsRef.current();
-    }, 10 * 60 * 1000);
-    return () => clearInterval(intervalId);
+    };
+    const intervalId = pollWhileVisible(runBatch, 10 * 60 * 1000);
+    const onVisibleBatch = () => { if (document.visibilityState === "visible") runBatch(); };
+    document.addEventListener("visibilitychange", onVisibleBatch);
+    return () => { clearInterval(intervalId); document.removeEventListener("visibilitychange", onVisibleBatch); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   // Tapping a notification about a specific trip now jumps straight to
@@ -10901,8 +10915,13 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // this cadence.
   const [badgeTick, setBadgeTick] = useState(0);
   useEffect(() => {
-    const h = pollWhileVisible(() => setBadgeTick(t => t + 1), 60000);
-    return () => clearInterval(h);
+    const bump = () => setBadgeTick(t => t + 1);
+    const h = pollWhileVisible(bump, 60000);
+    // Refresh the nav badge counts immediately on foreground, not up to
+    // 60s later.
+    const onVisible = () => { if (document.visibilityState === "visible") bump(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(h); document.removeEventListener("visibilitychange", onVisible); };
   }, []);
   // Nav badge sweep — over the admin's OWN scoped view (matches every
   // other count they see). One cheap (no-hours) pass.
