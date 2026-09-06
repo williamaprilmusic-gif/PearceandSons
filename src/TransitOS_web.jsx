@@ -19205,16 +19205,31 @@ class AppErrorBoundary extends React.Component {
 // Rollup dedupes this into one shared chunk regardless of how many lazy()
 // calls reference it), so an admin session pays for exactly one extra
 // network round-trip the first time any of the three renders, not three.
-const LazyViewerPortal = lazy(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.ViewerPortal })));
-const LazyFinancialPortal = lazy(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.FinancialPortal })));
-const LazyAdminApp = lazy(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.AdminApp })));
+// When a client with a STALE index.html (cached from before a later
+// deploy) hits the app, a lazy chunk's dynamic import 404s. main.jsx's
+// `vite:preloadError` handler catches that and reloads to pick up the
+// fresh index.html — but Vite's __vitePreload, once that handler calls
+// event.preventDefault(), RESOLVES ITS PROMISE TO `undefined` instead
+// of rejecting. React.lazy then reads `.default` off that undefined and
+// throws "Cannot read properties of undefined (reading 'default')" in
+// the split-second before window.location.reload() actually navigates
+// (observed once in client_errors, 2026-09-06). guardLazyChunk() turns
+// that empty resolution into a promise that never settles, so Suspense
+// just holds its fallback until the reload wins the race. A genuine,
+// persistent import rejection (the "already reloaded once, still
+// broken" case) still propagates to AppErrorBoundary as before.
+const guardLazyChunk = (loader) => () =>
+  Promise.resolve(loader()).then(m => (m && m.default != null ? m : new Promise(() => {})));
+const LazyViewerPortal = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.ViewerPortal }))));
+const LazyFinancialPortal = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.FinancialPortal }))));
+const LazyAdminApp = lazy(guardLazyChunk(() => import("./admin/AdminSection.jsx").then(m => ({ default: m.AdminApp }))));
 // DriverNavMap (Leaflet-based in-app navigation) split out the same way —
 // Leaflet was previously eager-imported at the top of this file, so every
 // agent/admin session paid for it even if they never open a map. Only a
 // driver actively navigating a trip ever renders this, at which point one
 // extra network round-trip for the map chunk is a fine tradeoff for every
 // other session never downloading it at all.
-const LazyDriverNavMap = lazy(() => import("./DriverNavMap.jsx").then(m => ({ default: m.DriverNavMap })));
+const LazyDriverNavMap = lazy(guardLazyChunk(() => import("./DriverNavMap.jsx").then(m => ({ default: m.DriverNavMap }))));
 function AdminSectionLoading() {
   return (
     <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.ink, color: COLORS.mist, fontFamily: FONTS.head, fontSize: 13, letterSpacing: 1 }}>
