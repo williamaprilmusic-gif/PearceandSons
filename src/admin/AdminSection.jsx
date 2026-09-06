@@ -9298,6 +9298,88 @@ function AdminStatus() {
           <Row s={checks.online ? "ok" : "down"} title="This device — connectivity" detail={`${checks.online ? "online" : "offline"} · tab open ${relTimeLabel(Date.now() - APP_BOOTED_AT)}`} />
         </>
       )}
+
+      <RetentionArchives />
+    </div>
+  );
+}
+
+// Lists retention_exports (the durable CSV archives written by
+// trip-history-retention / audit-log-retention) with per-row signed
+// download links. The `retention-archives` Storage bucket is private with
+// no storage.objects policy, so the download URL is minted by the
+// admin-gated retention-archive-url edge function, not client-side.
+function RetentionArchives() {
+  const [view, setView] = useState({ loading: true });
+  const [downloading, setDownloading] = useState(null); // storage_path in flight
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open || !supabase || !view.loading) return;
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from("retention_exports")
+        .select("id, table_name, export_date, storage_path, row_count, exported_at")
+        .order("exported_at", { ascending: false })
+        .limit(100);
+      if (cancelled) return;
+      setView(error ? { loading: false, error: error.message, rows: [] } : { loading: false, rows: data || [] });
+    })();
+    return () => { cancelled = true; };
+  }, [open, view.loading]);
+
+  const download = async (row) => {
+    setDownloading(row.storage_path);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/retention-archive-url`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}) },
+        body: JSON.stringify({ path: row.storage_path }),
+      });
+      if (res.status === 401 || res.status === 403) notifySessionExpired();
+      const data = await res.json();
+      if (!res.ok || !data.ok || !data.url) throw new Error(data.error || `Request failed (${res.status})`);
+      window.open(data.url, "_blank", "noopener");
+    } catch (e) {
+      setView(v => ({ ...v, error: e.message || "Couldn't get a download link." }));
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  const rows = view.rows || [];
+  return (
+    <div style={{ border: `1px solid ${COLORS.wire}`, borderRadius: 4, marginTop: 12, overflow: "hidden" }}>
+      <div onClick={() => setOpen(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 8px", cursor: "pointer", background: COLORS.surface }}>
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>{open ? "▾" : "▸"}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>Retention archives</span>
+        <span style={{ fontSize: 9, color: COLORS.ghost }}>durable CSV exports before deletion</span>
+      </div>
+      {open && (
+        <div style={{ padding: 10 }}>
+          {view.error && <div style={{ fontSize: 10, color: COLORS.red, marginBottom: 6 }}>{view.error}</div>}
+          {view.loading ? (
+            <div style={{ fontSize: 10, color: COLORS.ghost }}>Loading…</div>
+          ) : rows.length === 0 ? (
+            <div style={{ fontSize: 10, color: COLORS.ghost }}>No archives yet — the retention jobs write here the first time they purge data older than their cutoff.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+              {rows.map(r => (
+                <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 10, padding: "3px 0", borderBottom: `1px solid ${COLORS.wire}` }}>
+                  <span style={{ color: COLORS.mist, minWidth: 130 }}>{r.table_name}</span>
+                  <span style={{ color: COLORS.ghost }}>{r.export_date}</span>
+                  <span style={{ color: COLORS.ghost }}>{(r.row_count ?? 0).toLocaleString()} rows</span>
+                  <span style={{ flex: 1 }} />
+                  <span style={{ color: COLORS.ghost, fontSize: 9 }}>{r.exported_at ? relTimeLabel(Date.now() - r.exported_at) : ""}</span>
+                  <Button size="sm" variant="ghost" title={downloading === r.storage_path ? "…" : "⬇ CSV"} disabled={!!downloading} onClick={() => download(r)} />
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 8, color: COLORS.ghost, marginTop: 6 }}>Download links are signed and expire after 5 minutes.</div>
+        </div>
+      )}
     </div>
   );
 }
