@@ -92,6 +92,7 @@ import {
   tripTotalFeeAmount,
   tripNoun,
   tripNounCap,
+  pollWhileVisible,
   unifiedAddressSearch,
   usePersistedTab,
   useSortedDropoffs,
@@ -177,8 +178,16 @@ function useIsNarrowScreen(breakpointPx = 768) {
 function useTicker(intervalMs) {
   const [tick, setTick] = useState(() => Date.now());
   useEffect(() => {
-    const interval = setInterval(() => setTick(Date.now()), intervalMs);
-    return () => clearInterval(interval);
+    // Skip ticks while the tab is hidden — a background admin tab
+    // doesn't need its wall-clock memos re-running (and re-rendering the
+    // panels that read them) on a timer nobody's looking at. Snap to now
+    // on return so anything time-windowed is instantly current again.
+    const interval = setInterval(() => {
+      if (document.visibilityState !== "hidden") setTick(Date.now());
+    }, intervalMs);
+    const onVisible = () => { if (document.visibilityState === "visible") setTick(Date.now()); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearInterval(interval); document.removeEventListener("visibilitychange", onVisible); };
   }, [intervalMs]);
   return tick;
 }
@@ -6576,7 +6585,10 @@ function AdminLiveMap({ state, user, dispatch }) {
       if (!cancelled) setTrafficIncidents(incidents);
     };
     fetchIncidents();
-    const interval = setInterval(fetchIncidents, 3 * 60 * 1000);
+    // Skip the poll while the tab is hidden — this hits the (metered)
+    // TomTom traffic API, and a backgrounded admin tab isn't showing the
+    // map. Resumes on the next tick once foregrounded.
+    const interval = pollWhileVisible(fetchIncidents, 3 * 60 * 1000);
     return () => { cancelled = true; clearInterval(interval); };
   }, [showTraffic]);
 
@@ -10233,7 +10245,7 @@ function AdminExceptions({ state, dispatch, onJumpToTrip, onJumpToDrivers }) {
   // Costs nothing when the board isn't open.
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    const h = setInterval(() => setNowMs(Date.now()), 30000);
+    const h = pollWhileVisible(() => setNowMs(Date.now()), 30000);
     return () => clearInterval(h);
   }, []);
 
@@ -10810,7 +10822,13 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
     // (not a second timer). Reads current data via the ref so this
     // effect keeps its []-deps.
     runEscalationsRef.current();
-    const intervalId = setInterval(() => {
+    // This whole batch is a client-side fallback for jobs the pg_cron
+    // functions (check-trip-timing, check-document-expiry,
+    // check-hours-compliance) already run server-side, plus the
+    // escalation engine. A backgrounded admin tab — routine on an
+    // overnight shift — doesn't need to re-run 8 whole-fleet DB sweeps
+    // every 10 min; it picks straight back up when foregrounded.
+    const intervalId = pollWhileVisible(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_DOCUMENT_EXPIRY" }).catch(() => {});
       dispatch({ type: "DRIVER/CHECK_HOURS_COMPLIANCE" }).catch(() => {});
@@ -10883,7 +10901,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
   // this cadence.
   const [badgeTick, setBadgeTick] = useState(0);
   useEffect(() => {
-    const h = setInterval(() => setBadgeTick(t => t + 1), 60000);
+    const h = pollWhileVisible(() => setBadgeTick(t => t + 1), 60000);
     return () => clearInterval(h);
   }, []);
   // Nav badge sweep — over the admin's OWN scoped view (matches every

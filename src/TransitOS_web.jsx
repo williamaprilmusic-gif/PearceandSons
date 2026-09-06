@@ -1,5 +1,5 @@
 import React, { useState, useReducer, useEffect, useRef, useCallback, lazy, Suspense } from "react";
-import * as Sentry from "@sentry/react";
+import { reportError } from "./errorReporter.js";
 
 /* ============================================================
    Pearce & Sons — Corporate Transport Operations Platform (Web)
@@ -40,6 +40,19 @@ export const COLORS = {
   purple: "#7C4DFF", teal: "#00BCD4", black: "#000000",
 };
 export const FONTS = { mono: "'JetBrains Mono', 'Courier New', monospace", head: "'Rajdhani', 'Arial Narrow', sans-serif" };
+
+// Backstop-poll timer that skips its tick while the tab is hidden. Every
+// realtime-backed fetch cycle in this app already refetches immediately
+// on `visibilitychange` → visible, so a poll firing in the background
+// (where the realtime socket is throttled anyway and the "did the socket
+// die" case it guards can't be observed until return) is pure wasted
+// network + DB load — and this app runs mostly-backgrounded on a fleet
+// of phones. Returns the interval id so callers clear it the same way.
+export function pollWhileVisible(fn, intervalMs) {
+  return setInterval(() => {
+    if (typeof document === "undefined" || document.visibilityState !== "hidden") fn();
+  }, intervalMs);
+}
 
 const STATE_BADGE_MAP = {
   UNASSIGNED_BOOKING: { bg: "rgba(78,95,116,0.2)",   fg: COLORS.ghost,  border: COLORS.wire,             label: "UNASSIGNED" },
@@ -12209,7 +12222,7 @@ function useAppStore() {
     // socket died anyway" case, which doesn't need sub-minute freshness.
     // Calls refetch() directly (not debounced) — it's already on a
     // controlled cadence, nothing to coalesce against.
-    const pollInterval = setInterval(refetch, 3 * 60 * 1000);
+    const pollInterval = pollWhileVisible(refetch, 3 * 60 * 1000);
 
     // Also refetch immediately whenever the tab/app comes back to the
     // foreground — a driver returning from Maps or an admin switching
@@ -12339,7 +12352,7 @@ function useAppStore() {
     // visibility-change refetch — no time-based fallback at all, so a
     // dropped subscription could leave this data stale indefinitely
     // until a full page reload.
-    const pollInterval = setInterval(fetchCampaigns, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchCampaigns, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchCampaigns, myRole]);
 
@@ -12354,7 +12367,7 @@ function useAppStore() {
     document.addEventListener("visibilitychange", onVisible);
     // 5-minute poll backstop — see the identical fix/reasoning on the
     // campaigns fetch cycle just above.
-    const pollInterval = setInterval(fetchCompanies, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchCompanies, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchCompanies]);
 
@@ -12369,7 +12382,7 @@ function useAppStore() {
     document.addEventListener("visibilitychange", onVisible);
     // 5-minute poll backstop — see the identical fix/reasoning on the
     // campaigns fetch cycle above.
-    const pollInterval = setInterval(fetchTickets, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchTickets, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchTickets]);
 
@@ -12397,7 +12410,7 @@ function useAppStore() {
     // an admin staring at stale rates (or a trips CSV export computed
     // from stale rates) with no visible sign anything was wrong, and no
     // periodic self-correction until this fix.
-    const pollInterval = setInterval(fetchFeeRates, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchFeeRates, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchFeeRates, myRole]);
 
@@ -12412,7 +12425,7 @@ function useAppStore() {
       .subscribe();
     const onVisible = () => { if (document.visibilityState === "visible") fetchEscalationRules(); };
     document.addEventListener("visibilitychange", onVisible);
-    const pollInterval = setInterval(fetchEscalationRules, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchEscalationRules, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchEscalationRules, myRole]);
 
@@ -12432,7 +12445,7 @@ function useAppStore() {
     document.addEventListener("visibilitychange", onVisible);
     // 5-minute poll backstop — see the identical fix/reasoning on the
     // campaigns fetch cycle above.
-    const pollInterval = setInterval(fetchHazardReports, 5 * 60 * 1000);
+    const pollInterval = pollWhileVisible(fetchHazardReports, 5 * 60 * 1000);
     return () => { supabase.removeChannel(channel); document.removeEventListener("visibilitychange", onVisible); clearInterval(pollInterval); };
   }, [fetchHazardReports, myRole]);
 
@@ -12555,7 +12568,7 @@ function useAppStore() {
       // Dispatch failures (RLS denials, network errors, bad server
       // responses) never reach AppErrorBoundary — they're caught right
       // here, not thrown during render — so they need their own report.
-      Sentry.captureException(e, { extra: { action_type: action?.type } });
+      reportError(e, { action_type: action?.type });
       throw e;
     }
   }, [useFallback, refetch, fetchCampaigns, fetchCompanies, fetchTickets, fetchFeeRates, fetchHazardReports, fetchEscalationRules]);
@@ -17770,7 +17783,11 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     if (!supabase) return;
     dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
     dispatch({ type: "TRIP/CHECK_UPCOMING_REMINDERS" }).catch(() => {});
-    const intervalId = setInterval(() => {
+    // This is only a client-side fallback for the check-trip-timing
+    // pg_cron job — a backgrounded phone doesn't need to re-run the
+    // whole-fleet late-start sweep every 10 min; the server cron covers
+    // it, and this resumes the moment the tab is foregrounded again.
+    const intervalId = pollWhileVisible(() => {
       dispatch({ type: "TRIP/CHECK_LATE_START" }).catch(() => {});
     }, 10 * 60 * 1000);
     return () => clearInterval(intervalId);
@@ -19061,9 +19078,9 @@ class AppErrorBoundary extends React.Component {
   static getDerivedStateFromError(error) { return { error }; }
   componentDidCatch(error, info) {
     console.error("[Pearce & Sons] render error:", error, info);
-    // No-op until VITE_SENTRY_DSN is set (see main.jsx) — safe to call
-    // unconditionally either way.
-    Sentry.captureException(error, { extra: { componentStack: info?.componentStack } });
+    // No-op (and no @sentry chunk fetched) until VITE_SENTRY_DSN is set —
+    // see errorReporter.js. Safe to call unconditionally either way.
+    reportError(error, { componentStack: info?.componentStack });
     // Previously this only went to console.error — if a driver's app
     // crashed mid-trip, nobody found out unless they manually
     // screenshotted the fallback screen and messaged someone (see that
@@ -19464,7 +19481,10 @@ function AppInner() {
       } catch (e) { /* offline or network hiccup — try again next interval */ }
     };
     const t = setTimeout(check, 20000);
-    const iv = setInterval(check, 300000);
+    // Background ticks skipped — the onVisible handler already re-checks
+    // the moment the tab is foregrounded, which is the only time a
+    // reload would actually happen.
+    const iv = pollWhileVisible(check, 300000);
     const onVisible = () => { if (document.visibilityState === "visible") check(); };
     document.addEventListener("visibilitychange", onVisible);
     return () => { clearTimeout(t); clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); };
