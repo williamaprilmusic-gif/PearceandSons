@@ -65,15 +65,19 @@ export function pollWhileVisible(fn, intervalMs) {
 // run that fails on a flaky-connection foreground doesn't arm the
 // throttle against the next retry. Returns a single cleanup function.
 export function pollWhileVisibleWithCatchup(fn, intervalMs) {
-  let lastRunAt = 0;
+  // Seed to "now" — every caller runs fn() once at mount, so the
+  // throttle is armed from the start (a 0 seed would leave every
+  // foreground unthrottled until the first run's promise resolved,
+  // which on a hung/slow connection is never).
+  let lastRunAt = Date.now();
   const run = () => {
     const startedAt = Date.now();
-    try {
-      Promise.resolve(fn()).then(
-        () => { if (startedAt > lastRunAt) lastRunAt = startedAt; },
-        () => {}, // rejected → leave lastRunAt so the next foreground retries
-      );
-    } catch { /* sync throw — same: don't stamp */ }
+    const prev = lastRunAt;
+    lastRunAt = startedAt; // arm the throttle immediately, even mid-flight
+    Promise.resolve().then(fn).then(
+      () => {},
+      () => { if (lastRunAt === startedAt) lastRunAt = prev; }, // failed → roll back so the next foreground retries
+    );
   };
   const id = setInterval(() => {
     if (typeof document === "undefined" || document.visibilityState !== "hidden") run();
@@ -19513,10 +19517,14 @@ function AppInner() {
       } catch (e) { /* offline or network hiccup — try again next interval */ }
     };
     const t = setTimeout(check, 20000);
-    // Background ticks skipped; one throttled re-check on foreground
-    // (the only time a reload would actually happen anyway).
-    const stopPoll = pollWhileVisibleWithCatchup(check, 300000);
-    return () => { clearTimeout(t); stopPoll(); };
+    // Background ticks skipped, but re-check on EVERY foreground (not
+    // throttled) — this is a single cheap fetch("/index.html"), not a
+    // fleet sweep or a metered API, and its whole point is catching a
+    // stale bundle fast (a stale bundle silently fails every RLS write).
+    const iv = pollWhileVisible(check, 300000);
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { clearTimeout(t); clearInterval(iv); document.removeEventListener("visibilitychange", onVisible); };
   }, [pushToast]);
 
   useEffect(() => {
