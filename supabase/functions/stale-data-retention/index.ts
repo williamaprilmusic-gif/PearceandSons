@@ -4,8 +4,8 @@
 // delete) — but its own header comment notes that notifications/
 // driver_positions/driver_position_log/tickets/audit_logs/driver_status
 // all just SET NULL their tripid when a trip is deleted, they never lose
-// their OWN rows. Found via a dedicated audit: two of those tables grow
-// unbounded with zero cleanup —
+// their OWN rows. Found via a dedicated audit (and grown since): several
+// operational tables accumulate with zero cleanup — this sweeps them —
 //   - driver_position_log: ~1 row per active driver per ~8s GPS tick
 //     (3,900+ rows and climbing), kept as a breadcrumb trail "for later
 //     route review" (see the client's own comment on this table) tied to

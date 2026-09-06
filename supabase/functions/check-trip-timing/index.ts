@@ -12,17 +12,18 @@
 // specifically unifies the trip-timing family, all of which need
 // "every non-terminal trip" as their base set anyway.
 //
-// Each of the 4 checks below is a straight port of its own now-retired
-// function's logic — see check-late-start/check-upcoming-reminders's own
+// Checks #1–#3 are straight ports of their own now-retired functions'
+// logic — see check-late-start/check-upcoming-reminders's own
 // (still-deployed but no longer scheduled) source for the original
 // per-check header comments this summarizes (check-unassigned-
 // approaching's local source was deleted as dead code once its logic
 // was fully absorbed here; its deployment was already unscheduled).
-// Nothing about any individual check's threshold/notified-
-// flag/re-fire behavior changed in the merge, only that they now share
-// one query instead of four, plus a post-merge fix batching the driver-
-// name lookups checks #1/#4 need into one query up front instead of one
-// per trip inside the loop (see driverNameById below).
+// Nothing about a ported check's threshold/notified-flag/re-fire
+// behavior changed in the merge, only that they now share one query
+// instead of four, plus a post-merge fix batching the driver-name
+// lookups checks #1/#4 need into one query up front instead of one per
+// trip inside the loop (see driverNameById below). Checks #4 (stuck in
+// transit) and #5 (delay propagation) are NEW, added here directly.
 //
 //   1. Late start: DRIVER_CONFIRMED trips 30+ min past scheduled time,
 //      never having reached IN_TRANSIT — latestartnotified flag. Pushes
@@ -92,7 +93,7 @@ Deno.serve(async (req) => {
     const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY);
     const nowMs = Date.now();
 
-    // ── One shared query — superset covering all 4 checks below ────────
+    // ── One shared query — superset covering every check below ─────────
     const { data: trips, error } = await supabase
       .from("trips")
       .select("*")

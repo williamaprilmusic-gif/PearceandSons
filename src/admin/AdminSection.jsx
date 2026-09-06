@@ -1590,10 +1590,11 @@ function slotCoversWindow(slot, dow, win) {
 //   options: { lookbackWeeks = 4, now = Date.now(), statusHistory }
 // When `statusHistory` (driver_status_history rows, app-shaped) is given,
 // each cell also gets `onlineTypical` = the average distinct drivers who
-// were actually ONLINE during that window over the same lookback, and the
-// shortfall is computed against the effective supply = min(rostered,
-// round(onlineTypical)) — "you rostered 8 but only ~6 typically come
-// online". Without it, effective supply is just `rostered`.
+// were actually ONLINE during that window over the same lookback. If that
+// cell has >= MIN_PRESENCE_WEEKS of history, the shortfall is computed
+// against effectiveSupply = min(rostered, round(onlineTypical)) — "you
+// rostered 8 but only ~6 typically come online". Otherwise (thin/no
+// presence data) effectiveSupply is just `rostered`.
 //   `short` = round(demand) − effectiveSupply, floored at 0.
 export function computeStaffingForecast(state, mondaySlash, options = {}) {
   const { lookbackWeeks = 4, now = Date.now(), statusHistory } = options;
@@ -1644,6 +1645,7 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
         const first = new Date(s + SAST_OFFSET_MS);
         const firstDayMs = Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), first.getUTCDate());
         for (let dayMs = firstDayMs; dayMs - SAST_OFFSET_MS < e; dayMs += MS_DAY) {
+          if (dayMs >= nowDayStart) break; // today + future excluded, same as the demand side
           const wk = Math.floor((nowDayStart - dayMs) / (7 * MS_DAY));
           if (wk < 0 || wk >= lookbackWeeks) continue;
           const dow = new Date(dayMs).getUTCDay(); // dayMs is Date.UTC(sastY,M,D) -> SAST weekday
@@ -9509,10 +9511,14 @@ function RetentionArchives() {
   const [view, setView] = useState({ loading: true });
   const [downloading, setDownloading] = useState(null); // storage_path in flight
   const [open, setOpen] = useState(false);
+  const fetchedForThisOpenRef = useRef(false);
 
   useEffect(() => {
-    if (!open || !supabase || !view.loading) return;
+    if (!open) { fetchedForThisOpenRef.current = false; return; } // reopen re-fetches
+    if (!supabase || fetchedForThisOpenRef.current) return;
+    fetchedForThisOpenRef.current = true;
     let cancelled = false;
+    setView({ loading: true });
     (async () => {
       const { data, error } = await supabase
         .from("retention_exports")
@@ -9523,7 +9529,7 @@ function RetentionArchives() {
       setView(error ? { loading: false, error: error.message, rows: [] } : { loading: false, rows: data || [] });
     })();
     return () => { cancelled = true; };
-  }, [open, view.loading]);
+  }, [open]);
 
   const download = async (row) => {
     setDownloading(row.storage_path);
