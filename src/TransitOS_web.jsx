@@ -4721,6 +4721,28 @@ function appReducer(state, action) {
       return { ...workingState, _error: null, _lastBulkAssignResults: results };
     }
 
+    case "TRIP/AUTO_ASSIGN": {
+      // Accepts a plan of { trip_id, driver_id } pairs (from
+      // computeAutoAssignPlan) and runs each as a real TRIP/ASSIGN_DRIVER
+      // — per-trip capacity / sequencing / notifications / auto-merge all
+      // behave exactly as a manual dispatch. One bad pair doesn't block
+      // the rest.
+      const results = [];
+      let workingState = state;
+      for (const a of action.assignments || []) {
+        const before = workingState;
+        const after = appReducer(workingState, { type: "TRIP/ASSIGN_DRIVER", trip_id: a.trip_id, driver_id: a.driver_id });
+        if (after._error) {
+          results.push({ trip_id: a.trip_id, ok: false, reason: after._error });
+          workingState = { ...before, _error: null };
+        } else {
+          results.push({ trip_id: a.trip_id, ok: true });
+          workingState = { ...after, _error: null };
+        }
+      }
+      return { ...workingState, _error: null, _lastAutoAssignResults: results };
+    }
+
     case "TRIP/ASSIGN_DRIVER": {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       const drvStatus = state.driver_status.find(d => String(d.driver_id) === String(action.driver_id));
@@ -9469,6 +9491,26 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       return results;
     }
 
+    case "TRIP/AUTO_ASSIGN": {
+      // Runs a computeAutoAssignPlan output: each { trip_id, driver_id }
+      // pair through the real per-trip TRIP/ASSIGN_DRIVER (capacity,
+      // sequencing, doc check, notifications, same-day auto-merge). A
+      // pair that fails (docs expired, no longer unassigned, driver
+      // filled up by an earlier pair in this batch) is skipped, not
+      // fatal. One trailing refetch.
+      const autoResults = [];
+      for (const a of action.assignments || []) {
+        try {
+          await handleSupabaseAction({ type: "TRIP/ASSIGN_DRIVER", trip_id: a.trip_id, driver_id: a.driver_id }, activeUserRef, async () => {});
+          autoResults.push({ trip_id: a.trip_id, ok: true });
+        } catch (e) {
+          autoResults.push({ trip_id: a.trip_id, ok: false, reason: e.message || "Assignment failed" });
+        }
+      }
+      refetch();
+      return autoResults;
+    }
+
     case "TRIP/BULK_ADMIN_CANCEL": {
       // Cancel several already-dispatched trips in one action (site
       // closure / weather). Each goes through the real TRIP/ADMIN_CANCEL
@@ -12259,6 +12301,7 @@ function useAppStore() {
       // Same idea: per-day success/failure results, so the UI can show
       // which days of a week booking got assigned and why any didn't.
       if (action.type === "TRIP/BULK_ASSIGN_DRIVER") return result._lastBulkAssignResults;
+      if (action.type === "TRIP/AUTO_ASSIGN") return result._lastAutoAssignResults;
       // Same idea: per-booking success/failure results, so the UI can
       // show exactly which selected bookings were deleted and why any
       // others were skipped (e.g. got dispatched in the meantime).

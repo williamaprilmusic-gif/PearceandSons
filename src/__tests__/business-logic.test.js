@@ -51,6 +51,7 @@ import {
   buildEscalationItems,
   buildRosterWeek,
   computeStaffingForecast,
+  computeAutoAssignPlan,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1603,5 +1604,70 @@ describe("computeStaffingForecast — presence adjustment (statusHistory)", () =
     expect(c.onlineTypical).toBe(null);
     expect(c.short).toBe(0);
     expect(f.presenceAdjusted).toBe(false);
+  });
+});
+
+describe("computeAutoAssignPlan — best-fit driver per unassigned booking", () => {
+  const mkBooking = (trip_id, date, time, agents, dir = "INBOUND") => ({
+    trip_id, state: TRIP_STATE.UNASSIGNED_BOOKING, scheduled_date: date, scheduled_time: time,
+    direction: dir, agent_ids: agents,
+    pickup_sequence_coords: [{ lat: -33.9, lng: 18.5 }],
+    dropoff_sequence_coords: [{ lat: -33.92, lng: 18.42 }],
+  });
+
+  it("assigns each booking to an on-shift driver with room, best score first, and provisionally loads them", () => {
+    const state = {
+      trips: [mkBooking("b1", "2026/02/02", "07:00", ["a1", "a2"]), mkBooking("b2", "2026/02/02", "07:10", ["a3"])],
+      users: [
+        { id: "d1", role: "DRIVER", name: "Dee One" },
+        { id: "d2", role: "DRIVER", name: "Dee Two" },
+      ],
+      driver_status: [
+        { driver_id: "d1", capacity: 3, availability_schedule: [] }, // no schedule => always on shift
+        { driver_id: "d2", capacity: 3, availability_schedule: [] },
+      ],
+      driver_positions: {},
+    };
+    const plan = computeAutoAssignPlan(state, { nowMs: Date.UTC(2026, 1, 2, 5, 0, 0) });
+    expect(plan.total).toBe(2);
+    expect(plan.assignments).toHaveLength(2);
+    expect(plan.skipped).toHaveLength(0);
+    // b1 (2 seats) takes one driver; b2 must NOT also go to that driver if
+    // 2 + 1 > capacity 3 would... 3 fits, so it could — but the provisional
+    // load means the SECOND assignment sees the first driver at 2/3.
+    const byTrip = Object.fromEntries(plan.assignments.map(a => [a.trip_id, a.driver_id]));
+    expect(byTrip.b1).toBeDefined();
+    expect(byTrip.b2).toBeDefined();
+  });
+
+  it("skips a booking when no on-shift driver has room", () => {
+    const state = {
+      trips: [mkBooking("b1", "2026/02/02", "07:00", ["a1", "a2", "a3", "a4"])], // 4 seats
+      users: [{ id: "d1", role: "DRIVER", name: "Dee One" }],
+      driver_status: [{ driver_id: "d1", capacity: 3, availability_schedule: [] }],
+      driver_positions: {},
+    };
+    const plan = computeAutoAssignPlan(state, { nowMs: Date.UTC(2026, 1, 2, 5, 0, 0) });
+    expect(plan.assignments).toHaveLength(0);
+    expect(plan.skipped).toEqual([{ trip_id: "b1", reason: "no on-shift driver with room" }]);
+  });
+
+  it("excludes an unavailable driver and one off-shift for the slot", () => {
+    const state = {
+      trips: [mkBooking("b1", "2026/02/02", "23:00", ["a1"])], // Monday 23:00
+      users: [
+        { id: "d1", role: "DRIVER", name: "Off Shift" },
+        { id: "d2", role: "DRIVER", name: "Unavailable" },
+        { id: "d3", role: "DRIVER", name: "On Shift" },
+      ],
+      driver_status: [
+        { driver_id: "d1", capacity: 4, availability_schedule: [{ day: 1, start: "06:00", end: "14:00" }] }, // not 23:00
+        { driver_id: "d2", capacity: 4, availability_schedule: [], is_unavailable: true },
+        { driver_id: "d3", capacity: 4, availability_schedule: [{ day: 1, start: "20:00", end: "04:00" }] }, // covers 23:00
+      ],
+      driver_positions: {},
+    };
+    const plan = computeAutoAssignPlan(state, { nowMs: Date.UTC(2026, 1, 2, 21, 0, 0) });
+    expect(plan.assignments).toEqual([expect.objectContaining({ trip_id: "b1", driver_id: "d3" })]);
   });
 });

@@ -1727,6 +1727,69 @@ function scoreDriverForTrip(ds, u, distKm, tripAgentIds, trips) {
   return { score: Math.round(Math.max(0, Math.min(100, score))), proxScore: Math.round(proxScore), load, acceptRate, prevDeclinedThisAgent };
 }
 
+// Pure: for every currently-unassigned booking, pick the best-fit
+// on-shift driver with room — the plan behind the Dispatch "auto-assign
+// all" button. Same candidate rules and scoring the manual dispatch UI
+// uses (isDriverOnShift + per-day seat capacity + scoreDriverForTrip),
+// but run booking-by-booking. Bookings are handled earliest-first so the
+// most urgent get first pick, and each pick provisionally loads the
+// chosen driver so the batch can't over-fill one driver.
+// Returns { assignments: [{ trip_id, driver_id, driver_name, score }],
+//           skipped: [{ trip_id, reason }], total }.
+// Document-currency is enforced server-side by TRIP/ASSIGN_DRIVER at
+// execution time — a driver with expired docs surfaces as a skipped
+// result there, not here.
+export function computeAutoAssignPlan(state, options = {}) {
+  const { nowMs = Date.now() } = options;
+  const usersById = usersByIdMap(state.users || []);
+  const unassigned = (state.trips || [])
+    .filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING)
+    .sort((a, b) => `${a.scheduled_date} ${a.scheduled_time || ""}`.localeCompare(`${b.scheduled_date} ${b.scheduled_time || ""}`));
+
+  const provisional = new Map(); // `${driver_id}|${date}` -> seats added by this plan
+  const assignments = [];
+  const skipped = [];
+
+  for (const trip of unassigned) {
+    const date = trip.scheduled_date;
+    const time = trip.scheduled_time;
+    const seats = Math.max(1, trip.agent_ids?.length || 1);
+    const rankCoord = bookingRankCoord(trip);
+    const tripAgentIds = trip.agent_ids || [];
+
+    let best = null;
+    for (const ds of state.driver_status || []) {
+      if (ds.is_unavailable) continue;
+      if (!isDriverOnShift(ds, date, time)) continue;
+      const cap = ds.capacity || DRIVER_CAPACITY;
+      const key = `${ds.driver_id}|${date}`;
+      const load = getDriverLoad(state, ds.driver_id, date) + (provisional.get(key) || 0);
+      if (load + seats > cap) continue;
+      const u = usersById.get(String(ds.driver_id));
+      const livePos = state.driver_positions?.[ds.driver_id];
+      const liveFresh = livePos && (nowMs - new Date(livePos.updated_at).getTime()) <= 30000;
+      const origin = liveFresh ? { lat: livePos.lat, lng: livePos.lng } : (u?.home_address || null);
+      const distKm = (rankCoord?.lat != null && origin?.lat != null)
+        ? haversineKm(rankCoord.lat, rankCoord.lng, origin.lat, origin.lng) * ROAD_FACTOR
+        : null;
+      const { score } = scoreDriverForTrip(ds, u, distKm, tripAgentIds, state.trips);
+      if (!best || score > best.score) best = { ds, u, score };
+    }
+
+    if (!best) {
+      skipped.push({ trip_id: trip.trip_id, reason: "no on-shift driver with room" });
+      continue;
+    }
+    const key = `${best.ds.driver_id}|${date}`;
+    provisional.set(key, (provisional.get(key) || 0) + seats);
+    assignments.push({
+      trip_id: trip.trip_id, driver_id: best.ds.driver_id,
+      driver_name: best.u?.name || `#${best.ds.driver_id}`, score: best.score,
+    });
+  }
+  return { assignments, skipped, total: unassigned.length };
+}
+
 // "What-if" preview for dispatching `selectedTrips` to `driverId` — shows
 // the outcome the admin is about to commit, matching how handleDispatch
 // actually routes the selection:
@@ -4705,6 +4768,10 @@ function AdminDispatch({ state, dispatch, user }) {
   const [driverSearch, setDriverSearch] = useState("");
   const [msg, setMsg] = useState(null);
   const [dispatching, setDispatching] = useState(false);
+  // "Auto-assign all" — a staged plan (computeAutoAssignPlan output) the
+  // admin confirms before it runs.
+  const [autoPlan, setAutoPlan] = useState(null);
+  const [autoRunning, setAutoRunning] = useState(false);
   // Which driver a dispatch was actually started for — FOUND VIA
   // /code-review (10th pass): the loading spinner/disabled button was
   // rendered purely off `sel` (the CURRENTLY selected driver's card), so
@@ -5068,6 +5135,62 @@ function AdminDispatch({ state, dispatch, user }) {
           <span style={{ color: msg.startsWith("✗") ? COLORS.red : COLORS.green, fontWeight: 700, fontSize: 11 }}>{msg}</span>
         </div>
       )}
+
+      {/* Auto-assign all unassigned bookings to their best-fit driver */}
+      {unassignedAllDates.length > 0 && (
+        autoPlan ? (
+          <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
+            {autoPlan.assignments.length === 0 ? (
+              <span style={{ fontSize: 11, color: COLORS.amber }}>No booking has an on-shift driver with room right now — nothing to auto-assign.</span>
+            ) : (
+              <>
+                <span style={{ fontSize: 11, color: COLORS.chalk, fontWeight: 700 }}>
+                  Assign {autoPlan.assignments.length} booking{autoPlan.assignments.length !== 1 ? "s" : ""} to the best-fit on-shift driver?
+                  {autoPlan.skipped.length > 0 && <span style={{ color: COLORS.amber, fontWeight: 500 }}> {autoPlan.skipped.length} can't be placed (no driver with room).</span>}
+                </span>
+                <div style={{ maxHeight: 140, overflowY: "auto", display: "flex", flexDirection: "column", gap: 2 }}>
+                  {autoPlan.assignments.slice(0, 40).map(a => (
+                    <div key={a.trip_id} style={{ fontSize: 9, color: COLORS.ghost, display: "flex", gap: 8 }}>
+                      <span style={{ color: COLORS.mist }}>#{a.trip_id}</span>
+                      <span>→ {a.driver_name}</span>
+                      <span style={{ flex: 1 }} />
+                      <span>score {a.score}</span>
+                    </div>
+                  ))}
+                  {autoPlan.assignments.length > 40 && <div style={{ fontSize: 9, color: COLORS.ghost }}>…and {autoPlan.assignments.length - 40} more</div>}
+                </div>
+              </>
+            )}
+            <div style={{ display: "flex", gap: 8 }}>
+              <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setAutoPlan(null)} disabled={autoRunning} />
+              {autoPlan.assignments.length > 0 && (
+                <Button title={autoRunning ? "ASSIGNING…" : `ASSIGN ${autoPlan.assignments.length}`} variant="primary" size="sm" style={{ flex: 1 }} disabled={autoRunning} loading={autoRunning}
+                  onClick={async () => {
+                    setAutoRunning(true);
+                    try {
+                      const results = (await dispatch({ type: "TRIP/AUTO_ASSIGN", assignments: autoPlan.assignments })) || [];
+                      const ok = results.filter(r => r.ok).length;
+                      const fails = results.filter(r => !r.ok);
+                      const skippedNote = autoPlan.skipped.length > 0 ? `, ${autoPlan.skipped.length} unplaceable` : "";
+                      setMsg(fails.length === 0
+                        ? `✓ Auto-assigned ${ok} booking${ok !== 1 ? "s" : ""}${skippedNote}`
+                        : `⚠ Assigned ${ok}, ${fails.length} skipped — ${[...new Set(fails.map(r => r.reason))].join("; ")}${skippedNote}`);
+                    } catch (e) {
+                      setMsg(`✗ ${e.message || "Auto-assign failed — please try again."}`);
+                    } finally {
+                      setAutoRunning(false);
+                      setAutoPlan(null);
+                    }
+                  }} />
+              )}
+            </div>
+          </div>
+        ) : (
+          <Button title={`⚡ AUTO-ASSIGN ${unassignedAllDates.length} UNASSIGNED`} variant="ghost" size="sm" style={{ alignSelf: "flex-start", marginBottom: 10 }}
+            onClick={() => { setMsg(null); setAutoPlan(computeAutoAssignPlan(state)); }} />
+        )
+      )}
+
       {(() => {
         const suggestions = computeGroupSuggestions(unassignedAllDates.filter(t => !selectedTripIds.has(t.trip_id)), state.users, state.driver_status);
         if (!suggestions.length) return null;
