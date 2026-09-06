@@ -40,6 +40,15 @@
 //      ordering as check #1 — a stuck-for-3h trip is exactly the
 //      closed/crashed-app case a push (not just an in-app row) exists
 //      to reach.
+//   5. NEW — delay propagation: a driver running late on one trip almost
+//      always drags their LATER same-day trips late too. This runs as a
+//      post-loop pass (it needs each driver's worst current delay across
+//      ALL their trips before it can act on the downstream ones): for
+//      every not-yet-started trip whose driver is >= 20 min behind on an
+//      earlier trip today (and within a 4h horizon), the agents on it get
+//      one "your ride may be ~N min late" heads-up + push.
+//      delaypropagatednotified / delaypropagatedmins dedupe it, re-firing
+//      only if the estimate grows by 20+ min.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -50,6 +59,23 @@ const CRON_AUTH_TOKEN = Deno.env.get("CRON_AUTH_TOKEN") ?? "";
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+
+// ── Delay-propagation tuning (check #5) ──────────────────────────────
+const PROPAGATE_MIN_DELAY_MIN = 20;      // ignore a driver less than this behind
+const PROPAGATE_HORIZON_MS = 4 * 60 * 60 * 1000; // only warn trips within 4h after the late one
+const PROPAGATE_REFIRE_STEP_MIN = 20;    // re-notify only once the estimate grows this much
+const IN_TRANSIT_GRACE_MIN = 60;         // an IN_TRANSIT trip isn't "late" until this far past departure
+
+// A trip's scheduled departure as an epoch ms. Prefer the stored
+// scheduledtime; fall back to parsing scheduleddate (YYYY/MM/DD) +
+// scheduledtimestr (HH:MM) as SAST -> UTC, exactly as checks #1/#3 do.
+function schedMs(t: Record<string, unknown>): number | null {
+  if (t.scheduledtime != null) return Number(t.scheduledtime);
+  const [y, m, d] = String(t.scheduleddate || "").split("/").map(Number);
+  const [hh, mm] = String(t.scheduledtimestr || "").split(":").map(Number);
+  if (!y || !m || !d || hh == null || mm == null || Number.isNaN(hh) || Number.isNaN(mm)) return null;
+  return Date.UTC(y, m - 1, d, hh - 2, mm);
+}
 
 Deno.serve(async (req) => {
   try {
@@ -84,9 +110,38 @@ Deno.serve(async (req) => {
       for (const d of driverRows || []) driverNameById[String(d.id)] = d.fullname;
     }
 
-    const results = { lateStart: 0, upcomingReminders: 0, unassignedApproaching: 0, stuckInTransit: 0 };
+    const results = { lateStart: 0, upcomingReminders: 0, unassignedApproaching: 0, stuckInTransit: 0, delayPropagated: 0 };
+
+    // check #5 input: per driver, every trip they're currently behind on
+    // as { sMs: its scheduled departure, mins: how far behind }. A
+    // downstream trip then inherits the worst delay among this driver's
+    // sources scheduled BEFORE it (not just the single worst overall —
+    // an 08:00 trip 25 min late still drags the 10:00 trip even if the
+    // same driver's 14:00 trip is 90 min late).
+    const driverDelays: Record<string, Array<{ sMs: number; mins: number }>> = {};
+    const noteDelay = (driverId: unknown, mins: number, sMs: number) => {
+      if (driverId == null || mins < PROPAGATE_MIN_DELAY_MIN) return;
+      (driverDelays[String(driverId)] ||= []).push({ sMs, mins });
+    };
 
     for (const t of trips || []) {
+      // ── check #5 data-gathering (acts after the loop) ──────────────
+      // A driver is "behind" if a trip they own is either past its
+      // departure and not yet started, or has been IN_TRANSIT well past
+      // departure. Independent of the notified flags above — we want the
+      // live delay every run, not just the first.
+      if (t.driverid && (t.status === "DRIVER_CONFIRMED" || t.status === "ASSIGNED" || t.status === "IN_TRANSIT")) {
+        const sMs = schedMs(t);
+        if (sMs != null) {
+          const pastMin = (nowMs - sMs) / 60000;
+          if (t.status === "IN_TRANSIT") {
+            noteDelay(t.driverid, Math.floor(pastMin - IN_TRANSIT_GRACE_MIN), sMs);
+          } else {
+            noteDelay(t.driverid, Math.floor(pastMin), sMs);
+          }
+        }
+      }
+
       // ── 1. Late start ──────────────────────────────────────────────
       if (t.status === "DRIVER_CONFIRMED" && !t.latestartnotified) {
         const [y, m, d] = (t.scheduleddate || "").split("/").map(Number);
@@ -198,6 +253,52 @@ Deno.serve(async (req) => {
           results.stuckInTransit++;
         }
       }
+    }
+
+    // ── 5. Delay propagation (post-loop) ────────────────────────────────
+    // driverDelays is now fully populated. Warn the agents on each
+    // not-yet-started trip whose driver is behind on an EARLIER trip
+    // today, within the horizon.
+    for (const t of trips || []) {
+      if (t.status !== "DRIVER_CONFIRMED" && t.status !== "ASSIGNED") continue;
+      if (!t.driverid) continue;
+      const sources = driverDelays[String(t.driverid)];
+      if (!sources || sources.length === 0) continue;
+      const sMs = schedMs(t);
+      if (sMs == null) continue;
+      // don't warn about a departure that's already well in the past
+      if (sMs < nowMs - 30 * 60000) continue;
+      // worst delay among this driver's late trips scheduled before this
+      // one, within a horizon they can't realistically recover across
+      let estMin = 0;
+      for (const s of sources) {
+        if (s.sMs < sMs && sMs - s.sMs <= PROPAGATE_HORIZON_MS && s.mins > estMin) estMin = s.mins;
+      }
+      if (estMin < PROPAGATE_MIN_DELAY_MIN) continue;
+      const prevMin = t.delaypropagatedmins ?? 0;
+      if (t.delaypropagatednotified && estMin - prevMin < PROPAGATE_REFIRE_STEP_MIN) continue;
+
+      const agentIds = [t.agentid, ...(t.extraagentids || [])].filter(Boolean);
+      if (agentIds.length === 0) {
+        // nothing to notify, but still mark it so it isn't rechecked forever
+        await supabase.from("trips").update({ delaypropagatednotified: true, delaypropagatedmins: estMin }).eq("id", t.id);
+        continue;
+      }
+
+      await supabase.from("trips").update({ delaypropagatednotified: true, delaypropagatedmins: estMin }).eq("id", t.id);
+      const whenStr = t.scheduledtimestr || (t.scheduleddate ? `${t.scheduleddate}` : "");
+      const msg = `⚠ Your ride${whenStr ? ` (${whenStr})` : ""} may be about ${estMin} min late — your driver is running behind on an earlier trip. We'll keep you posted.`;
+      const notifRows = agentIds.map((agentId: number) => ({
+        title: "POSSIBLE DELAY", type: "TRIP_DELAY_PROPAGATED", forroles: ["AGENT"], userid: agentId,
+        message: msg, tripid: t.id, timestamp: nowMs, isread: false,
+      }));
+      await supabase.from("notifications").insert(notifRows);
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+        method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${CRON_AUTH_TOKEN}` },
+        body: JSON.stringify({ user_ids: agentIds, title: "POSSIBLE DELAY", message: msg, type: "TRIP_DELAY_PROPAGATED", trip_id: t.id, ts: nowMs }),
+        signal: AbortSignal.timeout(15000),
+      }).catch(e => console.warn("[check-trip-timing:delay-propagation] push failed:", e.message));
+      results.delayPropagated++;
     }
 
     return new Response(JSON.stringify({ ok: true, checked: (trips || []).length, ...results }), {
