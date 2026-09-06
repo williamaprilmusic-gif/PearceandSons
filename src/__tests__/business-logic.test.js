@@ -1519,3 +1519,37 @@ describe("computeStaffingForecast — window-edge fixes (code-review)", () => {
     expect(f.totalShort).toBe(0);
   });
 });
+
+describe("computeStaffingForecast — slotCoversWindow interval overlap", () => {
+  const NOW = Date.UTC(2026, 0, 19, 12, 0, 0);
+  const MONDAY = "2026/01/19";
+  const t = (date, time, d) => ({ scheduled_date: date, scheduled_time: time, driver_id: d, state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: ["a"] });
+
+  it("counts a slot that straddles two windows toward BOTH", () => {
+    const s = {
+      // 1 driver needed in Monday EARLY and 1 in Monday MID (1 wk of history)
+      trips: [t("2026/01/12", "10:00", "d1"), t("2026/01/12", "14:00", "d2")],
+      driver_status: [
+        // Mon 09:00–15:00 overlaps EARLY (…–12:00) and MID (12:00–…)
+        { driver_id: "x", availability_schedule: [{ day: 1, start: "09:00", end: "15:00" }] },
+      ],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "EARLY").rostered).toBe(1);
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "MID").rostered).toBe(1);
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "LATE").rostered).toBe(0);
+  });
+
+  it("does not count a slot that only touches a window's boundary instant", () => {
+    const s = {
+      trips: [t("2026/01/12", "13:00", "d1")], // Monday MID demand
+      driver_status: [
+        // ends exactly at 12:00 — touches MID's start but doesn't overlap it
+        { driver_id: "y", availability_schedule: [{ day: 1, start: "06:00", end: "12:00" }] },
+      ],
+    };
+    const f = computeStaffingForecast(s, MONDAY, { now: NOW });
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "MID").rostered).toBe(0);
+    expect(f.cells.find(c => c.date === MONDAY && c.window === "EARLY").rostered).toBe(1);
+  });
+});

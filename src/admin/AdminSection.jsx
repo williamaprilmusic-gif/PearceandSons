@@ -1543,10 +1543,11 @@ export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(sta
 // sample can't represent a midnight-wrapping interval: for LATE, 21:00/
 // 23:00 catch the evening crew and 01:00/03:00 catch the drivers whose
 // shift wraps into the small hours of that date).
+// LATE wraps past midnight (endMin < startMin).
 export const STAFFING_WINDOWS = [
-  { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60, samples: ["06:00", "09:00", "11:00"] },
-  { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60, samples: ["13:00", "16:00", "19:00"] },
-  { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60, samples: ["21:00", "23:00", "01:00", "03:00"] },
+  { key: "EARLY", label: "Early", range: "04:00–12:00", startMin: 4 * 60, endMin: 12 * 60 },
+  { key: "MID", label: "Midday", range: "12:00–20:00", startMin: 12 * 60, endMin: 20 * 60 },
+  { key: "LATE", label: "Late/Night", range: "20:00–04:00", startMin: 20 * 60, endMin: 4 * 60 },
 ];
 function staffingWindowOf(timeStr) {
   const mm = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
@@ -1556,6 +1557,26 @@ function staffingWindowOf(timeStr) {
   return STAFFING_WINDOWS.find(w =>
     w.endMin > w.startMin ? (mins >= w.startMin && mins < w.endMin) : (mins >= w.startMin || mins < w.endMin)
   )?.key || null;
+}
+const _minsRangesOverlap = (a1, a2, b1, b2) => a1 < b2 && b1 < a2;
+// Whether an availability_schedule SLOT covers any part of `win` on
+// weekday `dow` — exact wrap-aware interval overlap (both the slot and
+// the LATE window can straddle midnight), so no point-sampling.
+function slotCoversWindow(slot, dow, win) {
+  const [sh, sm] = String(slot.start || "").split(":").map(Number);
+  const [eh, em] = String(slot.end || "").split(":").map(Number);
+  if ([sh, sm, eh, em].some(n => !Number.isFinite(n))) return false;
+  const S = sh * 60 + sm, E = eh * 60 + em;
+  // slot's covered (weekday, [from,to)) segments
+  const slotSegs = E > S
+    ? [[slot.day, S, E]]
+    : [[slot.day, S, 1440], [(slot.day + 1) % 7, 0, E]];
+  // window's target segments, all anchored to `dow`
+  const winSegs = win.endMin > win.startMin
+    ? [[dow, win.startMin, win.endMin]]
+    : [[dow, win.startMin, 1440], [dow, 0, win.endMin]];
+  return slotSegs.some(([sd, sf, st]) =>
+    winSegs.some(([wd, wf, wt]) => sd === wd && _minsRangesOverlap(sf, st, wf, wt)));
 }
 
 // Pure: project drivers-needed vs. drivers-rostered per upcoming shift
@@ -1576,34 +1597,25 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
     TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT, TRIP_STATE.ARCHIVED_COMPLETED,
   ]);
   const MS_DAY = 24 * 60 * 60 * 1000;
-  const slashToMs = (s) => { const [y, m, d] = s.split("/").map(Number); return Date.UTC(y, m - 1, d); };
-  const toSlash = (ms) => {
-    const d = new Date(ms);
-    return `${d.getUTCFullYear()}/${String(d.getUTCMonth() + 1).padStart(2, "0")}/${String(d.getUTCDate()).padStart(2, "0")}`;
-  };
+  const slashToMs = (s) => { const [y, m, d] = String(s).split("/").map(Number); return Date.UTC(y, m - 1, d); };
   // "Today" pinned to SAST (UTC+2), like every other day-boundary in the
   // app (sastTodaySlashStr / sastMidnightMs) — a bare getUTC* date is the
-  // wrong day for the ~2h after SAST midnight.
+  // wrong day for the ~2h after SAST midnight. SA has no DST so a fixed
+  // +2h offset is exact.
   const sastNow = new Date(now + 2 * 60 * 60 * 1000);
   const nowDayStart = Date.UTC(sastNow.getUTCFullYear(), sastNow.getUTCMonth(), sastNow.getUTCDate());
-  const oldestMs = nowDayStart - lookbackWeeks * 7 * MS_DAY;
-  // String bounds so most of the archive is rejected by a cheap "YYYY/MM/DD"
-  // lexical compare before any Date parsing (resource-friendly-by-default —
-  // this memo reruns on every state.trips change during live dispatch).
-  const oldestSlash = toSlash(oldestMs);
-  const todaySlash = toSlash(nowDayStart);
 
   // history[dow][window] -> Map<weekBucket, Set<driverId>>  (+ trip/seat tallies)
   const hist = {};
   for (const t of state.trips || []) {
     if (!t.scheduled_date || t.driver_id == null || !ACTIVE_OR_DONE.has(t.state)) continue;
-    if (t.scheduled_date < oldestSlash || t.scheduled_date >= todaySlash) continue; // strictly past, within lookback (string compare)
-    const ms = slashToMs(t.scheduled_date);
-    if (Number.isNaN(ms)) continue;
+    const ms = slashToMs(t.scheduled_date); // Date.UTC — cheap, no allocation; tolerates non-padded parts
+    if (Number.isNaN(ms) || ms >= nowDayStart) continue; // must be strictly before today
+    const wk = Math.floor((nowDayStart - ms) / (7 * MS_DAY)); // whole weeks ago
+    if (wk < 0 || wk >= lookbackWeeks) continue; // outside the lookback (0 .. lookbackWeeks-1)
     const win = staffingWindowOf(t.scheduled_time);
     if (!win) continue;
-    const dow = rosterDow(t.scheduled_date);
-    const wk = Math.floor((nowDayStart - ms) / (7 * MS_DAY)); // 0..lookbackWeeks-1
+    const dow = rosterDow(t.scheduled_date); // Date alloc — only for the trips that survived the filters
     ((hist[dow] ||= {})[win] ||= { weeks: new Map(), trips: 0, seats: 0 });
     const cell = hist[dow][win];
     if (!cell.weeks.has(wk)) cell.weeks.set(wk, new Set());
@@ -1628,7 +1640,7 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
       const rostered = rosterDrivers.filter(ds => {
         const sched = ds.availability_schedule;
         if (!sched || sched.length === 0) return false; // unscheduled drivers aren't "rostered" for a slot
-        return w.samples.some(t => isDriverOnShift(ds, date, t));
+        return sched.some(slot => slotCoversWindow(slot, dow, w));
       }).length;
       const need = Math.round(demand);
       cells.push({
