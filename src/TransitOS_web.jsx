@@ -3525,7 +3525,7 @@ const CT_BOUNDS = { minLat: -35.0, maxLat: -33.0, minLng: 17.5, maxLng: 19.5 };
 // pushes the clock forward (last_confirmed_at) so a genuinely persistent
 // hazard doesn't vanish at 3h; a "gone" dismiss quorum clears it early
 // (see tallyHazardVotes / HAZARD_CLEAR_NET_DISMISS).
-const HAZARD_REPORT_WINDOW_HOURS = 3;
+export const HAZARD_REPORT_WINDOW_HOURS = 3;
 
 // Net "gone" votes (dismiss minus confirm) at which a peer hazard report
 // (source driver/agent) is auto-cleared. Deliberately low — two other
@@ -6188,6 +6188,19 @@ function appReducer(state, action) {
       const brResults = [];
       let brState = state;
       for (const tripId of action.trip_ids || []) {
+        const brTrip = brState.trips.find(t => String(t.trip_id) === String(tripId));
+        // Same guards the live path applies: only a not-yet-started
+        // assigned trip, and only one that actually has agents (the
+        // per-trip TRIP/SEND_REMINDER's own no-op path already covers
+        // "not found" / "already active").
+        if (brTrip && ![TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED].includes(brTrip.state)) {
+          brResults.push({ trip_id: tripId, ok: false, reason: "not an upcoming assigned trip" });
+          continue;
+        }
+        if (brTrip && (brTrip.agent_ids || []).length === 0) {
+          brResults.push({ trip_id: tripId, ok: false, reason: "no agents on this trip" });
+          continue;
+        }
         const before = brState;
         const after = appReducer(brState, { type: "TRIP/SEND_REMINDER", trip_id: tripId });
         if (after._error || after === before) {
@@ -9652,9 +9665,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         try {
           const { data: r } = await supabase.from("trips").select("*").eq("id", tripId).single();
           if (!r) { brResults.push({ trip_id: tripId, ok: false, reason: "trip not found" }); continue; }
+          // Same state contract as the per-trip TRIP/SEND_REMINDER's UI
+          // gate — a reminder only makes sense for a not-yet-started
+          // assigned trip, never an archived / in-transit one.
+          if (![TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED].includes(r.status)) {
+            brResults.push({ trip_id: tripId, ok: false, reason: "not an upcoming assigned trip" }); continue;
+          }
           if (r.remindersent) { brResults.push({ trip_id: tripId, ok: false, reason: "reminders already active" }); continue; }
-          must(await supabase.from("trips").update({ remindersent: true, lastreminderat: brTs }).eq("id", tripId));
           const brAgentIds = [r.agentid, ...(r.extraagentids || [])].filter(Boolean);
+          // No agents → insertNotification's for_user_ids:[] would fan out
+          // to EVERY agent (role broadcast). The per-trip handler's
+          // agent-ownership throw blocks that; here we just skip.
+          if (brAgentIds.length === 0) { brResults.push({ trip_id: tripId, ok: false, reason: "no agents on this trip" }); continue; }
+          must(await supabase.from("trips").update({ remindersent: true, lastreminderat: brTs }).eq("id", tripId));
           await insertNotification({
             type: "UPCOMING_TRIP", for_roles: [ROLE.AGENT], for_user_ids: brAgentIds,
             message: `Reminder: your trip from ${r.pickuplocation} departs at ${r.scheduledtimestr || r.scheduledtime}.`,

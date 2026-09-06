@@ -1908,6 +1908,7 @@ describe("computeShiftHandover — incoming-admin snapshot", () => {
       { trip_id: "run1", state: TRIP_STATE.IN_TRANSIT, driver_id: 9, agent_ids: [1], in_transit_at_epoch: min(-40), custom_pickup: "Home", custom_dropoff: "Office", no_shows: [] },
       { trip_id: "soon1", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: [1], scheduled_time_epoch: min(90), scheduled_time: "09:30", scheduled_date: "2026/01/19", no_shows: [] },
       { trip_id: "later", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: [1], scheduled_time_epoch: min(600), scheduled_time: "18:00", scheduled_date: "2026/01/19", no_shows: [] }, // beyond 6h
+      { trip_id: "overdue1", state: TRIP_STATE.UNASSIGNED_BOOKING, agent_ids: [1], scheduled_time_epoch: min(-20), scheduled_time: "07:40", scheduled_date: "2026/01/19", no_shows: [] }, // past its slot, no driver
       // a chronic-history agent → high cancel risk on a booking in 3h
       { trip_id: "risky", state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: 9, agent_ids: ["flaky"], scheduled_time_epoch: min(180), scheduled_time: "11:00", scheduled_date: "2026/01/19", no_shows: [] },
       ...Array.from({ length: 5 }, (_, i) => ({ trip_id: `fc${i}`, state: TRIP_STATE.ARCHIVED_CANCELLED, agent_ids: ["flaky"], no_shows: [] })),
@@ -1918,10 +1919,19 @@ describe("computeShiftHandover — incoming-admin snapshot", () => {
     const h = computeShiftHandover(state, { now: NOW, lookaheadHours: 6 });
     expect(h.counts.inTransit).toBe(1);
     expect(h.inTransit[0]).toMatchObject({ trip_id: "run1", driver: "Driver Nine", startedMinAgo: 40 });
-    expect(h.upcomingUnassigned.map(x => x.trip_id)).toEqual(["soon1"]);   // "later" is beyond 6h
+    expect(h.upcomingUnassigned.map(x => x.trip_id)).toEqual(["soon1"]);   // "later" is beyond 6h, "overdue1" is past
     expect(h.highCancelRisk.map(x => x.trip_id)).toEqual(["risky"]);
     expect(h.hazards.map(x => x.id)).toEqual(["h1", "h2"]);                // hOld dropped
     expect(h.hazards[0].kind).toBe("advisory");
+  });
+
+  it("surfaces an overdue-unassigned booking (counted in urgent) in its own group", () => {
+    const h = computeShiftHandover(state, { now: NOW, lookaheadHours: 6 });
+    expect(h.openExceptions.overdueUnassigned.map(e => e.trip_id)).toContain("overdue1");
+    expect(h.counts.overdueUnassigned).toBeGreaterThanOrEqual(1);
+    // it was already contributing to the urgent count — now it's visible
+    expect(h.counts.urgentExceptions).toBeGreaterThanOrEqual(h.counts.overdueUnassigned);
+    expect(formatShiftHandoverText(h)).toContain("Overdue unassigned");
   });
 
   it("reuses a passed-in computeOpsExceptions result instead of re-sweeping", () => {

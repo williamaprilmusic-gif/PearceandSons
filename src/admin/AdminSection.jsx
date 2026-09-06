@@ -35,6 +35,7 @@ import {
   TRAFFIC_INCIDENT_ICON,
   HAZARD_CATEGORIES,
   HAZARD_CATEGORY_ICON,
+  HAZARD_REPORT_WINDOW_HOURS,
   alertIconFor,
   TRIP_STATE,
   TextField,
@@ -1126,12 +1127,15 @@ function ClientSlaPanel({ state }) {
 
 // The "read this first" panel for an admin coming on shift —
 // computeShiftHandover packaged into scannable groups + a copy-for-
-// handover button. Its own 60s ticker: the in-transit "N min in" and
-// "unassigned in N min" figures should stay roughly live without the
-// panel forcing a recompute on every unrelated state change.
+// handover button. This is the only caller of computeShiftHandover, so
+// it runs the computeOpsExceptions sweep itself (AdminApp's shared
+// opsExceptions is the lighter includeDriverHours:false variant, which
+// this needs the hours items from). 5-min ticker — a handover snapshot
+// doesn't need the "N min in" figures second-accurate, and this keeps
+// the sweep off the 60s cadence the other live panels use.
 function ShiftHandoverPanel({ state }) {
   const [copied, setCopied] = React.useState(false);
-  const tick = useTicker(60 * 1000);
+  const tick = useTicker(5 * 60 * 1000);
   const h = React.useMemo(
     () => computeShiftHandover(
       { trips: state.trips, users: state.users, driver_status: state.driver_status, hazard_reports: state.hazard_reports },
@@ -1153,6 +1157,7 @@ function ShiftHandoverPanel({ state }) {
   const line = (k, txt) => <div key={k} style={{ fontSize: 10, color: COLORS.mist }}>{txt}</div>;
   const ex = h.openExceptions;
   const exRows = [
+    ...ex.overdueUnassigned.map(e => ["ou" + e.id, `⊕ ${e.title} — ${e.detail}`]),
     ...ex.lateStart.map(e => ["ls" + e.id, `⏱ ${e.detail}`]),
     ...ex.stuck.map(e => ["st" + e.id, `🛑 ${e.detail}`]),
     ...ex.disputes.map(e => ["dp" + e.id, `⚖ ${e.title} — ${e.detail}`]),
@@ -2221,24 +2226,29 @@ export function computeShiftHandover(state, options = {}) {
     }))
     .sort((a, b) => a.inMin - b.inMin);
 
-  // High cancel-risk bookings departing within the next 24h.
+  // High cancel-risk bookings departing within the next 24h — ordered by
+  // actual departure epoch (a "09:00" tomorrow must sort AFTER "20:00"
+  // today, which a time-of-day string compare gets wrong).
   const risk = computeCancellationRisk(state, { now });
   const highCancelRisk = trips
     .filter(t => risk[t.trip_id]?.level === "high"
       && t.scheduled_time_epoch != null && Number(t.scheduled_time_epoch) <= now + 24 * 3600000)
     .map(t => ({
-      trip_id: t.trip_id, at: t.scheduled_time, date: t.scheduled_date,
+      trip_id: t.trip_id, at: t.scheduled_time, date: t.scheduled_date, atEpoch: Number(t.scheduled_time_epoch),
       reasons: risk[t.trip_id].reasons, agents: (t.agent_ids || []).map(nameFor),
     }))
-    .sort((a, b) => Number(a.at > b.at) - Number(a.at < b.at));
+    .sort((a, b) => a.atEpoch - b.atEpoch);
 
   // Live hazards: admin advisories within their own display window, peer
-  // hazards within the lookahead.
+  // (crowd) hazards within HAZARD_REPORT_WINDOW_HOURS — the SAME recency
+  // the live map uses, so the handover doesn't show peer hazards the map
+  // has already dropped. Independent of lookaheadHours.
   const advWindowMs = (ADMIN_ADVISORY_WINDOW_HOURS || 12) * 3600000;
+  const peerWindowMs = (HAZARD_REPORT_WINDOW_HOURS || 3) * 3600000;
   const hazards = (state.hazard_reports || [])
     .filter(h => {
       const age = now - Number(h.created_at || 0);
-      return h.source === "admin" ? age <= advWindowMs : age <= lookaheadHours * 3600000;
+      return h.source === "admin" ? age <= advWindowMs : age <= peerWindowMs;
     })
     .map(h => ({
       id: h.id, kind: h.source === "admin" ? "advisory" : "peer hazard",
@@ -2249,6 +2259,12 @@ export function computeShiftHandover(state, options = {}) {
 
   const byKind = (k) => exc.filter(e => e.kind === k);
   const openExceptions = {
+    // Overdue bookings with no driver — computeOpsExceptions emits these
+    // as kind "unassigned" severity "high"; they're not in
+    // upcomingUnassigned (that's future-slot only) but DO count toward
+    // urgentExceptions, so surface them here or the "N urgent" badge
+    // points at nothing.
+    overdueUnassigned: exc.filter(e => e.kind === "unassigned" && e.severity === "high"),
     lateStart: byKind("late_start"),
     stuck: byKind("stuck"),
     disputes: byKind("dispute"),
@@ -2268,6 +2284,7 @@ export function computeShiftHandover(state, options = {}) {
     counts: {
       inTransit: inTransit.length,
       upcomingUnassigned: upcomingUnassigned.length,
+      overdueUnassigned: openExceptions.overdueUnassigned.length,
       highCancelRisk: highCancelRisk.length,
       hazards: hazards.length,
       urgentExceptions: exc.filter(e => e.severity === "high").length,
@@ -2293,6 +2310,7 @@ export function formatShiftHandoverText(h) {
     `[${x.kind}] ${x.category}${x.note ? `: ${x.note}` : ""} — ${x.by || "?"}, ${x.minAgo} min ago`));
   const ex = h.openExceptions;
   section("OPEN EXCEPTIONS", [
+    ...ex.overdueUnassigned.map(e => `Overdue unassigned: ${e.title} — ${e.detail}`),
     ...ex.lateStart.map(e => `Late start: ${e.detail}`),
     ...ex.stuck.map(e => `Stuck: ${e.detail}`),
     ...ex.disputes.map(e => `Dispute: ${e.title} — ${e.detail}`),
@@ -2300,7 +2318,7 @@ export function formatShiftHandoverText(h) {
     ...ex.driverHours.map(e => `Hours: ${e.title} — ${e.detail}`),
     ...ex.expiringDocs.map(e => `Doc: ${e.title}`),
   ]);
-  L.push("", `Generated ${new Date().toLocaleDateString("en-ZA")}`);
+  L.push("", `Generated ${new Date(h.generatedAt).toLocaleDateString("en-ZA")}`);
   return L.join("\n");
 }
 
@@ -4039,6 +4057,13 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // physically mid-route with the passengers).
   const REASSIGNABLE_TRIP_STATES = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED];
   const selectedReassignableIds = [...selectedTripIds].filter(id => REASSIGNABLE_TRIP_STATES.includes(state.trips.find(t => t.trip_id === id)?.state));
+  // Bulk message / bulk reminder — the two server handlers gate on
+  // manageDispatch, so only show the bar to who can actually run it.
+  const canBulkComms = hasAdminPermission(user, "manageDispatch");
+  // Bulk reminder only makes sense for a not-yet-started assigned trip
+  // (matches the per-trip REMIND button's gate) — the server skips the
+  // rest, this just keeps the button's count honest.
+  const selectedRemindableIds = [...selectedTripIds].filter(id => REASSIGNABLE_TRIP_STATES.includes(state.trips.find(t => t.trip_id === id)?.state));
   // Every completed trip CURRENTLY VISIBLE on screen — respects
   // whatever filters are active (state filter, date filter), same as
   // displayTrips itself, per explicit decision: "select all" means all
@@ -4143,7 +4168,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
           : "⚠ Nobody to message in that selection");
         setMsgText("");
       } else {
-        const results = (await dispatch({ type: "TRIP/BULK_SEND_REMINDER", trip_ids: ids })) || [];
+        const results = (await dispatch({ type: "TRIP/BULK_SEND_REMINDER", trip_ids: selectedRemindableIds })) || [];
         const ok = results.filter(r => r.ok).length;
         const fails = results.filter(r => !r.ok);
         setBulkMsg(fails.length === 0
@@ -4455,7 +4480,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
       )}
 
       {/* Bulk message / reminder — works on ANY selected trips. */}
-      {canEditTrips && selectedTripIds.size > 0 && (
+      {canBulkComms && selectedTripIds.size > 0 && (
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
           <span style={{ fontSize: 11, color: COLORS.chalk, fontWeight: 700 }}>
             {selectedTripIds.size} trip{selectedTripIds.size !== 1 ? "s" : ""} selected — communicate
@@ -4463,7 +4488,10 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
           {commsMode === null && (
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
               <Button title="📣 MESSAGE" variant="ghost" size="sm" onClick={() => setCommsMode("message")} />
-              <Button title="⏰ REMIND" variant="ghost" size="sm" onClick={() => setCommsMode("remind")} />
+              <Button
+                title={`⏰ REMIND${selectedRemindableIds.length !== selectedTripIds.size ? ` ${selectedRemindableIds.length}` : ""}`}
+                variant="ghost" size="sm" disabled={selectedRemindableIds.length === 0}
+                onClick={() => setCommsMode("remind")} />
             </div>
           )}
           {commsMode === "message" && (
@@ -4487,11 +4515,11 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
           {commsMode === "remind" && (
             <>
               <span style={{ fontSize: 10, color: COLORS.ghost }}>
-                Turn on recurring reminders for {selectedTripIds.size} selected trip{selectedTripIds.size !== 1 ? "s" : ""} — agents get a nudge now and hourly from 2h before departure. Trips already reminding are skipped.
+                Turn on recurring reminders for {selectedRemindableIds.length} assigned trip{selectedRemindableIds.length !== 1 ? "s" : ""} — agents get a nudge now and hourly from 2h before departure. Already-reminding trips and any that aren't assigned-and-upcoming are skipped.
               </span>
               <div style={{ display: "flex", gap: 8 }}>
                 <Button title="BACK" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setCommsMode(null)} disabled={commsActing} />
-                <Button title={commsActing ? "ENABLING…" : `REMIND ${selectedTripIds.size}`} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkComms("remind")} disabled={commsActing} loading={commsActing} />
+                <Button title={commsActing ? "ENABLING…" : `REMIND ${selectedRemindableIds.length}`} variant="primary" size="sm" style={{ flex: 1 }} onClick={() => runBulkComms("remind")} disabled={commsActing || selectedRemindableIds.length === 0} loading={commsActing} />
               </div>
             </>
           )}
