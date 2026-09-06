@@ -14,13 +14,15 @@
 // to content the app's own already-authorized insert path actually
 // produced), rather than accepting arbitrary POSTed content.
 //
-// DEDUPE / RATE-LIMIT (crash_alert_log): a render crash usually isn't a
-// one-off — a bad deploy or a data-shape bug puts a client into a
-// remount→crash→remount loop, and every iteration inserts a client_errors
-// row AND calls this function. Without a cap that's an unbounded flood of
-// identical emails + Resend quota burn (flagged in a security review).
-// Two gates, both fail-open (a dedupe-store hiccup must never swallow a
-// genuine first alert):
+// DEDUPE / RATE-LIMIT: a render crash usually isn't a one-off — a bad
+// deploy or a data-shape bug puts a client into a remount→crash→remount
+// loop, and every iteration inserts a client_errors row AND calls this
+// function. Without a cap that's an unbounded flood of identical emails +
+// Resend quota burn (flagged in a security review). The whole decision —
+// per-message cooldown + global-window ceiling + recording the send — is
+// one atomic, xact-advisory-locked DB function (crash_alert_gate over
+// crash_alert_log), so concurrent crash invocations can't race the
+// counter. It fails OPEN: if the gate RPC errors, the email still goes.
 //   - per-message cooldown: at most one email per distinct message every
 //     PER_KEY_COOLDOWN_MS.
 //   - global ceiling: at most GLOBAL_MAX emails per GLOBAL_WINDOW_MS across
@@ -33,7 +35,6 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 const PER_KEY_COOLDOWN_MS = 15 * 60 * 1000;
 const GLOBAL_WINDOW_MS = 60 * 60 * 1000;
 const GLOBAL_MAX = 8;
-const GLOBAL_KEY = "__global__";
 
 serve(async (req) => {
   const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
@@ -79,34 +80,22 @@ serve(async (req) => {
     return json({ error: "No matching crash record found" }, 403);
   }
 
-  // ── Dedupe / rate-limit gate ────────────────────────────────────────
-  const now = Date.now();
+  // ── Dedupe / rate-limit gate (atomic; see header) ──────────────────
   const msgKey = message.slice(0, 200);
-  let globalWindowStart = now;
-  let globalCount = 0;
   try {
-    const { data: logRows, error: logErr } = await sb
-      .from("crash_alert_log")
-      .select("message_key, last_sent_at, window_start, window_count")
-      .in("message_key", [msgKey, GLOBAL_KEY]);
-    if (logErr) throw logErr;
-
-    const keyRow = (logRows || []).find(r => r.message_key === msgKey);
-    if (keyRow && now - keyRow.last_sent_at < PER_KEY_COOLDOWN_MS) {
-      return json({ ok: true, deduped: "cooldown" });
-    }
-
-    const globalRow = (logRows || []).find(r => r.message_key === GLOBAL_KEY);
-    const windowLive = globalRow && globalRow.window_start != null
-      && now - globalRow.window_start < GLOBAL_WINDOW_MS;
-    globalWindowStart = windowLive ? globalRow.window_start : now;
-    globalCount = windowLive ? (globalRow.window_count || 0) : 0;
-    if (globalCount >= GLOBAL_MAX) {
-      return json({ ok: true, deduped: "global-cap" });
+    const { data: shouldSend, error: gateErr } = await sb.rpc("crash_alert_gate", {
+      p_msg_key: msgKey,
+      p_per_key_cooldown_ms: PER_KEY_COOLDOWN_MS,
+      p_global_window_ms: GLOBAL_WINDOW_MS,
+      p_global_max: GLOBAL_MAX,
+    });
+    if (gateErr) throw gateErr;
+    if (shouldSend === false) {
+      return json({ ok: true, deduped: true });
     }
   } catch (e) {
     // Fail open: a dedupe-store problem must not suppress a real alert.
-    console.warn("crash-alert: dedupe check failed, sending anyway:", (e as Error).message);
+    console.warn("crash-alert: dedupe gate failed, sending anyway:", (e as Error).message);
   }
 
   const esc = (v: unknown) => String(v ?? "").replace(/[&<>"']/g, c => (
@@ -146,18 +135,8 @@ serve(async (req) => {
     return json({ error: "Internal error — please try again." }, 500);
   }
 
-  // Record the send so the next call can honour the cooldown + ceiling.
-  // Best-effort: a failed write just means the next crash might send one
-  // more email than ideal — never worse than the pre-dedupe behaviour.
-  try {
-    await sb.from("crash_alert_log").upsert([
-      { message_key: msgKey, last_sent_at: now, window_start: null, window_count: 0 },
-      { message_key: GLOBAL_KEY, last_sent_at: now, window_start: globalWindowStart, window_count: globalCount + 1 },
-    ], { onConflict: "message_key" });
-  } catch (e) {
-    console.warn("crash-alert: dedupe write failed:", (e as Error).message);
-  }
-
+  // No post-send write needed — crash_alert_gate already recorded this
+  // send atomically when it returned true.
   return json({ ok: true });
 });
 
