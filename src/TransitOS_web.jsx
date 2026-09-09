@@ -6774,7 +6774,7 @@ export async function fetchEtaAccuracyData({ lookbackDays = 30 } = {}) {
   // row (a DESC sort would push new rows to the front and shift the
   // window, duplicating a page). Stop only on an EMPTY page; advance by
   // rows actually returned; `id` tiebreaker + a final de-dupe by id as
-  // belt-and-braces. Only the 9 columns the mapper reads.
+  // belt-and-braces. Only the columns the mapper + the id de-dupe need.
   const COLS = "id, trip_id, agent_id, predicted_at, predicted_eta_min, threshold, dist_km, speed_kmh, scheduled_time_str, pickup_company_id";
   const PAGE_SIZE = 1000;
   const byId = new Map();
