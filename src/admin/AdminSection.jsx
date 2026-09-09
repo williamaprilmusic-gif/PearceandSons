@@ -10294,9 +10294,15 @@ function EtaAccuracyReport({ companies = [] }) {
     return () => { cancelled = true; };
   }, [open]);
 
+  // Key the report memo on companies BY CONTENT (id+name), not by array
+  // identity — a poll cycle can hand back a fresh `state.companies`
+  // array with the same contents, and re-running the full O(rows)
+  // aggregation for that is wasted work.
+  const companiesKey = (companies || []).map(c => `${c.id}:${c.name}`).join("|");
   const report = React.useMemo(
     () => fetchState.rows ? computeEtaAccuracy(fetchState.rows, { companies }) : null,
-    [fetchState.rows, companies]
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [fetchState.rows, companiesKey]
   );
   const view = { loading: fetchState.loading, error: fetchState.error, report };
   const rep = report;

@@ -6767,23 +6767,29 @@ export async function fetchEtaAccuracyData({ lookbackDays = 30 } = {}) {
   // Paginate — an unbounded select silently truncates to PostgREST's
   // per-request row cap, and at real scale (check-pickup-eta logs up to
   // 2 rows per waiting agent per trip, every 3 min) a 30-day window is
-  // far more than that. Same pattern as fetchDriverStatusHistory: stop
-  // only on an EMPTY page, advance by rows actually returned, and add
-  // `id` as a tiebreaker since this table takes concurrent inserts while
-  // the report runs.
+  // far more than that. Sort ASCENDING (like fetchDriverStatusHistory):
+  // eta_predictions only ever gets INSERTs with predicted_at = now(), so
+  // any row added mid-report lands at the TAIL, past the current offset
+  // — offset pagination can't then skip or re-return an already-seen
+  // row (a DESC sort would push new rows to the front and shift the
+  // window, duplicating a page). Stop only on an EMPTY page; advance by
+  // rows actually returned; `id` tiebreaker + a final de-dupe by id as
+  // belt-and-braces. Only the 9 columns the mapper reads.
+  const COLS = "id, trip_id, agent_id, predicted_at, predicted_eta_min, threshold, dist_km, speed_kmh, scheduled_time_str, pickup_company_id";
   const PAGE_SIZE = 1000;
-  const preds = [];
+  const byId = new Map();
   let offset = 0;
   for (;;) {
     const { data, error } = await supabase.from("eta_predictions")
-      .select("*").gte("predicted_at", cutoff)
-      .order("predicted_at", { ascending: false }).order("id", { ascending: false })
+      .select(COLS).gte("predicted_at", cutoff)
+      .order("predicted_at", { ascending: true }).order("id", { ascending: true })
       .range(offset, offset + PAGE_SIZE - 1);
     if (error) throw error;
     if (!data || data.length === 0) break;
-    preds.push(...data);
+    for (const r of data) byId.set(r.id, r);
     offset += data.length;
   }
+  const preds = [...byId.values()];
   if (preds.length === 0) return [];
   const tripIds = [...new Set(preds.map(p => p.trip_id).filter(v => v != null))];
   const pickupByTrip = {};
