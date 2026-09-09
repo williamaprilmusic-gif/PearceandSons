@@ -6755,6 +6755,42 @@ export async function fetchGpsTrailForTrip(tripId) {
   return (data || []).map(r => ({ lat: r.lat, lng: r.lng, heading: r.heading, speed_kmh: r.speed_kmh, recorded_at: r.recordedat }));
 }
 
+// On-demand fetch for the admin ETA-accuracy report: every "your ride
+// is ~N min away" the check-pickup-eta cron fired in the last
+// `lookbackDays`, joined to the trip's ACTUAL pickup epoch for that
+// agent (trips.pickuptimestamps[agent_id]). `actual_pickup_at` is null
+// when the agent isn't picked up yet or the trip row is gone — those
+// rows just don't count toward the error stats. Trips are queried
+// directly (not from app state, which windows history to ~60 days).
+export async function fetchEtaAccuracyData({ lookbackDays = 30 } = {}) {
+  const cutoff = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+  const { data: preds, error } = await supabase.from("eta_predictions")
+    .select("*").gte("predicted_at", cutoff).order("predicted_at", { ascending: false });
+  if (error) throw error;
+  if (!preds || preds.length === 0) return [];
+  const tripIds = [...new Set(preds.map(p => p.trip_id).filter(v => v != null))];
+  const pickupByTrip = {};
+  for (let i = 0; i < tripIds.length; i += 200) {
+    const { data: trs } = await supabase.from("trips").select("id, pickuptimestamps").in("id", tripIds.slice(i, i + 200));
+    for (const tr of trs || []) pickupByTrip[String(tr.id)] = tr.pickuptimestamps || {};
+  }
+  return preds.map(p => {
+    const ts = pickupByTrip[String(p.trip_id)] || {};
+    const actual = ts[String(p.agent_id)] ?? ts[p.agent_id];
+    return {
+      trip_id: sid(p.trip_id), agent_id: sid(p.agent_id),
+      predicted_at: Number(p.predicted_at),
+      predicted_eta_min: Number(p.predicted_eta_min),
+      threshold: p.threshold,
+      dist_km: p.dist_km != null ? Number(p.dist_km) : null,
+      speed_kmh: p.speed_kmh != null ? Number(p.speed_kmh) : null,
+      scheduled_time_str: p.scheduled_time_str || null,
+      pickup_company_id: p.pickup_company_id != null ? sid(p.pickup_company_id) : null,
+      actual_pickup_at: actual != null ? Number(actual) : null,
+    };
+  });
+}
+
 // A rough GPS fix taken before the driver was really at the pickup point
 // (stale/delayed location lock) puts the trail's first recorded point
 // implausibly far from the pickup address — same issue GpsTrailModal's

@@ -58,6 +58,9 @@ import {
   formatClientSlaText,
   computeShiftHandover,
   formatShiftHandoverText,
+  computeEtaAccuracy,
+  etaTimeBandOf,
+  formatEtaAccuracyText,
   rosterMondayOf,
   cronIntervalMs,
   shiftDateStr,
@@ -1949,5 +1952,91 @@ describe("computeShiftHandover — incoming-admin snapshot", () => {
     expect(txt).toContain("HIGH CANCEL RISK (next 24h) (1)");
     expect(txt).toContain("HAZARDS / ADVISORIES (2)");
     expect(txt).toContain("run1 — Driver Nine, 40 min in — Home → Office");
+  });
+});
+
+describe("etaTimeBandOf — scheduled-time → band", () => {
+  it("maps HH:MM into the right band, wrap-aware for the evening band", () => {
+    expect(etaTimeBandOf("06:30")).toBe("EARLY");
+    expect(etaTimeBandOf("10:00")).toBe("MIDDAY");
+    expect(etaTimeBandOf("14:59")).toBe("MIDDAY");
+    expect(etaTimeBandOf("15:00")).toBe("PM_PEAK");
+    expect(etaTimeBandOf("18:59")).toBe("PM_PEAK");
+    expect(etaTimeBandOf("19:00")).toBe("EVENING");
+    expect(etaTimeBandOf("23:30")).toBe("EVENING");
+    expect(etaTimeBandOf("02:00")).toBe("EVENING");
+    expect(etaTimeBandOf("03:59")).toBe("EVENING");
+    expect(etaTimeBandOf("04:00")).toBe("EARLY");
+  });
+  it("returns null for junk", () => {
+    expect(etaTimeBandOf("")).toBeNull();
+    expect(etaTimeBandOf("25:00")).toBeNull();
+    expect(etaTimeBandOf("noon")).toBeNull();
+    expect(etaTimeBandOf(null)).toBeNull();
+  });
+});
+
+describe("computeEtaAccuracy — predicted vs actual pickup ETA", () => {
+  const P = 1_700_000_000_000; // arbitrary predicted_at epoch
+  const row = (over) => ({
+    trip_id: "t", agent_id: "a", predicted_at: P, predicted_eta_min: 5,
+    threshold: "five", dist_km: 2, speed_kmh: 25, scheduled_time_str: "07:00",
+    pickup_company_id: "co1", actual_pickup_at: P + 5 * 60000, ...over,
+  });
+
+  it("scores only rows with a plausible actual pickup after the prediction", () => {
+    const r = computeEtaAccuracy([
+      row({ actual_pickup_at: P + 8 * 60000 }),                 // scored: +3
+      row({ actual_pickup_at: null }),                          // no actual → skipped
+      row({ actual_pickup_at: P - 60000 }),                     // before prediction → skipped
+      row({ actual_pickup_at: P + 3 * 60 * 60000 }),            // 3h later → skipped
+    ]);
+    expect(r.totalRows).toBe(4);
+    expect(r.sampleCount).toBe(1);
+    expect(r.overall.meanSignedErrMin).toBe(3);
+  });
+
+  it("mean signed error is positive when rides run longer than told", () => {
+    const rows = [
+      row({ actual_pickup_at: P + 10 * 60000 }), // +5
+      row({ actual_pickup_at: P + 12 * 60000 }), // +7
+      row({ actual_pickup_at: P + 9 * 60000 }),  // +4
+    ];
+    const r = computeEtaAccuracy(rows);
+    expect(r.overall.meanSignedErrMin).toBeCloseTo(5.3, 1);
+    expect(r.overall.maeMin).toBeCloseTo(5.3, 1);
+    expect(r.overall.pctWithin5).toBe(67); // abs errs 4,5,7 — two of three ≤ 5
+  });
+
+  it("computes an implied multiplier only past the sample floor", () => {
+    const under = computeEtaAccuracy([row(), row(), row(), row()]); // 4 < 5
+    expect(under.overall.impliedMultiplier).toBeNull();
+    // 6 rows, each predicted 5 / actual 10 → multiplier 2.0
+    const over = computeEtaAccuracy(Array.from({ length: 6 }, () => row({ actual_pickup_at: P + 10 * 60000 })));
+    expect(over.overall.impliedMultiplier).toBe(2);
+  });
+
+  it("buckets by time-of-day band, client, and threshold", () => {
+    const rows = [
+      row({ scheduled_time_str: "07:00", pickup_company_id: "co1", threshold: "five", actual_pickup_at: P + 9 * 60000 }),
+      row({ scheduled_time_str: "16:30", pickup_company_id: "co2", threshold: "arrive", predicted_eta_min: 2, actual_pickup_at: P + 6 * 60000 }),
+      row({ scheduled_time_str: "07:30", pickup_company_id: "co1", threshold: "five", actual_pickup_at: P + 7 * 60000 }),
+    ];
+    const r = computeEtaAccuracy(rows, { companies: [{ id: "co1", name: "Acme" }, { id: "co2", name: "Globex" }] });
+    expect(r.byBand.map(b => b.key).sort()).toEqual(["EARLY", "PM_PEAK"]);
+    expect(r.byBand.find(b => b.key === "EARLY").n).toBe(2);
+    expect(r.byCompany.find(c => c.companyName === "Acme").n).toBe(2);
+    expect(r.byThreshold.map(t => t.threshold)).toEqual(["arrive", "five"]);
+  });
+
+  it("formatEtaAccuracyText renders the sections", () => {
+    const r = computeEtaAccuracy(Array.from({ length: 6 }, () => row({ actual_pickup_at: P + 10 * 60000 })),
+      { companies: [{ id: "co1", name: "Acme" }] });
+    const txt = formatEtaAccuracyText(r, 30);
+    expect(txt).toContain("ETA Accuracy (last 30 days)");
+    expect(txt).toContain("BY TIME OF DAY");
+    expect(txt).toContain("BY CLIENT");
+    expect(txt).toContain("Acme");
+    expect(txt).toContain("~2×");
   });
 });

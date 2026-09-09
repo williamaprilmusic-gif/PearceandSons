@@ -67,6 +67,7 @@ import {
   fetchDirectMessages,
   fetchDriverSafetyHistory,
   fetchDriverStatusHistory,
+  fetchEtaAccuracyData,
   fetchGpsTrailForTrip,
   fetchMyConversations,
   fetchTripDelays,
@@ -2196,6 +2197,131 @@ export function formatClientSlaText(rows, lookbackDays = 30) {
   }
   lines.push("", `Generated ${new Date().toLocaleDateString("en-ZA")}`);
   return lines.join("\n");
+}
+
+// ── ETA-accuracy report ──────────────────────────────────────────────
+// Pure: predicted-vs-actual error for the "your ride is ~N min away"
+// alerts (rows from fetchEtaAccuracyData — each is a check-pickup-eta
+// prediction joined to that agent's real pickup epoch), bucketed by
+// time-of-day / client / threshold so the ROAD_FACTOR + speed
+// assumptions behind pickup-ETA push and delay propagation can be tuned
+// with real data. SIGNED error = actualMin − predictedMin: POSITIVE
+// means the ride took LONGER than promised (the estimate ran optimistic).
+//   options: { companies }  (for the client-name lookup)
+export const ETA_TIME_BANDS = [
+  { key: "EARLY", label: "04:00–10:00", from: 4 * 60, to: 10 * 60 },
+  { key: "MIDDAY", label: "10:00–15:00", from: 10 * 60, to: 15 * 60 },
+  { key: "PM_PEAK", label: "15:00–19:00", from: 15 * 60, to: 19 * 60 },
+  { key: "EVENING", label: "19:00–04:00", from: 19 * 60, to: 4 * 60 }, // wraps midnight
+];
+export function etaTimeBandOf(timeStr) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(timeStr || "").trim());
+  if (!m) return null;
+  const mins = Number(m[1]) * 60 + Number(m[2]);
+  if (!Number.isFinite(mins) || mins < 0 || mins >= 1440) return null;
+  return ETA_TIME_BANDS.find(b =>
+    b.to > b.from ? (mins >= b.from && mins < b.to) : (mins >= b.from || mins < b.to)
+  )?.key || null;
+}
+
+const ETA_MIN_SAMPLE_FOR_MULTIPLIER = 5;
+const _round1 = (v) => Math.round(v * 10) / 10;
+function _etaBucketStats(rows) {
+  const n = rows.length;
+  if (n === 0) return { n: 0, meanSignedErrMin: null, maeMin: null, p50AbsMin: null, p90AbsMin: null, pctWithin5: null, impliedMultiplier: null };
+  const mean = (arr) => arr.reduce((s, x) => s + x, 0) / arr.length;
+  const abs = rows.map(r => Math.abs(r.signedErr)).sort((a, b) => a - b);
+  const pctile = (p) => _round1(abs[Math.min(abs.length - 1, Math.floor(p * abs.length))]);
+  return {
+    n,
+    meanSignedErrMin: _round1(mean(rows.map(r => r.signedErr))),
+    maeMin: _round1(mean(abs)),
+    p50AbsMin: pctile(0.5),
+    p90AbsMin: pctile(0.9),
+    pctWithin5: Math.round((abs.filter(x => x <= 5).length / n) * 100),
+    // How much longer the ride ACTUALLY took vs the estimate, on average
+    // — a value of 1.3 means "these ETAs should be ~30% longer" (bump
+    // ROAD_FACTOR / drop the speed assumption). Suppressed below a small
+    // sample where it's just noise.
+    impliedMultiplier: n >= ETA_MIN_SAMPLE_FOR_MULTIPLIER
+      ? Math.round(mean(rows.map(r => r.actualMin / Math.max(1, r.predictedMin))) * 100) / 100
+      : null,
+  };
+}
+
+export function computeEtaAccuracy(rows, options = {}) {
+  const { companies = [] } = options;
+  const coName = (id) => id == null ? "Ad-hoc / no company"
+    : (companies.find(c => String(c.id) === String(id))?.name || `#${id}`);
+
+  const scored = [];
+  for (const r of rows || []) {
+    if (r.actual_pickup_at == null || r.predicted_at == null) continue;
+    const actualMin = (Number(r.actual_pickup_at) - Number(r.predicted_at)) / 60000;
+    // <= 0 is clock skew; a pickup logged an hour+ after the estimate
+    // isn't "how long the ride took", it's a late-tapped confirm.
+    if (actualMin <= 0 || actualMin > 120) continue;
+    scored.push({
+      ...r,
+      actualMin,
+      predictedMin: r.predicted_eta_min,
+      signedErr: actualMin - r.predicted_eta_min,
+      band: etaTimeBandOf(r.scheduled_time_str),
+    });
+  }
+
+  const groupBy = (keyFn) => {
+    const m = new Map();
+    for (const r of scored) {
+      const k = keyFn(r);
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(r);
+    }
+    return m;
+  };
+
+  const byBand = [...groupBy(r => r.band || "UNKNOWN").entries()]
+    .map(([k, rs]) => ({ key: k, label: ETA_TIME_BANDS.find(b => b.key === k)?.label || "Unknown time", ..._etaBucketStats(rs) }))
+    .sort((a, b) => (b.meanSignedErrMin ?? 0) - (a.meanSignedErrMin ?? 0));
+  const byCompany = [...groupBy(r => (r.pickup_company_id == null ? "_none" : String(r.pickup_company_id))).entries()]
+    .map(([k, rs]) => ({ companyId: k === "_none" ? null : k, companyName: coName(k === "_none" ? null : k), ..._etaBucketStats(rs) }))
+    .sort((a, b) => b.n - a.n);
+  const byThreshold = [...groupBy(r => r.threshold || "?").entries()]
+    .map(([k, rs]) => ({ threshold: k, ..._etaBucketStats(rs) }))
+    .sort((a, b) => a.threshold.localeCompare(b.threshold));
+
+  return {
+    sampleCount: scored.length,
+    totalRows: (rows || []).length,
+    overall: _etaBucketStats(scored),
+    byBand,
+    byCompany,
+    byThreshold,
+  };
+}
+
+export function formatEtaAccuracyText(report, lookbackDays = 30) {
+  const s = (v, suffix = "") => v == null ? "—" : `${v > 0 ? "+" : ""}${v}${suffix}`;
+  const L = [
+    `Pearce & Sons — ETA Accuracy (last ${lookbackDays} days)`,
+    "=".repeat(52),
+    `Scored ${report.sampleCount} of ${report.totalRows} logged estimates.`,
+    "",
+    `OVERALL: mean error ${s(report.overall.meanSignedErrMin, " min")} (+ = ride ran longer than told), `
+      + `MAE ${report.overall.maeMin ?? "—"} min, ${report.overall.pctWithin5 ?? "—"}% within ±5 min`
+      + (report.overall.impliedMultiplier != null ? `, estimates should be ~${report.overall.impliedMultiplier}× longer` : ""),
+    "",
+    "BY TIME OF DAY",
+  ];
+  for (const b of report.byBand) {
+    L.push(`  ${b.label.padEnd(13)} n=${String(b.n).padStart(4)}  mean ${s(b.meanSignedErrMin, "m").padStart(6)}  MAE ${String(b.maeMin ?? "—").padStart(4)}  within5 ${b.pctWithin5 ?? "—"}%${b.impliedMultiplier != null ? `  ×${b.impliedMultiplier}` : ""}`);
+  }
+  L.push("", "BY CLIENT");
+  for (const c of report.byCompany) {
+    L.push(`  ${c.companyName.slice(0, 22).padEnd(22)} n=${String(c.n).padStart(4)}  mean ${s(c.meanSignedErrMin, "m").padStart(6)}  MAE ${String(c.maeMin ?? "—").padStart(4)}${c.impliedMultiplier != null ? `  ×${c.impliedMultiplier}` : ""}`);
+  }
+  L.push("", `Generated ${new Date().toLocaleDateString("en-ZA")}`);
+  return L.join("\n");
 }
 
 // ── Shift handover report ─────────────────────────────────────────────
@@ -9851,7 +9977,7 @@ function relTimeLabel(deltaMs, allowFuture = false) {
   return deltaMs < 0 ? `in ${v}` : `${v} ago`;
 }
 
-function AdminStatus() {
+function AdminStatus({ companies = [] }) {
   const [checks, setChecks] = useState(null);
   const [running, setRunning] = useState(false);
   const [ranAt, setRanAt] = useState(null);
@@ -10135,6 +10261,103 @@ function AdminStatus() {
       )}
 
       <RetentionArchives />
+      <EtaAccuracyReport companies={companies} />
+    </div>
+  );
+}
+
+// Predicted-vs-actual pickup-ETA error (computeEtaAccuracy over
+// fetchEtaAccuracyData). Collapsible + fetch-once-per-open, same shape
+// as RetentionArchives.
+function EtaAccuracyReport({ companies = [] }) {
+  const [open, setOpen] = useState(false);
+  const [view, setView] = useState({ loading: true });
+  const LOOKBACK = 30;
+  const fetchedForThisOpenRef = useRef(false);
+
+  useEffect(() => {
+    if (!open) { fetchedForThisOpenRef.current = false; return; }
+    if (!supabase || fetchedForThisOpenRef.current) return;
+    fetchedForThisOpenRef.current = true;
+    let cancelled = false;
+    setView({ loading: true });
+    (async () => {
+      try {
+        const rows = await fetchEtaAccuracyData({ lookbackDays: LOOKBACK });
+        if (!cancelled) setView({ loading: false, report: computeEtaAccuracy(rows, { companies }) });
+      } catch (e) {
+        if (!cancelled) setView({ loading: false, error: e.message || "Couldn't load ETA data." });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, companies]);
+
+  const rep = view.report;
+  const [copied, setCopied] = useState(false);
+  const copy = () => rep && navigator.clipboard.writeText(formatEtaAccuracyText(rep, LOOKBACK))
+    .then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });
+  const sgn = (v, s = "") => v == null ? "—" : `${v > 0 ? "+" : ""}${v}${s}`;
+  const errColor = (v) => v == null ? COLORS.ghost : Math.abs(v) <= 3 ? COLORS.green : Math.abs(v) <= 7 ? COLORS.amber : COLORS.red;
+
+  return (
+    <div style={{ border: `1px solid ${COLORS.wire}`, borderRadius: 4, marginTop: 12, overflow: "hidden" }}>
+      <div onClick={() => setOpen(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 8px", cursor: "pointer", background: COLORS.surface }}>
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>{open ? "▾" : "▸"}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>ETA accuracy</span>
+        <span style={{ fontSize: 9, color: COLORS.ghost }}>predicted vs actual pickup, last {LOOKBACK}d</span>
+      </div>
+      {open && (
+        <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+          {view.loading ? (
+            <div style={{ fontSize: 10, color: COLORS.ghost }}>Loading…</div>
+          ) : view.error ? (
+            <div style={{ fontSize: 10, color: COLORS.red }}>{view.error}</div>
+          ) : rep.sampleCount === 0 ? (
+            <div style={{ fontSize: 10, color: COLORS.ghost }}>
+              No scored estimates yet ({rep.totalRows} logged, none matched to an actual pickup). check-pickup-eta logs a row each time it fires a "your ride is ~N min away" alert; this fills in once those trips complete their pickups.
+            </div>
+          ) : (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 10, color: COLORS.ghost }}>Scored {rep.sampleCount} of {rep.totalRows} logged. + error = ride ran longer than the estimate.</span>
+                <Button title={copied ? "✓ COPIED" : "📋 COPY"} variant="ghost" size="sm"
+                  style={{ borderColor: copied ? COLORS.green : COLORS.wire, color: copied ? COLORS.green : COLORS.ghost }} onClick={copy} />
+              </div>
+              <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px", display: "flex", flexWrap: "wrap", gap: 12 }}>
+                {[
+                  ["MEAN ERROR", sgn(rep.overall.meanSignedErrMin, "m"), errColor(rep.overall.meanSignedErrMin)],
+                  ["MAE", (rep.overall.maeMin ?? "—") + "m", COLORS.chalk],
+                  ["WITHIN ±5m", (rep.overall.pctWithin5 ?? "—") + "%", rep.overall.pctWithin5 >= 70 ? COLORS.green : COLORS.amber],
+                  ["SHOULD BE", rep.overall.impliedMultiplier != null ? `×${rep.overall.impliedMultiplier}` : "—", rep.overall.impliedMultiplier > 1.15 ? COLORS.amber : COLORS.ghost],
+                ].map(([l, v, c]) => (
+                  <div key={l}>
+                    <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.6 }}>{l}</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: c, fontFamily: FONTS.head }}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              {[["By time of day", rep.byBand, r => r.label], ["By client", rep.byCompany, r => r.companyName], ["By threshold", rep.byThreshold, r => (r.threshold === "arrive" ? "\"arriving now\"" : "\"5 min away\"")]].map(([title, list, lbl]) => (
+                <div key={title}>
+                  <div style={{ fontSize: 9, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5, marginBottom: 4 }}>{title.toUpperCase()}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                    {list.map((r, i) => (
+                      <div key={i} style={{ display: "flex", gap: 8, fontSize: 10, color: COLORS.mist }}>
+                        <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{lbl(r)}</span>
+                        <span style={{ color: COLORS.ghost, flexShrink: 0 }}>n={r.n}</span>
+                        <span style={{ color: errColor(r.meanSignedErrMin), fontWeight: 700, width: 52, textAlign: "right", flexShrink: 0 }}>{sgn(r.meanSignedErrMin, "m")}</span>
+                        <span style={{ color: COLORS.ghost, width: 44, textAlign: "right", flexShrink: 0 }}>{r.impliedMultiplier != null ? `×${r.impliedMultiplier}` : ""}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              <div style={{ fontSize: 9, color: COLORS.ghost }}>
+                A consistent + mean error (or a multiplier above ~1.15) on a route means check-pickup-eta's ROAD_FACTOR (1.35) / fallback speed (25 km/h) run optimistic there — tune those in the edge function + the client hook.
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -11018,7 +11241,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "activity" && hasAdminPermission(user, "viewAuditLog") && <AdminActivityLog />}
-      {tab === "status" && hasAdminPermission(user, "manageDispatch") && <AdminStatus />}
+      {tab === "status" && hasAdminPermission(user, "manageDispatch") && <AdminStatus companies={state.companies} />}
       {tab === "ai" && hasAdminPermission(user, "manageDispatch") && <AdminAIAssistant user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}

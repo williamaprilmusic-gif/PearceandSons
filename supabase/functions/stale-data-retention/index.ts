@@ -36,6 +36,9 @@
 //   - crash_alert_log: per-message dedupe rows for crash-alert. Keep the
 //     '__global__' ceiling row; drop per-message keys not hit in 7 days
 //     (matches that function's cooldown horizon many times over).
+//   - eta_predictions: one row per pickup-ETA alert check-pickup-eta
+//     fires, read only by the admin ETA-accuracy report (last 30 days) —
+//     90-day cutoff.
 //
 // Unlike trip-history-retention, this does NOT export before deleting —
 // per explicit scope decision: these aren't billing/compliance records
@@ -79,6 +82,7 @@ Deno.serve(async (req) => {
       { error: hazErr, count: hazCount },
       { error: loginErr, count: loginCount },
       { error: calErr, count: calCount },
+      { error: etaErr, count: etaCount },
     ] = await Promise.all([
       supabase.from("driver_position_log").delete({ count: "exact" }).lt("recordedat", twoMonthsAgo.getTime()),
       supabase.from("notifications").delete({ count: "exact" }).lt("timestamp", ninetyDaysAgo),
@@ -95,12 +99,17 @@ Deno.serve(async (req) => {
       supabase.from("crash_alert_log").delete({ count: "exact" })
         .lt("last_sent_at", sevenDaysAgo)
         .neq("message_key", "__global__"),
+      // eta_predictions: one row per "your ride is ~N min away" alert
+      // check-pickup-eta fires. The admin ETA-accuracy report only ever
+      // reads the last 30 days; 90 days is generous headroom over that.
+      supabase.from("eta_predictions").delete({ count: "exact" }).lt("predicted_at", ninetyDaysAgo),
     ]);
     if (posErr) throw posErr;
     if (notifErr) throw notifErr;
     if (hazErr) throw hazErr;
     if (loginErr) throw loginErr;
     if (calErr) throw calErr;
+    if (etaErr) throw etaErr;
 
     return new Response(JSON.stringify({
       ok: true,
@@ -109,6 +118,7 @@ Deno.serve(async (req) => {
       purgedHazardReports: hazCount ?? 0,
       purgedLoginAttempts: loginCount ?? 0,
       purgedCrashAlertLog: calCount ?? 0,
+      purgedEtaPredictions: etaCount ?? 0,
     }), { headers: { "Content-Type": "application/json" } });
   } catch (e) {
     console.error("stale-data-retention failed:", e.message);

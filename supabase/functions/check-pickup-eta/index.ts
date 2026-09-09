@@ -22,6 +22,13 @@
 // skipped for THIS cron run and left un-marked, so it's re-evaluated
 // later once that window clears — the server still covers the agent who
 // has since closed the app, just a cycle behind.
+//
+// Every alert this fires is also logged to eta_predictions (predicted
+// minutes + the driver/pickup coords, distance and speed it used). The
+// admin ETA-accuracy report joins those against each trip's actual
+// pickup timestamp to show how far off the estimate ran, by route and
+// time of day, so ROAD_FACTOR / FALLBACK_SPEED_KMH can be tuned with
+// real data. Best-effort: a failed log never blocks the alert.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -102,15 +109,22 @@ Deno.serve(async (req) => {
       const notified: Record<string, { five?: boolean; arrive?: boolean }> =
         (t.pickup_eta_notified && typeof t.pickup_eta_notified === "object") ? { ...t.pickup_eta_notified } : {};
       // Compute what WOULD fire (cheap, no query), then filter.
-      const pending: Array<{ agentIdStr: string; agentId: number; message: string; mark: { five?: boolean; arrive?: boolean } }> = [];
+      type Pending = {
+        agentIdStr: string; agentId: number; message: string;
+        mark: { five?: boolean; arrive?: boolean };
+        etaMin: number; km: number; threshold: "five" | "arrive";
+        pickupLat: number; pickupLng: number;
+      };
+      const pending: Pending[] = [];
       for (const tgt of targets) {
         const km = haversineKm(pos.lat, pos.lng, tgt.lat, tgt.lng) * ROAD_FACTOR;
         const etaMin = Math.max(1, Math.round((km / speed) * 60));
         const seen = notified[tgt.agentId] || {};
+        const base = { agentIdStr: tgt.agentId, agentId: Number(tgt.agentId), km, etaMin, pickupLat: tgt.lat, pickupLng: tgt.lng };
         if (etaMin <= ARRIVE_MIN && !seen.arrive) {
-          pending.push({ agentIdStr: tgt.agentId, agentId: Number(tgt.agentId), message: "🚗 Your driver is ARRIVING NOW — please be at the pickup point.", mark: { ...seen, five: true, arrive: true } });
+          pending.push({ ...base, threshold: "arrive", message: "🚗 Your driver is ARRIVING NOW — please be at the pickup point.", mark: { ...seen, five: true, arrive: true } });
         } else if (etaMin <= FIVE_MIN && !seen.five) {
-          pending.push({ agentIdStr: tgt.agentId, agentId: Number(tgt.agentId), message: `🚗 Your driver is about ${etaMin} minute${etaMin !== 1 ? "s" : ""} away — please make your way to the pickup point.`, mark: { ...seen, five: true } });
+          pending.push({ ...base, threshold: "five", message: `🚗 Your driver is about ${etaMin} minute${etaMin !== 1 ? "s" : ""} away — please make your way to the pickup point.`, mark: { ...seen, five: true } });
         }
       }
       if (pending.length === 0) continue;
@@ -121,14 +135,14 @@ Deno.serve(async (req) => {
         .gte("timestamp", nowMs - RECENT_CLIENT_NOTIF_MS);
       const recentlyAlerted = new Set((recentNotifs || []).map(n => String(n.userid)));
 
-      const alerts: Array<{ agentId: number; message: string }> = [];
+      const alerts: Array<{ agentId: number; message: string; p: Pending }> = [];
       for (const p of pending) {
         // Skip (and DON'T persist the mark) when the client just alerted
         // this agent — a later cron cycle re-checks once the window
         // clears, so an app-closed agent still gets the next threshold.
         if (recentlyAlerted.has(p.agentIdStr)) continue;
         notified[p.agentIdStr] = p.mark;
-        alerts.push({ agentId: p.agentId, message: p.message });
+        alerts.push({ agentId: p.agentId, message: p.message, p });
       }
 
       if (alerts.length === 0) continue;
@@ -137,6 +151,17 @@ Deno.serve(async (req) => {
         title: "DRIVER ETA", type: "DRIVER_ETA", forroles: ["AGENT"], userid: a.agentId,
         message: a.message, tripid: t.id, timestamp: nowMs, isread: false,
       })));
+      // Accuracy log — one row per alert. Best-effort: never let a
+      // failed insert here break the alert/push path.
+      await supabase.from("eta_predictions").insert(alerts.map(a => ({
+        trip_id: t.id, agent_id: a.agentId, predicted_at: nowMs,
+        predicted_eta_min: a.p.etaMin, threshold: a.p.threshold,
+        dist_km: a.p.km, speed_kmh: speed,
+        driver_lat: pos.lat, driver_lng: pos.lng,
+        pickup_lat: a.p.pickupLat, pickup_lng: a.p.pickupLng,
+        scheduled_date: t.scheduleddate ?? null, scheduled_time_str: t.scheduledtimestr ?? null,
+        pickup_company_id: t.pickupcompanyid ?? null,
+      }))).then(({ error: logErr }) => { if (logErr) console.warn("[check-pickup-eta] eta_predictions log failed:", logErr.message); });
       // One push per agent — send-push-notification matches on
       // userid + message + ts, and agents on the same trip can be at
       // different thresholds (one "5 min away", one "arriving now").
