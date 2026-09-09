@@ -10271,7 +10271,9 @@ function AdminStatus({ companies = [] }) {
 // as RetentionArchives.
 function EtaAccuracyReport({ companies = [] }) {
   const [open, setOpen] = useState(false);
-  const [view, setView] = useState({ loading: true });
+  // Raw rows are fetched once per open; the report is DERIVED so client
+  // names fill in if state.companies arrives after the first expand.
+  const [fetchState, setFetchState] = useState({ loading: true });
   const LOOKBACK = 30;
   const fetchedForThisOpenRef = useRef(false);
 
@@ -10280,19 +10282,24 @@ function EtaAccuracyReport({ companies = [] }) {
     if (!supabase || fetchedForThisOpenRef.current) return;
     fetchedForThisOpenRef.current = true;
     let cancelled = false;
-    setView({ loading: true });
+    setFetchState({ loading: true });
     (async () => {
       try {
         const rows = await fetchEtaAccuracyData({ lookbackDays: LOOKBACK });
-        if (!cancelled) setView({ loading: false, report: computeEtaAccuracy(rows, { companies }) });
+        if (!cancelled) setFetchState({ loading: false, rows });
       } catch (e) {
-        if (!cancelled) setView({ loading: false, error: e.message || "Couldn't load ETA data." });
+        if (!cancelled) setFetchState({ loading: false, error: e.message || "Couldn't load ETA data." });
       }
     })();
     return () => { cancelled = true; };
-  }, [open, companies]);
+  }, [open]);
 
-  const rep = view.report;
+  const report = React.useMemo(
+    () => fetchState.rows ? computeEtaAccuracy(fetchState.rows, { companies }) : null,
+    [fetchState.rows, companies]
+  );
+  const view = { loading: fetchState.loading, error: fetchState.error, report };
+  const rep = report;
   const [copied, setCopied] = useState(false);
   const copy = () => rep && navigator.clipboard.writeText(formatEtaAccuracyText(rep, LOOKBACK))
     .then(() => { setCopied(true); setTimeout(() => setCopied(false), 3000); });

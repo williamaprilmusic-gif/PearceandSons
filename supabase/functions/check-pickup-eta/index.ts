@@ -151,8 +151,10 @@ Deno.serve(async (req) => {
         title: "DRIVER ETA", type: "DRIVER_ETA", forroles: ["AGENT"], userid: a.agentId,
         message: a.message, tripid: t.id, timestamp: nowMs, isread: false,
       })));
-      // Accuracy log — one row per alert. Best-effort: never let a
-      // failed insert here break the alert/push path.
+      // Accuracy log — one row per alert. Best-effort: BOTH settle
+      // callbacks are handled so this await can never throw to the outer
+      // catch and skip the pushes below (same guarantee the .catch on
+      // the push fetch gives).
       await supabase.from("eta_predictions").insert(alerts.map(a => ({
         trip_id: t.id, agent_id: a.agentId, predicted_at: nowMs,
         predicted_eta_min: a.p.etaMin, threshold: a.p.threshold,
@@ -161,7 +163,10 @@ Deno.serve(async (req) => {
         pickup_lat: a.p.pickupLat, pickup_lng: a.p.pickupLng,
         scheduled_date: t.scheduleddate ?? null, scheduled_time_str: t.scheduledtimestr ?? null,
         pickup_company_id: t.pickupcompanyid ?? null,
-      }))).then(({ error: logErr }) => { if (logErr) console.warn("[check-pickup-eta] eta_predictions log failed:", logErr.message); });
+      }))).then(
+        ({ error: logErr }) => { if (logErr) console.warn("[check-pickup-eta] eta_predictions log failed:", logErr.message); },
+        (e) => console.warn("[check-pickup-eta] eta_predictions log threw:", e?.message),
+      );
       // One push per agent — send-push-notification matches on
       // userid + message + ts, and agents on the same trip can be at
       // different thresholds (one "5 min away", one "arriving now").

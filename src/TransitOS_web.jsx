@@ -6764,10 +6764,27 @@ export async function fetchGpsTrailForTrip(tripId) {
 // directly (not from app state, which windows history to ~60 days).
 export async function fetchEtaAccuracyData({ lookbackDays = 30 } = {}) {
   const cutoff = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
-  const { data: preds, error } = await supabase.from("eta_predictions")
-    .select("*").gte("predicted_at", cutoff).order("predicted_at", { ascending: false });
-  if (error) throw error;
-  if (!preds || preds.length === 0) return [];
+  // Paginate — an unbounded select silently truncates to PostgREST's
+  // per-request row cap, and at real scale (check-pickup-eta logs up to
+  // 2 rows per waiting agent per trip, every 3 min) a 30-day window is
+  // far more than that. Same pattern as fetchDriverStatusHistory: stop
+  // only on an EMPTY page, advance by rows actually returned, and add
+  // `id` as a tiebreaker since this table takes concurrent inserts while
+  // the report runs.
+  const PAGE_SIZE = 1000;
+  const preds = [];
+  let offset = 0;
+  for (;;) {
+    const { data, error } = await supabase.from("eta_predictions")
+      .select("*").gte("predicted_at", cutoff)
+      .order("predicted_at", { ascending: false }).order("id", { ascending: false })
+      .range(offset, offset + PAGE_SIZE - 1);
+    if (error) throw error;
+    if (!data || data.length === 0) break;
+    preds.push(...data);
+    offset += data.length;
+  }
+  if (preds.length === 0) return [];
   const tripIds = [...new Set(preds.map(p => p.trip_id).filter(v => v != null))];
   const pickupByTrip = {};
   for (let i = 0; i < tripIds.length; i += 200) {
