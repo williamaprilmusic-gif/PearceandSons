@@ -1476,36 +1476,6 @@ export function earliestScheduledTime(rawRows) {
   return times[0] ?? null;
 }
 
-// Progressive-reveal predicate for the DRIVER dashboard: day N of a week
-// booking stays hidden from the driver until day N-1 of the same series
-// is finished (completed OR cancelled) — this is what makes "next day's
-// trip pops up once today's is done" work instead of dumping every day
-// of the series into the driver's list (and today's navigation route) at
-// once. Pure/exported so it can be unit-tested; DriverApp filters through
-// it.
-//   trip     — one app-shaped trip ({ week_group_id, week_day_num, state })
-//   allTrips — the full app trip list, to resolve the prior day against
-// Always visible: a non-week trip, day 1 of a series, and — the case that
-// used to strand trips forever — a day whose prior-day row doesn't exist
-// anywhere (series that doesn't start at day 1, or earlier days deleted).
-// With no predecessor row there is no event that could ever flip the gate
-// open, so hiding it is a permanent disappearance, not a deferral.
-export function isWeekSeriesTripRevealed(trip, allTrips) {
-  if (!trip || !trip.week_group_id || !trip.week_day_num || trip.week_day_num <= 1) return true;
-  // A week booking WITH a return leg creates TWO rows for the same day —
-  // outbound + return, sharing week_group_id AND week_day_num (see the
-  // week-booking loop). Match ALL prior-day rows, not just the first one
-  // .find() happens to hit: if only one leg were archived while the other
-  // is still being driven, a single-row check would open the gate mid-
-  // trip and let day N's pickup bleed into today's navigation route —
-  // the exact "whole series at once" behavior this reveal exists to stop.
-  const priorDays = (allTrips || []).filter(
-    other => String(other.week_group_id) === String(trip.week_group_id) && other.week_day_num === trip.week_day_num - 1
-  );
-  if (priorDays.length === 0) return true;
-  return priorDays.every(p => [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(p.state));
-}
-
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
 // When this JS bundle first started executing — used by the admin Status
 // page to show how long the current session/tab has been live.
@@ -16963,25 +16933,25 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
   const [noShowFor, setNoShowFor] = useState(null); // { trip_id, agent_id, agent_name } | null
-  // myTrips comes from DriverApp already filtered through the week-series
-  // progressive reveal (day N hidden until day N-1 completes). Deriving
-  // from raw state.trips here bypassed that: ASSIGN_DRIVER auto-confirms,
-  // so bulk-assigning a week series made every future day's pickup appear
-  // in TODAY's navigation route at once. Falls back to state.trips only
-  // if the prop is missing (defensive, e.g. older call sites).
+  // myTrips is DriverApp's full list of this driver's trips (no
+  // progressive reveal any more — every assigned trip is shown, and the
+  // 2h start-time gate is what stops a future day being acted on early).
+  // Falls back to state.trips only if the prop is missing (defensive,
+  // e.g. older call sites).
   const navSourceTrips = myTrips ?? state.trips.filter(t => String(t.driver_id) === String(user.id));
-  // Exactly ONE day's worth of trips, not "today or earlier" — FOUND VIA
-  // DIRECT USER REPORT, THEN CORRECTED VIA CODE REVIEW: 3 independently-
-  // booked DAY trips (no week_group_id, so the progressive-reveal filter
-  // above never touches them) for the same agent/driver on 3 CONSECUTIVE
-  // days all got confirmed together, and with nothing here comparing
-  // scheduled_date, all 3 showed up in myActiveTrips at once — meaning
-  // pickupStops' flatMap below combined tomorrow's and the day after's
-  // pickup into TODAY's route alongside today's own stop. The single-
-  // target-day resolution (IN_TRANSIT wins outright, else earliest due
-  // date) now lives in the shared resolveDriverActiveTripDate — also used
-  // by the geofence auto-confirm loop, so nav display and GPS auto-
-  // confirm can never pick a different target day from each other.
+  // Exactly ONE day's worth of trips — FOUND VIA DIRECT USER REPORT, THEN
+  // CORRECTED VIA CODE REVIEW: 3 independently-booked DAY trips for the
+  // same agent/driver on 3 CONSECUTIVE days all got confirmed together,
+  // and with nothing here comparing scheduled_date, all 3 showed up in
+  // myActiveTrips at once — meaning pickupStops' flatMap below combined
+  // tomorrow's and the day after's pickup into TODAY's route alongside
+  // today's own stop. resolveDriverActiveTripDate resolves the single
+  // target day (only trips due today-or-earlier are candidates; IN_TRANSIT
+  // wins outright, else earliest due date) — also used by the geofence
+  // auto-confirm loop, so nav display and GPS auto-confirm can never pick
+  // a different target day from each other. This is ALSO what keeps the
+  // now-unfiltered myTrips (which includes future week-series days) from
+  // bleeding a future day's pickups into today's navigation route.
   // useMemo — FOUND VIA /simplify (efficiency pass), MADE ACTUALLY
   // EFFECTIVE VIA /code-review: driverPosition changes on every GPS tick
   // (several times a minute while driving), which re-renders this
@@ -18048,25 +18018,19 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
     return pollWhileVisibleWithCatchup(checkLateStart, 10 * 60 * 1000);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  // Progressive reveal for week-trip series: a trip that's part of a
-  // week group (week_group_id set) and isn't day 1 stays hidden from the
-  // driver's dashboard until the PRIOR day in that same group is DONE —
-  // completed OR cancelled. This is what makes "next day's trip pops up
-  // once today's is done" actually work — without this, all of a week
-  // booking's daily trips would be visible (and bookable for navigation)
-  // at once, which isn't how a driver should plan a multi-day series.
-  // The prior-day lookup inside isWeekSeriesTripRevealed spans the FULL
-  // trip set (state.trips), not just this driver's own trips — "has day
-  // N-1 happened yet" is a property of that trip, not of who drives it.
-  // Cancellation counts as "done" alongside completion (a mid-week sick
-  // day is a real scenario, and a cancelled day never becomes
-  // ARCHIVED_COMPLETED, so gating only on completion would hide the rest
-  // of the series forever). A day whose predecessor row is missing
-  // entirely is revealed rather than stranded — see the helper.
-  const myTrips = React.useMemo(
-    () => allMyTrips.filter(t => isWeekSeriesTripRevealed(t, state.trips)),
-    [allMyTrips, state.trips]
-  );
+  // Every trip assigned to this driver is shown — the Trips tab groups by
+  // date and DriverTripsTab collapses each card, so a multi-day week
+  // series is a scannable dated list, not a wall of detail. There is NO
+  // progressive "day N hidden until day N-1 completes" reveal any more
+  // (per explicit request): the thing that actually stops a driver acting
+  // on a future day early is the start-time gate — a trip can't be
+  // started until TRIP_EARLY_START_MS (2h) before its scheduled time, and
+  // that's enforced in handleStartTrip AND in the TRIP/RECORD_ROUTE
+  // reducer + Supabase handler, so showing the trip early can't let it be
+  // started early. DriverNavTab still scopes its own route to a single
+  // due-today target day via resolveDriverActiveTripDate, so future days
+  // in this list never bleed into today's navigation route.
+  const myTrips = allMyTrips;
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   // Seats used, scoped to TODAY only — FOUND VIA DIRECT USER REPORT: this
   // used to sum agent_ids across EVERY active trip regardless of date
