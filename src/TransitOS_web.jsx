@@ -1476,6 +1476,29 @@ export function earliestScheduledTime(rawRows) {
   return times[0] ?? null;
 }
 
+// Progressive-reveal predicate for the DRIVER dashboard: day N of a week
+// booking stays hidden from the driver until day N-1 of the same series
+// is finished (completed OR cancelled) — this is what makes "next day's
+// trip pops up once today's is done" work instead of dumping every day
+// of the series into the driver's list (and today's navigation route) at
+// once. Pure/exported so it can be unit-tested; DriverApp filters through
+// it.
+//   trip     — one app-shaped trip ({ week_group_id, week_day_num, state })
+//   allTrips — the full app trip list, to resolve the prior day against
+// Always visible: a non-week trip, day 1 of a series, and — the case that
+// used to strand trips forever — a day whose prior-day row doesn't exist
+// anywhere (series that doesn't start at day 1, or earlier days deleted).
+// With no predecessor row there is no event that could ever flip the gate
+// open, so hiding it is a permanent disappearance, not a deferral.
+export function isWeekSeriesTripRevealed(trip, allTrips) {
+  if (!trip || !trip.week_group_id || !trip.week_day_num || trip.week_day_num <= 1) return true;
+  const priorDay = (allTrips || []).find(
+    other => String(other.week_group_id) === String(trip.week_group_id) && other.week_day_num === trip.week_day_num - 1
+  );
+  if (!priorDay) return true;
+  return [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state);
+}
+
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();
 // When this JS bundle first started executing — used by the admin Status
 // page to show how long the current session/tab has been live.
@@ -18025,22 +18048,18 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // once today's is done" actually work — without this, all of a week
   // booking's daily trips would be visible (and bookable for navigation)
   // at once, which isn't how a driver should plan a multi-day series.
-  const myTrips = React.useMemo(() => allMyTrips.filter(t => {
-    if (!t.week_group_id || !t.week_day_num || t.week_day_num <= 1) return true;
-    const priorDay = allMyTrips.find(other => String(other.week_group_id) === String(t.week_group_id) && other.week_day_num === t.week_day_num - 1);
-    // If the prior day's trip isn't even in this driver's list yet (e.g.
-    // assigned to a different driver, or not yet assigned at all), don't
-    // reveal this one either — the whole point is sequential visibility.
-    // Cancellation counts as "done" here too, not just completion — each
-    // day of a week booking can be independently cancelled (confirmed:
-    // no cancel path ever touches sibling week_group_id rows), and that's
-    // a real, expected scenario (a sick day mid-week, say). Gating only
-    // on ARCHIVED_COMPLETED meant a single cancelled day permanently
-    // hid every later day of that week's series from the driver forever
-    // — a cancelled trip never transitions to ARCHIVED_COMPLETED, so the
-    // gate could never open.
-    return priorDay ? [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state) : false;
-  }), [allMyTrips]);
+  // The prior-day lookup inside isWeekSeriesTripRevealed spans the FULL
+  // trip set (state.trips), not just this driver's own trips — "has day
+  // N-1 happened yet" is a property of that trip, not of who drives it.
+  // Cancellation counts as "done" alongside completion (a mid-week sick
+  // day is a real scenario, and a cancelled day never becomes
+  // ARCHIVED_COMPLETED, so gating only on completion would hide the rest
+  // of the series forever). A day whose predecessor row is missing
+  // entirely is revealed rather than stranded — see the helper.
+  const myTrips = React.useMemo(
+    () => allMyTrips.filter(t => isWeekSeriesTripRevealed(t, state.trips)),
+    [allMyTrips, state.trips]
+  );
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
   // Seats used, scoped to TODAY only — FOUND VIA DIRECT USER REPORT: this
   // used to sum agent_ids across EVERY active trip regardless of date

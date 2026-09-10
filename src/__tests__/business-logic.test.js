@@ -27,6 +27,7 @@ import {
   computeDriverHoursThisWeek,
   cropTrailToPickupWindow,
   earliestScheduledTime,
+  isWeekSeriesTripRevealed,
   companyPolicyDistanceCapKm,
   csvEscapeCell,
   tripRowToApp,
@@ -622,6 +623,52 @@ describe("earliestScheduledTime — earliest scheduledtime among raw DB-shaped r
   it("returns null when no row has a real scheduledtime", () => {
     expect(earliestScheduledTime([])).toBeNull();
     expect(earliestScheduledTime([{ scheduledtime: null }, {}])).toBeNull();
+  });
+});
+
+describe("isWeekSeriesTripRevealed — driver-side progressive reveal for week series", () => {
+  const mk = (o) => ({ week_group_id: "wg", week_day_num: null, state: TRIP_STATE.ASSIGNED, ...o });
+
+  it("always shows non-week trips and day 1", () => {
+    expect(isWeekSeriesTripRevealed(mk({ week_group_id: null, week_day_num: null }), [])).toBe(true);
+    expect(isWeekSeriesTripRevealed(mk({ week_day_num: 1 }), [])).toBe(true);
+  });
+
+  it("hides day N while day N-1 is still active", () => {
+    const day1 = mk({ week_day_num: 1, state: TRIP_STATE.IN_TRANSIT });
+    const day2 = mk({ week_day_num: 2 });
+    expect(isWeekSeriesTripRevealed(day2, [day1, day2])).toBe(false);
+  });
+
+  it("reveals day N once day N-1 is completed or cancelled", () => {
+    const day2 = mk({ week_day_num: 2 });
+    expect(isWeekSeriesTripRevealed(day2, [mk({ week_day_num: 1, state: TRIP_STATE.ARCHIVED_COMPLETED }), day2])).toBe(true);
+    expect(isWeekSeriesTripRevealed(day2, [mk({ week_day_num: 1, state: TRIP_STATE.ARCHIVED_CANCELLED }), day2])).toBe(true);
+  });
+
+  it("reveals a day whose predecessor row does not exist at all (partial series / earlier days deleted)", () => {
+    // The live bug: a series holding only days 4-6 left every one of them
+    // permanently hidden from the (re)assigned driver.
+    const day4 = mk({ week_day_num: 4 });
+    const day5 = mk({ week_day_num: 5 });
+    const day6 = mk({ week_day_num: 6 });
+    const list = [day4, day5, day6];
+    expect(isWeekSeriesTripRevealed(day4, list)).toBe(true); // no day 3 anywhere -> reveal
+    expect(isWeekSeriesTripRevealed(day5, list)).toBe(false); // day 4 exists, not done
+    expect(isWeekSeriesTripRevealed(day6, list)).toBe(false); // day 5 exists, not done
+  });
+
+  it("resolves the prior day against the full trip set, not one driver's — a different driver completing day N-1 still unlocks day N", () => {
+    const day1OtherDriver = mk({ week_day_num: 1, state: TRIP_STATE.ARCHIVED_COMPLETED });
+    const day2 = mk({ week_day_num: 2 });
+    // day2 is the only row this driver holds; day1 belongs to someone else
+    expect(isWeekSeriesTripRevealed(day2, [day1OtherDriver, day2])).toBe(true);
+  });
+
+  it("matches week_group_id across string/number id shapes", () => {
+    const day1 = { week_group_id: 100, week_day_num: 1, state: TRIP_STATE.ARCHIVED_COMPLETED };
+    const day2 = { week_group_id: "100", week_day_num: 2, state: TRIP_STATE.ASSIGNED };
+    expect(isWeekSeriesTripRevealed(day2, [day1, day2])).toBe(true);
   });
 });
 
