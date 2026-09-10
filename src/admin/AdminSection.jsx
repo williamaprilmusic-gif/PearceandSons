@@ -827,8 +827,12 @@ function AuditExportPanel({ state }) {
   );
 }
 
-function computeSchedulingRecommendations(trips, driverStatus, companies, now = new Date()) {
+function computeSchedulingRecommendations(trips, driverStatus, companies, now = new Date(), users = []) {
   const gaps = [];
+  // Archived accounts (removed, kept for trip history) aren't real
+  // rostered supply — same exclusion the roster / staffing-forecast /
+  // auto-assign helpers apply.
+  const archivedDriverIds = new Set((users || []).filter(u => u.archived).map(u => String(u.id)));
 
   // For each of the next 7 days
   for (let d = 1; d <= 7; d++) {
@@ -862,7 +866,7 @@ function computeSchedulingRecommendations(trips, driverStatus, companies, now = 
 
       // Count drivers rostered for this slot
       const rosteredCount = (driverStatus || []).filter(ds =>
-        isDriverOnShift(ds, dateStr, timeStr) && !ds.is_unavailable
+        isDriverOnShift(ds, dateStr, timeStr) && !ds.is_unavailable && !archivedDriverIds.has(String(ds.driver_id))
       ).length;
 
       if (rosteredCount < driversNeeded) {
@@ -886,8 +890,8 @@ function SmartSchedulingPanel({ state }) {
   // comment for why a memo reading wall-clock time needs this at all.
   const nowTick = useTicker(30 * 60 * 1000);
   const gaps = React.useMemo(() =>
-    computeSchedulingRecommendations(state.trips || [], state.driver_status || [], state.companies || [], new Date(nowTick)),
-    [state.trips, state.driver_status, state.companies, nowTick]
+    computeSchedulingRecommendations(state.trips || [], state.driver_status || [], state.companies || [], new Date(nowTick), state.users || []),
+    [state.trips, state.driver_status, state.companies, state.users, nowTick]
   );
   if (gaps.length === 0) return (
     <div style={{ fontSize: 10, color: COLORS.ghost }}>
@@ -10803,7 +10807,7 @@ function AdminRoster({ state, dispatch }) {
   // Same narrow deps as `week` (trips = demand, driver_status =
   // schedules) plus presenceHistory once loaded.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const forecast = React.useMemo(() => computeStaffingForecast(state, monday, { statusHistory: presenceHistory || undefined }), [state.trips, state.driver_status, monday, presenceHistory]);
+  const forecast = React.useMemo(() => computeStaffingForecast(state, monday, { statusHistory: presenceHistory || undefined }), [state.trips, state.driver_status, state.users, monday, presenceHistory]);
 
   const activePlace = dragging || pending;
 

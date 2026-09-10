@@ -4150,6 +4150,11 @@ function appReducer(state, action) {
       return {
         ...state,
         users: state.users.map(u => String(u.id) === String(action.user_id) ? { ...u, status: "ACTIVE", archived: false } : u),
+        // Clear ONLY a driver_status row left unavailable by the older
+        // archive code (unavailable_reason === "ARCHIVED", the exact
+        // sentinel it used) — see the live handler's comment.
+        driver_status: state.driver_status.map(d => (String(d.driver_id) === String(action.user_id) && d.unavailable_reason === "ARCHIVED")
+          ? { ...d, is_unavailable: false, unavailable_reason: null } : d),
         _error: null,
       };
     }
@@ -8083,10 +8088,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "ADMIN/UNARCHIVE_USER": {
       // Reverse of the archive path in ADMIN/DELETE_USERS — puts an
       // archived account back to ACTIVE (login works again, lists show
-      // it, dispatch can use it). Nothing to undo in driver_status: the
-      // archive path deliberately never touched it (status='ARCHIVED' is
-      // the source of truth), so any manual "on leave" state there is
-      // still exactly as the admin left it.
+      // it, dispatch can use it). The current archive path never touches
+      // driver_status, so a manual "on leave" state there survives
+      // untouched — but an EARLIER deployed version (commit 5c5e0de) did
+      // stamp isunavailable=true / unavailablereason='ARCHIVED', so this
+      // still clears exactly that sentinel row (and only that) so a
+      // driver archived under the old code isn't left permanently
+      // unbookable after being restored.
       const { data: unarchTarget } = await supabase.from("users").select("id, role, fullname, status").eq("id", action.user_id).maybeSingle();
       if (!unarchTarget) throw new Error("User not found");
       // Same per-target permission tiering as ADMIN/DELETE_USERS: an
@@ -8096,6 +8104,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const actingUnarch = await assertAdminPermission(activeUserRef, unarchTarget.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
       if (unarchTarget.status !== "ARCHIVED") throw new Error("That account isn't archived.");
       must(await supabase.from("users").update({ status: "ACTIVE" }).eq("id", action.user_id));
+      if (unarchTarget.role === ROLE.DRIVER) {
+        await supabase.from("driver_status")
+          .update({ isunavailable: false, unavailablereason: null })
+          .eq("driverid", action.user_id).eq("unavailablereason", "ARCHIVED")
+          .then(() => {}, () => {});
+      }
       await logAuditAction({
         actorId: actingUnarch.id, actorName: actingUnarch.name, actionType: "ADMIN/UNARCHIVE_USER",
         targetUserId: action.user_id, details: `Un-archived ${unarchTarget.role.toLowerCase()} account: ${unarchTarget.fullname}`,
