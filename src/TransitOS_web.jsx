@@ -1492,11 +1492,18 @@ export function earliestScheduledTime(rawRows) {
 // open, so hiding it is a permanent disappearance, not a deferral.
 export function isWeekSeriesTripRevealed(trip, allTrips) {
   if (!trip || !trip.week_group_id || !trip.week_day_num || trip.week_day_num <= 1) return true;
-  const priorDay = (allTrips || []).find(
+  // A week booking WITH a return leg creates TWO rows for the same day —
+  // outbound + return, sharing week_group_id AND week_day_num (see the
+  // week-booking loop). Match ALL prior-day rows, not just the first one
+  // .find() happens to hit: if only one leg were archived while the other
+  // is still being driven, a single-row check would open the gate mid-
+  // trip and let day N's pickup bleed into today's navigation route —
+  // the exact "whole series at once" behavior this reveal exists to stop.
+  const priorDays = (allTrips || []).filter(
     other => String(other.week_group_id) === String(trip.week_group_id) && other.week_day_num === trip.week_day_num - 1
   );
-  if (!priorDay) return true;
-  return [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(priorDay.state);
+  if (priorDays.length === 0) return true;
+  return priorDays.every(p => [TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(p.state));
 }
 
 const mkId = () => Math.random().toString(36).slice(2, 9).toUpperCase();

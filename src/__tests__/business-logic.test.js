@@ -670,6 +670,17 @@ describe("isWeekSeriesTripRevealed — driver-side progressive reveal for week s
     const day2 = { week_group_id: "100", week_day_num: 2, state: TRIP_STATE.ASSIGNED };
     expect(isWeekSeriesTripRevealed(day2, [day1, day2])).toBe(true);
   });
+
+  it("with a return leg (two rows share week_day_num), needs BOTH prior-day legs finished", () => {
+    const day1Out = mk({ week_day_num: 1, state: TRIP_STATE.ARCHIVED_COMPLETED });
+    const day1Ret = mk({ week_day_num: 1, state: TRIP_STATE.IN_TRANSIT });
+    const day2 = mk({ week_day_num: 2 });
+    // one leg done, the other still being driven -> day 2 stays hidden
+    expect(isWeekSeriesTripRevealed(day2, [day1Out, day1Ret, day2])).toBe(false);
+    // both legs finished (completed + cancelled both count as done) -> reveal
+    day1Ret.state = TRIP_STATE.ARCHIVED_CANCELLED;
+    expect(isWeekSeriesTripRevealed(day2, [day1Out, day1Ret, day2])).toBe(true);
+  });
 });
 
 describe("companyPolicyDistanceCapKm — driver route distance cap scales with passenger count", () => {
