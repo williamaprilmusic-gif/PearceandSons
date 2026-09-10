@@ -3433,7 +3433,7 @@ function AddAgentPanel({ trip, state, dispatch, onClose }) {
   const [dropConfirmed, setDropConfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  const availableAgentsAll = state.users.filter(u => u.role === ROLE.AGENT && !trip.agent_ids.some(id => String(id) === String(u.id)));
+  const availableAgentsAll = state.users.filter(u => u.role === ROLE.AGENT && !u.archived && !trip.agent_ids.some(id => String(id) === String(u.id)));
   // Search-to-filter, per explicit request — a flat unfiltered list is
   // fine for a handful of agents, but genuinely slow to scroll through
   // on a real fleet with many. Same case-insensitive substring match on
@@ -4604,7 +4604,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
                 style={{ background: COLORS.ink, color: COLORS.chalk, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "6px 8px", fontSize: 11 }}
               >
                 <option value="">Select a driver…</option>
-                {state.users.filter(u => u.role === ROLE.DRIVER).sort((a, b) => (a.name || "").localeCompare(b.name || "")).map(d => (
+                {state.users.filter(u => u.role === ROLE.DRIVER && !u.archived).sort((a, b) => (a.name || "").localeCompare(b.name || "")).map(d => (
                   <option key={d.id} value={d.id}>{d.name}</option>
                 ))}
               </select>
@@ -9013,6 +9013,8 @@ function AdminUsers({ state, dispatch, user }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteResults, setDeleteResults] = useState(null);
+  const [unarchivingId, setUnarchivingId] = useState(null);
+  const [unarchiveError, setUnarchiveError] = useState(null);
   // Search/filter — genuinely missing before (a flat, unfiltered list
   // of every user in the whole system), found during a scan for real
   // friction points and built per explicit approval. Matches on name,
@@ -9024,6 +9026,11 @@ function AdminUsers({ state, dispatch, user }) {
   // import), not just a bug backlog. ANDs with the text search rather than
   // replacing it, so an admin can still narrow by name/role at the same time.
   const [showOnlyUnconfirmed, setShowOnlyUnconfirmed] = useState(false);
+  // Archived accounts (removed but kept because of trip history) are
+  // hidden by default — this toggle brings them back so they can be
+  // reviewed / un-archived.
+  const [showArchived, setShowArchived] = useState(false);
+  const archivedCount = React.useMemo(() => state.users.filter(u => u.archived).length, [state.users]);
   const needsAddressConfirmation = React.useMemo(() => usersNeedingAddressConfirmation(state.users), [state.users]);
   const needsAddressConfirmationIds = React.useMemo(() => new Set(needsAddressConfirmation.map(u => u.id)), [needsAddressConfirmation]);
   const filteredUsers = (userSearch.trim().length >= 1
@@ -9032,7 +9039,8 @@ function AdminUsers({ state, dispatch, user }) {
         return u.name.toLowerCase().includes(q) || (u.staff_number || "").toLowerCase().includes(q) || u.role.toLowerCase().includes(q);
       })
     : state.users
-  ).filter(u => !showOnlyUnconfirmed || needsAddressConfirmationIds.has(u.id));
+  ).filter(u => !showOnlyUnconfirmed || needsAddressConfirmationIds.has(u.id))
+   .filter(u => showArchived || !u.archived);
   const toggleSelected = (id) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
@@ -9152,8 +9160,10 @@ function AdminUsers({ state, dispatch, user }) {
           {deleteResults && (
             <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
               {deleteResults.map((r, i) => (
-                <span key={i} style={{ fontSize: 10, color: r.ok ? COLORS.green : COLORS.red }}>
-                  {r.ok ? "✓" : "✗"} {r.name || "Account"}{!r.ok && r.reason ? ` — ${r.reason}` : ""}
+                <span key={i} style={{ fontSize: 10, color: r.ok ? (r.archived ? COLORS.amber : COLORS.green) : COLORS.red }}>
+                  {r.ok ? (r.archived ? "📦" : "✓") : "✗"} {r.name || "Account"}
+                  {r.ok && r.archived ? " — archived (has trip history; trips kept, login disabled)" : ""}
+                  {!r.ok && r.reason ? ` — ${r.reason}` : ""}
                 </span>
               ))}
             </div>
@@ -9163,7 +9173,7 @@ function AdminUsers({ state, dispatch, user }) {
           ) : (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <span style={{ fontSize: 10, color: COLORS.chalk }}>
-                Delete {selectedIds.size} account{selectedIds.size !== 1 ? "s" : ""}? This can't be undone. Accounts with any trip history will be refused automatically rather than deleted.
+                Delete {selectedIds.size} account{selectedIds.size !== 1 ? "s" : ""}? Accounts with NO trip history are removed permanently (can't be undone). Accounts WITH trip history are <b>archived</b> instead — the trip records stay, the account is hidden and can't log in, and it can be un-archived later.
               </span>
               <div style={{ display: "flex", gap: 8 }}>
                 <Button title="CANCEL" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setConfirmingDelete(false)} />
@@ -9287,6 +9297,13 @@ function AdminUsers({ state, dispatch, user }) {
           {" "}<b>{showOnlyUnconfirmed ? "SHOWING ONLY THESE — tap to clear" : "TAP TO SHOW THEM"}</b>
         </div>
       )}
+      {(archivedCount > 0 || showArchived) && (
+        <div onClick={() => setShowArchived(v => !v)}
+          style={{ cursor: "pointer", background: COLORS.surface, border: `1px solid ${showArchived ? COLORS.amber : COLORS.wire}`, borderRadius: 4, padding: 10, fontSize: 10, color: COLORS.chalk }}>
+          📦 {archivedCount} archived account{archivedCount !== 1 ? "s" : ""} — removed but kept because of trip history (can't log in, hidden from dispatch).
+          {" "}<b>{showArchived ? "SHOWING — tap to hide" : "TAP TO SHOW"}</b>
+        </div>
+      )}
       <TextField label="Search by name, staff number, or role" value={userSearch} onChange={e => setUserSearch(e.target.value)} placeholder="e.g. Nomsa Dlamini, AG1001, or driver" />
       <Card body={false}>
         {filteredUsers.length === 0 ? (
@@ -9309,7 +9326,10 @@ function AdminUsers({ state, dispatch, user }) {
           // other admins; disabling those rows here means the confirm
           // step never shows a selection that the backend would just
           // refuse anyway.
-          const canDeleteThisUser = !isSelf && (u.role === ROLE.ADMIN ? canManageAdmins : canCreateAgentsDrivers);
+          // Already-archived accounts have nothing left to delete — the
+          // row's action is "un-archive" instead.
+          const canDeleteThisUser = !isSelf && !u.archived && (u.role === ROLE.ADMIN ? canManageAdmins : canCreateAgentsDrivers);
+          const canUnarchiveThisUser = u.archived && (u.role === ROLE.ADMIN ? canManageAdmins : canCreateAgentsDrivers);
           const isSelected = selectedIds.has(u.id);
           const rowClick = selectMode
             ? () => { if (canDeleteThisUser) toggleSelected(u.id); }
@@ -9317,12 +9337,15 @@ function AdminUsers({ state, dispatch, user }) {
           return (
             <React.Fragment key={u.id}>
               <div onClick={rowClick}
-                style={{ cursor: (selectMode ? canDeleteThisUser : true) ? "pointer" : "default", opacity: selectMode && !canDeleteThisUser ? .4 : 1, display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: isExpanded ? "none" : `1px solid ${COLORS.wire}`, background: isExpanded ? "rgba(245,166,35,.05)" : isSelected ? "rgba(220,53,69,.06)" : "transparent" }}>
+                style={{ cursor: (selectMode ? canDeleteThisUser : true) ? "pointer" : "default", opacity: (selectMode && !canDeleteThisUser) || u.archived ? .5 : 1, display: "flex", alignItems: "center", gap: 12, padding: 12, borderBottom: isExpanded ? "none" : `1px solid ${COLORS.wire}`, background: isExpanded ? "rgba(245,166,35,.05)" : isSelected ? "rgba(220,53,69,.06)" : "transparent" }}>
                 {selectMode && (
                   <span style={{ width: 16, height: 16, borderRadius: 3, border: `1px solid ${isSelected ? COLORS.red : COLORS.wire}`, background: isSelected ? COLORS.red : "transparent", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#fff", flexShrink: 0 }}>{isSelected && "✓"}</span>
                 )}
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 11, fontWeight: 700 }}>{u.name}{isSelf && selectMode && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> (you)</span>}</div>
+                  <div style={{ fontSize: 11, fontWeight: 700 }}>
+                    {u.name}{isSelf && selectMode && <span style={{ color: COLORS.ghost, fontWeight: 400 }}> (you)</span>}
+                    {u.archived && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.amber, border: `1px solid ${COLORS.amber}`, borderRadius: 2, padding: "1px 5px", marginLeft: 6 }}>ARCHIVED</span>}
+                  </div>
                   <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>Staff #: {u.staff_number || "—"}</div>
                   {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && u.home_address && (
                     hasResolvedCoord(u.home_address)
@@ -9348,7 +9371,25 @@ function AdminUsers({ state, dispatch, user }) {
                   ) : (
                     <>
                       <UserProfilePanel u={u} driverStatus={driverStatus} state={state} />
-                      {canEditThisUser && <Button title="✎ EDIT ACCOUNT" variant="ghost" size="sm" onClick={() => setEditModeId(u.id)} />}
+                      {u.archived && (
+                        <div style={{ fontSize: 10, color: COLORS.amber, background: "rgba(245,166,35,.08)", border: `1px solid rgba(245,166,35,.3)`, borderRadius: 4, padding: "6px 8px" }}>
+                          📦 Archived — this account can't log in and is hidden from dispatch. All its trip history is intact.
+                        </div>
+                      )}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        {canEditThisUser && !u.archived && <Button title="✎ EDIT ACCOUNT" variant="ghost" size="sm" style={{ flex: 1 }} onClick={() => setEditModeId(u.id)} />}
+                        {canUnarchiveThisUser && (
+                          <Button title={unarchivingId === u.id ? "RESTORING…" : "♻ UN-ARCHIVE"} variant="ghost" size="sm" style={{ flex: 1, borderColor: COLORS.green, color: COLORS.green }}
+                            disabled={unarchivingId === u.id}
+                            onClick={async () => {
+                              setUnarchivingId(u.id);
+                              try { await dispatch({ type: "ADMIN/UNARCHIVE_USER", user_id: u.id }); }
+                              catch (e) { setUnarchiveError(e.message || "Couldn't un-archive — please try again."); }
+                              finally { setUnarchivingId(null); }
+                            }} />
+                        )}
+                      </div>
+                      {unarchiveError && <span style={{ fontSize: 10, color: COLORS.red }}>{unarchiveError}</span>}
                     </>
                   )}
                 </div>

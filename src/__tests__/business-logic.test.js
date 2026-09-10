@@ -750,6 +750,14 @@ describe("row mappers — hydration-boundary id normalization", () => {
     expect(driverStatusRowToApp({ driverid: 6, currenttripid: null }).current_trip_id).toBe(null);
   });
 
+  it("userRowToApp surfaces archived status (default ACTIVE)", () => {
+    expect(userRowToApp({ id: 1, role: ROLE.AGENT, fullname: "A" }).archived).toBe(false);
+    expect(userRowToApp({ id: 1, role: ROLE.AGENT, fullname: "A", status: "ACTIVE" }).archived).toBe(false);
+    const arch = userRowToApp({ id: 2, role: ROLE.DRIVER, fullname: "B", status: "ARCHIVED" });
+    expect(arch.archived).toBe(true);
+    expect(arch.status).toBe("ARCHIVED");
+  });
+
   it("scopeUsersToCompany matches a numeric branch_id against a string companyId (post-hydration shape)", () => {
     const users = [
       { id: "1", role: ROLE.AGENT, branch_id: 2 },       // number branch_id

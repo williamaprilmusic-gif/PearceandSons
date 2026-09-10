@@ -4032,6 +4032,8 @@ function appReducer(state, action) {
         ? state.users.find(u => String(u.id) === String(action.user_id))
         : state.users.find(u => u.auth.login === action.login && u.auth.pass === action.pass);
       if (!user) return { ...state, _error: "Invalid credentials" };
+      // Mirrors session-login / webauthn's status !== 'ACTIVE' gate.
+      if (user.status === "ARCHIVED") return { ...state, _error: "This account has been archived. Contact an administrator." };
       // Per explicit decision: "online" means logged in right now — set
       // the instant login succeeds, cleared on logout, no idle timeout.
       // Per a LATER explicit decision, this is now role-agnostic — lives
@@ -4100,7 +4102,27 @@ function appReducer(state, action) {
         // tickets/direct_messages all cascade automatically and need no
         // guard.
         const hasAnyTrip = workingState.trips.some(t => t.agent_ids.some(id => String(id) === String(targetId)) || t.driver_id === targetId);
-        if (hasAnyTrip) { results.push({ id: targetId, ok: false, name: target.name, reason: "Has trip history on file — the database keeps trip records tied to their account and won't allow deletion while any exist" }); continue; }
+        if (hasAnyTrip) {
+          // Mirrors the live handler: can't hard-delete a user with trip
+          // history (the trips stay), so ARCHIVE them instead — unless
+          // they're on a not-yet-finished trip, in which case make the
+          // admin clear that first.
+          const activeStates = [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
+          const activeCount = workingState.trips.filter(t => activeStates.includes(t.state)
+            && (t.agent_ids.some(id => String(id) === String(targetId)) || String(t.driver_id) === String(targetId))).length;
+          if (activeCount > 0) {
+            results.push({ id: targetId, ok: false, name: target.name, reason: `Has ${activeCount} active trip${activeCount !== 1 ? "s" : ""} — reassign or cancel ${activeCount !== 1 ? "those" : "it"} first, then archive.` });
+            continue;
+          }
+          workingState = {
+            ...workingState,
+            users: workingState.users.map(u => String(u.id) === String(targetId) ? { ...u, status: "ARCHIVED", archived: true, is_online: false } : u),
+            driver_status: workingState.driver_status.map(d => String(d.driver_id) === String(targetId) ? { ...d, is_unavailable: true, is_online: false, unavailable_reason: "ARCHIVED" } : d),
+            notifications: workingState.notifications.filter(n => !n.for_user_ids?.some(id => String(id) === String(targetId))),
+          };
+          results.push({ id: targetId, ok: true, name: target.name, archived: true });
+          continue;
+        }
         workingState = {
           ...workingState,
           users: workingState.users.filter(u => String(u.id) !== String(targetId)),
@@ -4115,6 +4137,19 @@ function appReducer(state, action) {
         results.push({ id: targetId, ok: true, name: target.name });
       }
       return { ...workingState, _error: null, _lastDeleteResults: results };
+    }
+
+    case "ADMIN/UNARCHIVE_USER": {
+      const unarchTarget = state.users.find(u => String(u.id) === String(action.user_id));
+      if (!unarchTarget) return { ...state, _error: "User not found" };
+      if (unarchTarget.status !== "ARCHIVED") return { ...state, _error: "That account isn't archived." };
+      return {
+        ...state,
+        users: state.users.map(u => String(u.id) === String(action.user_id) ? { ...u, status: "ACTIVE", archived: false } : u),
+        driver_status: state.driver_status.map(d => (String(d.driver_id) === String(action.user_id) && d.unavailable_reason === "ARCHIVED")
+          ? { ...d, is_unavailable: false, unavailable_reason: null } : d),
+        _error: null,
+      };
     }
 
     case "ADMIN/UPDATE_USER": {
@@ -6490,7 +6525,14 @@ export function userRowToApp(row) {
   // Supabase-backed UI ever reads it (only auth.login, for username
   // display); it was pure over-retention that sat in every session's
   // client state. See AUTH/LOGIN's comment for the full incident.
-  const user = { id: sid(row.id), role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null };
+  const user = { id: sid(row.id), role: row.role, name: row.fullname, staff_number: row.staffnumber || null, auth: { login: row.username }, is_online: row.isonline || false, phone: row.phone && row.phone !== "N/A" ? row.phone : null,
+    // "ARCHIVED" = the account was removed but has trip history the DB
+    // won't let us hard-delete, so it's kept as a dead row: blocked from
+    // login (session-login/webauthn's existing status !== 'ACTIVE'
+    // check), hidden from every admin list, and dropped from dispatch.
+    // Reversible via ADMIN/UNARCHIVE_USER. Its name still resolves on old
+    // trips because the row stays.
+    status: row.status || "ACTIVE", archived: row.status === "ARCHIVED" };
   // Home address is meaningful for both agents (pickup point) and drivers
   // (which area they live in, for assignment purposes) — not agent-only.
   if ((row.role === ROLE.AGENT || row.role === ROLE.DRIVER) && row.homelat != null) {
@@ -6624,7 +6666,7 @@ async function fetchAllFromSupabase() {
     // comment for the full incident this was found as part of. Every
     // field userRowToApp actually reads is listed explicitly here — add
     // to both places together if a new field is ever needed.
-    supabase.from("users").select("id, role, fullname, staffnumber, username, isonline, phone, homelat, homelng, homeaddress, homearea, branchid, branchhistory, campaignid, adminlevel, scopedcompanyids").order("id"),
+    supabase.from("users").select("id, role, fullname, staffnumber, username, isonline, phone, homelat, homelng, homeaddress, homearea, branchid, branchhistory, campaignid, adminlevel, scopedcompanyids, status").order("id"),
     // Explicit column list — same reasoning as the users select above.
     // Was select("*"), so every logged-in agent client (not just admins)
     // received every driver's raw document-expiry dates in memory. Lower
@@ -7943,7 +7985,44 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           .select("id", { count: "exact", head: true })
           .contains("extraagentids", [targetId]);
         if ((tripCount || 0) > 0 || (extraCount || 0) > 0) {
-          results.push({ id: targetId, ok: false, name: target.fullname, reason: "Has trip history on file — the database keeps trip records tied to their account and won't allow deletion while any exist" });
+          // Can't hard-delete (trips.agentid/driverid/extraagentids are
+          // RESTRICT) — and per explicit decision the trip records STAY.
+          // Instead ARCHIVE the user: the row is kept (so its name still
+          // resolves on every historical trip), but marked non-ACTIVE so
+          // session-login/webauthn's existing status check blocks login,
+          // the admin lists hide it, and dispatch drops it. Reversible
+          // (ADMIN/UNARCHIVE_USER).
+          //
+          // But NOT while they're on a not-yet-finished trip — archiving
+          // a driver mid-route, or an agent booked for tomorrow, would
+          // leave a live trip pointing at a dead account. Make the admin
+          // reassign/cancel those first.
+          const ACTIVE = "(UNASSIGNED_BOOKING,ASSIGNED,DRIVER_CONFIRMED,IN_TRANSIT)";
+          const { count: activeDirect } = await supabase.from("trips")
+            .select("id", { count: "exact", head: true })
+            .filter("status", "in", ACTIVE)
+            .or(`agentid.eq.${targetId},driverid.eq.${targetId}`);
+          const { count: activeExtra } = await supabase.from("trips")
+            .select("id", { count: "exact", head: true })
+            .filter("status", "in", ACTIVE)
+            .contains("extraagentids", [targetId]);
+          const activeCount = (activeDirect || 0) + (activeExtra || 0);
+          if (activeCount > 0) {
+            results.push({ id: targetId, ok: false, name: target.fullname, reason: `Has ${activeCount} active trip${activeCount !== 1 ? "s" : ""} — reassign or cancel ${activeCount !== 1 ? "those" : "it"} first, then archive.` });
+            continue;
+          }
+          await supabase.from("users").update({ status: "ARCHIVED", isonline: false }).eq("id", targetId);
+          if (target.role === ROLE.DRIVER) {
+            await supabase.from("driver_status").update({ isonline: false, isunavailable: true, unavailablereason: "ARCHIVED" }).eq("driverid", targetId).then(() => {}, () => {});
+          }
+          await supabase.from("notifications").delete().eq("userid", targetId).then(() => {}, () => {});
+          if (actorRow) {
+            await logAuditAction({
+              actorId: actorRow.id, actorName: actorRow.fullname, actionType: "ADMIN/ARCHIVE_USER",
+              targetUserId: targetId, details: `Archived ${target.role.toLowerCase()} account (has trip history): ${target.fullname}`,
+            });
+          }
+          results.push({ id: targetId, ok: true, name: target.fullname, archived: true });
           continue;
         }
         // Notifications tied to this user are cleaned up automatically
@@ -7988,6 +8067,30 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return results;
+    }
+    case "ADMIN/UNARCHIVE_USER": {
+      // Reverse of the archive path in ADMIN/DELETE_USERS — puts an
+      // archived account back to ACTIVE (login works again, lists show
+      // it, dispatch can use it). A driver also comes off the
+      // ARCHIVED-reason unavailability, but ONLY if nothing else set it
+      // (a real "on leave" flag from before shouldn't be cleared here).
+      const actingUnarch = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      const { data: unarchTarget } = await supabase.from("users").select("id, role, fullname, status").eq("id", action.user_id).maybeSingle();
+      if (!unarchTarget) throw new Error("User not found");
+      if (unarchTarget.status !== "ARCHIVED") throw new Error("That account isn't archived.");
+      must(await supabase.from("users").update({ status: "ACTIVE" }).eq("id", action.user_id));
+      if (unarchTarget.role === ROLE.DRIVER) {
+        await supabase.from("driver_status")
+          .update({ isunavailable: false, unavailablereason: null })
+          .eq("driverid", action.user_id).eq("unavailablereason", "ARCHIVED")
+          .then(() => {}, () => {});
+      }
+      await logAuditAction({
+        actorId: actingUnarch.id, actorName: actingUnarch.name, actionType: "ADMIN/UNARCHIVE_USER",
+        targetUserId: action.user_id, details: `Un-archived ${unarchTarget.role.toLowerCase()} account: ${unarchTarget.fullname}`,
+      });
+      refetch(); // fire-and-forget — see handleSupabaseAction's header comment
+      return;
     }
     case "ADMIN/UPDATE_USER": {
       // Explicit column list, no passwordhash/passwordsalt — this admin
