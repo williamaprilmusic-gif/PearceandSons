@@ -1652,7 +1652,9 @@ export function buildRosterWeek(state, mondaySlash, usersById = usersByIdMap(sta
     byDriverDate.get(k).push(t);
   }
 
-  const drivers = (state.driver_status || []).map(ds => {
+  const drivers = (state.driver_status || [])
+    .filter(ds => !usersById.get(String(ds.driver_id))?.archived) // archived = removed account, kept for trip history
+    .map(ds => {
     const capacity = ds.capacity || DRIVER_CAPACITY;
     const sched = ds.availability_schedule || [];
     const hasSchedule = sched.length > 0;
@@ -1809,7 +1811,8 @@ export function computeStaffingForecast(state, mondaySlash, options = {}) {
     }
   }
 
-  const rosterDrivers = (state.driver_status || []).filter(ds => !ds.is_unavailable);
+  const archivedDriverIds = new Set((state.users || []).filter(u => u.archived).map(u => String(u.id)));
+  const rosterDrivers = (state.driver_status || []).filter(ds => !ds.is_unavailable && !archivedDriverIds.has(String(ds.driver_id)));
   const hasPresence = Array.isArray(statusHistory) && statusHistory.length > 0;
 
   const cells = [];
@@ -1927,6 +1930,7 @@ export function computeAutoAssignPlan(state, options = {}) {
     let best = null;
     for (const ds of state.driver_status || []) {
       if (ds.is_unavailable) continue;
+      if (usersById.get(String(ds.driver_id))?.archived) continue; // removed account, kept for trip history
       if (!isDriverOnShift(ds, date, time)) continue;
       const cap = ds.capacity || DRIVER_CAPACITY;
       const key = `${ds.driver_id}|${date}`;
@@ -5611,6 +5615,11 @@ function AdminDispatch({ state, dispatch, user }) {
     tripHomeAreas, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
     isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
   } = React.useMemo(() => {
+    // Archived accounts (removed but kept for trip history) must never
+    // be dispatchable — status='ARCHIVED' on the user is the single
+    // source of truth (the archive action deliberately doesn't mutate
+    // driver_status).
+    const archivedDriverIds = new Set(state.users.filter(u => u.archived).map(u => String(u.id)));
     const unassignedAllDates = state.trips.filter(t => t.state === TRIP_STATE.UNASSIGNED_BOOKING);
     const availableDates = [...new Set(unassignedAllDates.map(t => t.scheduled_date))].sort();
     const unassignedByDay = dayFilter ? unassignedAllDates.filter(t => t.scheduled_date === dayFilter) : unassignedAllDates;
@@ -5668,6 +5677,7 @@ function AdminDispatch({ state, dispatch, user }) {
     // and was never the kind of under-filled trip this rule targets.
     const underCapacityWarning = !isMultiDaySelection && totalSeats > 0 && !overCapacity && (totalSeats / DRIVER_CAPACITY) < MIN_FULL_PCT;
     const availableDriversRaw = state.driver_status.filter(ds => {
+      if (archivedDriverIds.has(String(ds.driver_id))) return false;
       // Feature 7: shift filtering — exclude drivers not rostered for this time slot.
       // isDriverOnShift returns true when no schedule is set (backward compat).
       const tripTimeStr = primaryTrip?.scheduled_time || null;

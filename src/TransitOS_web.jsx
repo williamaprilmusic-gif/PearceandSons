@@ -4116,8 +4116,12 @@ function appReducer(state, action) {
           }
           workingState = {
             ...workingState,
+            // status='ARCHIVED' / archived is the source of truth (see
+            // the live handler) — dispatch/roster/staffing filter on it,
+            // so don't touch driver_status.unavailable_reason and lose a
+            // real "on leave" state through an archive round-trip.
             users: workingState.users.map(u => String(u.id) === String(targetId) ? { ...u, status: "ARCHIVED", archived: true, is_online: false } : u),
-            driver_status: workingState.driver_status.map(d => String(d.driver_id) === String(targetId) ? { ...d, is_unavailable: true, is_online: false, unavailable_reason: "ARCHIVED" } : d),
+            driver_status: workingState.driver_status.map(d => String(d.driver_id) === String(targetId) ? { ...d, is_online: false } : d),
             notifications: workingState.notifications.filter(n => !n.for_user_ids?.some(id => String(id) === String(targetId))),
           };
           results.push({ id: targetId, ok: true, name: target.name, archived: true });
@@ -4146,8 +4150,6 @@ function appReducer(state, action) {
       return {
         ...state,
         users: state.users.map(u => String(u.id) === String(action.user_id) ? { ...u, status: "ACTIVE", archived: false } : u),
-        driver_status: state.driver_status.map(d => (String(d.driver_id) === String(action.user_id) && d.unavailable_reason === "ARCHIVED")
-          ? { ...d, is_unavailable: false, unavailable_reason: null } : d),
         _error: null,
       };
     }
@@ -4834,6 +4836,9 @@ function appReducer(state, action) {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       const drvStatus = state.driver_status.find(d => String(d.driver_id) === String(action.driver_id));
       if (!trip || !drvStatus) return state;
+      if (state.users.find(u => String(u.id) === String(action.driver_id))?.archived) {
+        return { ...state, _error: "That driver's account is archived — un-archive it before dispatching." };
+      }
 
       const currentLoad = getDriverLoad(state, action.driver_id, trip.scheduled_date);
       const incomingSeats = Math.max(1, trip.agent_ids?.length || 0);
@@ -8011,9 +8016,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             results.push({ id: targetId, ok: false, name: target.fullname, reason: `Has ${activeCount} active trip${activeCount !== 1 ? "s" : ""} — reassign or cancel ${activeCount !== 1 ? "those" : "it"} first, then archive.` });
             continue;
           }
-          await supabase.from("users").update({ status: "ARCHIVED", isonline: false }).eq("id", targetId);
+          // status='ARCHIVED' is the SINGLE source of truth — dispatch,
+          // auto-assign, the roster and staffing all filter on the
+          // hydrated `archived` flag now, so this deliberately does NOT
+          // also mutate driver_status (a prior manual "on leave" reason
+          // there must survive an archive → un-archive round-trip). Only
+          // clear the live "online right now" bit.
+          const { error: archErr } = await supabase.from("users").update({ status: "ARCHIVED", isonline: false }).eq("id", targetId);
+          if (archErr) { results.push({ id: targetId, ok: false, name: target.fullname, reason: archErr.message }); continue; }
           if (target.role === ROLE.DRIVER) {
-            await supabase.from("driver_status").update({ isonline: false, isunavailable: true, unavailablereason: "ARCHIVED" }).eq("driverid", targetId).then(() => {}, () => {});
+            await supabase.from("driver_status").update({ isonline: false }).eq("driverid", targetId).then(() => {}, () => {});
           }
           await supabase.from("notifications").delete().eq("userid", targetId).then(() => {}, () => {});
           if (actorRow) {
@@ -8071,20 +8083,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "ADMIN/UNARCHIVE_USER": {
       // Reverse of the archive path in ADMIN/DELETE_USERS — puts an
       // archived account back to ACTIVE (login works again, lists show
-      // it, dispatch can use it). A driver also comes off the
-      // ARCHIVED-reason unavailability, but ONLY if nothing else set it
-      // (a real "on leave" flag from before shouldn't be cleared here).
-      const actingUnarch = await assertAdminPermission(activeUserRef, "manageAgentsDrivers");
+      // it, dispatch can use it). Nothing to undo in driver_status: the
+      // archive path deliberately never touched it (status='ARCHIVED' is
+      // the source of truth), so any manual "on leave" state there is
+      // still exactly as the admin left it.
       const { data: unarchTarget } = await supabase.from("users").select("id, role, fullname, status").eq("id", action.user_id).maybeSingle();
       if (!unarchTarget) throw new Error("User not found");
+      // Same per-target permission tiering as ADMIN/DELETE_USERS: an
+      // admin account can only be restored by someone who could have
+      // deleted one (manageAdmins), not just anyone with
+      // manageAgentsDrivers.
+      const actingUnarch = await assertAdminPermission(activeUserRef, unarchTarget.role === ROLE.ADMIN ? "manageAdmins" : "manageAgentsDrivers");
       if (unarchTarget.status !== "ARCHIVED") throw new Error("That account isn't archived.");
       must(await supabase.from("users").update({ status: "ACTIVE" }).eq("id", action.user_id));
-      if (unarchTarget.role === ROLE.DRIVER) {
-        await supabase.from("driver_status")
-          .update({ isunavailable: false, unavailablereason: null })
-          .eq("driverid", action.user_id).eq("unavailablereason", "ARCHIVED")
-          .then(() => {}, () => {});
-      }
       await logAuditAction({
         actorId: actingUnarch.id, actorName: actingUnarch.name, actionType: "ADMIN/UNARCHIVE_USER",
         targetUserId: action.user_id, details: `Un-archived ${unarchTarget.role.toLowerCase()} account: ${unarchTarget.fullname}`,
@@ -9912,6 +9923,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       const { data: driverRow } = await supabase.from("driver_status").select("*").eq("driverid", action.driver_id).single();
       if (!tripRow || !driverRow) throw new Error("Trip or driver not found");
+      // Server-side guard against dispatching an archived account (the UI
+      // filters them out, but the dispatch path is reachable directly).
+      const { data: assignDriverUser } = await supabase.from("users").select("status, fullname").eq("id", action.driver_id).maybeSingle();
+      if (assignDriverUser?.status === "ARCHIVED") throw new Error(`${assignDriverUser.fullname || "That driver"}'s account is archived — un-archive it before dispatching.`);
       await assertDriverDocsCurrent(action.driver_id);
       // Auto-merge: if this driver already has an ACTIVE trip on the SAME
       // DAY (assigned via a previous single dispatch, not necessarily
