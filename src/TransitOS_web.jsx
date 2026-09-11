@@ -11677,12 +11677,28 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const tomtomTotalKm = await tomtomRealRouteKm(driver_coord, orderedPickups, dropOrdered, departAtEpochRecord);
       const totalRoadKm = tomtomTotalKm ?? haversineTotalKm;
       console.log(`[RECORD_ROUTE] route: TomTom=${tomtomTotalKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${totalRoadKm.toFixed(1)} km`);
+      // FOUND VIA /code-review (of the ownership-check fix just above):
+      // that check runs ONCE, up front — but assertDriverDocsCurrent plus
+      // two external TomTom HTTP calls (buildPickupSequenceTomTom,
+      // tomtomRealRouteKm) all await between it and this write, a window
+      // easily long enough for an admin to reassign one of these trips to
+      // a different driver. Without a fresh ownership check, this loop
+      // would still overwrite that trip's route km/sequence with THIS
+      // (now former) driver's stale data. Scoping the UPDATE itself to
+      // `driverid = caller` re-verifies ownership atomically with the
+      // write — a trip reassigned mid-flight simply matches zero rows and
+      // is left untouched (its NEW driver's own Start Trip / dispatch
+      // re-route will set correct values) instead of being silently
+      // clobbered.
       for (const t of routeTrips) {
-        await supabase.from("trips").update({
+        const { data: rrUpdated } = await supabase.from("trips").update({
           routetotalkm: totalRoadKm,
           pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
           dropsequencenum: firstDropoffPosForTrip[t.trip_id] ?? t.drop_sequence_num ?? null,
-        }).eq("id", t.trip_id);
+        }).eq("id", t.trip_id).eq("driverid", activeUserRef.current).select("id");
+        if (!rrUpdated || rrUpdated.length === 0) {
+          console.warn(`[RECORD_ROUTE] trip ${t.trip_id} skipped — no longer assigned to this driver (reassigned while the route was being computed).`);
+        }
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
