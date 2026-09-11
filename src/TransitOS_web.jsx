@@ -4975,6 +4975,14 @@ function appReducer(state, action) {
     case "TRIP/ACCEPT": {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
+      // Idempotent no-op if already past ASSIGNED — mirrors the live
+      // Supabase handler's identical guard (see its comment): without
+      // this, a driver's retry after handleStartTrip's RECORD_ROUTE step
+      // fails for ANY reason re-sends ACCEPT for a trip already promoted,
+      // and assertTripTransition's raw "DRIVER_CONFIRMED -> DRIVER_CONFIRMED
+      // ILLEGAL" would surface as a confusing _error instead of quietly
+      // succeeding.
+      if (trip.state === TRIP_STATE.DRIVER_CONFIRMED) return state;
       try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
       catch (e) { return { ...state, _error: e.message }; }
       const driverUser = state.users.find(u => String(u.id) === String(trip.driver_id));
@@ -7476,6 +7484,23 @@ function must(res) {
 // TRIP/DRIVER_CONFIRM, matching that handler's own scheduled-time gate).
 // Roadworthy cert stays advisory-only (DOC_TYPES.required:
 // false), matching the driver-facing summary's own severity split.
+// Shared by TRIP/RECORD_ROUTE's two ownership checkpoints (an up-front
+// fast-fail before the expensive doc-check/TomTom calls, and a recheck
+// immediately before the write — see that handler's comments for why
+// both exist). Returns true only if EVERY id resolves to a real trip row
+// owned by driverId. FOUND VIA /code-review: an inline copy of this
+// silently treated a FAILED lookup (network/DB error, `data: null`) the
+// same as "zero rows found," surfacing a spurious "not assigned to you"
+// instead of a transient/retryable error — and keeping two independent
+// copies of the same check is exactly how that kind of drift creeps in,
+// so it's a single shared helper now.
+async function tripsOwnedByDriver(tripIds, driverId) {
+  const { data: rows, error } = await supabase.from("trips").select("id, driverid").in("id", tripIds);
+  if (error) throw error;
+  const ownerById = new Map((rows || []).map(r => [String(r.id), r.driverid]));
+  return tripIds.every(id => String(ownerById.get(String(id))) === String(driverId));
+}
+
 async function assertDriverDocsCurrent(driverId) {
   const { data: docsRow } = await supabase.from("driver_status").select("documents").eq("driverid", driverId).maybeSingle();
   const docs = docsRow?.documents || {};
@@ -10851,6 +10876,21 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!tripRow) throw new Error("Trip not found");
       // Ownership check — see TRIP/DRIVER_CONFIRM.
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
+      // Idempotent no-op if already past ASSIGNED — FOUND VIA /code-review
+      // (of TRIP/RECORD_ROUTE's ownership-recheck fix): handleStartTrip's
+      // ACCEPT-then-RECORD_ROUTE flow can legitimately fail AFTER ACCEPT
+      // already succeeded for one or more trips in the batch (a
+      // mid-flight reassignment caught on a SIBLING trip, expired driver
+      // docs, a TomTom outage, a plain network blip) — its local trip
+      // list isn't refetched on that failure, so a driver's retry
+      // re-sends ACCEPT for a trip an earlier attempt already promoted.
+      // Without this guard that unconditionally re-stamped
+      // acceptedat/confirmedat and fired a SECOND "Driver accepted your
+      // trip" notification on every retry.
+      if (tripRow.status === TRIP_STATE.DRIVER_CONFIRMED) { refetch(); return; }
+      if (tripRow.status !== TRIP_STATE.ASSIGNED) {
+        throw new Error(`Can't accept a trip that's currently ${tripRow.status}.`);
+      }
       await assertDriverDocsCurrent(activeUserRef.current);
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
       const nowTs = nowEpoch();
@@ -11602,19 +11642,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // attacker-controlled values. `trips` RLS only requires an
       // authenticated app user for UPDATE (no per-row ownership check at
       // the DB level — see the "authenticated update - trips" policy), so
-      // this app-level check is the ONLY thing enforcing it.
-      // FOUND VIA /code-review (of an unrelated commit): the original
-      // `.some(r => driverid mismatch)` form fails OPEN when the lookup
-      // returns FEWER rows than requested ids — .some() on an empty (or
-      // partial) array only checks the rows that came back, so a
-      // nonexistent/stale/mistyped trip_id (matching zero rows) silently
-      // satisfied the check instead of failing it. Every requested id must
-      // now resolve to a real row owned by the caller.
+      // this app-level check is the ONLY thing enforcing it. This is a
+      // fast fail-early check, before the expensive doc-check/TomTom calls
+      // below — see the recheck right before the write for why a SECOND
+      // call to the same helper is needed, not just this one.
       const routeTripIds = routeTrips.map(t => t.trip_id);
-      const { data: routeOwnerRows } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
-      const routeOwnerById = new Map((routeOwnerRows || []).map(r => [String(r.id), r.driverid]));
-      const routeOwnershipOk = routeTripIds.every(id => String(routeOwnerById.get(String(id))) === String(activeUserRef.current));
-      if (!routeOwnershipOk) {
+      if (!(await tripsOwnedByDriver(routeTripIds, activeUserRef.current))) {
         throw new Error("This trip isn't assigned to you.");
       }
       await assertDriverDocsCurrent(activeUserRef.current);
@@ -11677,39 +11710,38 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const tomtomTotalKm = await tomtomRealRouteKm(driver_coord, orderedPickups, dropOrdered, departAtEpochRecord);
       const totalRoadKm = tomtomTotalKm ?? haversineTotalKm;
       console.log(`[RECORD_ROUTE] route: TomTom=${tomtomTotalKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${totalRoadKm.toFixed(1)} km`);
-      // FOUND VIA /code-review, TWICE (of the ownership-check fix just
-      // above, then of THAT fix): the up-front ownership check alone isn't
-      // enough — assertDriverDocsCurrent plus two external TomTom HTTP
-      // calls all await between it and the write, a window easily long
-      // enough for an admin to reassign one of these trips mid-flight.
-      // A per-row `driverid = caller` guard on the write (first attempt at
-      // this fix) stopped a reassigned trip's OWN row from being
-      // clobbered, but totalRoadKm/the sequence numbers are a SHARED
-      // result computed once across the WHOLE original routeTrips batch —
-      // so the trips the caller still legitimately owns would silently
-      // get written with numbers computed from a route that still
-      // included the now-departed trip's stop. Re-checking ownership HERE
-      // — right after every await, immediately before any write — and
-      // rejecting the whole batch on a mismatch (rather than writing
-      // partial/stale composite data) means nothing is ever persisted
-      // from a route whose membership changed underneath it. The driver's
-      // retry (client resends Start Trip) naturally excludes the
-      // no-longer-theirs trip, since their refetched active-trip list no
-      // longer includes it.
-      const { data: recheckRows, error: recheckErr } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
-      if (recheckErr) throw recheckErr;
-      const recheckOwnerById = new Map((recheckRows || []).map(r => [String(r.id), r.driverid]));
-      const stillAllOwned = routeTripIds.every(id => String(recheckOwnerById.get(String(id))) === String(activeUserRef.current));
-      if (!stillAllOwned) {
+      // FOUND VIA /code-review, repeatedly: the up-front ownership check
+      // alone isn't enough — assertDriverDocsCurrent plus two external
+      // TomTom HTTP calls all await between it and the write, a window
+      // easily long enough for an admin to reassign one of these trips
+      // mid-flight. totalRoadKm/the sequence numbers are a SHARED result
+      // computed once across the WHOLE original routeTrips batch, so even
+      // the trips the caller still legitimately owns would get written
+      // with numbers computed from a route that still included the
+      // now-departed trip's stop. Re-checking ownership HERE — right
+      // after every await, immediately before any write — and rejecting
+      // the whole batch on a mismatch (rather than writing partial/stale
+      // composite data) means nothing is ever persisted from a route
+      // whose membership changed underneath it. The driver's retry
+      // (client resends Start Trip) naturally excludes the
+      // no-longer-theirs trip, since TRIP/ACCEPT is now idempotent (see
+      // its own comment) and their refetched active-trip list no longer
+      // includes the reassigned trip either.
+      if (!(await tripsOwnedByDriver(routeTripIds, activeUserRef.current))) {
         throw new Error("One of these trips was reassigned while your route was being calculated — please try Start Trip again.");
       }
+      // Attempt every trip's write even if one fails, rather than bailing
+      // out mid-batch and leaving LATER trips completely unattempted —
+      // then throw once, at the end, if anything failed, so the driver
+      // sees an error and retries (safe: ACCEPT is idempotent and this
+      // whole write is naturally re-runnable) instead of believing every
+      // trip in the batch got the new route when only some did. The
+      // driverid guard on each write is now belt-and-suspenders (the
+      // recheck above already confirmed ownership moments earlier)
+      // rather than the primary defense — but each write is still its
+      // own await, so it's a real, if vanishingly small, residual window.
+      const rrFailedTripIds = [];
       for (const t of routeTrips) {
-        // The driverid guard here is now belt-and-suspenders (the recheck
-        // above already confirmed ownership moments earlier) rather than
-        // the primary defense — but each write is still its own await, so
-        // it's a real, if vanishingly small, residual window. error is
-        // checked explicitly so a genuine DB/network failure is never
-        // logged as if it were an (impossible, post-recheck) reassignment.
         const { data: rrUpdated, error: rrUpdateErr } = await supabase.from("trips").update({
           routetotalkm: totalRoadKm,
           pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
@@ -11717,9 +11749,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }).eq("id", t.trip_id).eq("driverid", activeUserRef.current).select("id");
         if (rrUpdateErr) {
           console.error(`[RECORD_ROUTE] trip ${t.trip_id} update FAILED: ${rrUpdateErr.message}`);
+          rrFailedTripIds.push(t.trip_id);
         } else if (!rrUpdated || rrUpdated.length === 0) {
+          // Should be unreachable given the recheck immediately above —
+          // only a reassignment/deletion landing in the single remaining
+          // instant between that recheck and this specific row's write
+          // could cause it.
           console.warn(`[RECORD_ROUTE] trip ${t.trip_id} skipped — reassigned in the instant between the recheck above and this write.`);
+          rrFailedTripIds.push(t.trip_id);
         }
+      }
+      if (rrFailedTripIds.length > 0) {
+        throw new Error(`Couldn't save the route for trip${rrFailedTripIds.length > 1 ? "s" : ""} ${rrFailedTripIds.join(", ")} — please try Start Trip again.`);
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
