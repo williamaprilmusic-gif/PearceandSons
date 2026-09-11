@@ -3058,8 +3058,18 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
     // something conjurable client-side), but the human-readable address
     // a driver actually reads is materially more useful with the number
     // kept than silently dropped.
+    // FOUND VIA /code-review, on THIS exact fix: labelHasHouseNumber (the
+    // anchored, case-insensitive check) and the isAddress guard were
+    // added to unifiedAddressSearch/pickStreetSuggestion but never wired
+    // in here — the actual dropdown-click handler, the primary selection
+    // path for every StreetInput on the whole app — which still ran the
+    // raw `.includes()` (typed "5" wrongly "satisfied" by a suggestion
+    // labeled "125 ...") and still had no POI guard (typed "5 Pick n Pay"
+    // selecting a business hit would still save "5 Pick n Pay, ...").
     const typedHouseNum = leadingHouseNumber(query);
-    const finalLabel = (typedHouseNum && !r.label.includes(typedHouseNum)) ? `${typedHouseNum} ${r.label}` : r.label;
+    const finalLabel = (typedHouseNum && r.isAddress !== false && !labelHasHouseNumber(r.label, typedHouseNum))
+      ? `${typedHouseNum} ${r.label}`
+      : r.label;
     setQuery(finalLabel);
     setSelected({ ...r, label: finalLabel });
     setShowDrop(false);

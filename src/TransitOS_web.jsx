@@ -10967,8 +10967,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (tripRow.status !== TRIP_STATE.ASSIGNED) {
         throw new Error(`Can't accept a trip that's currently ${tripRow.status}.`);
       }
-      await assertDriverDocsCurrent(activeUserRef.current);
-      const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).single();
+      // Independent reads (a docs-expiry check, a name lookup only used
+      // for the notification text below) — FOUND VIA /code-review, in
+      // the same pass that added RECORD_ROUTE's Promise.all a few dozen
+      // lines down: no reason to pay these as two sequential round trips.
+      const [, { data: driverUser }] = await Promise.all([
+        assertDriverDocsCurrent(activeUserRef.current),
+        supabase.from("users").select("fullname").eq("id", tripRow.driverid).single(),
+      ]);
       const nowTs = nowEpoch();
       // Promote to DRIVER_CONFIRMED — driver has explicitly accepted.
       // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
