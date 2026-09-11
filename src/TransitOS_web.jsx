@@ -7577,6 +7577,30 @@ async function tripsOwnedByDriver(tripIds, driverId) {
   return tripIds.every(id => String(ownerById.get(String(id))) === String(driverId));
 }
 
+// Distinguishes "a concurrent call already achieved the exact same
+// outcome" (a genuine no-op, safe to treat as success) from "something
+// ELSE changed this row" (a real error the caller must see) after a
+// lost optimistic-concurrency race — used by TRIP/ACCEPT,
+// TRIP/DRIVER_CONFIRM, and TRIP/DECLINE right after each one's own
+// atomic `.eq("status", ...)` write matches zero rows. FOUND VIA
+// /code-review: the first two of those independently grew their own
+// copy of this check (one of them missing an `.error` check, one of
+// them checking driverid where the other didn't), and a third call site
+// was about to make it a third drifted copy — one shared implementation
+// instead.
+//   isExpectedNoop(row) — row is the trip's CURRENT columns (whichever
+//     `selectCols` asks for); return true only if it's genuinely already
+//     in the shape this action was trying to reach.
+// Throws (never silently swallows) on a failed lookup itself — a
+// transient DB/network error must never be indistinguishable from "the
+// trip actually changed."
+async function raceLostIsHarmless(tripId, isExpectedNoop, selectCols = "status") {
+  const { data: row, error } = await supabase.from("trips").select(selectCols).eq("id", tripId).maybeSingle();
+  if (error) throw error;
+  if (isExpectedNoop(row)) return true;
+  throw new Error(`This trip has changed (now ${row?.status || "unavailable"}) — please refresh and try again.`);
+}
+
 async function assertDriverDocsCurrent(driverId) {
   const { data: docsRow } = await supabase.from("driver_status").select("documents").eq("driverid", driverId).maybeSingle();
   const docs = docsRow?.documents || {};
@@ -9601,7 +9625,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const acScheduledDt = parseScheduledDateTime(acTripRow.scheduleddate, acTripRow.scheduledtimestr);
       const acHoursUntil = acScheduledDt ? (acScheduledDt.getTime() - Date.now()) / 3600000 : null;
       const acIsLate = acHoursUntil != null && acHoursUntil < 2;
-      const acOtherAgentIds = acAgentIds.filter(id => id !== action.agent_id);
+      // String()-normalized — FOUND VIA /code-review: acAgentIds comes
+      // from the raw, unmapped DB row (acTripRow.agentid/extraagentids),
+      // while action.agent_id is always activeUserRef.current — the
+      // exact id-shape mismatch this file's sid()/String() hydration
+      // layer exists to paper over. A strict `!==` that never matches
+      // would leave the caller in acOtherAgentIds, making acWasOnlyAgent
+      // false even when this genuinely is the trip's last remaining
+      // agent — taking the partial-removal branch instead of
+      // archiving/deleting the trip, while the notification text still
+      // claims it was cancelled outright.
+      const acOtherAgentIds = acAgentIds.filter(id => String(id) !== String(action.agent_id));
       const acWasOnlyAgent = acOtherAgentIds.length === 0;
 
       // FOUND VIA /code-review: this notify+audit block used to run
@@ -9687,8 +9721,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const acDeleteRes = must(await supabase.from("trips").delete().eq("id", action.trip_id).eq("status", acTripRow.status).select("id"));
           if (!acDeleteRes.data || acDeleteRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
         }
-        // The write above succeeded — safe to tell people about it now.
-        await acSendCancelNotifications();
         if (acIsLate && acTripRow.driverid) {
           // The archive branch above updates the trip row in place —
           // driver_status.currenttripid may still point at this now-
@@ -9703,19 +9735,38 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             updatedat: new Date(acNowTs).toISOString(),
           }).eq("driverid", acTripRow.driverid);
         }
+        // Notifications LAST — FOUND VIA /code-review: insertNotification
+        // can genuinely throw (must()-wrapped, deliberately, so a failed
+        // insert isn't silently swallowed). Running it before the
+        // driver_status re-point above meant a transient notification
+        // failure would abort this handler with the trip already
+        // archived/deleted but driver_status left stale/incorrect — core
+        // data consistency must complete before the "tell people" step,
+        // which is comparatively best-effort.
+        await acSendCancelNotifications();
         refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
       }
 
       // Other agents remain on the trip — remove just this one, same
       // primary-slot-promotion and re-sequencing logic REMOVE_AGENT uses.
-      const acWasPrimary = acTripRow.agentid === action.agent_id;
+      // String()-normalized throughout — FOUND VIA /code-review: these
+      // three (plus completedpickups just below) were still strict `===`/
+      // `!==` even though the neighboring extrapickups/extradropoffs
+      // filters two lines down already use the normalized form. A
+      // mismatch would leave a phantom extraagentid with no matching
+      // pickup/dropoff coords, a stale completedpickups entry able to
+      // prematurely satisfy an "all agents handled" check elsewhere, and
+      // (for acWasPrimary) skip the departing primary's promotion
+      // entirely — leaving pickup/dropoff coordinates and a phone number
+      // on the trip that still belong to the agent who just cancelled.
+      const acWasPrimary = String(acTripRow.agentid) === String(action.agent_id);
       const acNewExtraPickups = (acTripRow.extrapickups || []).filter(p => String(p.agent_id) !== String(action.agent_id));
-      const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => id !== action.agent_id);
+      const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => String(id) !== String(action.agent_id));
       // Also remove this agent's dropoff entry.
       const acNewExtraDropoffs = (acTripRow.extradropoffs || []).filter(d => String(d.agent_id) !== String(action.agent_id));
       const acUpdate = {
-        completedpickups: (acTripRow.completedpickups || []).filter(id => id !== action.agent_id),
+        completedpickups: (acTripRow.completedpickups || []).filter(id => String(id) !== String(action.agent_id)),
         extrapickups: acNewExtraPickups, extraagentids: acNewExtraAgentIds, extradropoffs: acNewExtraDropoffs,
       };
       if (acWasPrimary) {
@@ -9728,7 +9779,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // promotion logic above.
           acUpdate.pickuplat = acPromoted.lat; acUpdate.pickuplng = acPromoted.lng; acUpdate.pickuplabel = acPromoted.label; acUpdate.phone = acPromoted.phone ?? null;
           acUpdate.extrapickups = acNewExtraPickups.slice(1);
-          acUpdate.extraagentids = acNewExtraAgentIds.filter(id => id !== acPromoted.agent_id);
+          // String()-normalized — same sibling risk as above: acPromoted
+          // comes from extrapickups (JSONB), acNewExtraAgentIds from
+          // extraagentids, two different columns with no guaranteed
+          // matching JS type for the same underlying id.
+          acUpdate.extraagentids = acNewExtraAgentIds.filter(id => String(id) !== String(acPromoted.agent_id));
         }
         // Promote dropoff slot too if primary agent held it.
         const acPromotedDrop = acNewExtraDropoffs[0];
@@ -9756,8 +9811,6 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         acTripRow.updatedat
       ).select("id"));
       if (!acPartialRes.data || acPartialRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
-      // The write above succeeded — safe to tell people about it now.
-      await acSendCancelNotifications();
 
       if (acTripRow.driverid) {
         // Scoped to the SAME DATE as the trip being modified — a 7th copy
@@ -9794,6 +9847,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
       }
+      // Notifications LAST — see the identical fix/comment in the
+      // acWasOnlyAgent branch above: insertNotification can genuinely
+      // throw, and the driver's route/sequencing recompute just above is
+      // core data consistency that must complete first.
+      await acSendCancelNotifications();
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -10983,6 +11041,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     }
 
     case "TRIP/DRIVER_CONFIRM": {
+      // FOUND VIA /code-review: no live `dispatch({ type: "TRIP/DRIVER_CONFIRM" })`
+      // call site exists anywhere in this file any more — see
+      // handleStartTrip's own comment on TRIP/ACCEPT for why (this used
+      // to run right after ACCEPT, but ACCEPT alone already reaches
+      // DRIVER_CONFIRMED, so the follow-up call always threw "ILLEGAL"
+      // and was removed from the client). Kept as a real, hardened
+      // handler (not deleted) in case something dispatches it again —
+      // its ownership/idempotency/race-hardening fixes are correct — but
+      // TRIP/ACCEPT below is the one actually reachable from the UI and
+      // deserves priority if choosing where to look for a live bug.
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
       // Ownership check — without this, any authenticated driver could
@@ -11020,17 +11088,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // closes the same double-tap TOCTOU just fixed on TRIP/ACCEPT.
       const confirmRes = must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id).eq("status", tripRow.status).select("id"));
       if (!confirmRes.data || confirmRes.data.length === 0) {
-        // FOUND VIA /code-review: a lost race here isn't necessarily "a
-        // duplicate confirm already went through" — it could equally be a
-        // cancellation/reassignment landing in the same window, which is
-        // a genuinely different outcome the driver should be told about,
-        // not silently swallowed as success. Re-read to tell the two
-        // apart: only a trip that's now ACTUALLY DRIVER_CONFIRMED is a
-        // true no-op (the trip IS confirmed, just not by this exact
-        // call); anything else surfaces as a real error.
-        const { data: ccRecheck } = await supabase.from("trips").select("status").eq("id", action.trip_id).maybeSingle();
-        if (ccRecheck?.status === TRIP_STATE.DRIVER_CONFIRMED) { refetch(); return; }
-        throw new Error(`Couldn't confirm — this trip is now ${ccRecheck?.status || "no longer available"}. Please refresh.`);
+        // raceLostIsHarmless — see its own comment. A lost race here isn't
+        // necessarily "a duplicate confirm already went through" — it
+        // could equally be a cancellation/reassignment landing in the
+        // same window (including a reassignment to a DIFFERENT driver who
+        // then confirmed it themselves — driverid is checked alongside
+        // status for exactly that reason, matching TRIP/ACCEPT's identical
+        // fix), a genuinely different outcome this driver should be told
+        // about, not silently swallowed as success.
+        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && String(r?.driverid) === String(activeUserRef.current), "status, driverid");
+        refetch(); return;
       }
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
@@ -11104,11 +11171,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
       }).eq("id", action.trip_id).eq("status", TRIP_STATE.ASSIGNED).select("id"));
       if (!acceptRes.data || acceptRes.data.length === 0) {
-        // Lost the race to a concurrent ACCEPT (or the trip moved on for
-        // some other reason in the instant since the read above) — the
-        // trip IS accepted, just not by this exact call, so this is the
-        // same idempotent outcome as the DRIVER_CONFIRMED check above, not
-        // a failure the driver needs to see or retry.
+        // raceLostIsHarmless — see its own comment. FOUND VIA /code-review:
+        // this used to treat EVERY lost race as "already accepted, safe
+        // no-op" unconditionally — but the concurrent write that changed
+        // this row could just as easily have been a reassignment to a
+        // DIFFERENT driver who then confirmed it themselves (status is
+        // DRIVER_CONFIRMED again, but for someone else); a driver's client
+        // silently treating that as their own successful accept would
+        // proceed into RECORD_ROUTE believing this trip is still theirs.
+        // driverid is checked alongside status for exactly that reason
+        // (TRIP/DRIVER_CONFIRM's identical check only compares status —
+        // flagged as a smaller gap there since RECORD_ROUTE's own
+        // ownership re-verification is the actual backstop for ACCEPT's
+        // callers; kept consistent with DECLINE's driverid check here too).
+        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && String(r?.driverid) === String(activeUserRef.current), "status, driverid");
         refetch();
         return;
       }
@@ -11475,15 +11551,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         updatedat: nowTs,
       }).eq("id", action.trip_id).eq("status", tripRow.status).select("id"));
       if (!declineRes.data || declineRes.data.length === 0) {
-        // FOUND VIA /code-review: same reasoning as TRIP/DRIVER_CONFIRM's
-        // identical fix — a lost race here could be a genuinely different
-        // outcome (an admin reassigned/removed the driver, not another
-        // decline), which a silent "success" would paper over. Only a
-        // trip that's now ACTUALLY in the exact declined shape (still
-        // UNASSIGNED_BOOKING, driverid cleared) is a true no-op.
-        const { data: dcRecheck } = await supabase.from("trips").select("status, driverid").eq("id", action.trip_id).maybeSingle();
-        if (dcRecheck && dcRecheck.status === TRIP_STATE.UNASSIGNED_BOOKING && dcRecheck.driverid == null) { refetch(); return; }
-        throw new Error(`Couldn't decline — this trip has changed (now ${dcRecheck?.status || "unavailable"}). Please refresh.`);
+        // raceLostIsHarmless — see its own comment. A lost race here could
+        // be a genuinely different outcome (an admin reassigned/removed
+        // the driver, not another decline), which a silent "success"
+        // would paper over. Only a trip that's now ACTUALLY in the exact
+        // declined shape (still UNASSIGNED_BOOKING, driverid cleared) is
+        // a true no-op.
+        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.UNASSIGNED_BOOKING && r?.driverid == null, "status, driverid");
+        refetch(); return;
       }
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", action.driver_id)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
