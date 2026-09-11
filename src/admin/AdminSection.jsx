@@ -86,6 +86,7 @@ import {
   scopeUsersToCompany,
   sortDropoffCoordsByProximity,
   sortDropoffsByProximity,
+  leadingHouseNumber,
   staticSearch,
   supabase,
   tomtomTrafficIncidents,
@@ -2929,6 +2930,18 @@ export function FinancialPortal({ state, dispatch, user }) {
   );
 }
 
+// leadingHouseNumber is imported from TransitOS_web.jsx (shared with
+// unifiedAddressSearch's own Nominatim-fallback check) — see its comment.
+// FOUND VIA DIRECT USER REPORT: for a real address (Cedric Close,
+// Mitchells Plain), TomTom's search only has a STREET-level record for
+// that road at all (verified directly against TomTom's own API: type
+// "Street", no streetNumber on any hit) and Nominatim/OpenStreetMap has
+// no record of the street whatsoever — a real coverage gap in both of
+// this app's geocoding vendors for this area, not something either can
+// be queried "harder" to fix. Google Maps/Waze resolve it because their
+// proprietary datasets are more complete there. selectResult below is
+// the part that WAS fixable: preserving a typed house number a
+// street-level suggestion's own label doesn't carry.
 function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   const [query, setQuery] = useState(value || "");
   const [results, setResults] = useState([]);
@@ -3025,12 +3038,26 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   };
 
   const selectResult = (r) => {
-    setQuery(r.label);
-    setSelected(r);
+    // A suggestion can be STREET-level (no house number in the vendor's
+    // own data — see leadingHouseNumber's comment) even when the admin
+    // DID type a specific number. Previously selecting always overwrote
+    // whatever was typed with the vendor's label verbatim, silently
+    // dropping that number — a saved home address that read "Cedric
+    // Close, Mitchells Plain" with no way to tell a driver which house.
+    // Preserve a typed leading number the result doesn't already carry,
+    // prepended onto the saved label. The lat/lng underneath is still
+    // only street-level precision (a real vendor-data limit, not
+    // something conjurable client-side), but the human-readable address
+    // a driver actually reads is materially more useful with the number
+    // kept than silently dropped.
+    const typedHouseNum = leadingHouseNumber(query);
+    const finalLabel = (typedHouseNum && !r.label.includes(typedHouseNum)) ? `${typedHouseNum} ${r.label}` : r.label;
+    setQuery(finalLabel);
+    setSelected({ ...r, label: finalLabel });
     setShowDrop(false);
     setResults([]);
     setStreetSuggestions([]);
-    onChange({ street: r.label, area: r.area, coord: { lat: r.lat, lng: r.lng, label: r.label }, label: r.label, confirmed: true });
+    onChange({ street: finalLabel, area: r.area, coord: { lat: r.lat, lng: r.lng, label: finalLabel }, label: finalLabel, confirmed: true });
     inputRef.current?.blur();
   };
 

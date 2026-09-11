@@ -3807,14 +3807,50 @@ async function nominatimReverseGeocode(lat, lng) {
   }
 }
 
+// A typed address that LEADS with digits ("5 Cedric Close") is asking for
+// a specific house number — used below to notice when TomTom's results
+// don't actually carry the number the person typed, and by StreetInput
+// (AdminSection.jsx) to preserve a typed number a selected suggestion's
+// label doesn't have. Exported so both share one implementation.
+export function leadingHouseNumber(text) {
+  const m = (text || "").trim().match(/^(\d+[A-Za-z]?)\b/);
+  return m ? m[1] : null;
+}
+
 export async function unifiedAddressSearch(query) {
   const offline = staticSearch(query);
+  const houseNum = leadingHouseNumber(query);
+  let tomtom = [];
   if (TOMTOM_API_KEY) {
-    const tomtom = await tomtomAutocompleteSearch(query);
-    if (tomtom.length > 0) return { results: tomtom, liveOk: true, source: "tomtom" };
+    tomtom = await tomtomAutocompleteSearch(query);
+    // A typed house number satisfied by at least one TomTom hit -> done,
+    // as before. FOUND VIA DIRECT USER REPORT: TomTom's fuzzy search can
+    // return only a STREET-level record (no house numbers at all) for a
+    // real, typed address even when Nominatim's separately-sourced
+    // OpenStreetMap data happens to have the precise point (or vice
+    // versa) — the two vendors' coverage gaps don't overlap. Previously
+    // ANY non-empty TomTom result short-circuited straight past Nominatim
+    // — permanently and silently, since TomTom almost always returns
+    // SOMETHING — so a house number Nominatim could have resolved was
+    // never even attempted. A typed house number that none of TomTom's
+    // hits actually carry now triggers a real Nominatim attempt too.
+    if (tomtom.length > 0 && (!houseNum || tomtom.some(r => r.label.includes(houseNum)))) {
+      return { results: tomtom, liveOk: true, source: "tomtom" };
+    }
   }
   const live = await nominatimSearch(query);
-  if (live.length > 0) return { results: live, liveOk: true, source: "nominatim" };
+  if (live.length > 0) {
+    // Nominatim resolved it (or no house number was asked for in the
+    // first place) — lead with it. TomTom's hits, if any, are still
+    // offered after in case the admin actually wanted one of those
+    // instead (e.g. a POI/business-name search, where TomTom's `poi.name`
+    // matching is genuinely the better source) — deduped by coordinate.
+    const merged = [...live, ...tomtom.filter(t => !live.some(l => l.lat === t.lat && l.lng === t.lng))];
+    return { results: merged, liveOk: true, source: "nominatim" };
+  }
+  // Neither source resolved the typed house number — TomTom's
+  // street-level hit (if any) is still better than nothing.
+  if (tomtom.length > 0) return { results: tomtom, liveOk: true, source: "tomtom" };
   return { results: offline, liveOk: false, source: "offline" };
 }
 
