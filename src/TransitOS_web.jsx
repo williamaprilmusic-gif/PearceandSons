@@ -11677,27 +11677,48 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const tomtomTotalKm = await tomtomRealRouteKm(driver_coord, orderedPickups, dropOrdered, departAtEpochRecord);
       const totalRoadKm = tomtomTotalKm ?? haversineTotalKm;
       console.log(`[RECORD_ROUTE] route: TomTom=${tomtomTotalKm?.toFixed(1) ?? "n/a (used haversine fallback)"} km, using=${totalRoadKm.toFixed(1)} km`);
-      // FOUND VIA /code-review (of the ownership-check fix just above):
-      // that check runs ONCE, up front — but assertDriverDocsCurrent plus
-      // two external TomTom HTTP calls (buildPickupSequenceTomTom,
-      // tomtomRealRouteKm) all await between it and this write, a window
-      // easily long enough for an admin to reassign one of these trips to
-      // a different driver. Without a fresh ownership check, this loop
-      // would still overwrite that trip's route km/sequence with THIS
-      // (now former) driver's stale data. Scoping the UPDATE itself to
-      // `driverid = caller` re-verifies ownership atomically with the
-      // write — a trip reassigned mid-flight simply matches zero rows and
-      // is left untouched (its NEW driver's own Start Trip / dispatch
-      // re-route will set correct values) instead of being silently
-      // clobbered.
+      // FOUND VIA /code-review, TWICE (of the ownership-check fix just
+      // above, then of THAT fix): the up-front ownership check alone isn't
+      // enough — assertDriverDocsCurrent plus two external TomTom HTTP
+      // calls all await between it and the write, a window easily long
+      // enough for an admin to reassign one of these trips mid-flight.
+      // A per-row `driverid = caller` guard on the write (first attempt at
+      // this fix) stopped a reassigned trip's OWN row from being
+      // clobbered, but totalRoadKm/the sequence numbers are a SHARED
+      // result computed once across the WHOLE original routeTrips batch —
+      // so the trips the caller still legitimately owns would silently
+      // get written with numbers computed from a route that still
+      // included the now-departed trip's stop. Re-checking ownership HERE
+      // — right after every await, immediately before any write — and
+      // rejecting the whole batch on a mismatch (rather than writing
+      // partial/stale composite data) means nothing is ever persisted
+      // from a route whose membership changed underneath it. The driver's
+      // retry (client resends Start Trip) naturally excludes the
+      // no-longer-theirs trip, since their refetched active-trip list no
+      // longer includes it.
+      const { data: recheckRows, error: recheckErr } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
+      if (recheckErr) throw recheckErr;
+      const recheckOwnerById = new Map((recheckRows || []).map(r => [String(r.id), r.driverid]));
+      const stillAllOwned = routeTripIds.every(id => String(recheckOwnerById.get(String(id))) === String(activeUserRef.current));
+      if (!stillAllOwned) {
+        throw new Error("One of these trips was reassigned while your route was being calculated — please try Start Trip again.");
+      }
       for (const t of routeTrips) {
-        const { data: rrUpdated } = await supabase.from("trips").update({
+        // The driverid guard here is now belt-and-suspenders (the recheck
+        // above already confirmed ownership moments earlier) rather than
+        // the primary defense — but each write is still its own await, so
+        // it's a real, if vanishingly small, residual window. error is
+        // checked explicitly so a genuine DB/network failure is never
+        // logged as if it were an (impossible, post-recheck) reassignment.
+        const { data: rrUpdated, error: rrUpdateErr } = await supabase.from("trips").update({
           routetotalkm: totalRoadKm,
           pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
           dropsequencenum: firstDropoffPosForTrip[t.trip_id] ?? t.drop_sequence_num ?? null,
         }).eq("id", t.trip_id).eq("driverid", activeUserRef.current).select("id");
-        if (!rrUpdated || rrUpdated.length === 0) {
-          console.warn(`[RECORD_ROUTE] trip ${t.trip_id} skipped — no longer assigned to this driver (reassigned while the route was being computed).`);
+        if (rrUpdateErr) {
+          console.error(`[RECORD_ROUTE] trip ${t.trip_id} update FAILED: ${rrUpdateErr.message}`);
+        } else if (!rrUpdated || rrUpdated.length === 0) {
+          console.warn(`[RECORD_ROUTE] trip ${t.trip_id} skipped — reassigned in the instant between the recheck above and this write.`);
         }
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
