@@ -11599,10 +11599,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // checks driverid against the caller; this one previously didn't, so
       // any dispatch call naming someone else's trip_ids in `trips` could
       // overwrite that driver's route sequence numbers and total km with
-      // attacker-controlled values.
+      // attacker-controlled values. `trips` RLS only requires an
+      // authenticated app user for UPDATE (no per-row ownership check at
+      // the DB level — see the "authenticated update - trips" policy), so
+      // this app-level check is the ONLY thing enforcing it.
+      // FOUND VIA /code-review (of an unrelated commit): the original
+      // `.some(r => driverid mismatch)` form fails OPEN when the lookup
+      // returns FEWER rows than requested ids — .some() on an empty (or
+      // partial) array only checks the rows that came back, so a
+      // nonexistent/stale/mistyped trip_id (matching zero rows) silently
+      // satisfied the check instead of failing it. Every requested id must
+      // now resolve to a real row owned by the caller.
       const routeTripIds = routeTrips.map(t => t.trip_id);
       const { data: routeOwnerRows } = await supabase.from("trips").select("id, driverid").in("id", routeTripIds);
-      if ((routeOwnerRows || []).some(r => String(r.driverid) !== String(activeUserRef.current))) {
+      const routeOwnerById = new Map((routeOwnerRows || []).map(r => [String(r.id), r.driverid]));
+      const routeOwnershipOk = routeTripIds.every(id => String(routeOwnerById.get(String(id))) === String(activeUserRef.current));
+      if (!routeOwnershipOk) {
         throw new Error("This trip isn't assigned to you.");
       }
       await assertDriverDocsCurrent(activeUserRef.current);
