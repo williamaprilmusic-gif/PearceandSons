@@ -7605,6 +7605,38 @@ async function raceLostIsHarmless(tripId, isExpectedNoop, selectCols) {
   throw new Error(`This trip has changed (now ${row?.status || "unavailable"}) — please refresh and try again.`);
 }
 
+// Runs `fn` and swallows (logs, doesn't rethrow) any failure — for a step
+// that's genuinely best-effort AFTER the action's own core write has
+// already succeeded and been verified (e.g. a notification, an audit-log
+// entry): the caller's action is already a real success by that point,
+// and a transient failure telling people about it must never surface as
+// if the whole action failed. FOUND VIA /code-review, TWICE: first a bare
+// `await insertNotification(...)` sequence run before the guarded write
+// meant a failed write still looked "already announced"; then, once
+// notifications were moved to run last, an unguarded throw there still
+// masked an already-successful action as an error AND (if steps ran
+// sequentially inside one try/catch) silently skipped every step after
+// the first failure. Call bestEffort separately per INDEPENDENT step
+// (not one try/catch wrapping several awaits) so one failing notification
+// doesn't take a second, unrelated one down with it.
+async function bestEffort(label, fn) {
+  try { await fn(); }
+  catch (e) { console.error(`[${label}] failed: ${e.message}`); }
+}
+
+// String()-normalized id equality — for comparing a RAW, unmapped DB
+// column (e.g. tripRow.agentid, fresh off a `select("*")`) against an
+// already-hydrated app-side id (e.g. action.agent_id, activeUserRef.current).
+// FOUND VIA /code-review: this exact one-line comparison was independently
+// gotten wrong (bare `===`/`!==`, no String() at all) at half a dozen call
+// sites across this file's Supabase handlers, all the same root cause —
+// this app's ids can be a JS number OR a string depending on which layer
+// last touched them, and nothing here guarantees which side of a raw-vs-
+// hydrated comparison has which.
+function sameId(a, b) {
+  return String(a) === String(b);
+}
+
 async function assertDriverDocsCurrent(driverId) {
   const { data: docsRow } = await supabase.from("driver_status").select("documents").eq("driverid", driverId).maybeSingle();
   const docs = docsRow?.documents || {};
@@ -8657,7 +8689,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           { name: driverUserForComplianceRem?.fullname }, driverStatusForComplianceRem, routeDistanceKmRem, totalAgentCountRem
         );
         for (const issue of complianceIssuesRem) {
-          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false });
+          await bestEffort("REMOVE_AGENT compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false }));
         }
       }
 
@@ -8667,32 +8699,36 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // "broadcast to a role except one sub-tier" mechanism (every other
       // admin notification is either everyone with ROLE.ADMIN, or a
       // specific user id) — resolved explicitly here via a query on
-      // adminlevel, and targeted individually through for_user_ids.
+      // adminlevel, and targeted individually through for_user_ids. Every
+      // step below is bestEffort — FOUND VIA /code-review: the trip write
+      // above (guarded, verified) has already succeeded by this point, so
+      // a failure telling people about it must never surface as if the
+      // whole removal failed.
       const removedAgentName = (await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle()).data?.fullname;
-      await insertNotification({
+      await bestEffort("REMOVE_AGENT agent notify", () => insertNotification({
         type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
         message: `You've been removed from trip ${action.trip_id}.`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
-      });
+      }));
       if (tripRow.driverid) {
-        await insertNotification({
+        await bestEffort("REMOVE_AGENT driver notify", () => insertNotification({
           type: "TRIP_UPDATED", for_roles: [ROLE.DRIVER], for_user_ids: [tripRow.driverid],
           message: `${removedAgentName || "A passenger"} was removed from trip ${action.trip_id} by an admin — your route has been updated.`,
           trip_id: action.trip_id, ts: nowEpoch(), read: false,
-        });
+        }));
       }
       const { data: nonViewerAdmins } = await supabase.from("users").select("id").eq("role", ROLE.ADMIN).neq("adminlevel", ADMIN_LEVEL.VIEWER);
       if (nonViewerAdmins && nonViewerAdmins.length > 0) {
-        await insertNotification({
+        await bestEffort("REMOVE_AGENT admin notify", () => insertNotification({
           type: "TRIP_UPDATED", for_roles: [ROLE.ADMIN], for_user_ids: nonViewerAdmins.map(a => a.id),
           message: `${removedAgentName || "A passenger"} was removed from trip ${action.trip_id} by ${actingAdminRemove.name}.`,
           trip_id: action.trip_id, ts: nowEpoch(), read: false,
-        });
+        }));
       }
-      await logAuditAction({
+      await bestEffort("REMOVE_AGENT audit log", () => logAuditAction({
         actorId: actingAdminRemove.id, actorName: actingAdminRemove.name, actionType: "TRIP/REMOVE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: "Removed passenger from trip",
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -8786,19 +8822,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           { name: driverUserForComplianceReloc?.fullname }, driverStatusForComplianceReloc, routeDistanceKmReloc, totalAgentCountReloc
         );
         for (const issue of complianceIssuesReloc) {
-          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false });
+          await bestEffort("RELOCATE_AGENT compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowEpoch(), read: false }));
         }
       }
 
-      await insertNotification({
+      // bestEffort — FOUND VIA /code-review: the trip write above (guarded,
+      // verified) has already succeeded, so a failure telling the agent
+      // about it must never surface as if the relocation itself failed.
+      await bestEffort("RELOCATE_AGENT agent notify", () => insertNotification({
         type: "TRIP_UPDATED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
         message: `Your pickup for trip ${action.trip_id} was moved to ${action.pickup_label}.`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
-      });
-      await logAuditAction({
+      }));
+      await bestEffort("RELOCATE_AGENT audit log", () => logAuditAction({
         actorId: actingAdminReloc.id, actorName: actingAdminReloc.name, actionType: "TRIP/RELOCATE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Relocated pickup to ${action.pickup_label}`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -9501,101 +9540,35 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
     case "TRIP/ADMIN_CANCEL": {
       // Admin-initiated cancellation of any not-yet-completed trip — see
       // the in-memory reducer's case for the TRIP/CANCEL distinction.
-      // Notifications are inserted BEFORE the delete and reference the
-      // trip id as plain data, so they survive as the record of what was
-      // cancelled and when (plus the audit log entry below).
       const actingAdminCancel = await assertAdminPermission(activeUserRef, "manageTrips");
       const { data: tripRow } = await supabase.from("trips").select("*").eq("id", action.trip_id).single();
       if (!tripRow) throw new Error("Trip not found");
       if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) throw new Error("Completed trips can't be cancelled — they're already archived.");
       const nowTs = nowEpoch();
-      const cancelAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      if (cancelAgentIds.length) {
-        await insertNotification({
-          type: "TRIP_CANCELLED", for_roles: [ROLE.AGENT], for_user_ids: cancelAgentIds,
-          message: `Your trip ${action.trip_id} (${tripRow.scheduleddate || ""} ${tripRow.scheduledtimestr || ""}) was cancelled by an admin.`,
-          trip_id: action.trip_id, ts: nowTs, read: false,
-        });
-      }
+      // Computed once, read-only, before any writes — used both to
+      // decide the driver_status clear below AND the post-delete route
+      // recompute further down.
+      const remaining = tripRow.driverid
+        ? (await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+            .neq("id", action.trip_id)).data
+        : null;
       if (tripRow.driverid) {
-        await insertNotification({
-          type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [tripRow.driverid],
-          message: `Trip ${action.trip_id} was cancelled by an admin and removed from your route.`,
-          trip_id: action.trip_id, ts: nowTs, read: false,
-        });
-      }
-      await logAuditAction({
-        actorId: actingAdminCancel.id, actorName: actingAdminCancel.name, actionType: "TRIP/ADMIN_CANCEL",
-        tripId: action.trip_id, details: `Cancelled trip (was ${tripRow.status})`,
-      });
-      // Clear the driver's currenttripid BEFORE deleting the trip, not
-      // after — driver_status.currenttripid is a foreign key pointing
-      // AT trips.id, so deleting the trip while this driver's
-      // currenttripid still points to it fails with a real, confirmed
-      // production error: "update or delete on table trips violates
-      // foreign key constraint driver_status_currenttripid_fkey".
-      // Reversed from the original order (delete first, clear after),
-      // which is exactly what was hitting that error.
-      if (tripRow.driverid) {
-        const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
-          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
-          .neq("id", action.trip_id);
+        // Clear the driver's currenttripid BEFORE deleting the trip, not
+        // after — driver_status.currenttripid is a foreign key pointing
+        // AT trips.id, so deleting the trip while this driver's
+        // currenttripid still points to it fails with a real, confirmed
+        // production error: "update or delete on table trips violates
+        // foreign key constraint driver_status_currenttripid_fkey". This
+        // is the one piece of this handler that genuinely MUST happen
+        // before the delete — everything else (notifications, audit,
+        // route recompute for the driver's OTHER trips) doesn't share
+        // that DB-level dependency and now runs after, see below.
         await supabase.from("driver_status").update({
           state: remaining && remaining.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
           currenttripid: remaining?.[0]?.id || null,
           updatedat: new Date(nowTs).toISOString(),
         }).eq("driverid", tripRow.driverid);
-        // Re-sequence + recompute driver_route_km/driver_route_exceeds_policy
-        // for whatever's left, same as ADD_AGENT/REMOVE_AGENT/
-        // RELOCATE_AGENT/ASSIGN_DRIVER already do on any change to a
-        // driver's route — this handler was missing it entirely. Without
-        // this, a driver with two merged trips whose combined route was
-        // computed together would keep the OLD, now-stale (inflated)
-        // driver_route_km/driver_route_exceeds_policy on the surviving
-        // trip after cancelling the other one, with no compliance
-        // re-check firing either way (a route that's now genuinely fine
-        // could keep showing as exceeding policy, or vice versa).
-        if (remaining && remaining.length > 0) {
-          // Scoped to the SAME DATE as the cancelled trip — same fix as
-          // TRIP/ADD_AGENT, TRIP/REMOVE_AGENT, TRIP/RELOCATE_AGENT, and
-          // TRIP/ASSIGN_DRIVER (all found and fixed together): the
-          // driver's route/compliance numbers must never be computed
-          // across their whole multi-day backlog at once.
-          const { data: driverTripsRawCancel } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid)
-            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
-            .eq("scheduleddate", tripRow.scheduleddate);
-          const allForDriverCancel = (driverTripsRawCancel || []).map(r => {
-            const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
-            const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
-            const dropoffCoords = (() => {
-              const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
-              const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
-              return ed.length > 0 ? [...fd, ...ed] : fd;
-            })();
-            return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
-          });
-          const supaCoCancel = await fetchCompanyAnchor();
-          const departEpochCancel = earliestScheduledTime(driverTripsRawCancel || []);
-          const {
-            seqMap: seqMapCancel, dropMap: dropMapCancel, totalAgentCount: totalAgentCountCancel,
-            routeDistanceKm: routeDistanceKmCancel, policyCapKm: policyCapKmCancel, exceedsPolicy: exceedsPolicyCancel,
-          } = await recomputeDriverRouteAndCompliance(allForDriverCancel, supaCoCancel, departEpochCancel);
-          for (const t of driverTripsRawCancel || []) {
-            const patch = {};
-            if (seqMapCancel[t.id] != null && seqMapCancel[t.id] !== t.pickupordernum) patch.pickupordernum = seqMapCancel[t.id];
-            if (dropMapCancel[t.id] != null && dropMapCancel[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMapCancel[t.id];
-            patch.driverroutekm = routeDistanceKmCancel; patch.driverroutecapkm = policyCapKmCancel; patch.driverrouteexceedspolicy = exceedsPolicyCancel;
-            if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
-          }
-          const { data: driverUserForComplianceCancel } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
-          const { data: driverStatusForComplianceCancel } = await supabase.from("driver_status").select("capacity").eq("driverid", tripRow.driverid).maybeSingle();
-          const complianceIssuesCancel = checkComplianceTriggers(
-            { name: driverUserForComplianceCancel?.fullname }, driverStatusForComplianceCancel, routeDistanceKmCancel, totalAgentCountCancel
-          );
-          for (const issue of complianceIssuesCancel) {
-            await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: remaining[0]?.id ?? action.trip_id, ts: nowTs, read: false });
-          }
-        }
       }
       // Safety net: also clear ANY OTHER driver_status row that might still
       // reference this trip_id as currenttripid (e.g. left over from an
@@ -9613,6 +9586,87 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!cancelDeleteResult || cancelDeleteResult.length === 0) {
         throw new Error("This trip was just changed by someone else — please refresh and try again.");
       }
+      // FOUND VIA /code-review: everything from here down used to run
+      // BEFORE the guarded delete above (its own comment even said so —
+      // "notifications are inserted BEFORE the delete... so they survive
+      // as the record of what was cancelled" — reasoning about surviving
+      // the delete, not about whether the delete would actually happen).
+      // If the delete then lost its optimistic-concurrency race, agents/
+      // driver had ALREADY been told the trip was cancelled and the audit
+      // log already recorded it — a false record for a cancellation that
+      // never took effect, the exact bug class fixed on the sibling
+      // TRIP/AGENT_CANCEL a few commits back. The delete is now verified
+      // FIRST; everything below only runs once it's actually succeeded.
+      if (tripRow.driverid && remaining && remaining.length > 0) {
+        // Re-sequence + recompute driver_route_km/driver_route_exceeds_policy
+        // for whatever's left, same as ADD_AGENT/REMOVE_AGENT/
+        // RELOCATE_AGENT/ASSIGN_DRIVER already do on any change to a
+        // driver's route — this handler was missing it entirely. Without
+        // this, a driver with two merged trips whose combined route was
+        // computed together would keep the OLD, now-stale (inflated)
+        // driver_route_km/driver_route_exceeds_policy on the surviving
+        // trip after cancelling the other one, with no compliance
+        // re-check firing either way (a route that's now genuinely fine
+        // could keep showing as exceeding policy, or vice versa).
+        // Scoped to the SAME DATE as the cancelled trip — same fix as
+        // TRIP/ADD_AGENT, TRIP/REMOVE_AGENT, TRIP/RELOCATE_AGENT, and
+        // TRIP/ASSIGN_DRIVER (all found and fixed together): the
+        // driver's route/compliance numbers must never be computed
+        // across their whole multi-day backlog at once.
+        const { data: driverTripsRawCancel } = await supabase.from("trips").select("*").eq("driverid", tripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT])
+          .eq("scheduleddate", tripRow.scheduleddate);
+        const allForDriverCancel = (driverTripsRawCancel || []).map(r => {
+          const first = r.pickuplat != null ? [{ lat: r.pickuplat, lng: r.pickuplng, agent_id: r.agentid }] : [];
+          const extra = (r.extrapickups || []).map(p => ({ lat: p.lat, lng: p.lng, agent_id: p.agent_id }));
+          const dropoffCoords = (() => {
+            const fd = r.dropofflat != null ? [{ lat: r.dropofflat, lng: r.dropofflng, agent_id: r.agentid }] : [];
+            const ed = (r.extradropoffs || []).map(d => ({ lat: d.lat, lng: d.lng, agent_id: d.agent_id }));
+            return ed.length > 0 ? [...fd, ...ed] : fd;
+          })();
+          return { trip_id: r.id, pickup_sequence_coords: [...first, ...extra], dropoff_sequence_coords: dropoffCoords, direction: r.direction };
+        });
+        const supaCoCancel = await fetchCompanyAnchor();
+        const departEpochCancel = earliestScheduledTime(driverTripsRawCancel || []);
+        const {
+          seqMap: seqMapCancel, dropMap: dropMapCancel, totalAgentCount: totalAgentCountCancel,
+          routeDistanceKm: routeDistanceKmCancel, policyCapKm: policyCapKmCancel, exceedsPolicy: exceedsPolicyCancel,
+        } = await recomputeDriverRouteAndCompliance(allForDriverCancel, supaCoCancel, departEpochCancel);
+        for (const t of driverTripsRawCancel || []) {
+          const patch = {};
+          if (seqMapCancel[t.id] != null && seqMapCancel[t.id] !== t.pickupordernum) patch.pickupordernum = seqMapCancel[t.id];
+          if (dropMapCancel[t.id] != null && dropMapCancel[t.id] !== t.dropsequencenum) patch.dropsequencenum = dropMapCancel[t.id];
+          patch.driverroutekm = routeDistanceKmCancel; patch.driverroutecapkm = policyCapKmCancel; patch.driverrouteexceedspolicy = exceedsPolicyCancel;
+          if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
+        }
+        const { data: driverUserForComplianceCancel } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
+        const { data: driverStatusForComplianceCancel } = await supabase.from("driver_status").select("capacity").eq("driverid", tripRow.driverid).maybeSingle();
+        const complianceIssuesCancel = checkComplianceTriggers(
+          { name: driverUserForComplianceCancel?.fullname }, driverStatusForComplianceCancel, routeDistanceKmCancel, totalAgentCountCancel
+        );
+        for (const issue of complianceIssuesCancel) {
+          await bestEffort("ADMIN_CANCEL compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: remaining[0]?.id ?? action.trip_id, ts: nowTs, read: false }));
+        }
+      }
+      const cancelAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      if (cancelAgentIds.length) {
+        await bestEffort("ADMIN_CANCEL agent notify", () => insertNotification({
+          type: "TRIP_CANCELLED", for_roles: [ROLE.AGENT], for_user_ids: cancelAgentIds,
+          message: `Your trip ${action.trip_id} (${tripRow.scheduleddate || ""} ${tripRow.scheduledtimestr || ""}) was cancelled by an admin.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        }));
+      }
+      if (tripRow.driverid) {
+        await bestEffort("ADMIN_CANCEL driver notify", () => insertNotification({
+          type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [tripRow.driverid],
+          message: `Trip ${action.trip_id} was cancelled by an admin and removed from your route.`,
+          trip_id: action.trip_id, ts: nowTs, read: false,
+        }));
+      }
+      await bestEffort("ADMIN_CANCEL audit log", () => logAuditAction({
+        actorId: actingAdminCancel.id, actorName: actingAdminCancel.name, actionType: "TRIP/ADMIN_CANCEL",
+        tripId: action.trip_id, details: `Cancelled trip (was ${tripRow.status})`,
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -9662,31 +9716,36 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // ALREADY been told the trip was cancelled and the audit log
       // already recorded it — a false trail for a cancellation that
       // never actually took effect. Extracted so it can be called ONCE,
-      // AFTER whichever branch's write has actually succeeded.
+      // AFTER whichever branch's write has actually succeeded. Each step
+      // runs through bestEffort INDEPENDENTLY (not one try/catch around
+      // all of them) — FOUND VIA /code-review, again: a single wrapping
+      // try/catch meant a failure on the FIRST notification silently
+      // skipped every step after it too, including the audit-log write,
+      // with nothing but one console.error to show for it.
       const acSendCancelNotifications = async () => {
         if (acTripRow.driverid) {
-          await insertNotification({
+          await bestEffort("AGENT_CANCEL driver notify", () => insertNotification({
             type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [acTripRow.driverid],
             message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — the trip has been cancelled" : ""}.`,
             trip_id: action.trip_id, ts: acNowTs, read: false,
-          });
+          }));
         }
-        await insertNotification({
+        await bestEffort("AGENT_CANCEL admin notify", () => insertNotification({
           type: "TRIP_CANCELLED", for_roles: [ROLE.ADMIN],
           message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — trip cancelled, driver freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
           trip_id: action.trip_id, ts: acNowTs, read: false,
-        });
+        }));
         if (acIsLate) {
-          await insertNotification({
+          await bestEffort("AGENT_CANCEL late-cancellation notify", () => insertNotification({
             type: "LATE_CANCELLATION", for_roles: [ROLE.ADMIN],
             message: `⏰ LATE CANCELLATION: ${cancellingAgentName} cancelled trip ${action.trip_id} only ${acHoursUntil < 0 ? "after" : acHoursUntil.toFixed(1) + "h before"} the scheduled time (${acTripRow.scheduleddate || ""} ${acTripRow.scheduledtimestr || ""}).`,
             trip_id: action.trip_id, ts: acNowTs, read: false,
-          });
+          }));
         }
-        await logAuditAction({
+        await bestEffort("AGENT_CANCEL audit log", () => logAuditAction({
           actorId: action.agent_id, actorName: cancellingAgentName, actionType: "TRIP/AGENT_CANCEL",
           tripId: action.trip_id, details: `Agent cancelled their own spot${acIsLate ? " (LATE)" : ""}${acWasOnlyAgent ? " — whole trip cancelled" : " — removed, trip continues"}`,
-        });
+        }));
       };
 
       if (acWasOnlyAgent) {
@@ -9753,22 +9812,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             updatedat: new Date(acNowTs).toISOString(),
           }).eq("driverid", acTripRow.driverid);
         }
-        // Notifications LAST, and now actually best-effort — FOUND VIA
-        // /code-review (twice): insertNotification can genuinely throw
+        // Notifications LAST, and genuinely best-effort (each step inside
+        // acSendCancelNotifications is independently bestEffort-wrapped —
+        // see its own comment) — insertNotification can genuinely throw
         // (must()-wrapped, deliberately, so a failed insert isn't
-        // silently swallowed). Running it before the driver_status
-        // re-point above meant a transient failure would abort this
-        // handler with the trip already archived/deleted but
-        // driver_status left stale (round 1's fix — reordering alone).
-        // But reordering to run LAST, unguarded, just moved the same
-        // problem: a throw here would still skip refetch() below and
-        // report a fully-successful cancellation to the agent as an
-        // error, leaving their local UI showing a trip that's actually
-        // already gone/archived server-side. Catching it here is what
-        // actually makes it best-effort, matching what the comment
-        // already claimed.
-        try { await acSendCancelNotifications(); }
-        catch (e) { console.error(`[AGENT_CANCEL] notification/audit failed after a successful cancellation: ${e.message}`); }
+        // silently swallowed), and running it before the driver_status
+        // re-point above would abort this handler with the trip already
+        // archived/deleted but driver_status left stale.
+        await acSendCancelNotifications();
         refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
       }
@@ -9872,15 +9923,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
       }
-      // Notifications LAST and best-effort — see the identical fix/comment
-      // in the acWasOnlyAgent branch above: insertNotification can
-      // genuinely throw, the driver's route/sequencing recompute just
-      // above is core data consistency that must complete first, and a
-      // caught (not propagated) failure here is what keeps a transient
-      // notification hiccup from reporting this already-successful
-      // cancellation to the agent as an error.
-      try { await acSendCancelNotifications(); }
-      catch (e) { console.error(`[AGENT_CANCEL] notification/audit failed after a successful cancellation: ${e.message}`); }
+      // Notifications LAST and genuinely best-effort — see the identical
+      // fix/comment in the acWasOnlyAgent branch above.
+      await acSendCancelNotifications();
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
