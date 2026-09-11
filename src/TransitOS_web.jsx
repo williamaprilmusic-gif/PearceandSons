@@ -3194,6 +3194,12 @@ async function tomtomAutocompleteSearch(query) {
       area: r.address?.municipalitySubdivision || r.address?.municipality || "Cape Town",
       lat: r.position?.lat, lng: r.position?.lon,
       source: "tomtom",
+      // A real street/postal address (freeformAddress) vs. a POI/business
+      // name fallback (r.poi.name) or the raw typed query — StreetInput's
+      // house-number preservation must never prepend onto the latter two
+      // (e.g. a typed "5 Pick n Pay" selecting a POI hit would otherwise
+      // save the nonsensical "5 Pick n Pay, Mitchells Plain").
+      isAddress: !!r.address?.freeformAddress,
     })).filter(r => r.lat != null && r.lng != null);
   } catch (e) {
     console.warn("[TomTom] autocomplete failed, falling back to Nominatim:", e.message);
@@ -3763,6 +3769,11 @@ async function nominatimSearch(query) {
         lat: parseFloat(r.lat),
         lng: parseFloat(r.lon),
         source: "osm",
+        // See tomtomAutocompleteSearch's identical flag — true only when
+        // this is a real road-based address, not Nominatim's own generic
+        // display_name/raw-query fallback (which can be a suburb, POI, or
+        // anything else).
+        isAddress: !!road,
       };
     }).filter(r => !isNaN(r.lat) && !isNaN(r.lng));
   } catch (e) {
@@ -3817,6 +3828,20 @@ export function leadingHouseNumber(text) {
   return m ? m[1] : null;
 }
 
+// True if `label` contains `houseNum` as its OWN token, not merely as a
+// digit-substring of a different number. FOUND VIA /code-review: a plain
+// `label.includes(houseNum)` treats typed "5" as satisfied by "125" or
+// "45" appearing anywhere in the label (a street number, a postal code, a
+// unit number) — exactly backwards for a check whose entire point is
+// telling a DIFFERENT number apart from the one that was typed.
+// Case-insensitive so a letter suffix's case ("5a" vs "5A") isn't treated
+// as a mismatch by itself.
+export function labelHasHouseNumber(label, houseNum) {
+  if (!houseNum) return true;
+  const escaped = houseNum.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^0-9a-z])${escaped}([^0-9a-z]|$)`, "i").test(label || "");
+}
+
 export async function unifiedAddressSearch(query) {
   const offline = staticSearch(query);
   const houseNum = leadingHouseNumber(query);
@@ -3833,8 +3858,11 @@ export async function unifiedAddressSearch(query) {
     // — permanently and silently, since TomTom almost always returns
     // SOMETHING — so a house number Nominatim could have resolved was
     // never even attempted. A typed house number that none of TomTom's
-    // hits actually carry now triggers a real Nominatim attempt too.
-    if (tomtom.length > 0 && (!houseNum || tomtom.some(r => r.label.includes(houseNum)))) {
+    // address-type hits actually carry now triggers a real Nominatim
+    // attempt too (POI hits don't count — a business name never carries a
+    // typed house number and shouldn't force an extra network round trip).
+    const tomtomSatisfiesNumber = !houseNum || tomtom.some(r => r.isAddress !== false && labelHasHouseNumber(r.label, houseNum));
+    if (tomtom.length > 0 && tomtomSatisfiesNumber) {
       return { results: tomtom, liveOk: true, source: "tomtom" };
     }
   }
@@ -3844,8 +3872,12 @@ export async function unifiedAddressSearch(query) {
     // first place) — lead with it. TomTom's hits, if any, are still
     // offered after in case the admin actually wanted one of those
     // instead (e.g. a POI/business-name search, where TomTom's `poi.name`
-    // matching is genuinely the better source) — deduped by coordinate.
-    const merged = [...live, ...tomtom.filter(t => !live.some(l => l.lat === t.lat && l.lng === t.lng))];
+    // matching is genuinely the better source) — deduped by rounded
+    // coordinate via the same helper used for route waypoints, live
+    // results winning ties, rather than a strict float-equality check
+    // that two independently-sourced geocoders would essentially never
+    // satisfy for the same physical address.
+    const merged = dedupeCoordsByLocation([...live, ...tomtom]);
     return { results: merged, liveOk: true, source: "nominatim" };
   }
   // Neither source resolved the typed house number — TomTom's
@@ -5019,8 +5051,16 @@ function appReducer(state, action) {
       // ILLEGAL" would surface as a confusing _error instead of quietly
       // succeeding.
       if (trip.state === TRIP_STATE.DRIVER_CONFIRMED) return state;
-      try { assertTripTransition(trip.state, TRIP_STATE.DRIVER_CONFIRMED); }
-      catch (e) { return { ...state, _error: e.message }; }
+      // ASSIGNED specifically, not assertTripTransition's generic table —
+      // FOUND VIA /code-review: TRIP_TRANSITIONS also permits
+      // UNASSIGNED_BOOKING -> DRIVER_CONFIRMED (a different flow's
+      // shortcut), which the live handler's own explicit ASSIGNED-only
+      // check (added alongside this one) does NOT allow for TRIP/ACCEPT
+      // specifically — using the shared table here would silently let
+      // demo mode diverge from live for this exact action.
+      if (trip.state !== TRIP_STATE.ASSIGNED) {
+        return { ...state, _error: `Can't accept a trip that's currently ${trip.state}.` };
+      }
       const driverUser = state.users.find(u => String(u.id) === String(trip.driver_id));
       const nowAccept = now();
       const newTrips = state.trips.map(t =>
@@ -10934,11 +10974,27 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
       // comment for why must()'s error-only check can't catch a zero-row
       // RLS-blocked update, same real class of gap on this sibling handler.
+      // FOUND VIA /code-review (of the idempotency guard just above): that
+      // guard reads status, THEN writes — a TOCTOU gap a fast double-tap
+      // (no disabled/loading state on the Accept/Start Trip buttons) or a
+      // slow-network retry can land inside, with both calls reading
+      // ASSIGNED before either write lands and both then unconditionally
+      // succeeding. Scoping the UPDATE itself to `status = ASSIGNED` makes
+      // the check-and-set atomic: only the FIRST of two racing calls can
+      // ever match a row and send the notification below.
       const acceptRes = must(await supabase.from("trips").update({
         status: TRIP_STATE.DRIVER_CONFIRMED,
         driveraccepted: true, acceptedat: nowTs, confirmedat: nowTs, updatedat: nowTs,
-      }).eq("id", action.trip_id).select("id"));
-      if (!acceptRes.data || acceptRes.data.length === 0) throw new Error("Couldn't accept the trip — your session may have expired. Please try again.");
+      }).eq("id", action.trip_id).eq("status", TRIP_STATE.ASSIGNED).select("id"));
+      if (!acceptRes.data || acceptRes.data.length === 0) {
+        // Lost the race to a concurrent ACCEPT (or the trip moved on for
+        // some other reason in the instant since the read above) — the
+        // trip IS accepted, just not by this exact call, so this is the
+        // same idempotent outcome as the DRIVER_CONFIRMED check above, not
+        // a failure the driver needs to see or retry.
+        refetch();
+        return;
+      }
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       // Two separate insertNotification calls, not one row with
       // for_roles:[AGENT,ADMIN] + for_user_ids:tripAgentIds — insertNotification
@@ -11776,8 +11832,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // recheck above already confirmed ownership moments earlier)
       // rather than the primary defense — but each write is still its
       // own await, so it's a real, if vanishingly small, residual window.
-      const rrFailedTripIds = [];
-      for (const t of routeTrips) {
+      // FOUND VIA /code-review: each write targets a different trip row
+      // with no ordering dependency between them, so running them via
+      // Promise.all (rather than a sequential for-of) turns N serial
+      // round trips into one — real latency on the exact multi-stop
+      // batch this handler exists to serve, especially on a driver's
+      // mobile connection.
+      const rrFailedTripIds = (await Promise.all(routeTrips.map(async (t) => {
         const { data: rrUpdated, error: rrUpdateErr } = await supabase.from("trips").update({
           routetotalkm: totalRoadKm,
           pickupordernum: firstPickupPosForTrip[t.trip_id] ?? t.pickup_order_num ?? null,
@@ -11785,16 +11846,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }).eq("id", t.trip_id).eq("driverid", activeUserRef.current).select("id");
         if (rrUpdateErr) {
           console.error(`[RECORD_ROUTE] trip ${t.trip_id} update FAILED: ${rrUpdateErr.message}`);
-          rrFailedTripIds.push(t.trip_id);
-        } else if (!rrUpdated || rrUpdated.length === 0) {
+          return t.trip_id;
+        }
+        if (!rrUpdated || rrUpdated.length === 0) {
           // Should be unreachable given the recheck immediately above —
           // only a reassignment/deletion landing in the single remaining
           // instant between that recheck and this specific row's write
           // could cause it.
           console.warn(`[RECORD_ROUTE] trip ${t.trip_id} skipped — reassigned in the instant between the recheck above and this write.`);
-          rrFailedTripIds.push(t.trip_id);
+          return t.trip_id;
         }
-      }
+        return null;
+      }))).filter(Boolean);
       if (rrFailedTripIds.length > 0) {
         throw new Error(`Couldn't save the route for trip${rrFailedTripIds.length > 1 ? "s" : ""} ${rrFailedTripIds.join(", ")} — please try Start Trip again.`);
       }

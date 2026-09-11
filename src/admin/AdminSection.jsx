@@ -86,6 +86,7 @@ import {
   scopeUsersToCompany,
   sortDropoffCoordsByProximity,
   sortDropoffsByProximity,
+  labelHasHouseNumber,
   leadingHouseNumber,
   staticSearch,
   supabase,
@@ -3015,10 +3016,17 @@ function StreetInput({ value, onChange, placeholder, error, preConfirmed }) {
   // Tapping a street-name suggestion re-runs the search scoped to that
   // exact name, so Nominatim gets a clean, unambiguous query instead of
   // whatever partial text the person had typed — much more likely to
-  // resolve to a real coordinate.
+  // resolve to a real coordinate. FOUND VIA /code-review (of
+  // selectResult's own house-number fix just below): this used to
+  // replace `query` with the bare chip name outright, discarding a house
+  // number the admin had already typed BEFORE selectResult ever runs —
+  // reintroducing the exact bug that fix exists to close, since
+  // leadingHouseNumber(query) would then find nothing to preserve.
+  // Preserve it here too, the same way.
   const pickStreetSuggestion = (name) => {
     setStreetSuggestions([]);
-    setQuery(name);
+    const typedHouseNum = leadingHouseNumber(query);
+    setQuery(typedHouseNum && !labelHasHouseNumber(name, typedHouseNum) ? `${typedHouseNum} ${name}` : name);
   };
 
   useEffect(() => {
