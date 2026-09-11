@@ -9378,9 +9378,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // comment for why must()'s error-only check can't catch a zero-row
       // RLS-blocked delete. Here specifically: without this, an agent
       // whose delete got silently blocked would see their booking
-      // reported as cancelled while it still exists server-side.
-      const cancelDelRes = must(await supabase.from("trips").delete().eq("id", action.trip_id).select("id"));
-      if (!cancelDelRes.data || cancelDelRes.data.length === 0) throw new Error("Couldn't cancel — your session may have expired. Please try again.");
+      // reported as cancelled while it still exists server-side. Also
+      // re-scoped to `.eq("status", UNASSIGNED_BOOKING)` — FOUND VIA A
+      // PROACTIVE SWEEP: an admin dispatching this exact booking in the
+      // window since cancelRow was read above would otherwise still get
+      // deleted out from under them by this unconditional delete-by-id.
+      const cancelDelRes = must(await supabase.from("trips").delete().eq("id", action.trip_id).eq("status", TRIP_STATE.UNASSIGNED_BOOKING).select("id"));
+      if (!cancelDelRes.data || cancelDelRes.data.length === 0) throw new Error("Couldn't cancel — this booking may have already been dispatched or changed. Please refresh and try again.");
       await supabase.from("notifications").delete().eq("tripid", action.trip_id);
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -9402,8 +9406,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
         // Clear any orphaned driver_status reference before deleting.
         await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", tripId);
-        const { error: bdDelErr } = await supabase.from("trips").delete().eq("id", tripId);
+        // Status-scoped delete — FOUND VIA A PROACTIVE SWEEP: the status
+        // check above (line 9403) and this delete are two separate
+        // round trips with an await between them; re-asserting the same
+        // status on the delete itself closes that window instead of
+        // relying on the earlier read staying true.
+        const { data: bdDelData, error: bdDelErr } = await supabase.from("trips").delete().eq("id", tripId).eq("status", TRIP_STATE.UNASSIGNED_BOOKING).select("id");
         if (bdDelErr) { results.push({ trip_id: tripId, ok: false, reason: bdDelErr.message }); continue; }
+        if (!bdDelData || bdDelData.length === 0) { results.push({ trip_id: tripId, ok: false, reason: "No longer unassigned — already dispatched" }); continue; }
         await logAuditAction({
           actorId: actingAdminBulkDelete.id, actorName: actingAdminBulkDelete.name, actionType: "TRIP/ADMIN_BULK_DELETE_UNASSIGNED",
           tripId, details: "Deleted unassigned booking (bulk delete)",
@@ -9625,7 +9635,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // still deletes cleanly, unchanged.
         if (acIsLate) {
           assertTripTransition(acTripRow.status, TRIP_STATE.ARCHIVED_CANCELLED);
-          must(await supabase.from("trips").update({ status: TRIP_STATE.ARCHIVED_CANCELLED, cancelledat: acNowTs, isexception: true, updatedat: acNowTs }).eq("id", action.trip_id));
+          // Optimistic-concurrency write — FOUND VIA A PROACTIVE SWEEP:
+          // several insertNotification/logAuditAction awaits sit between
+          // the read above and this write, and there was no guard at all
+          // (not even a .select("id") row-count check) — e.g. a driver
+          // completing this exact trip in that window could have this
+          // write silently override a genuine completion back to
+          // ARCHIVED_CANCELLED, losing completion/pay-relevant data.
+          const acArchiveRes = must(await withUpdatedAtGuard(
+            supabase.from("trips").update({ status: TRIP_STATE.ARCHIVED_CANCELLED, cancelledat: acNowTs, isexception: true, updatedat: acNowTs }).eq("id", action.trip_id),
+            acTripRow.updatedat
+          ).select("id"));
+          if (!acArchiveRes.data || acArchiveRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
         } else {
           // Clear/update the driver's currenttripid BEFORE deleting the
           // trip — driver_status.currenttripid is a foreign key
@@ -9648,7 +9669,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // Safety net: clear ANY other driver_status row still pointing at
           // this trip_id, regardless of which driver it belongs to.
           await supabase.from("driver_status").update({ currenttripid: null }).eq("currenttripid", action.trip_id);
-          must(await supabase.from("trips").delete().eq("id", action.trip_id));
+          // Status-scoped delete — FOUND VIA A PROACTIVE SWEEP: an
+          // unconditional delete-by-id here would happily delete a trip
+          // that's changed status since acTripRow was read above (e.g. the
+          // driver completed it in the same window this cancellation was
+          // processing) — destroying real completion/pay-relevant data
+          // instead of the cancellation this call actually authorized.
+          const acDeleteRes = must(await supabase.from("trips").delete().eq("id", action.trip_id).eq("status", acTripRow.status).select("id"));
+          if (!acDeleteRes.data || acDeleteRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
         }
         if (acIsLate && acTripRow.driverid) {
           // The archive branch above updates the trip row in place —
@@ -9833,6 +9861,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           newExtraDropoffs.push(sec.extradropoffs?.[i] || { lat: sec.dropofflat, lng: sec.dropofflng, label: sec.dropofflocation, agent_id: sec.extraagentids[i] });
         }
       }
+      // Re-verify the secondaries are STILL unassigned right before the
+      // writes below — FOUND VIA A PROACTIVE SWEEP: the status check at
+      // the top of this handler and this point are separated by several
+      // awaits (the duplicate-agent lookup loop, capacity/driver_status
+      // queries), and the primary's own optimistic-concurrency guard just
+      // below protects the PRIMARY row but not the secondaries, which get
+      // force-deleted by id alone further down with no re-check at all.
+      // Doing this recheck BEFORE the primary write (rather than only
+      // guarding the delete after) matters because the primary write
+      // already folds each secondary's agent into extraagentids — once
+      // that's committed there's no clean way to "undo" it if a secondary
+      // then turns out to be stale, short of a real DB transaction this
+      // client-side call sequence doesn't have.
+      if (secondaryIds.length) {
+        const { data: secondaryRecheck } = await supabase.from("trips").select("id, status").in("id", secondaryIds);
+        if ((secondaryRecheck || []).length !== secondaryIds.length || (secondaryRecheck || []).some(t => t.status !== TRIP_STATE.UNASSIGNED_BOOKING)) {
+          throw new Error("One of the selected trips changed while this was being prepared — please refresh and try combining again.");
+        }
+      }
       // Optimistic-concurrency write, same pattern as the auto-merge fix in
       // TRIP/ASSIGN_DRIVER: conditioned on primaryRow.updatedat still
       // matching what was read above. Narrower race window than the
@@ -9872,7 +9919,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         await supabase.from("driver_status")
           .update({ currenttripid: primaryId })
           .in("currenttripid", secondaryIds);
-        must(await supabase.from("trips").delete().in("id", secondaryIds));
+        // Status-scoped, same defense-in-depth as the recheck above — by
+        // this point the primary write has already committed, so this
+        // can no longer prevent the partial-merge outcome the recheck
+        // exists to catch, but it stops the delete itself from silently
+        // destroying a secondary trip a genuinely-simultaneous action
+        // moved out of UNASSIGNED_BOOKING in the instant since.
+        const secDelRes = must(await supabase.from("trips").delete().in("id", secondaryIds).eq("status", TRIP_STATE.UNASSIGNED_BOOKING).select("id"));
+        if (!secDelRes.data || secDelRes.data.length !== secondaryIds.length) {
+          console.error(`[DISPATCH_MULTI] expected to delete ${secondaryIds.length} secondary trip(s), deleted ${secDelRes.data?.length ?? 0} — one may have changed state mid-merge.`);
+        }
         await supabase.from("notifications").delete().in("tripid", secondaryIds);
       }
       const combinedAgentIds = (secondaryRows || []).flatMap(t => [t.agentid, ...(t.extraagentids || [])].filter(Boolean));
@@ -10906,6 +10962,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // different driver, since nothing else in this handler verifies
       // the caller actually owns it.
       if (String(tripRow.driverid) !== String(activeUserRef.current)) throw new Error("This trip isn't assigned to you.");
+      // Idempotent no-op if already confirmed — FOUND VIA A PROACTIVE
+      // SWEEP: same rationale as TRIP/ACCEPT's identical guard (its
+      // direct structural sibling — both promote to DRIVER_CONFIRMED,
+      // share this file's "Ownership check — see TRIP/DRIVER_CONFIRM"
+      // comment everywhere else). A double-tap or a retry after some
+      // unrelated later step fails shouldn't re-stamp confirmedat or
+      // re-notify every agent, and without this, assertTripTransition's
+      // raw "DRIVER_CONFIRMED -> DRIVER_CONFIRMED ILLEGAL" would surface
+      // as a confusing error instead of a quiet success.
+      if (tripRow.status === TRIP_STATE.DRIVER_CONFIRMED) { refetch(); return; }
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       const nowTs = nowEpoch();
       // .select("id") + a row-count check, not just must()'s error check —
@@ -10919,8 +10985,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // lockdown's write paths; same latent gap exists at ~30 other
       // must(supabase....update/delete(...)) sites with no .select(),
       // flagged in project memory as a scoped follow-up, not fixed here.
-      const confirmRes = must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id).select("id"));
-      if (!confirmRes.data || confirmRes.data.length === 0) throw new Error("Couldn't confirm the trip — your session may have expired. Please try again.");
+      // Also now scoped to `.eq("status", tripRow.status)` (the EXACT
+      // status just validated — DRIVER_CONFIRM legally starts from either
+      // UNASSIGNED_BOOKING or ASSIGNED per TRIP_TRANSITIONS, so this can't
+      // be hardcoded to ASSIGNED the way TRIP/ACCEPT's atomic guard is) —
+      // closes the same double-tap TOCTOU just fixed on TRIP/ACCEPT. A
+      // lost race is the same idempotent outcome as the check above, not
+      // an error: the trip IS confirmed, just not by this exact call.
+      const confirmRes = must(await supabase.from("trips").update({ status: TRIP_STATE.DRIVER_CONFIRMED, confirmedat: nowTs, updatedat: nowTs }).eq("id", action.trip_id).eq("status", tripRow.status).select("id"));
+      if (!confirmRes.data || confirmRes.data.length === 0) { refetch(); return; }
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
       await insertNotification({
         type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
@@ -11341,7 +11414,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       action = { ...action, driver_id: tripRow.driverid };
       const nowTs = nowEpoch();
       // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
-      // comment; same real gap on this state-transition handler.
+      // comment; same real gap on this state-transition handler. Also
+      // scoped to `.eq("status", tripRow.status)` — FOUND VIA A
+      // PROACTIVE SWEEP: without it, a double-tap/retry landing before
+      // either write lands both pass the ownership check above (this
+      // handler nulls driverid on success, which is what makes a
+      // genuine LATER retry fail ownership naturally — this only closes
+      // the narrower window of two concurrent calls racing each other)
+      // and both write, duplicating the admin notification + audit log
+      // entry below. A lost race is treated the same as success, not an
+      // error — the decline already went through, just via the other call.
       const declineRes = must(await supabase.from("trips").update({
         status: TRIP_STATE.UNASSIGNED_BOOKING, driverid: null, pickupordernum: null, dropsequencenum: null,
         driveraccepted: false,
@@ -11354,8 +11436,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         rejectiondriverid: action.driver_id,
         isexception: true,
         updatedat: nowTs,
-      }).eq("id", action.trip_id).select("id"));
-      if (!declineRes.data || declineRes.data.length === 0) throw new Error("Couldn't decline the trip — your session may have expired. Please try again.");
+      }).eq("id", action.trip_id).eq("status", tripRow.status).select("id"));
+      if (!declineRes.data || declineRes.data.length === 0) { refetch(); return; }
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", action.driver_id)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       if (!remaining || remaining.length === 0) {
@@ -11423,12 +11505,25 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           },
         };
       }
-      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
-      // comment; this handler records real passenger pickup state, so a
-      // silently-blocked write here is a genuine safety/dispatch-accuracy
-      // issue, not just a cosmetic staleness.
-      const pickupRes = must(await supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, pickuplocations: newPickupLocations, updatedat: nowTs }).eq("id", action.trip_id).select("id"));
-      if (!pickupRes.data || pickupRes.data.length === 0) throw new Error("Couldn't confirm pickup — your session may have expired. Please try again.");
+      // Optimistic-concurrency write — see withUpdatedAtGuard, same
+      // pattern as TRIP/ADD_AGENT/REMOVE_AGENT. FOUND VIA A PROACTIVE
+      // SWEEP for this exact bug class: newCompleted/newPickupTimestamps/
+      // newPickupLocations are all read-modify-write on tripRow's OWN
+      // arrays/maps, with a real await (reverseGeocode) in between the
+      // read and this write — a driver confirming two different agents'
+      // pickups in quick succession (a very plausible real action) could
+      // have both reads land before either write, and a plain
+      // `.eq("id", ...)` write would let the second one silently
+      // overwrite (lose) the first's completedpickups entry. This is the
+      // identical "two admins each removing a different passenger... would
+      // otherwise silently undo one of the two" lost-update risk
+      // ADD_AGENT/REMOVE_AGENT already guard against for the same trip
+      // row — just missed here.
+      const pickupRes = must(await withUpdatedAtGuard(
+        supabase.from("trips").update({ status: newState, intransitat: inTransitAt, completedpickups: newCompleted, pickuptimestamps: newPickupTimestamps, pickuplocations: newPickupLocations, updatedat: nowTs }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id"));
+      if (!pickupRes.data || pickupRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
       if (allPickedUp) {
         await insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
@@ -11480,7 +11575,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Prefer action.confirmed_at over nowTs — see the identical
       // fix/reasoning on CONFIRM_AGENT_PICKUP above.
       const confirmTs = action.confirmed_at ?? nowTs;
-      const newCompletedDropoffs = [...new Set([...(tripRow.completeddropoffs || []), action.agent_id])];
+      // String-normalized dedup, matching CONFIRM_AGENT_PICKUP's
+      // newCompleted just above (and allDroppedOff's own check right
+      // below) — FOUND VIA A PROACTIVE SWEEP: a plain `Set` dedupes by
+      // strict `===`, so if action.agent_id's type ever differs from
+      // what's already stored (string vs number — the exact id-shape
+      // inconsistency the whole app's sid()/String() hydration layer
+      // exists to paper over) it would push a genuine duplicate entry
+      // instead of recognizing the agent as already confirmed.
+      const newCompletedDropoffs = (tripRow.completeddropoffs || []).some(c => String(c) === String(action.agent_id))
+        ? (tripRow.completeddropoffs || [])
+        : [...(tripRow.completeddropoffs || []), action.agent_id];
       const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
       // reverseGeocode (this agent's own dropoff address) and, only when
@@ -11510,30 +11615,38 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (allDroppedOff) {
         // All agents dropped off — complete the trip
         assertTripTransition(tripRow.status, TRIP_STATE.ARCHIVED_COMPLETED);
-        // .select("id") + row-count checks on both writes below — see
-        // TRIP/DRIVER_CONFIRM's own comment. Same real safety/dispatch-
-        // accuracy stakes as CONFIRM_AGENT_PICKUP above: a silently-blocked
-        // completion leaves the trip mid-lifecycle while the driver's own
-        // UI has already moved on, and a silently-blocked driver_status
-        // write leaves them stuck BUSY/unavailable for new dispatch.
-        const completeRes = must(await supabase.from("trips").update({
-          status: TRIP_STATE.ARCHIVED_COMPLETED,
-          completedat: nowTs,
-          // Real GPS-measured distance only, or null — no estimate
-          // fallback baked into this column anymore, per explicit
-          // request ("only show the exact kms"). tripDriverPayment
-          // still protects driver pay via its OWN independent fallback
-          // to est_distance_km when actual_distance_km is null, so
-          // nothing about pay changes — this just stops an estimate
-          // from silently hiding inside a field every display site now
-          // treats as always-exact.
-          actualdistancekm: actualRouteKmDrop,
-          completeddropoffs: newCompletedDropoffs,
-          dropofftimestamps: newDropoffTimestamps,
-          dropofflocations: newDropoffLocations,
-          updatedat: nowTs,
-        }).eq("id", action.trip_id).select("id"));
-        if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
+        // Optimistic-concurrency write (withUpdatedAtGuard) — see
+        // CONFIRM_AGENT_PICKUP's identical fix above for the full
+        // rationale: real awaits (reverseGeocode/computeActualRouteKm)
+        // sit between the read and this write, and completeddropoffs is
+        // a read-modify-write array, so a second confirmation landing in
+        // that window must not silently overwrite this one. Same real
+        // safety/dispatch-accuracy stakes as CONFIRM_AGENT_PICKUP above:
+        // a silently-blocked completion leaves the trip mid-lifecycle
+        // while the driver's own UI has already moved on, and a
+        // silently-blocked driver_status write (further down) leaves
+        // them stuck BUSY/unavailable for new dispatch.
+        const completeRes = must(await withUpdatedAtGuard(
+          supabase.from("trips").update({
+            status: TRIP_STATE.ARCHIVED_COMPLETED,
+            completedat: nowTs,
+            // Real GPS-measured distance only, or null — no estimate
+            // fallback baked into this column anymore, per explicit
+            // request ("only show the exact kms"). tripDriverPayment
+            // still protects driver pay via its OWN independent fallback
+            // to est_distance_km when actual_distance_km is null, so
+            // nothing about pay changes — this just stops an estimate
+            // from silently hiding inside a field every display site now
+            // treats as always-exact.
+            actualdistancekm: actualRouteKmDrop,
+            completeddropoffs: newCompletedDropoffs,
+            dropofftimestamps: newDropoffTimestamps,
+            dropofflocations: newDropoffLocations,
+            updatedat: nowTs,
+          }).eq("id", action.trip_id),
+          tripRow.updatedat
+        ).select("id"));
+        if (!completeRes.data || completeRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
         // Update driver state
         const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
           .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
@@ -11554,15 +11667,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           message: `Trip ${action.trip_id} archived.`, trip_id: action.trip_id, ts: nowTs, read: false });
         for (const n of agentNotifs) await insertNotification(n);
       } else {
-        // Partial — just save this agent's dropoff. Same row-count check
-        // as the completion branch above.
-        const partialDropoffRes = must(await supabase.from("trips").update({
-          completeddropoffs: newCompletedDropoffs,
-          dropofftimestamps: newDropoffTimestamps,
-          dropofflocations: newDropoffLocations,
-          updatedat: nowTs,
-        }).eq("id", action.trip_id).select("id"));
-        if (!partialDropoffRes.data || partialDropoffRes.data.length === 0) throw new Error("Couldn't confirm dropoff — your session may have expired. Please try again.");
+        // Partial — just save this agent's dropoff. Same optimistic-
+        // concurrency guard as the completion branch above.
+        const partialDropoffRes = must(await withUpdatedAtGuard(
+          supabase.from("trips").update({
+            completeddropoffs: newCompletedDropoffs,
+            dropofftimestamps: newDropoffTimestamps,
+            dropofflocations: newDropoffLocations,
+            updatedat: nowTs,
+          }).eq("id", action.trip_id),
+          tripRow.updatedat
+        ).select("id"));
+        if (!partialDropoffRes.data || partialDropoffRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -11611,13 +11727,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         note: action.note?.trim() || null,
       };
       const newNoShows = [...(tripRow.noshows || []), noShowRecord];
-      // .select("id") + row-count check — see TRIP/DRIVER_CONFIRM's own
-      // comment; same stakes as CONFIRM_AGENT_PICKUP/DROPOFF above.
-      const noShowRes = must(await supabase.from("trips").update({
-        status: nsNewState, intransitat: nsInTransitAt, completedat: nsCompletedAt, completedpickups: nsNewCompleted,
-        noshows: newNoShows, isexception: true, updatedat: nsNowTs,
-      }).eq("id", action.trip_id).select("id"));
-      if (!noShowRes.data || noShowRes.data.length === 0) throw new Error("Couldn't record the no-show — your session may have expired. Please try again.");
+      // Optimistic-concurrency write — same pattern (and same class of
+      // read-modify-write array race, e.g. against a concurrent
+      // CONFIRM_AGENT_PICKUP on a different agent of this trip) as
+      // CONFIRM_AGENT_PICKUP/DROPOFF above.
+      const noShowRes = must(await withUpdatedAtGuard(
+        supabase.from("trips").update({
+          status: nsNewState, intransitat: nsInTransitAt, completedat: nsCompletedAt, completedpickups: nsNewCompleted,
+          noshows: newNoShows, isexception: true, updatedat: nsNowTs,
+        }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id"));
+      if (!noShowRes.data || noShowRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
       // If the trip just auto-completed, free the driver the same way
       // ADMIN_CANCEL/AGENT_CANCEL already do.
       if (nsNewState === TRIP_STATE.ARCHIVED_COMPLETED && tripRow.driverid) {
@@ -11687,20 +11808,26 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           label: dropoffLabel || null,
         };
       });
-      // .select("id") + row-count checks on both writes below — see
-      // TRIP/DRIVER_CONFIRM's own comment (identical sibling logic to
-      // CONFIRM_AGENT_DROPOFF's completion branch, which already has this
-      // guard — this handler was missing it). A silently-blocked
-      // completion leaves the trip mid-lifecycle while the driver's own
-      // UI has already moved on, and a silently-blocked driver_status
-      // write leaves them stuck BUSY/unavailable for new dispatch.
-      const completeRes = must(await supabase.from("trips").update({
-        // Real GPS-measured distance only, or null — see the identical
-        // fix/comment on CONFIRM_AGENT_DROPOFF's completion branch above.
-        status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: actualRouteKmComplete,
-        completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, dropofflocations: newDropoffLocations, updatedat: nowTs,
-      }).eq("id", action.trip_id).select("id"));
-      if (!completeRes.data || completeRes.data.length === 0) throw new Error("Couldn't complete the trip — your session may have expired. Please try again.");
+      // Optimistic-concurrency write (withUpdatedAtGuard) — FOUND VIA A
+      // PROACTIVE SWEEP: real awaits (reverseGeocode/computeActualRouteKm)
+      // sit between the read and this write, with no guard at all against
+      // a concurrent change landing in that window — e.g. an agent
+      // cancelling this exact trip at the same moment the driver taps
+      // Complete could otherwise have this write silently resurrect a
+      // cancelled trip back to ARCHIVED_COMPLETED, or (less dramatically)
+      // just clobber whatever that other write touched. Same sibling logic
+      // CONFIRM_AGENT_DROPOFF's completion branch already had — this
+      // handler was missing it.
+      const completeRes = must(await withUpdatedAtGuard(
+        supabase.from("trips").update({
+          // Real GPS-measured distance only, or null — see the identical
+          // fix/comment on CONFIRM_AGENT_DROPOFF's completion branch above.
+          status: TRIP_STATE.ARCHIVED_COMPLETED, completedat: nowTs, actualdistancekm: actualRouteKmComplete,
+          completeddropoffs: tripAgentIdsForDrop, dropofftimestamps: newDropoffTimestamps, dropofflocations: newDropoffLocations, updatedat: nowTs,
+        }).eq("id", action.trip_id),
+        tripRow.updatedat
+      ).select("id"));
+      if (!completeRes.data || completeRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
       const { data: remaining } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
         .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       const stillBusy = (remaining || []).filter(r => String(r.id) !== String(action.trip_id));
