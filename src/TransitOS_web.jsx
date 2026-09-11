@@ -8584,10 +8584,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // sibling). action.agent_id is String()-hydrated client state
       // (trip.agent_ids via sidArr()), while tripRow.agentid/
       // extraagentids/completedpickups are the raw, unmapped DB columns.
-      const newCompletedPickups = (tripRow.completedpickups || []).filter(id => String(id) !== String(action.agent_id));
-      const wasPrimary = String(tripRow.agentid) === String(action.agent_id);
-      const newExtraPickups = (tripRow.extrapickups || []).filter(p => String(p.agent_id) !== String(action.agent_id));
-      const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => String(id) !== String(action.agent_id));
+      const newCompletedPickups = (tripRow.completedpickups || []).filter(id => !sameId(id, action.agent_id));
+      const wasPrimary = sameId(tripRow.agentid, action.agent_id);
+      const newExtraPickups = (tripRow.extrapickups || []).filter(p => !sameId(p.agent_id, action.agent_id));
+      const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => !sameId(id, action.agent_id));
       // Remove this agent's dropoff entry too (parallel to extrapickups cleanup).
       const newExtraDropoffs = (tripRow.extradropoffs || []).filter(d => String(d.agent_id) !== String(action.agent_id));
 
@@ -8618,7 +8618,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // actually be sent, correctly clearing it.
           update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label; update.phone = promoted.phone ?? null;
           update.extrapickups = newExtraPickups.slice(1);
-          update.extraagentids = newExtraAgentIds.filter(id => String(id) !== String(promoted.agent_id));
+          update.extraagentids = newExtraAgentIds.filter(id => !sameId(id, promoted.agent_id));
         }
         // If the primary agent also had the primary dropoff slot, promote the
         // first extradropoff entry into it so dropofflat/lng/label stays right.
@@ -8748,7 +8748,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // live in pickuplat/lng directly (never touched), and the `else`
       // branch's own correctly-normalized filter finds no matching entry
       // in extrapickups (the primary was never IN that array) either.
-      const isPrimary = String(tripRow.agentid) === String(action.agent_id);
+      const isPrimary = sameId(tripRow.agentid, action.agent_id);
       const update = {};
       if (isPrimary) {
         update.pickuplat = action.pickup_coord.lat; update.pickuplng = action.pickup_coord.lng; update.pickuplabel = action.pickup_label;
@@ -9707,7 +9707,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // agent — taking the partial-removal branch instead of
       // archiving/deleting the trip, while the notification text still
       // claims it was cancelled outright.
-      const acOtherAgentIds = acAgentIds.filter(id => String(id) !== String(action.agent_id));
+      const acOtherAgentIds = acAgentIds.filter(id => !sameId(id, action.agent_id));
       const acWasOnlyAgent = acOtherAgentIds.length === 0;
 
       // FOUND VIA /code-review: this notify+audit block used to run
@@ -9836,13 +9836,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // (for acWasPrimary) skip the departing primary's promotion
       // entirely — leaving pickup/dropoff coordinates and a phone number
       // on the trip that still belong to the agent who just cancelled.
-      const acWasPrimary = String(acTripRow.agentid) === String(action.agent_id);
+      const acWasPrimary = sameId(acTripRow.agentid, action.agent_id);
       const acNewExtraPickups = (acTripRow.extrapickups || []).filter(p => String(p.agent_id) !== String(action.agent_id));
-      const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => String(id) !== String(action.agent_id));
+      const acNewExtraAgentIds = (acTripRow.extraagentids || []).filter(id => !sameId(id, action.agent_id));
       // Also remove this agent's dropoff entry.
       const acNewExtraDropoffs = (acTripRow.extradropoffs || []).filter(d => String(d.agent_id) !== String(action.agent_id));
       const acUpdate = {
-        completedpickups: (acTripRow.completedpickups || []).filter(id => String(id) !== String(action.agent_id)),
+        completedpickups: (acTripRow.completedpickups || []).filter(id => !sameId(id, action.agent_id)),
         extrapickups: acNewExtraPickups, extraagentids: acNewExtraAgentIds, extradropoffs: acNewExtraDropoffs,
       };
       if (acWasPrimary) {
@@ -9859,7 +9859,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // comes from extrapickups (JSONB), acNewExtraAgentIds from
           // extraagentids, two different columns with no guaranteed
           // matching JS type for the same underlying id.
-          acUpdate.extraagentids = acNewExtraAgentIds.filter(id => String(id) !== String(acPromoted.agent_id));
+          acUpdate.extraagentids = acNewExtraAgentIds.filter(id => !sameId(id, acPromoted.agent_id));
         }
         // Promote dropoff slot too if primary agent held it.
         const acPromotedDrop = acNewExtraDropoffs[0];
@@ -11170,7 +11170,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // status for exactly that reason, matching TRIP/ACCEPT's identical
         // fix), a genuinely different outcome this driver should be told
         // about, not silently swallowed as success.
-        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && String(r?.driverid) === String(activeUserRef.current), "status, driverid");
+        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && sameId(r?.driverid, activeUserRef.current), "status, driverid");
         refetch(); return;
       }
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
@@ -11258,7 +11258,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // flagged as a smaller gap there since RECORD_ROUTE's own
         // ownership re-verification is the actual backstop for ACCEPT's
         // callers; kept consistent with DECLINE's driverid check here too).
-        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && String(r?.driverid) === String(activeUserRef.current), "status, driverid");
+        await raceLostIsHarmless(action.trip_id, r => r?.status === TRIP_STATE.DRIVER_CONFIRMED && sameId(r?.driverid, activeUserRef.current), "status, driverid");
         refetch();
         return;
       }
