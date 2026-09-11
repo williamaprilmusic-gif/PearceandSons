@@ -7591,10 +7591,14 @@ async function tripsOwnedByDriver(tripIds, driverId) {
 //   isExpectedNoop(row) — row is the trip's CURRENT columns (whichever
 //     `selectCols` asks for); return true only if it's genuinely already
 //     in the shape this action was trying to reach.
+//   selectCols — REQUIRED, not defaulted: every current caller needs
+//     driverid alongside status, so a same-looking-but-untested "status
+//     only" default would leave any driverid check in isExpectedNoop
+//     silently seeing undefined for a caller that forgot to pass it.
 // Throws (never silently swallows) on a failed lookup itself — a
 // transient DB/network error must never be indistinguishable from "the
 // trip actually changed."
-async function raceLostIsHarmless(tripId, isExpectedNoop, selectCols = "status") {
+async function raceLostIsHarmless(tripId, isExpectedNoop, selectCols) {
   const { data: row, error } = await supabase.from("trips").select(selectCols).eq("id", tripId).maybeSingle();
   if (error) throw error;
   if (isExpectedNoop(row)) return true;
@@ -8541,10 +8545,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (agentIds.length <= 1) throw new Error("Cannot remove the last passenger — cancel or reassign the trip instead");
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot remove a passenger from a completed or cancelled trip");
 
-      const newCompletedPickups = (tripRow.completedpickups || []).filter(id => id !== action.agent_id);
-      const wasPrimary = tripRow.agentid === action.agent_id;
+      // String()-normalized throughout — FOUND VIA /code-review (of the
+      // identical fix on TRIP/AGENT_CANCEL's partial-removal branch,
+      // whose own comment cites THIS handler as sharing the same
+      // promotion/re-sequencing logic — the fix missed this, its actual
+      // sibling). action.agent_id is String()-hydrated client state
+      // (trip.agent_ids via sidArr()), while tripRow.agentid/
+      // extraagentids/completedpickups are the raw, unmapped DB columns.
+      const newCompletedPickups = (tripRow.completedpickups || []).filter(id => String(id) !== String(action.agent_id));
+      const wasPrimary = String(tripRow.agentid) === String(action.agent_id);
       const newExtraPickups = (tripRow.extrapickups || []).filter(p => String(p.agent_id) !== String(action.agent_id));
-      const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => id !== action.agent_id);
+      const newExtraAgentIds = (tripRow.extraagentids || []).filter(id => String(id) !== String(action.agent_id));
       // Remove this agent's dropoff entry too (parallel to extrapickups cleanup).
       const newExtraDropoffs = (tripRow.extradropoffs || []).filter(d => String(d.agent_id) !== String(action.agent_id));
 
@@ -8575,7 +8586,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           // actually be sent, correctly clearing it.
           update.pickuplat = promoted.lat; update.pickuplng = promoted.lng; update.pickuplabel = promoted.label; update.phone = promoted.phone ?? null;
           update.extrapickups = newExtraPickups.slice(1);
-          update.extraagentids = newExtraAgentIds.filter(id => id !== promoted.agent_id);
+          update.extraagentids = newExtraAgentIds.filter(id => String(id) !== String(promoted.agent_id));
         }
         // If the primary agent also had the primary dropoff slot, promote the
         // first extradropoff entry into it so dropofflat/lng/label stays right.
@@ -8694,7 +8705,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!agentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
       if ([TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(tripRow.status)) throw new Error("Cannot relocate a passenger on a completed or cancelled trip");
 
-      const isPrimary = tripRow.agentid === action.agent_id;
+      // String()-normalized — FOUND VIA /code-review: tripRow.agentid is
+      // the raw, unmapped DB column, action.agent_id is String()-hydrated
+      // client state — a mismatch here doesn't just misfile a record, it
+      // makes the relocation silently a no-op: the primary agent's coords
+      // live in pickuplat/lng directly (never touched), and the `else`
+      // branch's own correctly-normalized filter finds no matching entry
+      // in extrapickups (the primary was never IN that array) either.
+      const isPrimary = String(tripRow.agentid) === String(action.agent_id);
       const update = {};
       if (isPrimary) {
         update.pickuplat = action.pickup_coord.lat; update.pickuplng = action.pickup_coord.lng; update.pickuplabel = action.pickup_label;
@@ -9735,15 +9753,22 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             updatedat: new Date(acNowTs).toISOString(),
           }).eq("driverid", acTripRow.driverid);
         }
-        // Notifications LAST — FOUND VIA /code-review: insertNotification
-        // can genuinely throw (must()-wrapped, deliberately, so a failed
-        // insert isn't silently swallowed). Running it before the
-        // driver_status re-point above meant a transient notification
-        // failure would abort this handler with the trip already
-        // archived/deleted but driver_status left stale/incorrect — core
-        // data consistency must complete before the "tell people" step,
-        // which is comparatively best-effort.
-        await acSendCancelNotifications();
+        // Notifications LAST, and now actually best-effort — FOUND VIA
+        // /code-review (twice): insertNotification can genuinely throw
+        // (must()-wrapped, deliberately, so a failed insert isn't
+        // silently swallowed). Running it before the driver_status
+        // re-point above meant a transient failure would abort this
+        // handler with the trip already archived/deleted but
+        // driver_status left stale (round 1's fix — reordering alone).
+        // But reordering to run LAST, unguarded, just moved the same
+        // problem: a throw here would still skip refetch() below and
+        // report a fully-successful cancellation to the agent as an
+        // error, leaving their local UI showing a trip that's actually
+        // already gone/archived server-side. Catching it here is what
+        // actually makes it best-effort, matching what the comment
+        // already claimed.
+        try { await acSendCancelNotifications(); }
+        catch (e) { console.error(`[AGENT_CANCEL] notification/audit failed after a successful cancellation: ${e.message}`); }
         refetch(); // fire-and-forget — see handleSupabaseAction's header comment
         return;
       }
@@ -9847,11 +9872,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           if (Object.keys(patch).length) must(await supabase.from("trips").update(patch).eq("id", t.id));
         }
       }
-      // Notifications LAST — see the identical fix/comment in the
-      // acWasOnlyAgent branch above: insertNotification can genuinely
-      // throw, and the driver's route/sequencing recompute just above is
-      // core data consistency that must complete first.
-      await acSendCancelNotifications();
+      // Notifications LAST and best-effort — see the identical fix/comment
+      // in the acWasOnlyAgent branch above: insertNotification can
+      // genuinely throw, the driver's route/sequencing recompute just
+      // above is core data consistency that must complete first, and a
+      // caught (not propagated) failure here is what keeps a transient
+      // notification hiccup from reporting this already-successful
+      // cancellation to the agent as an error.
+      try { await acSendCancelNotifications(); }
+      catch (e) { console.error(`[AGENT_CANCEL] notification/audit failed after a successful cancellation: ${e.message}`); }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
