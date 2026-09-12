@@ -8551,19 +8551,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           { name: driverUserForComplianceAdd?.fullname }, { capacity: addAgentDriverCapacitySupa }, routeDistanceKmAdd, totalAgentCountAdd
         );
         for (const issue of complianceIssuesAdd) {
-          await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: addAgentNowTs, read: false });
+          await bestEffort("ADD_AGENT compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: addAgentNowTs, read: false }));
         }
       }
 
-      await insertNotification({
+      // bestEffort — FOUND VIA A PROACTIVE SWEEP (same class fixed on
+      // AGENT_CANCEL/REMOVE_AGENT/RELOCATE_AGENT/ADMIN_CANCEL): the write
+      // above is already guarded and verified, so a notification/audit
+      // failure here must never report a successful passenger-add as a
+      // failure.
+      await bestEffort("ADD_AGENT agent notify", () => insertNotification({
         type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [action.agent_id],
         message: `You've been added to trip ${action.trip_id} (pickup: ${action.pickup_label}).`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
-      });
-      await logAuditAction({
+      }));
+      await bestEffort("ADD_AGENT audit log", () => logAuditAction({
         actorId: actingAdminAdd.id, actorName: actingAdminAdd.name, actionType: "TRIP/ADD_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Added passenger (pickup: ${action.pickup_label})`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -9423,7 +9428,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       } catch (e) { /* malformed date/time — skip late-booking check */ }
 
-      for (const row of notifRows) await insertNotification(row);
+      // bestEffort — FOUND VIA A PROACTIVE SWEEP: the insert above already
+      // succeeded (error-checked, `tripId` is real). A notification
+      // failure here must never throw past this point — the caller (the
+      // booking form) treats ANY throw from this action as "this leg
+      // failed to book" and, for a multi-leg week/with-return booking,
+      // cancels the already-created SIBLING legs as cleanup. A merely
+      // best-effort notification hiccup would wrongly trigger that
+      // rollback for a booking that actually succeeded.
+      for (const row of notifRows) await bestEffort("BOOK notify", () => insertNotification(row));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       // Hand the new id back to the caller — the booking form uses this to
       // cancel already-created legs if a later leg of a multi-leg (week /
@@ -10097,17 +10110,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // agent or describe the trip as "combined"/"shared". Matches
       // TRIP/ADD_AGENT's neutral convention (trip id + pickup detail,
       // nothing about who else is on it).
+      // bestEffort — FOUND VIA A PROACTIVE SWEEP: the primary write above
+      // is already guarded/verified, so a notify/audit failure here must
+      // never report a successful merge-and-dispatch as a failure.
       for (const aid of combinedAgentIds) {
-        await insertNotification({
+        await bestEffort("DISPATCH_MULTI agent notify", () => insertNotification({
           type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
           message: `Your trip (${primaryId}) has been dispatched to a driver.`,
           trip_id: primaryId, ts: nowEpoch(), read: false,
-        });
+        }));
       }
-      await logAuditAction({
+      await bestEffort("DISPATCH_MULTI audit log", () => logAuditAction({
         actorId: actingAdminMulti.id, actorName: actingAdminMulti.name, actionType: "TRIP/DISPATCH_MULTI",
         tripId: primaryId, details: `Merged ${secondaryIds.length} trip(s) [${secondaryIds.join(", ")}] into ${primaryId} and dispatched`,
-      });
+      }));
       // From here, the exact same code path as a normal single-trip
       // assignment — capacity check, sequencing, DRIVER_ASSIGNED /
       // DRIVER_FULLY_BOOKED notifications, all of it.
@@ -10416,17 +10432,20 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           const mergedInAgents = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
           // Same privacy requirement as TRIP/DISPATCH_MULTI above — never
           // name the other agent or describe this as a merge/combine.
+          // bestEffort — the merge write above is already guarded/verified
+          // (or retried against fresh data), so a notify/audit failure
+          // here must never report a successful merge as a failure.
           for (const aid of mergedInAgents) {
-            await insertNotification({
+            await bestEffort("ASSIGN_DRIVER merge agent notify", () => insertNotification({
               type: "TRIP_BOOKED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
               message: `Your trip (${mergeTargetTrip.id}) has been dispatched to a driver.`,
               trip_id: mergeTargetTrip.id, ts: nowEpoch(), read: false,
-            });
+            }));
           }
-          await logAuditAction({
+          await bestEffort("ASSIGN_DRIVER merge audit log", () => logAuditAction({
             actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
             tripId: mergeTargetTrip.id, details: `Auto-merged trip ${action.trip_id} into existing trip ${mergeTargetTrip.id} for the same driver/day`,
-          });
+          }));
           // Recompute pickup/dropoff sequencing across the driver's full
           // updated route. NOTE: we do NOT recurse back through
           // TRIP/ASSIGN_DRIVER for mergeTargetTrip — its status is already
@@ -10564,37 +10583,41 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!assignBusyRes.data || assignBusyRes.data.length === 0) throw new Error("Trip assigned, but couldn't update the driver's status — please refresh and check manually.");
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      await insertNotification({
+      // bestEffort throughout — FOUND VIA A PROACTIVE SWEEP: both writes
+      // above (the trip update + the driver_status BUSY flip) are already
+      // guarded and verified, so a notify/audit failure here must never
+      // report a successful assignment as a failure.
+      await bestEffort("ASSIGN_DRIVER agent notify", () => insertNotification({
         type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
         message: `Driver ${driverUser?.fullname} (${driverRow.vehicle}) has been assigned and is reviewing your trip. Pickup #${seqMap[action.trip_id]}, drop-off #${dropMap[action.trip_id]}.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
-      });
+      }));
       // Feature 13: compliance checks — run after route is computed
       const { data: driverUserForCompliance } = await supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle();
       const complianceIssues = checkComplianceTriggers(
         { name: driverUserForCompliance?.fullname }, driverRow, routeDistanceKm, totalAgentCountAssign
       );
       for (const issue of complianceIssues) {
-        await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false });
+        await bestEffort("ASSIGN_DRIVER compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false }));
       }
       if (newLoad >= assignDriverCapacitySupa) {
-        await insertNotification({
+        await bestEffort("ASSIGN_DRIVER fully-booked notify", () => insertNotification({
           type: "DRIVER_FULLY_BOOKED", for_roles: [ROLE.ADMIN],
           message: `⚠ Driver ${driverUser?.fullname} is now FULLY BOOKED (${newLoad}/${assignDriverCapacitySupa} seats).`,
           ts: nowTs, read: false,
-        });
+        }));
       }
       if (exceedsPolicy) {
-        await insertNotification({
+        await bestEffort("ASSIGN_DRIVER route-exceeds-policy notify", () => insertNotification({
           type: "ROUTE_EXCEEDS_POLICY", for_roles: [ROLE.ADMIN],
           message: `⚠ Driver ${driverUser?.fullname}'s total route is ${routeDistanceKm.toFixed(1)} km — exceeds the ${policyCapKm} km policy cap for ${totalAgentCountAssign} agent${totalAgentCountAssign !== 1 ? "s" : ""} (40 km × ${totalAgentCountAssign}).`,
           trip_id: action.trip_id, ts: nowTs, read: false,
-        });
+        }));
       }
-      await logAuditAction({
+      await bestEffort("ASSIGN_DRIVER audit log", () => logAuditAction({
         actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
         tripId: action.trip_id, targetUserId: action.driver_id, details: `Assigned driver ${driverUser?.fullname || action.driver_id}`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11174,10 +11197,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         refetch(); return;
       }
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      await insertNotification({
+      // bestEffort — the write above is already guarded/verified.
+      await bestEffort("DRIVER_CONFIRM agent notify", () => insertNotification({
         type: "TRIP_CONFIRMED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
         message: "Your driver has confirmed the trip. They are on the way.", trip_id: action.trip_id, ts: nowTs, read: false,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11273,14 +11297,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // a targeted row for the agents + a separate broadcast row (empty
       // for_user_ids -> userid: null) for admins.
       const tripAcceptedMsg = `Driver ${driverUser?.fullname} accepted your trip.`;
-      await insertNotification({
+      // bestEffort — the write above is already guarded/verified.
+      await bestEffort("ACCEPT agent notify", () => insertNotification({
         type: "TRIP_ACCEPTED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
         message: tripAcceptedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
-      });
-      await insertNotification({
+      }));
+      await bestEffort("ACCEPT admin notify", () => insertNotification({
         type: "TRIP_ACCEPTED", for_roles: [ROLE.ADMIN], for_user_ids: [],
         message: tripAcceptedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11324,18 +11349,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // Split into an agent-targeted row + an admin-broadcast row — see the
       // identical fix/comment on TRIP/ACCEPT's insertNotification above.
       const driverRemovedMsg = `Driver ${removedDriverUser?.fullname || removedDriverId} was removed from trip ${action.trip_id} by an admin. Trip needs reassignment.`;
-      await insertNotification({
+      // bestEffort — the write above is already guarded/verified.
+      await bestEffort("REMOVE_DRIVER agent notify", () => insertNotification({
         type: "DRIVER_REMOVED", for_roles: [ROLE.AGENT], for_user_ids: tripAgentIds,
         message: driverRemovedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
-      });
-      await insertNotification({
+      }));
+      await bestEffort("REMOVE_DRIVER admin notify", () => insertNotification({
         type: "DRIVER_REMOVED", for_roles: [ROLE.ADMIN], for_user_ids: [],
         message: driverRemovedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
-      });
-      await logAuditAction({
+      }));
+      await bestEffort("REMOVE_DRIVER audit log", () => logAuditAction({
         actorId: actingAdminRemoveDriver.id, actorName: actingAdminRemoveDriver.name, actionType: "TRIP/REMOVE_DRIVER",
         tripId: action.trip_id, targetUserId: removedDriverId, details: `Removed driver ${removedDriverUser?.fullname || removedDriverId} from trip`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11477,33 +11503,36 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         supabase.from("users").select("fullname").eq("id", action.driver_id).maybeSingle(),
       ]);
       const reassignAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      await insertNotification({
+      // bestEffort throughout — the write(s) above are already
+      // guarded/verified, so a notify/audit failure here must never
+      // report a successful reassignment as a failure.
+      await bestEffort("REASSIGN_DRIVER old-driver notify", () => insertNotification({
         type: "DRIVER_REMOVED", for_roles: [ROLE.DRIVER], for_user_ids: [oldDriverId],
         message: `Trip ${action.trip_id} was reassigned to another driver by an admin and removed from your route.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
-      });
-      await insertNotification({
+      }));
+      await bestEffort("REASSIGN_DRIVER agent notify", () => insertNotification({
         type: "DRIVER_ASSIGNED", for_roles: [ROLE.AGENT], for_user_ids: reassignAgentIds,
         message: `Your trip's driver was changed to ${newDriverUser?.fullname || action.driver_id} (${newDriverRow.vehicle}), who is reviewing it. Pickup #${rSeqMap[action.trip_id]}, drop-off #${rDropMap[action.trip_id]}.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
-      });
+      }));
       // Compliance re-check for the new driver, same as ASSIGN_DRIVER.
       const reassignCompliance = checkComplianceTriggers({ name: newDriverUser?.fullname }, newDriverRow, rRouteKm, rAgentCount);
       for (const issue of reassignCompliance) {
-        await insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false });
+        await bestEffort("REASSIGN_DRIVER compliance notify", () => insertNotification({ type: issue.type, for_roles: [ROLE.ADMIN], message: issue.message, trip_id: action.trip_id, ts: nowTs, read: false }));
       }
       if (rExceeds) {
-        await insertNotification({
+        await bestEffort("REASSIGN_DRIVER route-exceeds-policy notify", () => insertNotification({
           type: "ROUTE_EXCEEDS_POLICY", for_roles: [ROLE.ADMIN],
           message: `⚠ Driver ${newDriverUser?.fullname}'s total route is ${rRouteKm.toFixed(1)} km — exceeds the ${rPolicyCap} km policy cap for ${rAgentCount} agent${rAgentCount !== 1 ? "s" : ""}.`,
           trip_id: action.trip_id, ts: nowTs, read: false,
-        });
+        }));
       }
-      await logAuditAction({
+      await bestEffort("REASSIGN_DRIVER audit log", () => logAuditAction({
         actorId: actingReassign.id, actorName: actingReassign.name, actionType: "TRIP/REASSIGN_DRIVER",
         tripId: action.trip_id, targetUserId: action.driver_id,
         details: `Reassigned trip from ${oldDriverUser?.fullname || oldDriverId} to ${newDriverUser?.fullname || action.driver_id}`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11640,17 +11669,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         await supabase.from("driver_status").update({ state: DRIVER_STATE.AVAILABLE, currenttripid: null, updatedat: new Date(nowTs).toISOString() }).eq("driverid", action.driver_id);
       }
       const { data: driverUser } = await supabase.from("users").select("fullname").eq("id", action.driver_id).single();
-      await insertNotification({
+      // bestEffort — the write above is already guarded/verified.
+      await bestEffort("DECLINE admin notify", () => insertNotification({
         type: "TRIP_DECLINED", for_roles: [ROLE.ADMIN],
         message: `⚠ DRIVER REJECTION — ${driverUser?.fullname} rejected trip ${action.trip_id}: "${action.reason || "No reason given"}"${action.note ? ` — "${action.note}"` : ""}. Needs reassignment.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
-      });
-      await logAuditAction({
+      }));
+      await bestEffort("DECLINE audit log", () => logAuditAction({
         actorId: action.driver_id, actorName: driverUser?.fullname || action.driver_id,
         actionType: "TRIP/DECLINE",
         tripId: action.trip_id,
         details: `Driver rejected trip. Reason: ${action.reason || "(none)"}${action.note ? ` — "${action.note}"` : ""}`,
-      });
+      }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11721,10 +11751,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       ).select("id"));
       if (!pickupRes.data || pickupRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
       if (allPickedUp) {
-        await insertNotification({
+        // bestEffort — the write above is already guarded/verified.
+        await bestEffort("CONFIRM_AGENT_PICKUP in-transit notify", () => insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`, trip_id: action.trip_id, ts: nowTs, read: false,
-        });
+        }));
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -11853,15 +11884,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           updatedat: new Date(nowTs).toISOString(),
         }).eq("driverid", tripRow.driverid).select("driverid"));
         if (!freeRes.data || freeRes.data.length === 0) throw new Error("Trip completed, but couldn't update your driver status — please refresh.");
-        // Notify agents
+        // Notify agents — bestEffort throughout, both writes above are
+        // already guarded/verified.
         const agentNotifs = tripAgentIds.map(aid => ({
           type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
           message: "Your trip has been completed and archived.",
           trip_id: action.trip_id, ts: nowTs, read: false,
         }));
-        await insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
-          message: `Trip ${action.trip_id} archived.`, trip_id: action.trip_id, ts: nowTs, read: false });
-        for (const n of agentNotifs) await insertNotification(n);
+        await bestEffort("CONFIRM_AGENT_DROPOFF admin notify", () => insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
+          message: `Trip ${action.trip_id} archived.`, trip_id: action.trip_id, ts: nowTs, read: false }));
+        for (const n of agentNotifs) await bestEffort("CONFIRM_AGENT_DROPOFF agent notify", () => insertNotification(n));
       } else {
         // Partial — just save this agent's dropoff. Same optimistic-
         // concurrency guard as the completion branch above.
@@ -11954,23 +11986,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
       const { data: noShowAgentRow } = await supabase.from("users").select("fullname").eq("id", action.agent_id).maybeSingle();
-      await insertNotification({
+      // bestEffort throughout — the write above is already guarded/verified.
+      await bestEffort("MARK_NO_SHOW notify", () => insertNotification({
         type: "NO_SHOW", for_roles: [ROLE.ADMIN],
         message: `🚫 NO SHOW: ${noShowAgentRow?.fullname || "An agent"} wasn't at pickup for trip ${action.trip_id}.${action.note?.trim() ? ` Note: ${action.note.trim()}` : ""}`,
         trip_id: action.trip_id, ts: nsNowTs, read: false,
-      });
+      }));
       if (nsNewState === TRIP_STATE.ARCHIVED_COMPLETED) {
-        await insertNotification({
+        await bestEffort("MARK_NO_SHOW auto-complete notify", () => insertNotification({
           type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id} concluded automatically — every agent was a no-show, nothing left to drop off.`,
           trip_id: action.trip_id, ts: nsNowTs, read: false,
-        });
+        }));
       } else if (nsNewState === TRIP_STATE.IN_TRANSIT) {
-        await insertNotification({
+        await bestEffort("MARK_NO_SHOW in-transit notify", () => insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
           message: `Trip ${action.trip_id}: all passengers handled. Now in transit.`,
           trip_id: action.trip_id, ts: nsNowTs, read: false,
-        });
+        }));
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -12043,13 +12076,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       }).eq("driverid", tripRow.driverid).select("driverid"));
       if (!freeRes.data || freeRes.data.length === 0) throw new Error("Trip completed, but couldn't update your driver status — please refresh.");
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      // bestEffort throughout — both writes above are already guarded/verified.
       const agentNotifs = tripAgentIds.map(aid => ({
         type: "TRIP_COMPLETED", for_roles: [ROLE.AGENT], for_user_ids: [aid],
         message: "Your trip has been completed and archived.", trip_id: action.trip_id, ts: nowTs, read: false,
       }));
-      for (const row of agentNotifs) await insertNotification(row);
+      for (const row of agentNotifs) await bestEffort("COMPLETE agent notify", () => insertNotification(row));
       const { data: completedDriverUser } = await supabase.from("users").select("fullname").eq("id", tripRow.driverid).maybeSingle();
-      await insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN], message: `Trip ${action.trip_id} archived. Driver ${completedDriverUser?.fullname || tripRow.driverid} has ${stillBusy.length} trips remaining.`, ts: nowTs, read: false });
+      await bestEffort("COMPLETE admin notify", () => insertNotification({ type: "TRIP_COMPLETED", for_roles: [ROLE.ADMIN], message: `Trip ${action.trip_id} archived. Driver ${completedDriverUser?.fullname || tripRow.driverid} has ${stillBusy.length} trips remaining.`, ts: nowTs, read: false }));
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
