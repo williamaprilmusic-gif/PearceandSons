@@ -7619,9 +7619,20 @@ async function raceLostIsHarmless(tripId, isExpectedNoop, selectCols) {
 // the first failure. Call bestEffort separately per INDEPENDENT step
 // (not one try/catch wrapping several awaits) so one failing notification
 // doesn't take a second, unrelated one down with it.
+// Still routes to reportError() (Sentry, once configured — see
+// errorReporter.js) — FOUND VIA /code-review: not rethrowing means this
+// failure never reaches dispatch's own catch block, which is the ONLY
+// other place reportError gets called for an action-level error. Without
+// this, a genuine failure on a safety/compliance-relevant notification
+// (an insurance-distance or overload alert, say) would leave zero trace
+// once Sentry is configured, not just skip the misleading "action
+// failed" banner it's supposed to skip.
 async function bestEffort(label, fn) {
   try { await fn(); }
-  catch (e) { console.error(`[${label}] failed: ${e.message}`); }
+  catch (e) {
+    console.error(`[${label}] failed: ${e.message}`);
+    reportError(e, { best_effort_step: label });
+  }
 }
 
 // String()-normalized id equality — for comparing a RAW, unmapped DB
@@ -8565,10 +8576,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `You've been added to trip ${action.trip_id} (pickup: ${action.pickup_label}).`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       }));
-      await bestEffort("ADD_AGENT audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows (see its own comment) — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminAdd.id, actorName: actingAdminAdd.name, actionType: "TRIP/ADD_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Added passenger (pickup: ${action.pickup_label})`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -8730,10 +8743,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nowEpoch(), read: false,
         }));
       }
-      await bestEffort("REMOVE_AGENT audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminRemove.id, actorName: actingAdminRemove.name, actionType: "TRIP/REMOVE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: "Removed passenger from trip",
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -8839,10 +8854,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `Your pickup for trip ${action.trip_id} was moved to ${action.pickup_label}.`,
         trip_id: action.trip_id, ts: nowEpoch(), read: false,
       }));
-      await bestEffort("RELOCATE_AGENT audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminReloc.id, actorName: actingAdminReloc.name, actionType: "TRIP/RELOCATE_AGENT",
         tripId: action.trip_id, targetUserId: action.agent_id, details: `Relocated pickup to ${action.pickup_label}`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -9676,10 +9693,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nowTs, read: false,
         }));
       }
-      await bestEffort("ADMIN_CANCEL audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminCancel.id, actorName: actingAdminCancel.name, actionType: "TRIP/ADMIN_CANCEL",
         tripId: action.trip_id, details: `Cancelled trip (was ${tripRow.status})`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -9755,10 +9774,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             trip_id: action.trip_id, ts: acNowTs, read: false,
           }));
         }
-        await bestEffort("AGENT_CANCEL audit log", () => logAuditAction({
+        // logAuditAction already catches+warns internally and never
+        // rethrows — no bestEffort wrapper needed here.
+        await logAuditAction({
           actorId: action.agent_id, actorName: cancellingAgentName, actionType: "TRIP/AGENT_CANCEL",
           tripId: action.trip_id, details: `Agent cancelled their own spot${acIsLate ? " (LATE)" : ""}${acWasOnlyAgent ? " — whole trip cancelled" : " — removed, trip continues"}`,
-        }));
+        });
       };
 
       if (acWasOnlyAgent) {
@@ -10120,10 +10141,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: primaryId, ts: nowEpoch(), read: false,
         }));
       }
-      await bestEffort("DISPATCH_MULTI audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminMulti.id, actorName: actingAdminMulti.name, actionType: "TRIP/DISPATCH_MULTI",
         tripId: primaryId, details: `Merged ${secondaryIds.length} trip(s) [${secondaryIds.join(", ")}] into ${primaryId} and dispatched`,
-      }));
+      });
       // From here, the exact same code path as a normal single-trip
       // assignment — capacity check, sequencing, DRIVER_ASSIGNED /
       // DRIVER_FULLY_BOOKED notifications, all of it.
@@ -10442,10 +10465,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
               trip_id: mergeTargetTrip.id, ts: nowEpoch(), read: false,
             }));
           }
-          await bestEffort("ASSIGN_DRIVER merge audit log", () => logAuditAction({
+          // logAuditAction already catches+warns internally and never
+          // rethrows — no bestEffort wrapper needed here.
+          await logAuditAction({
             actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
             tripId: mergeTargetTrip.id, details: `Auto-merged trip ${action.trip_id} into existing trip ${mergeTargetTrip.id} for the same driver/day`,
-          }));
+          });
           // Recompute pickup/dropoff sequencing across the driver's full
           // updated route. NOTE: we do NOT recurse back through
           // TRIP/ASSIGN_DRIVER for mergeTargetTrip — its status is already
@@ -10614,10 +10639,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nowTs, read: false,
         }));
       }
-      await bestEffort("ASSIGN_DRIVER audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminAssign.id, actorName: actingAdminAssign.name, actionType: "TRIP/ASSIGN_DRIVER",
         tripId: action.trip_id, targetUserId: action.driver_id, details: `Assigned driver ${driverUser?.fullname || action.driver_id}`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11358,10 +11385,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         type: "DRIVER_REMOVED", for_roles: [ROLE.ADMIN], for_user_ids: [],
         message: driverRemovedMsg, trip_id: action.trip_id, ts: nowTs, read: false,
       }));
-      await bestEffort("REMOVE_DRIVER audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingAdminRemoveDriver.id, actorName: actingAdminRemoveDriver.name, actionType: "TRIP/REMOVE_DRIVER",
         tripId: action.trip_id, targetUserId: removedDriverId, details: `Removed driver ${removedDriverUser?.fullname || removedDriverId} from trip`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11528,11 +11557,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           trip_id: action.trip_id, ts: nowTs, read: false,
         }));
       }
-      await bestEffort("REASSIGN_DRIVER audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: actingReassign.id, actorName: actingReassign.name, actionType: "TRIP/REASSIGN_DRIVER",
         tripId: action.trip_id, targetUserId: action.driver_id,
         details: `Reassigned trip from ${oldDriverUser?.fullname || oldDriverId} to ${newDriverUser?.fullname || action.driver_id}`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
@@ -11582,11 +11613,16 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (error) throw error;
       const { data: reportingDriver } = await supabase.from("users").select("fullname").eq("id", activeUserRef.current).maybeSingle();
       const tripAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
-      await insertNotification({
+      // bestEffort throughout — FOUND VIA A PROACTIVE SWEEP (same class
+      // fixed on the trip-lifecycle handlers elsewhere this session,
+      // missed here): the insert above is already error-checked and has
+      // succeeded, so a notify failure must never report a successful
+      // delay report as a failure.
+      await bestEffort("REPORT_DELAY admin notify", () => insertNotification({
         type: "TRIP_DELAY", for_roles: [ROLE.ADMIN], for_user_ids: [],
         message: `⏱ ${reportingDriver?.fullname || "Driver"} reported a delay on trip ${action.trip_id}: ${action.reason}${action.note ? ` — "${action.note.trim()}"` : ""}`,
         trip_id: action.trip_id, ts: nowTs, read: false,
-      });
+      }));
       // Feature 3: Delay cascade — notify agents on ALL of this driver's
       // active trips, not just the one that reported the delay. If a
       // driver is stuck in traffic on trip #1, agents on trips #2 and #3
@@ -11603,13 +11639,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const isOnCurrentTrip = (aid) => tripAgentIds.some(id => String(id) === String(aid));
       for (const aid of allAffectedAgentIds) {
         const isCurrentTrip = isOnCurrentTrip(aid);
-        await insertNotification({
+        await bestEffort("REPORT_DELAY agent notify", () => insertNotification({
           type: "TRIP_DELAY", for_roles: [ROLE.AGENT], for_user_ids: [aid],
           message: isCurrentTrip
             ? `⏱ Your driver reported a delay: ${action.reason}. Your trip may take longer than expected.`
             : `⏱ Your driver reported a delay on an earlier run (${action.reason}). Your pick-up time may be affected — please stand by.`,
           trip_id: action.trip_id, ts: nowTs, read: false,
-        });
+        }));
       }
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
@@ -11675,12 +11711,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         message: `⚠ DRIVER REJECTION — ${driverUser?.fullname} rejected trip ${action.trip_id}: "${action.reason || "No reason given"}"${action.note ? ` — "${action.note}"` : ""}. Needs reassignment.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
       }));
-      await bestEffort("DECLINE audit log", () => logAuditAction({
+      // logAuditAction already catches+warns internally and never
+      // rethrows — no bestEffort wrapper needed here.
+      await logAuditAction({
         actorId: action.driver_id, actorName: driverUser?.fullname || action.driver_id,
         actionType: "TRIP/DECLINE",
         tripId: action.trip_id,
         details: `Driver rejected trip. Reason: ${action.reason || "(none)"}${action.note ? ` — "${action.note}"` : ""}`,
-      }));
+      });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
