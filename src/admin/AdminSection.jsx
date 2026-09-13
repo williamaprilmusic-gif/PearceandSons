@@ -9722,7 +9722,17 @@ function AdminContacts({ state, dispatch, user, call }) {
   // One effect + a `cancelled` cleanup flag is the same, already-correct
   // pattern StreetInput's debounced search uses for this exact bug class.
   useEffect(() => {
-    if (!selectedId || !supabase) { setDmMessages([]); return; }
+    if (!selectedId || !supabase) {
+      // Reset the ref on close too — otherwise reopening the SAME
+      // conversation afterward isn't seen as a switch (current !==
+      // selectedId would compare selectedId's old id against itself)
+      // and loadingDm's finally() below never fires, leaving it stuck
+      // true forever. Same reset-on-exit convention as DriverNavMap's
+      // lastFetchedDestKeyRef. FOUND VIA /code-review.
+      lastFetchedSelectedIdRef.current = null;
+      setDmMessages([]);
+      return;
+    }
     const isConversationSwitch = lastFetchedSelectedIdRef.current !== selectedId;
     lastFetchedSelectedIdRef.current = selectedId;
     let cancelled = false;
