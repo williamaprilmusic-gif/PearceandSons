@@ -329,11 +329,31 @@ async function verifyPassword(supabase: ReturnType<typeof createClient>, userId:
 }
 
 // ── Action handlers ────────────────────────────────────────────────────────
-async function registrationOptions(userId: number, username: string, password: string) {
+async function registrationOptions(userId: number, username: string, password: string, replace: boolean) {
   const supabase = db();
   const pwCheck = await verifyPassword(supabase, userId, password);
   if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
   if (!pwCheck) return err('Incorrect password', 401);
+  // FOUND VIA /code-review: the client's "change biometric" flow used to
+  // be three full round trips (a standalone remove, then this, then
+  // register) — three separate password re-verifications for one
+  // logical action. Folding the removal in here, gated on this explicit
+  // flag, drops it back to the normal two (this + register) without
+  // relaxing the security bar: password is still checked exactly once
+  // per round trip, same as every other action here.
+  if (replace) {
+    // Deletes EVERY credential this account has, not just the one
+    // belonging to whichever device is re-enrolling right now — nothing
+    // stops a user having registered biometrics on two separate devices
+    // (excludeCredentials below only blocks the SAME physical
+    // authenticator from re-registering, it doesn't scope removal to
+    // "just this device"). There's no per-device picker in the UI to
+    // remove just one, so this is a deliberate "one biometric identity"
+    // model — the client-side confirm step discloses this before
+    // calling, so it's not a silent surprise. FOUND VIA /code-review.
+    const { error: delErr } = await supabase.from('webauthn_credentials').delete().eq('app_user_id', userId);
+    if (delErr) return err('Failed to clear the existing credential: ' + delErr.message);
+  }
   const challenge = randomChallenge();
   await supabase.from('webauthn_challenges')
     .delete().eq('user_id', userId).eq('type', 'registration');
@@ -469,33 +489,6 @@ function extractAuthData(attObj: Uint8Array): Uint8Array | null {
   return null;
 }
 
-// FOUND VIA DIRECT USER REPORT ("can't change the biometrics fingerprint"):
-// there was no way to remove a previously-registered credential at all.
-// Once one existed, re-enrolling (new phone, wiped browser data, a
-// different finger on the same device) was a dead end two different
-// ways: the platform authenticator's own excludeCredentials list (built
-// from every existing row for this user in registrationOptions() above)
-// makes the SAME physical authenticator refuse to create a second
-// credential for this account (throws InvalidStateError before even
-// prompting), and even if a genuinely different authenticator got past
-// that, credential_id_b64's UNIQUE constraint would only reject an exact
-// re-derivation of the same id anyway — there was simply no delete path
-// to clear the old row first. Deletes ALL of this user's credentials
-// (not just one device's) — the account only ever has one "registered
-// biometric" from the UI's point of view, and requiring the same
-// password re-verification as register()/registrationOptions() (see the
-// CRITICAL comment above verifyPassword) keeps this to the same security
-// bar as enrolling a new one.
-async function removeCredential(userId: number, password: string) {
-  const supabase = db();
-  const pwCheck = await verifyPassword(supabase, userId, password);
-  if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
-  if (!pwCheck) return err('Incorrect password', 401);
-  const { error } = await supabase.from('webauthn_credentials').delete().eq('app_user_id', userId);
-  if (error) return err('Failed to remove credential: ' + error.message);
-  return json({ success: true });
-}
-
 // Read-only check used by the login screen to decide whether to label the
 // button "USE FINGERPRINT / FACE ID" vs "SIGN IN WITH BIOMETRICS" while the
 // user is still typing their username. Deliberately does NOT touch
@@ -617,11 +610,9 @@ Deno.serve(async (req: Request) => {
   try {
     switch (body.action as string) {
       case 'registration-options':
-        return await registrationOptions(body.user_id as number, body.username as string, body.password as string);
+        return await registrationOptions(body.user_id as number, body.username as string, body.password as string, !!body.replace);
       case 'register':
         return await register(body.user_id as number, body.credential as Parameters<typeof register>[1], body.password as string);
-      case 'remove':
-        return await removeCredential(body.user_id as number, body.password as string);
       case 'has-credential':
         return await hasCredential(body.username as string);
       case 'authentication-options':

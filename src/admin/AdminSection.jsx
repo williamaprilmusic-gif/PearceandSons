@@ -679,8 +679,7 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
   // Type-safe ID comparison — bigint vs string vs number all normalised to string
   const idEq = (a, b) => String(a) === String(b);
 
-  const agentNames = (t) => (t.agent_ids || [])
-    .map(id => users.find(u => idEq(u.id, id))?.name || String(id)).join(" | ");
+  const agentNames = (t) => formatAgentNames(t.agent_ids, users, " | ");
   const driverName = (t) => {
     if (!t.driver_id) return "";
     return users.find(u => idEq(u.id, t.driver_id))?.name || String(t.driver_id);
@@ -1231,6 +1230,19 @@ function scheduledTimeToMinutes(timeStr) {
 // rather than reusing this one.
 export function usersByIdMap(users) {
   return new Map(users.map(u => [String(u.id), u]));
+}
+
+// Shared by exportComplianceAudit's CSV agentNames() and AdminDispatch's
+// dispatch-card agentNamesFor() — FOUND VIA /code-review: these had
+// drifted into two independent copies of the same agent-id → name
+// lookup, with different unknown-id fallbacks (bare "123" vs "#123"),
+// risking a future fix to one being missed on the other. Separator is a
+// parameter since the two call sites want different ones (CSV: " | ",
+// dispatch card: ", ") — not a difference worth two whole functions.
+export function formatAgentNames(agentIds, users, separator = ", ") {
+  return (agentIds || [])
+    .map(id => users.find(u => String(u.id) === String(id))?.name || `#${id}`)
+    .join(separator);
 }
 
 // Resolves the ONE company a booking belongs to via its first agent's
@@ -5741,11 +5753,9 @@ function AdminDispatch({ state, dispatch, user }) {
     // card below only ever rendered a bare passenger COUNT ("2
     // passengers"), never who they actually are — an admin picking which
     // bookings to combine/dispatch had no name to go on without opening
-    // a separate screen. Mirrors the agentNames() helper already used
-    // for CSV export elsewhere in this file.
-    const agentNamesFor = (t) => (t.agent_ids || [])
-      .map(id => state.users.find(u => String(u.id) === String(id))?.name || `#${id}`)
-      .join(", ");
+    // a separate screen. Shares formatAgentNames() with exportComplianceAudit's
+    // CSV agentNames() — see that helper's own comment.
+    const agentNamesFor = (t) => formatAgentNames(t.agent_ids, state.users);
     const availableAreas = directionFilter === "INBOUND"
       ? [...new Set(unassignedByDirection.flatMap(tripHomeAreas))].sort()
       : [];

@@ -7735,14 +7735,27 @@ function arrayBufToB64(buf) {
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 }
 
-// Register the current device's biometric as a credential
-async function webauthnRegister(userId, username, password) {
+// Register the current device's biometric as a credential. `replace`
+// (re-enrolling over an existing credential — see BiometricEnrollButton)
+// tells the edge function to clear the account's existing credential(s)
+// as PART OF this same registration-options call, rather than a
+// separate remove round trip beforehand — FOUND VIA /code-review: a
+// standalone remove + this + register was 3 password re-verifications
+// for one logical action; folding it in here keeps it to the normal 2.
+// `onReplaced` fires the moment that deletion is confirmed to have
+// happened server-side (i.e. registration-options returned
+// successfully with replace:true) — BEFORE the biometric prompt even
+// appears — so the caller can track "the old credential is definitely
+// gone now" independently of whether the REST of this call (the
+// prompt, or the final register()) goes on to succeed or fail.
+async function webauthnRegister(userId, username, password, { replace = false, onReplaced } = {}) {
   // 1. Get challenge + options from Edge Function. Requires the account's
   // current password — the edge function re-verifies it server-side before
   // issuing a challenge or storing a credential, since user_id alone proves
   // nothing about who's actually asking (see the CRITICAL comment on
   // verifyPassword in supabase/functions/webauthn/index.ts).
-  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username, password });
+  const opts = await webauthnPost({ action: "registration-options", user_id: userId, username, password, replace });
+  if (replace) onReplaced?.();
   // 2. Convert strings → ArrayBuffers for the browser API
   opts.challenge = b64ToArrayBuf(opts.challenge);
   opts.user.id = b64ToArrayBuf(opts.user.id);
@@ -15982,15 +15995,20 @@ export function BiometricEnrollButton({ user }) {
     // authenticator refuse to create a second credential outright, and
     // the DB's UNIQUE constraint on credential_id_b64 would reject it
     // even if it somehow got through. The old credential has to be
-    // deleted server-side FIRST — see webauthn/index.ts's removeCredential.
+    // deleted server-side FIRST — webauthnRegister's `replace` flag does
+    // that as part of its own registration-options call (see its header
+    // comment for why this isn't a separate remove() round trip).
     const wasReplacing = hasCredential;
     let oldRemoved = false;
     try {
-      if (wasReplacing) {
-        await webauthnPost({ action: "remove", user_id: user.id, password });
-        oldRemoved = true;
-      }
-      await webauthnRegister(user.id, user.name, password);
+      await webauthnRegister(user.id, user.name, password, {
+        replace: wasReplacing,
+        // Fires only once the server has CONFIRMED the old credential is
+        // gone — not merely "we're about to ask it to be" — so a later
+        // failure (prompt cancelled, register() rejected) is correctly
+        // attributed below.
+        onReplaced: () => { oldRemoved = true; },
+      });
       setHasCredential(true);
       setStatus("success");
       setMsg(wasReplacing
@@ -16034,7 +16052,13 @@ export function BiometricEnrollButton({ user }) {
         <div style={{ display: "flex", flexDirection: "column", gap: 6, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8 }}>
           <div style={{ fontSize: 9, color: COLORS.ghost }}>
             {hasCredential
-              ? "Confirm your password to replace your registered biometric with this device's:"
+              // FOUND VIA /code-review: this removes ALL of the account's
+              // registered credentials, not just one — if biometrics were
+              // ever enrolled on more than one device, this disables the
+              // OTHER one(s) too. There's no per-device picker, so the
+              // only honest fix short of building one is disclosing it
+              // here rather than doing it silently.
+              ? "Confirm your password to replace your registered biometric with this device's — this also removes it from any OTHER device it was registered on:"
               : "Confirm your password to register this device:"}
           </div>
           <input
