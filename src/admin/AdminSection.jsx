@@ -5720,7 +5720,7 @@ function AdminDispatch({ state, dispatch, user }) {
   const MIN_FULL_PCT = 0.75;
   const {
     unassignedAllDates, availableDates, unassignedByDay, availableDirections, unassignedByDirection,
-    tripHomeAreas, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
+    tripHomeAreas, agentNamesFor, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
     isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
   } = React.useMemo(() => {
     // Archived accounts (removed but kept for trip history) must never
@@ -5736,6 +5736,16 @@ function AdminDispatch({ state, dispatch, user }) {
     const tripHomeAreas = (t) => (t.agent_ids || [])
       .map(id => state.users.find(u => String(u.id) === String(id))?.home_address?.area)
       .filter(Boolean);
+    // FOUND VIA DIRECT USER REPORT ("doesn't show the agent's name in
+    // dispatch when I want to assign a booking"): the unassigned-booking
+    // card below only ever rendered a bare passenger COUNT ("2
+    // passengers"), never who they actually are — an admin picking which
+    // bookings to combine/dispatch had no name to go on without opening
+    // a separate screen. Mirrors the agentNames() helper already used
+    // for CSV export elsewhere in this file.
+    const agentNamesFor = (t) => (t.agent_ids || [])
+      .map(id => state.users.find(u => String(u.id) === String(id))?.name || `#${id}`)
+      .join(", ");
     const availableAreas = directionFilter === "INBOUND"
       ? [...new Set(unassignedByDirection.flatMap(tripHomeAreas))].sort()
       : [];
@@ -5815,7 +5825,7 @@ function AdminDispatch({ state, dispatch, user }) {
     });
     return {
       unassignedAllDates, availableDates, unassignedByDay, availableDirections, unassignedByDirection,
-      tripHomeAreas, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
+      tripHomeAreas, agentNamesFor, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
       isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6225,7 +6235,7 @@ function AdminDispatch({ state, dispatch, user }) {
                 👀 also selected by {otherSelectors.map(o => o.admin_name).join(", ")} — check before dispatching to avoid duplicate work
               </span>
             )}
-            <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_ids.length} passenger{t.agent_ids.length !== 1 ? "s" : ""}</div>
+            <div style={{ fontSize: 11, fontWeight: 700 }}>{t.agent_ids.length} passenger{t.agent_ids.length !== 1 ? "s" : ""} — {agentNamesFor(t)}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.green }}>◉ </span>{t.custom_pickup}</div>
             <div style={{ fontSize: 11 }}><span style={{ color: COLORS.red }}>◎ </span>{t.custom_dropoff}</div>
             <div style={{ display: "flex", gap: 10 }}>
@@ -6266,7 +6276,7 @@ function AdminDispatch({ state, dispatch, user }) {
           <div style={{ background: overCapacity ? "rgba(220,53,69,.08)" : "rgba(245,166,35,.08)", borderRadius: 4, padding: 10, border: `1px solid ${overCapacity ? "rgba(220,53,69,.3)" : "rgba(245,166,35,.3)"}`, display: "flex", flexDirection: "column", gap: 4 }}>
             <span style={{ fontSize: 10, color: COLORS.mist }}>
               {selectedTrips.length === 1
-                ? <>Assigning: <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> — {primaryTrip.custom_pickup}</>
+                ? <>Assigning: <span style={{ color: COLORS.amber }}>{primaryTrip.trip_id}</span> — <span style={{ color: COLORS.amber }}>{agentNamesFor(primaryTrip)}</span> — {primaryTrip.custom_pickup}</>
                 : isMultiDaySelection
                 ? <>Assigning <span style={{ color: COLORS.amber }}>{new Set(selectedTrips.flatMap(t => t.agent_ids || [])).size} agent{new Set(selectedTrips.flatMap(t => t.agent_ids || [])).size !== 1 ? "s" : ""}</span> to the same driver across <span style={{ color: COLORS.amber }}>{distinctWeekDays(selectedTrips)} days</span> ({[...new Set(selectedTrips.map(t => t.scheduled_date))].sort().join(", ")})</>
                 : <>Combining <span style={{ color: COLORS.amber }}>{selectedTrips.length} bookings</span> ({selectedTrips.reduce((n, t) => n + (t.agent_ids?.length || 1), 0)} passengers total) onto {primaryTrip.trip_id}</>}

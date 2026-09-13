@@ -15939,7 +15939,6 @@ export function BiometricEnrollButton({ user }) {
   const [status, setStatus] = useState(null); // null | 'success' | 'error'
   const [msg, setMsg] = useState("");
   const [hasCredential, setHasCredential] = useState(false);
-  const [removing, setRemoving] = useState(false);
   const [confirmingPassword, setConfirmingPassword] = useState(false);
   const [password, setPassword] = useState("");
 
@@ -15976,16 +15975,39 @@ export function BiometricEnrollButton({ user }) {
     setEnrolling(true);
     setStatus(null);
     setMsg("");
+    // FOUND VIA DIRECT USER REPORT ("can't change the biometrics
+    // fingerprint"): once a credential already existed, re-enrolling was
+    // a dead end — the browser's own excludeCredentials list (built from
+    // every row this account already has) makes the SAME device's
+    // authenticator refuse to create a second credential outright, and
+    // the DB's UNIQUE constraint on credential_id_b64 would reject it
+    // even if it somehow got through. The old credential has to be
+    // deleted server-side FIRST — see webauthn/index.ts's removeCredential.
+    const wasReplacing = hasCredential;
+    let oldRemoved = false;
     try {
+      if (wasReplacing) {
+        await webauthnPost({ action: "remove", user_id: user.id, password });
+        oldRemoved = true;
+      }
       await webauthnRegister(user.id, user.name, password);
       setHasCredential(true);
       setStatus("success");
-      setMsg("Biometric registered! You can now log in with your fingerprint or Face ID.");
+      setMsg(wasReplacing
+        ? "Biometric updated! You can now log in with your new fingerprint or Face ID."
+        : "Biometric registered! You can now log in with your fingerprint or Face ID.");
       setConfirmingPassword(false);
       setPassword("");
     } catch (e) {
+      // The old credential is already gone server-side but the new one
+      // failed to register (e.g. the biometric prompt was cancelled) —
+      // leaving "BIOMETRIC ACTIVE" showing would be a lie, the account
+      // now has no working credential at all.
+      if (oldRemoved) setHasCredential(false);
       setStatus("error");
-      setMsg(e.message || "Registration failed — please try again.");
+      setMsg(oldRemoved
+        ? `${e.message || "Registration failed"} — your old biometric was removed, so please enroll again.`
+        : (e.message || "Registration failed — please try again."));
     } finally {
       setEnrolling(false);
     }
@@ -16006,11 +16028,15 @@ export function BiometricEnrollButton({ user }) {
           }}
         >
           <span style={{ fontSize: 14 }}>{hasCredential ? "✅" : "🔒"}</span>
-          {hasCredential ? "BIOMETRIC ACTIVE" : "ENABLE BIOMETRIC LOGIN"}
+          {hasCredential ? "CHANGE BIOMETRIC" : "ENABLE BIOMETRIC LOGIN"}
         </button>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8 }}>
-          <div style={{ fontSize: 9, color: COLORS.ghost }}>Confirm your password to register this device:</div>
+          <div style={{ fontSize: 9, color: COLORS.ghost }}>
+            {hasCredential
+              ? "Confirm your password to replace your registered biometric with this device's:"
+              : "Confirm your password to register this device:"}
+          </div>
           <input
             type="password" value={password} autoFocus
             onChange={e => setPassword(e.target.value)}

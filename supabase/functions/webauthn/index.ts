@@ -469,6 +469,33 @@ function extractAuthData(attObj: Uint8Array): Uint8Array | null {
   return null;
 }
 
+// FOUND VIA DIRECT USER REPORT ("can't change the biometrics fingerprint"):
+// there was no way to remove a previously-registered credential at all.
+// Once one existed, re-enrolling (new phone, wiped browser data, a
+// different finger on the same device) was a dead end two different
+// ways: the platform authenticator's own excludeCredentials list (built
+// from every existing row for this user in registrationOptions() above)
+// makes the SAME physical authenticator refuse to create a second
+// credential for this account (throws InvalidStateError before even
+// prompting), and even if a genuinely different authenticator got past
+// that, credential_id_b64's UNIQUE constraint would only reject an exact
+// re-derivation of the same id anyway — there was simply no delete path
+// to clear the old row first. Deletes ALL of this user's credentials
+// (not just one device's) — the account only ever has one "registered
+// biometric" from the UI's point of view, and requiring the same
+// password re-verification as register()/registrationOptions() (see the
+// CRITICAL comment above verifyPassword) keeps this to the same security
+// bar as enrolling a new one.
+async function removeCredential(userId: number, password: string) {
+  const supabase = db();
+  const pwCheck = await verifyPassword(supabase, userId, password);
+  if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
+  if (!pwCheck) return err('Incorrect password', 401);
+  const { error } = await supabase.from('webauthn_credentials').delete().eq('app_user_id', userId);
+  if (error) return err('Failed to remove credential: ' + error.message);
+  return json({ success: true });
+}
+
 // Read-only check used by the login screen to decide whether to label the
 // button "USE FINGERPRINT / FACE ID" vs "SIGN IN WITH BIOMETRICS" while the
 // user is still typing their username. Deliberately does NOT touch
@@ -593,6 +620,8 @@ Deno.serve(async (req: Request) => {
         return await registrationOptions(body.user_id as number, body.username as string, body.password as string);
       case 'register':
         return await register(body.user_id as number, body.credential as Parameters<typeof register>[1], body.password as string);
+      case 'remove':
+        return await removeCredential(body.user_id as number, body.password as string);
       case 'has-credential':
         return await hasCredential(body.username as string);
       case 'authentication-options':
