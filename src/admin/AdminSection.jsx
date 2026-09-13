@@ -5579,19 +5579,28 @@ function AuditLogEntryRow({ log, compact }) {
   );
 }
 
-// Calls one of this project's admin-only AI edge functions (ai-ops-
-// assistant, ai-dispatch-suggestion) — shared so the session-expiry
-// handling and the {ok,error} response contract stay identical between
-// both callers instead of two hand-maintained copies. FOUND VIA
-// /code-review: this is a raw fetch to an edge function, not a
-// supabase.from() call, so it doesn't go through the central
-// global.fetch wrapper's own 401-retry/notifySessionExpired() handling —
-// that signal has to be raised here explicitly, or an admin whose token
-// expired mid-use sees a generic "Request failed (401)" with no path
-// back to a working session, unlike every other screen in the app.
-// Throws on any failure (network, non-2xx, or {ok:false}) — the caller's
-// own try/catch decides how to present that.
-async function callAiEdgeFunction(functionName, body) {
+// Calls ANY admin-facing edge function that follows this project's
+// standard shape (POST, bearer session token, {ok, ...} | {ok:false,
+// error} JSON response) — deliberately named/documented generically, not
+// after its first two callers (ai-ops-assistant, ai-dispatch-suggestion).
+// FOUND VIA /code-review: an earlier, AI-specific name/comment on this
+// exact helper was the reason a THIRD identical hand-rolled copy
+// (RetentionArchives.download, calling retention-archive-url) went
+// unnoticed as a fit and un-migrated — a future maintainer scanning for
+// "does a reusable fetch helper already exist for this" has to recognize
+// a generic pattern, not mentally strip away an AI-specific frame first.
+// Shared so the session-expiry handling and the base response contract
+// stay identical across every caller instead of hand-maintained copies.
+// This is a raw fetch to an edge function, not a supabase.from() call, so
+// it doesn't go through the central global.fetch wrapper's own
+// 401-retry/notifySessionExpired() handling — that signal has to be
+// raised here explicitly, or an admin whose token expired mid-use sees a
+// generic "Request failed (401)" with no path back to a working session,
+// unlike every other screen in the app. Throws on any failure (network,
+// non-2xx, or {ok:false}) — the caller's own try/catch decides how to
+// present that, and can layer its own extra shape checks (e.g. requiring
+// a specific field) on the returned data.
+async function callAdminEdgeFunction(functionName, body) {
   const res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
     method: "POST",
     headers: {
@@ -5902,26 +5911,29 @@ function AdminDispatch({ state, dispatch, user }) {
     return { pickupCoord, availableDrivers, nearestDriverId, topScoredDriverId, displayedDrivers };
   }, [primaryTrip, availableDriversRaw, selectedTrips, state.users, state.driver_positions, state.trips, driverSearch, nowTick]);
 
-  // A stale AI recommendation for a DIFFERENT trip selection must never
-  // linger once the admin picks something else.
-  useEffect(() => { setAiSuggestion(null); }, [primaryTrip?.trip_id]);
-  // Always holds the CURRENT primary trip id — read inside
-  // askAiForDispatchSuggestion's async continuation below, not the
-  // trip_id closed over when the request started. FOUND VIA /code-review:
-  // without this, switching trips while a request is in flight correctly
-  // cleared the panel (the effect above), but the in-flight request's OWN
-  // resolution then unconditionally overwrote aiSuggestion again with the
-  // PREVIOUS trip's answer, silently showing driver advice for the wrong
-  // trip.
-  const primaryTripIdRef = useRef(primaryTrip?.trip_id ?? null);
-  useEffect(() => { primaryTripIdRef.current = primaryTrip?.trip_id ?? null; }, [primaryTrip?.trip_id]);
+  // Generation counter, bumped on EVERY event that should invalidate an
+  // in-flight AI request — a trip-selection change (the effect below) AND
+  // the start of a NEW ask (inside the function below). FOUND VIA
+  // /code-review, TWICE: the first fix here only keyed staleness on trip
+  // id, so switching trips while a request was in flight correctly
+  // cleared the panel, but the request's own resolution then still
+  // unconditionally overwrote it with the previous trip's answer. Keying
+  // on trip id ALSO failed to catch the narrower case of asking the SAME
+  // trip twice (e.g. retry-after-error, or switching away and back) —
+  // two in-flight requests for one trip id can resolve out of order, and
+  // a trip-id-only check can't tell an old one from a new one. A
+  // strictly-increasing generation number, checked against "is this
+  // still the latest," closes both cases at once: only the most recent
+  // request for ANY trip is ever allowed to write into state.
+  const aiRequestGenRef = useRef(0);
+  useEffect(() => { aiRequestGenRef.current++; setAiSuggestion(null); }, [primaryTrip?.trip_id]);
 
   const askAiForDispatchSuggestion = async () => {
     if (!primaryTrip || availableDrivers.length === 0) return;
-    const askedForTripId = primaryTrip.trip_id;
+    const myGen = ++aiRequestGenRef.current;
     setAiSuggestion({ loading: true });
     try {
-      const data = await callAiEdgeFunction("ai-dispatch-suggestion", {
+      const data = await callAdminEdgeFunction("ai-dispatch-suggestion", {
         trip: {
           direction: primaryTrip.direction, scheduled_date: primaryTrip.scheduled_date, scheduled_time: primaryTrip.scheduled_time,
           pickup_area: primaryTrip.custom_pickup, agent_count: totalSeats,
@@ -5936,10 +5948,10 @@ function AdminDispatch({ state, dispatch, user }) {
           vehicle: ds.vehicle,
         })),
       });
-      if (askedForTripId !== primaryTripIdRef.current) return; // selection moved on — drop this stale response
+      if (myGen !== aiRequestGenRef.current) return; // a newer request/selection has since superseded this one
       setAiSuggestion({ loading: false, text: data.recommendation });
     } catch (e) {
-      if (askedForTripId !== primaryTripIdRef.current) return;
+      if (myGen !== aiRequestGenRef.current) return;
       setAiSuggestion({ loading: false, error: e.message || "Couldn't reach the assistant — please try again." });
     }
   };
@@ -10061,10 +10073,10 @@ function AdminAIAssistant({ user }) {
     setMessages(nextMessages);
     setLoading(true);
     try {
-      // callAiEdgeFunction (shared with AdminDispatch's identical
-      // ai-dispatch-suggestion caller) handles the session-expiry
-      // signal/response contract — see its own comment.
-      const data = await callAiEdgeFunction("ai-ops-assistant", {
+      // callAdminEdgeFunction (shared with AdminDispatch's identical
+      // ai-dispatch-suggestion caller, and RetentionArchives') handles
+      // the session-expiry signal/response contract — see its own comment.
+      const data = await callAdminEdgeFunction("ai-ops-assistant", {
         // Only the last few turns — matches the edge function's own cap,
         // no point sending more than it'll use.
         question, history: nextMessages.slice(0, -1).slice(-6),
@@ -10685,14 +10697,12 @@ function RetentionArchives() {
   const download = async (row) => {
     setDownloading(row.storage_path);
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/retention-archive-url`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}) },
-        body: JSON.stringify({ path: row.storage_path }),
-      });
-      if (res.status === 401 || res.status === 403) notifySessionExpired();
-      const data = await res.json();
-      if (!res.ok || !data.ok || !data.url) throw new Error(data.error || `Request failed (${res.status})`);
+      // callAdminEdgeFunction handles the session-expiry signal/base
+      // {ok,error} contract — see its own comment. This call needs one
+      // extra check on top (a real `url` field), since {ok:true} alone
+      // wouldn't be a usable result here.
+      const data = await callAdminEdgeFunction("retention-archive-url", { path: row.storage_path });
+      if (!data.url) throw new Error("No download URL returned.");
       window.open(data.url, "_blank", "noopener");
     } catch (e) {
       setView(v => ({ ...v, error: e.message || "Couldn't get a download link." }));
