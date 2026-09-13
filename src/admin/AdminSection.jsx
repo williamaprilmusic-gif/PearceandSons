@@ -9671,6 +9671,15 @@ function AdminContacts({ state, dispatch, user, call }) {
   const openConversation = (u) => {
     setSelectedId(u.id);
     setQuery("");
+    // Clear the PREVIOUS conversation's messages synchronously, in the
+    // same batch as setSelectedId — FOUND VIA /code-review: without
+    // this, the render right after switching shows the NEW person's
+    // header over the OLD conversation's still-displayed messages for
+    // one frame (dmMessages/loadingDm hadn't changed yet), until the
+    // effect below gets a chance to run. loadingDm is set here too so
+    // that frame shows a loading state instead of stale content.
+    setDmMessages([]);
+    setLoadingDm(true);
     // Mark all unread DIRECT_MESSAGE notifications for this admin as read
     // the moment they open a conversation — same as MessagesTab (agents/
     // drivers) does on mount. Without this the Contacts badge and the
@@ -9679,7 +9688,7 @@ function AdminContacts({ state, dispatch, user, call }) {
       n => n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.some(id => String(id) === String(user.id))
     );
     dmNotifs.forEach(n => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {}));
-    // Fetching itself is entirely the effect's job now — see its comment.
+    // The actual fetch is entirely the effect's job below.
   };
 
   // Own tick, bumped after a successful send — see send() below.
@@ -9688,6 +9697,16 @@ function AdminContacts({ state, dispatch, user, call }) {
   // just-sent message (see send()'s original comment), so a local
   // trigger is still needed to refresh right after sending.
   const [localDmRefreshTick, setLocalDmRefreshTick] = useState(0);
+  // Tracks which conversation the LAST fetch effect run was for — lets
+  // the effect tell "the selection actually changed" (show a loading
+  // state) apart from "state._dmVersion/localDmRefreshTick bumped for
+  // the SAME still-open conversation" (silent background refresh).
+  // FOUND VIA /code-review: without this distinction, unrelated DM
+  // traffic ANYWHERE in the system (state._dmVersion is a single global
+  // counter, not scoped to the open conversation) flashed a "loading"
+  // state over the currently-open thread and forced a redundant refetch
+  // of it, which the three-call-sites version this replaced never did.
+  const lastFetchedSelectedIdRef = useRef(selectedId);
 
   // Single fetch effect owning ALL of dmMessages/loadingDm — reruns on a
   // conversation switch, a new realtime DM event, or a local post-send
@@ -9704,12 +9723,14 @@ function AdminContacts({ state, dispatch, user, call }) {
   // pattern StreetInput's debounced search uses for this exact bug class.
   useEffect(() => {
     if (!selectedId || !supabase) { setDmMessages([]); return; }
+    const isConversationSwitch = lastFetchedSelectedIdRef.current !== selectedId;
+    lastFetchedSelectedIdRef.current = selectedId;
     let cancelled = false;
-    setLoadingDm(true);
+    if (isConversationSwitch) setLoadingDm(true); // already true from openConversation, but covers a direct URL/programmatic selectedId change too
     fetchDirectMessages(user.id, selectedId)
       .then(msgs => { if (!cancelled) setDmMessages(msgs); })
       .catch(() => { if (!cancelled) setDmMessages([]); })
-      .finally(() => { if (!cancelled) setLoadingDm(false); });
+      .finally(() => { if (!cancelled && isConversationSwitch) setLoadingDm(false); });
     return () => { cancelled = true; };
   }, [selectedId, state._dmVersion, localDmRefreshTick, user.id]);
 
@@ -9851,6 +9872,17 @@ function AdminTickets({ state, dispatch, user }) {
   const STATUS_COLOR = { OPEN: COLORS.amber, IN_PROGRESS: COLORS.blue2, RESOLVED: COLORS.green };
 
   const [ticketActionError, setTicketActionError] = useState(null);
+  // Mirrors expandedId for sendReply's async continuation to read — FOUND
+  // VIA /code-review: sendReply is a closure re-created every render,
+  // capturing THAT render's expandedId. The button calling it only
+  // exists while expandedId === t.id, so the closed-over expandedId and
+  // the ticketId argument are equal by construction at call time — a
+  // plain `ticketId === expandedId` check inside the async continuation
+  // can never see a LATER switch, since it's still comparing against the
+  // stale value from when the closure was made. A ref that a useEffect
+  // keeps current is required to observe the real, latest expandedId.
+  const expandedIdRef = useRef(expandedId);
+  useEffect(() => { expandedIdRef.current = expandedId; }, [expandedId]);
 
   const setStatus = async (ticketId, status) => {
     setSavingId(ticketId);
@@ -9876,8 +9908,10 @@ function AdminTickets({ state, dispatch, user }) {
       // unconditional clear on a slow send's success could still fire
       // AFTER the admin has already switched to a DIFFERENT ticket and
       // started typing a reply for THAT one, wiping their in-progress
-      // text. Only clear if this reply's ticket is still the one open.
-      if (ticketId === expandedId) setReplyText("");
+      // text. Only clear if this reply's ticket is still the one open —
+      // via the ref above, not the closed-over expandedId state (see its
+      // declaration comment for why the state value can't work here).
+      if (ticketId === expandedIdRef.current) setReplyText("");
     } catch (e) {
       setTicketActionError(e.message || "Couldn't send the reply — please try again.");
     } finally {
