@@ -5579,6 +5579,33 @@ function AuditLogEntryRow({ log, compact }) {
   );
 }
 
+// Calls one of this project's admin-only AI edge functions (ai-ops-
+// assistant, ai-dispatch-suggestion) — shared so the session-expiry
+// handling and the {ok,error} response contract stay identical between
+// both callers instead of two hand-maintained copies. FOUND VIA
+// /code-review: this is a raw fetch to an edge function, not a
+// supabase.from() call, so it doesn't go through the central
+// global.fetch wrapper's own 401-retry/notifySessionExpired() handling —
+// that signal has to be raised here explicitly, or an admin whose token
+// expired mid-use sees a generic "Request failed (401)" with no path
+// back to a working session, unlike every other screen in the app.
+// Throws on any failure (network, non-2xx, or {ok:false}) — the caller's
+// own try/catch decides how to present that.
+async function callAiEdgeFunction(functionName, body) {
+  const res = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401 || res.status === 403) notifySessionExpired();
+  const data = await res.json();
+  if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  return data;
+}
+
 function AdminDispatch({ state, dispatch, user }) {
   // Multiple unassigned trips can be selected together — for when several
   // agents happen to be going the same way and one driver should pick up
@@ -5878,41 +5905,41 @@ function AdminDispatch({ state, dispatch, user }) {
   // A stale AI recommendation for a DIFFERENT trip selection must never
   // linger once the admin picks something else.
   useEffect(() => { setAiSuggestion(null); }, [primaryTrip?.trip_id]);
+  // Always holds the CURRENT primary trip id — read inside
+  // askAiForDispatchSuggestion's async continuation below, not the
+  // trip_id closed over when the request started. FOUND VIA /code-review:
+  // without this, switching trips while a request is in flight correctly
+  // cleared the panel (the effect above), but the in-flight request's OWN
+  // resolution then unconditionally overwrote aiSuggestion again with the
+  // PREVIOUS trip's answer, silently showing driver advice for the wrong
+  // trip.
+  const primaryTripIdRef = useRef(primaryTrip?.trip_id ?? null);
+  useEffect(() => { primaryTripIdRef.current = primaryTrip?.trip_id ?? null; }, [primaryTrip?.trip_id]);
 
   const askAiForDispatchSuggestion = async () => {
     if (!primaryTrip || availableDrivers.length === 0) return;
+    const askedForTripId = primaryTrip.trip_id;
     setAiSuggestion({ loading: true });
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-dispatch-suggestion`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
+      const data = await callAiEdgeFunction("ai-dispatch-suggestion", {
+        trip: {
+          direction: primaryTrip.direction, scheduled_date: primaryTrip.scheduled_date, scheduled_time: primaryTrip.scheduled_time,
+          pickup_area: primaryTrip.custom_pickup, agent_count: totalSeats,
         },
-        body: JSON.stringify({
-          trip: {
-            direction: primaryTrip.direction, scheduled_date: primaryTrip.scheduled_date, scheduled_time: primaryTrip.scheduled_time,
-            pickup_area: primaryTrip.custom_pickup, agent_count: totalSeats,
-          },
-          // Top 5 — matches the edge function's own cap; the app's real
-          // ranking (scoreDriverForTrip) already ran, this just asks for
-          // a plain-English gloss on it, not a fresh ranking.
-          candidates: availableDrivers.slice(0, 5).map(({ u, ds, score, distKm, acceptRate, prevDeclinedThisAgent }) => ({
-            name: u?.name || `#${ds.driver_id}`, score, dist_km: distKm,
-            load: getDriverLoad(state, ds.driver_id, primaryTrip.scheduled_date), capacity: ds.capacity || DRIVER_CAPACITY,
-            accept_rate_pct: Math.round((acceptRate ?? 1) * 100), prev_declined_this_agent: !!prevDeclinedThisAgent,
-            vehicle: ds.vehicle,
-          })),
-        }),
+        // Top 5 — matches the edge function's own cap; the app's real
+        // ranking (scoreDriverForTrip) already ran, this just asks for
+        // a plain-English gloss on it, not a fresh ranking.
+        candidates: availableDrivers.slice(0, 5).map(({ u, ds, score, distKm, acceptRate, prevDeclinedThisAgent }) => ({
+          name: u?.name || `#${ds.driver_id}`, score, dist_km: distKm,
+          load: getDriverLoad(state, ds.driver_id, primaryTrip.scheduled_date), capacity: ds.capacity || DRIVER_CAPACITY,
+          accept_rate_pct: Math.round((acceptRate ?? 1) * 100), prev_declined_this_agent: !!prevDeclinedThisAgent,
+          vehicle: ds.vehicle,
+        })),
       });
-      // Same 401/403 handling as AdminAIAssistant's identical raw fetch
-      // to an edge function — see its own comment for why this can't
-      // rely on the central global.fetch wrapper's retry logic.
-      if (res.status === 401 || res.status === 403) notifySessionExpired();
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      if (askedForTripId !== primaryTripIdRef.current) return; // selection moved on — drop this stale response
       setAiSuggestion({ loading: false, text: data.recommendation });
     } catch (e) {
+      if (askedForTripId !== primaryTripIdRef.current) return;
       setAiSuggestion({ loading: false, error: e.message || "Couldn't reach the assistant — please try again." });
     }
   };
@@ -10034,26 +10061,14 @@ function AdminAIAssistant({ user }) {
     setMessages(nextMessages);
     setLoading(true);
     try {
-      const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-ops-assistant`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
-        },
+      // callAiEdgeFunction (shared with AdminDispatch's identical
+      // ai-dispatch-suggestion caller) handles the session-expiry
+      // signal/response contract — see its own comment.
+      const data = await callAiEdgeFunction("ai-ops-assistant", {
         // Only the last few turns — matches the edge function's own cap,
         // no point sending more than it'll use.
-        body: JSON.stringify({ question, history: nextMessages.slice(0, -1).slice(-6) }),
+        question, history: nextMessages.slice(0, -1).slice(-6),
       });
-      // This is a raw fetch to an edge function, not a supabase.from()
-      // call — it doesn't go through the central global.fetch wrapper's
-      // 401-retry/notifySessionExpired() handling, so that signal has to
-      // be raised here explicitly. Without this, an admin whose token
-      // expired mid-chat just saw a generic "Request failed (401)" error
-      // bubble with no path back to a working session, unlike every other
-      // screen in the app.
-      if (res.status === 401 || res.status === 403) notifySessionExpired();
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
       setMessages(m => [...m, { role: "assistant", content: data.answer }]);
     } catch (e) {
       setError(e.message || "Couldn't reach the assistant — please try again.");
@@ -10484,9 +10499,6 @@ function AdminStatus({ companies = [], users = [] }) {
   );
 }
 
-// Predicted-vs-actual pickup-ETA error (computeEtaAccuracy over
-// fetchEtaAccuracyData). Collapsible + fetch-once-per-open, same shape
-// as RetentionArchives.
 // Dashboard-level summary for the two address-quality signals — see
 // usersNeedingAddressConfirmation/usersWithStreetLevelAddress's own
 // comments. Deliberately just a summary + a pointer, not a second
@@ -10532,6 +10544,9 @@ function AddressQualityReport({ users = [] }) {
   );
 }
 
+// Predicted-vs-actual pickup-ETA error (computeEtaAccuracy over
+// fetchEtaAccuracyData). Collapsible + fetch-once-per-open, same shape
+// as RetentionArchives.
 function EtaAccuracyReport({ companies = [] }) {
   const [open, setOpen] = useState(false);
   // Raw rows are fetched once per open; the report is DERIVED so client
