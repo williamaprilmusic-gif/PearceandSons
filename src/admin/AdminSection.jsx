@@ -4727,6 +4727,14 @@ function AdminProfileSearch({ state, user, dispatch }) {
   const [historyTrips, setHistoryTrips] = useState(null); // null = not loaded yet
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // Generation counter, bumped on every selectProfile call — FOUND VIA A
+  // PROACTIVE SWEEP (same class as AdminDispatch's AI-recommendation
+  // race): fetchTripHistory's resolution used to unconditionally
+  // overwrite historyTrips with no check that selectedUserId was still
+  // the person this fetch was for. Selecting profile A, then — before
+  // its (slower) fetch resolves — selecting profile B, could have A's
+  // history silently land on screen while B's card/header is showing.
+  const profileFetchGenRef = useRef(0);
 
   // Viewer can search agent profiles only — driver profiles require
   // viewDriverProfiles, which Viewer doesn't have.
@@ -4740,14 +4748,16 @@ function AdminProfileSearch({ state, user, dispatch }) {
   const driverStatus = selectedUser?.role === ROLE.DRIVER ? state.driver_status.find(d => String(d.driver_id) === String(selectedUser.id)) : null;
 
   const selectProfile = async (u) => {
+    const myGen = ++profileFetchGenRef.current;
     setSelectedUserId(u.id);
     setQuery("");
     setHistoryTrips(null);
     setLoadingHistory(true);
     try {
       const hits = await fetchTripHistory(u.role === ROLE.AGENT ? { agentId: u.id } : { driverId: u.id });
-      // Same scoping principle as the trip-search tab's runSearch/
-      // runSearchWithRange — FOUND VIA /code-review: fetchTripHistory
+      if (myGen !== profileFetchGenRef.current) return; // a different profile has since been selected
+      // Same scoping principle as the trip-search tab's runSearch —
+      // FOUND VIA /code-review: fetchTripHistory
       // queries by agent/driver id only, with no company filter, so
       // without this a Viewer could reassign-then-search their way into
       // an agent's out-of-scope-company trip history (and from there, GPS
@@ -4756,9 +4766,10 @@ function AdminProfileSearch({ state, user, dispatch }) {
       // so this is a straight scope-or-don't, no user-selected override.
       setHistoryTrips(isCompanyScoped(user, state.companies) ? scopeTripsToCompany(hits, state.users, getAdminCompanyIds(user, state.companies)) : hits);
     } catch (e) {
+      if (myGen !== profileFetchGenRef.current) return;
       setHistoryTrips([]);
     } finally {
-      setLoadingHistory(false);
+      if (myGen === profileFetchGenRef.current) setLoadingHistory(false);
     }
   };
 
@@ -5012,6 +5023,12 @@ function AdminHistory({ state, user, dispatch }) {
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [err, setErr] = useState(null);
+  // Guards against SEARCH and a quick-range button (or two quick-range
+  // clicks) firing overlapping requests — same pattern as
+  // AdminActivityLog's own identical fix, missed here. Without this, a
+  // slow first request resolving AFTER a faster second one would silently
+  // overwrite results with stale data and no indication anything raced.
+  const searchSeqRef = useRef(0);
 
   const agents = state.users.filter(u => u.role === ROLE.AGENT);
   const drivers = state.users.filter(u => u.role === ROLE.DRIVER);
@@ -5028,17 +5045,31 @@ function AdminHistory({ state, user, dispatch }) {
     setFromDate(v);
   };
 
-  const runSearch = async () => {
+  // Takes optional explicit fromStr/toStr (defaulting to current state) —
+  // FOUND VIA A PROACTIVE SWEEP: this used to be two near-identical
+  // functions (this one reading fromDate/toDate from state, a separate
+  // runSearchWithRange taking explicit args) because applyQuickRange's
+  // setFromDate/setToDate calls don't take effect until the next render,
+  // so calling this one immediately after would've read the OLD state
+  // values — solved the same way AdminActivityLog's own runSearch already
+  // does it (explicit-args-with-defaults), instead of a second copy of
+  // the whole function. searchSeqRef guards against SEARCH and a
+  // quick-range button (or two quick-range clicks) firing overlapping
+  // requests — without it, a slow first request resolving AFTER a faster
+  // second one would silently overwrite results with stale data.
+  const runSearch = async (fromStr = fromDate, toStr = toDate) => {
+    const seq = ++searchSeqRef.current;
     setLoading(true); setErr(null);
     try {
-      const effectiveFromDate = isViewer && fromDate < earliestAllowedStr ? earliestAllowedStr : fromDate;
+      const effectiveFromDate = isViewer && fromStr < earliestAllowedStr ? earliestAllowedStr : fromStr;
       const fromMs = effectiveFromDate ? new Date(`${effectiveFromDate}T00:00:00`).getTime() : undefined;
-      const toMs = toDate ? new Date(`${toDate}T23:59:59`).getTime() : undefined;
+      const toMs = toStr ? new Date(`${toStr}T23:59:59`).getTime() : undefined;
       const hits = await fetchTripHistory({
         fromMs, toMs,
         agentId: agentFilter || undefined,
         driverId: driverFilter || undefined,
       });
+      if (seq !== searchSeqRef.current) return; // superseded by a newer search
       // fetchTripHistory queries Supabase directly, independent of the
       // already-scoped state.trips the rest of this tab reads from — so
       // a company-scoped Viewer's search still needs its own explicit
@@ -5053,10 +5084,11 @@ function AdminHistory({ state, user, dispatch }) {
         : (companyFilter.length ? companyFilter : null);
       setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
     } catch (e) {
+      if (seq !== searchSeqRef.current) return;
       setErr(e.message || "Search failed");
       setResults(null);
     } finally {
-      setLoading(false);
+      if (seq === searchSeqRef.current) setLoading(false);
     }
   };
 
@@ -5077,36 +5109,10 @@ function AdminHistory({ state, user, dispatch }) {
     const clampedStartStr = isViewer && startStr < earliestAllowedStr ? earliestAllowedStr : startStr;
     setFromDate(clampedStartStr);
     setToDate(endStr);
-    setTimeout(() => runSearchWithRange(clampedStartStr, endStr), 0);
-  };
-
-  // Same as runSearch but takes explicit dates — needed because
-  // applyQuickRange's setFromDate/setToDate calls don't take effect until
-  // the next render, so runSearch() called immediately after would still
-  // read the OLD state values.
-  const runSearchWithRange = async (fromStr, toStr) => {
-    setLoading(true); setErr(null);
-    try {
-      const fromMs = new Date(`${fromStr}T00:00:00`).getTime();
-      const toMs = new Date(`${toStr}T23:59:59`).getTime();
-      const hits = await fetchTripHistory({
-        fromMs, toMs,
-        agentId: agentFilter || undefined,
-        driverId: driverFilter || undefined,
-      });
-      // Same scoping as runSearch — this was previously missing entirely
-      // here, so the quick-range buttons let a company-scoped Viewer see
-      // every company's trips regardless of their assigned scope.
-      const effectiveCompanyIds = isCompanyScoped(user, state.companies)
-        ? getAdminCompanyIds(user, state.companies)
-        : (companyFilter.length ? companyFilter : null);
-      setResults(effectiveCompanyIds ? scopeTripsToCompany(hits, state.users, effectiveCompanyIds) : hits);
-    } catch (e) {
-      setErr(e.message || "Search failed");
-      setResults(null);
-    } finally {
-      setLoading(false);
-    }
+    // Explicit args sidestep the stale-state problem directly — no
+    // setTimeout(...,0) workaround needed (that was only ever masking
+    // runSearch not accepting args yet).
+    runSearch(clampedStartStr, endStr);
   };
 
   return (
@@ -5123,9 +5129,14 @@ function AdminHistory({ state, user, dispatch }) {
       <Card>
         <SectionHeader label="Quick Range" />
         <div style={{ display: "flex", gap: 8 }}>
-          <Button title="TODAY" size="sm" variant="ghost" onClick={() => applyQuickRange("day")} style={{ flex: 1 }} />
-          <Button title="PAST WEEK" size="sm" variant="ghost" onClick={() => applyQuickRange("week")} style={{ flex: 1 }} />
-          <Button title="PAST MONTH" size="sm" variant="ghost" onClick={() => applyQuickRange("month")} style={{ flex: 1 }} />
+          {/* disabled={loading} — FOUND VIA A PROACTIVE SWEEP: these were the
+              one gap AdminActivityLog's own identical quick-range buttons
+              already close (see runSearch/searchSeqRef's comment above) —
+              without it, SEARCH and a quick-range click could fire
+              overlapping requests. */}
+          <Button title="TODAY" size="sm" variant="ghost" onClick={() => applyQuickRange("day")} disabled={loading} style={{ flex: 1 }} />
+          <Button title="PAST WEEK" size="sm" variant="ghost" onClick={() => applyQuickRange("week")} disabled={loading} style={{ flex: 1 }} />
+          <Button title="PAST MONTH" size="sm" variant="ghost" onClick={() => applyQuickRange("month")} disabled={loading} style={{ flex: 1 }} />
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <div style={{ flex: "1 1 140px" }}>
@@ -5184,7 +5195,13 @@ function AdminHistory({ state, user, dispatch }) {
             <span style={{ fontSize: 10, color: COLORS.chalk }}>Exception bookings <span style={{ color: COLORS.red }}>(E)</span></span>
           </div>
         </div>
-        <Button title={loading ? "SEARCHING…" : "SEARCH"} variant="amber" full onClick={runSearch} disabled={loading} style={{ marginTop: 12 }} />
+        {/* onClick={() => runSearch()}, not a bare `runSearch` reference —
+            runSearch now takes optional args (defaulting via `= fromDate`),
+            and a bare onClick={fn} reference receives the native click
+            event as the first argument, which is truthy/defined and so
+            would NOT fall through to the default — matches
+            AdminActivityLog's own identical button for the same reason. */}
+        <Button title={loading ? "SEARCHING…" : "SEARCH"} variant="amber" full onClick={() => runSearch()} disabled={loading} style={{ marginTop: 12 }} />
       </Card>
 
       {err && (
@@ -9651,10 +9668,9 @@ function AdminContacts({ state, dispatch, user, call }) {
 
   const selected = selectedId ? state.users.find(u => String(u.id) === String(selectedId)) : null;
 
-  const openConversation = async (u) => {
+  const openConversation = (u) => {
     setSelectedId(u.id);
     setQuery("");
-    setLoadingDm(true);
     // Mark all unread DIRECT_MESSAGE notifications for this admin as read
     // the moment they open a conversation — same as MessagesTab (agents/
     // drivers) does on mount. Without this the Contacts badge and the
@@ -9663,24 +9679,39 @@ function AdminContacts({ state, dispatch, user, call }) {
       n => n.type === "DIRECT_MESSAGE" && !n.read && n.for_user_ids?.some(id => String(id) === String(user.id))
     );
     dmNotifs.forEach(n => dispatch({ type: "NOTIF/MARK_READ", id: n.id }).catch(() => {}));
-    try {
-      const msgs = await fetchDirectMessages(user.id, u.id);
-      setDmMessages(msgs);
-    } catch (e) {
-      setDmMessages([]);
-    } finally {
-      setLoadingDm(false);
-    }
+    // Fetching itself is entirely the effect's job now — see its comment.
   };
 
-  // Reload the open conversation thread whenever a new DM arrives
-  // (state._dmVersion increments on every direct_messages realtime event).
-  // Without this, a new message from the other person only appears after
-  // the admin closes and reopens the conversation.
+  // Own tick, bumped after a successful send — see send() below.
+  // state._dmVersion only bumps on a REALTIME direct_messages event,
+  // which doesn't fire back to the sender's own client for their own
+  // just-sent message (see send()'s original comment), so a local
+  // trigger is still needed to refresh right after sending.
+  const [localDmRefreshTick, setLocalDmRefreshTick] = useState(0);
+
+  // Single fetch effect owning ALL of dmMessages/loadingDm — reruns on a
+  // conversation switch, a new realtime DM event, or a local post-send
+  // refresh. FOUND VIA A PROACTIVE SWEEP (same class as AdminDispatch's
+  // AI-recommendation race, AdminProfileSearch's history race): this used
+  // to be THREE separate call sites (openConversation's own fetch, this
+  // effect, and send()'s post-send refetch) each writing dmMessages with
+  // no check that selectedId hadn't moved on — opening conversation A,
+  // then quickly switching to B, could have A's slower response land on
+  // screen while B's thread header is showing (and the two ALSO
+  // double-fetched the same conversation on every open, since selectedId
+  // changing re-ran this effect on top of openConversation's own call).
+  // One effect + a `cancelled` cleanup flag is the same, already-correct
+  // pattern StreetInput's debounced search uses for this exact bug class.
   useEffect(() => {
-    if (!selectedId || !supabase) return;
-    fetchDirectMessages(user.id, selectedId).then(setDmMessages).catch(() => {});
-  }, [state._dmVersion, selectedId, user.id]);
+    if (!selectedId || !supabase) { setDmMessages([]); return; }
+    let cancelled = false;
+    setLoadingDm(true);
+    fetchDirectMessages(user.id, selectedId)
+      .then(msgs => { if (!cancelled) setDmMessages(msgs); })
+      .catch(() => { if (!cancelled) setDmMessages([]); })
+      .finally(() => { if (!cancelled) setLoadingDm(false); });
+    return () => { cancelled = true; };
+  }, [selectedId, state._dmVersion, localDmRefreshTick, user.id]);
 
   const send = async () => {
     if (!text.trim() || !selected || sending) return;
@@ -9688,11 +9719,7 @@ function AdminContacts({ state, dispatch, user, call }) {
     try {
       await dispatch({ type: "DM/SEND", sender_id: user.id, sender_name: user.name, sender_role: ROLE.ADMIN, recipient_id: selected.id, message: text.trim() });
       setText("");
-      // DM/SEND doesn't trigger a refetch (direct_messages isn't part of
-      // the main sync cycle) — re-fetch just this conversation so the new
-      // message shows up immediately.
-      const msgs = await fetchDirectMessages(user.id, selected.id);
-      setDmMessages(msgs);
+      setLocalDmRefreshTick(t => t + 1); // triggers the shared fetch effect above
       loadConversations(); // also refresh the inbox list's preview/order
     } catch (e) {
       // The global toast wrapper already told the user the send failed
@@ -9843,7 +9870,14 @@ function AdminTickets({ state, dispatch, user }) {
     setTicketActionError(null);
     try {
       await dispatch({ type: "TICKET/UPDATE", ticket_id: ticketId, admin_reply: replyText.trim(), admin_id: user.id, status: "IN_PROGRESS" });
-      setReplyText("");
+      // FOUND VIA A PROACTIVE SWEEP: replyText is one shared box across
+      // every ticket row (only one is ever expanded at once), cleared on
+      // switching tickets (see setExpandedId's onClick) — but this
+      // unconditional clear on a slow send's success could still fire
+      // AFTER the admin has already switched to a DIFFERENT ticket and
+      // started typing a reply for THAT one, wiping their in-progress
+      // text. Only clear if this reply's ticket is still the one open.
+      if (ticketId === expandedId) setReplyText("");
     } catch (e) {
       setTicketActionError(e.message || "Couldn't send the reply — please try again.");
     } finally {
