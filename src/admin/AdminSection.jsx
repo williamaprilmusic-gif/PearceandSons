@@ -5592,6 +5592,11 @@ function AdminDispatch({ state, dispatch, user }) {
   // but the driver list itself has no filtering at all, which matters
   // on a fleet with many drivers.
   const [driverSearch, setDriverSearch] = useState("");
+  // Smart dispatch suggestion — one of three AI feature options scoped
+  // alongside the AI Ops Assistant (2026-08-07) but not built until now.
+  // { loading, text, error } | null — null means "not asked yet for the
+  // current trip selection"; reset whenever the selection changes below.
+  const [aiSuggestion, setAiSuggestion] = useState(null);
   const [msg, setMsg] = useState(null);
   const [dispatching, setDispatching] = useState(false);
   // "Auto-assign all" — a staged plan (computeAutoAssignPlan output) the
@@ -5869,6 +5874,48 @@ function AdminDispatch({ state, dispatch, user }) {
       : availableDrivers;
     return { pickupCoord, availableDrivers, nearestDriverId, topScoredDriverId, displayedDrivers };
   }, [primaryTrip, availableDriversRaw, selectedTrips, state.users, state.driver_positions, state.trips, driverSearch, nowTick]);
+
+  // A stale AI recommendation for a DIFFERENT trip selection must never
+  // linger once the admin picks something else.
+  useEffect(() => { setAiSuggestion(null); }, [primaryTrip?.trip_id]);
+
+  const askAiForDispatchSuggestion = async () => {
+    if (!primaryTrip || availableDrivers.length === 0) return;
+    setAiSuggestion({ loading: true });
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/ai-dispatch-suggestion`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(_cachedSessionToken ? { Authorization: `Bearer ${_cachedSessionToken}` } : {}),
+        },
+        body: JSON.stringify({
+          trip: {
+            direction: primaryTrip.direction, scheduled_date: primaryTrip.scheduled_date, scheduled_time: primaryTrip.scheduled_time,
+            pickup_area: primaryTrip.custom_pickup, agent_count: totalSeats,
+          },
+          // Top 5 — matches the edge function's own cap; the app's real
+          // ranking (scoreDriverForTrip) already ran, this just asks for
+          // a plain-English gloss on it, not a fresh ranking.
+          candidates: availableDrivers.slice(0, 5).map(({ u, ds, score, distKm, acceptRate, prevDeclinedThisAgent }) => ({
+            name: u?.name || `#${ds.driver_id}`, score, dist_km: distKm,
+            load: getDriverLoad(state, ds.driver_id, primaryTrip.scheduled_date), capacity: ds.capacity || DRIVER_CAPACITY,
+            accept_rate_pct: Math.round((acceptRate ?? 1) * 100), prev_declined_this_agent: !!prevDeclinedThisAgent,
+            vehicle: ds.vehicle,
+          })),
+        }),
+      });
+      // Same 401/403 handling as AdminAIAssistant's identical raw fetch
+      // to an edge function — see its own comment for why this can't
+      // rely on the central global.fetch wrapper's retry logic.
+      if (res.status === 401 || res.status === 403) notifySessionExpired();
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      setAiSuggestion({ loading: false, text: data.recommendation });
+    } catch (e) {
+      setAiSuggestion({ loading: false, error: e.message || "Couldn't reach the assistant — please try again." });
+    }
+  };
 
   // "What-if" preview for the currently selected driver — the exact seat +
   // route + policy outcome of dispatching this selection to them, shown on
@@ -6179,6 +6226,25 @@ function AdminDispatch({ state, dispatch, user }) {
               </span>
             )}
           </div>
+          {hasAdminPermission(user, "manageDispatch") && availableDrivers.length > 0 && (
+            <div style={{ border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+              {!aiSuggestion ? (
+                <Button title="🤖 ASK AI FOR A RECOMMENDATION" variant="ghost" size="sm" onClick={askAiForDispatchSuggestion} />
+              ) : aiSuggestion.loading ? (
+                <span style={{ fontSize: 10, color: COLORS.ghost }}>Thinking…</span>
+              ) : aiSuggestion.error ? (
+                <>
+                  <span style={{ fontSize: 10, color: COLORS.red }}>{aiSuggestion.error}</span>
+                  <Button title="RETRY" variant="ghost" size="sm" onClick={askAiForDispatchSuggestion} />
+                </>
+              ) : (
+                <>
+                  <span style={{ fontSize: 9, color: COLORS.ghost, letterSpacing: 0.5 }}>🤖 AI RECOMMENDATION — based on the same ranking below, not a fresh lookup</span>
+                  <span style={{ fontSize: 11, color: COLORS.chalk, lineHeight: 1.5 }}>{aiSuggestion.text}</span>
+                </>
+              )}
+            </div>
+          )}
           {availableDrivers.length > 1 && (
             <TextField label="Search drivers by name, vehicle, or area" value={driverSearch} onChange={e => setDriverSearch(e.target.value)} placeholder="e.g. Sipho, Hiace, or Milnerton" />
           )}
@@ -9051,6 +9117,29 @@ export function usersNeedingAddressConfirmation(users) {
   );
 }
 
+// Agents/drivers whose home address DOES have resolved real coordinates
+// (so they're never caught by usersNeedingAddressConfirmation above) but
+// whose saved label carries no house number at all — a real, live-found
+// gap (Marisa Williams, 2026-09-11: homelat/homelng were genuinely set,
+// but the label read just "Cedric Close, Mitchells Plain" — a StreetInput
+// bug silently dropped a typed house number when the only suggestion
+// available was a street-level match; now fixed, see leadingHouseNumber's
+// own comment for why some streets genuinely have no house-number data in
+// EITHER geocoding vendor). A flagged row isn't necessarily wrong — some
+// addresses are legitimately just a street/farm name — but it's worth an
+// admin's eyes: a driver reading this label out loud has nothing to
+// identify which house, and this now catches it even though the
+// coordinate itself resolved fine (the "needs confirming" flag above
+// never would).
+export function usersWithStreetLevelAddress(users) {
+  return (users || []).filter(u =>
+    (u.role === ROLE.AGENT || u.role === ROLE.DRIVER) &&
+    u.home_address?.label &&
+    hasResolvedCoord(u.home_address) &&
+    !leadingHouseNumber(u.home_address.label)
+  );
+}
+
 function AdminUsers({ state, dispatch, user }) {
   const [show, setShow] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -9086,6 +9175,11 @@ function AdminUsers({ state, dispatch, user }) {
   // import), not just a bug backlog. ANDs with the text search rather than
   // replacing it, so an admin can still narrow by name/role at the same time.
   const [showOnlyUnconfirmed, setShowOnlyUnconfirmed] = useState(false);
+  // Geocoding quality — see usersWithStreetLevelAddress's own comment.
+  // Separate toggle from showOnlyUnconfirmed above: that one is "no
+  // coordinate at all", this one is "has a coordinate, but the label is
+  // missing a house number" — a different, milder quality signal.
+  const [showOnlyStreetLevel, setShowOnlyStreetLevel] = useState(false);
   // Archived accounts (removed but kept because of trip history) are
   // hidden by default — this toggle brings them back so they can be
   // reviewed / un-archived.
@@ -9093,6 +9187,8 @@ function AdminUsers({ state, dispatch, user }) {
   const archivedCount = React.useMemo(() => state.users.filter(u => u.archived).length, [state.users]);
   const needsAddressConfirmation = React.useMemo(() => usersNeedingAddressConfirmation(state.users), [state.users]);
   const needsAddressConfirmationIds = React.useMemo(() => new Set(needsAddressConfirmation.map(u => u.id)), [needsAddressConfirmation]);
+  const streetLevelAddresses = React.useMemo(() => usersWithStreetLevelAddress(state.users), [state.users]);
+  const streetLevelAddressIds = React.useMemo(() => new Set(streetLevelAddresses.map(u => u.id)), [streetLevelAddresses]);
   const filteredUsers = (userSearch.trim().length >= 1
     ? state.users.filter(u => {
         const q = userSearch.trim().toLowerCase();
@@ -9100,6 +9196,7 @@ function AdminUsers({ state, dispatch, user }) {
       })
     : state.users
   ).filter(u => !showOnlyUnconfirmed || needsAddressConfirmationIds.has(u.id))
+   .filter(u => !showOnlyStreetLevel || streetLevelAddressIds.has(u.id))
    .filter(u => showArchived || !u.archived);
   const toggleSelected = (id) => {
     setSelectedIds(prev => {
@@ -9357,6 +9454,17 @@ function AdminUsers({ state, dispatch, user }) {
           {" "}<b>{showOnlyUnconfirmed ? "SHOWING ONLY THESE — tap to clear" : "TAP TO SHOW THEM"}</b>
         </div>
       )}
+      {/* Same "keep rendering while the filter is active" fix as the
+          banner above, for the same reason. */}
+      {(streetLevelAddresses.length > 0 || showOnlyStreetLevel) && (
+        <div onClick={() => setShowOnlyStreetLevel(v => !v)}
+          style={{ cursor: "pointer", background: "rgba(245,166,35,.08)", border: `1px solid ${showOnlyStreetLevel ? COLORS.amber : "rgba(245,166,35,.3)"}`, borderRadius: 4, padding: 10, fontSize: 10, color: COLORS.chalk }}>
+          {streetLevelAddresses.length > 0
+            ? <>🔍 {streetLevelAddresses.length} agent/driver address{streetLevelAddresses.length !== 1 ? "es" : ""} resolved but missing a house number — a driver reading it out has nothing to identify which house.</>
+            : <>✓ Every resolved address has a house number.</>}
+          {" "}<b>{showOnlyStreetLevel ? "SHOWING ONLY THESE — tap to clear" : "TAP TO SHOW THEM"}</b>
+        </div>
+      )}
       {(archivedCount > 0 || showArchived) && (
         <div onClick={() => setShowArchived(v => !v)}
           style={{ cursor: "pointer", background: COLORS.surface, border: `1px solid ${showArchived ? COLORS.amber : COLORS.wire}`, borderRadius: 4, padding: 10, fontSize: 10, color: COLORS.chalk }}>
@@ -9408,15 +9516,23 @@ function AdminUsers({ state, dispatch, user }) {
                   </div>
                   <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 1 }}>Staff #: {u.staff_number || "—"}</div>
                   {(u.role === ROLE.AGENT || u.role === ROLE.DRIVER) && u.home_address && (
-                    hasResolvedCoord(u.home_address)
-                      ? <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>
+                    !hasResolvedCoord(u.home_address)
                       // FOUND VIA /code-review: this line used to show the
                       // same green pin whether or not the address had ever
                       // resolved to real coordinates (label-only bulk-
                       // import rows looked identical to confirmed ones,
                       // and drivers never got this line at all — added
                       // here too, same shape as the agent case).
-                      : <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>⚠ {u.home_address.label} (needs confirming)</div>
+                      ? <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>⚠ {u.home_address.label} (needs confirming)</div>
+                      // Resolved, but no house number in the label — see
+                      // usersWithStreetLevelAddress's own comment. A
+                      // milder, separate signal from the unresolved case
+                      // above: this address DOES work for dispatch/
+                      // routing, it's just not precise enough for a
+                      // driver to identify the exact house.
+                      : streetLevelAddressIds.has(u.id)
+                      ? <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>🔍 {u.home_address.label} (no house number)</div>
+                      : <div style={{ fontSize: 9, color: COLORS.green, marginTop: 2 }}>📍 {u.home_address.label}</div>
                   )}
                   {u.role === ROLE.DRIVER && driverStatus?.vehicle && <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 2 }}>🚐 {driverStatus.vehicle}</div>}
                   {u.role === ROLE.ADMIN && u.admin_level && <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>{ADMIN_LEVEL_LABEL[u.admin_level]}</div>}
@@ -10078,7 +10194,7 @@ function relTimeLabel(deltaMs, allowFuture = false) {
   return deltaMs < 0 ? `in ${v}` : `${v} ago`;
 }
 
-function AdminStatus({ companies = [] }) {
+function AdminStatus({ companies = [], users = [] }) {
   const [checks, setChecks] = useState(null);
   const [running, setRunning] = useState(false);
   const [ranAt, setRanAt] = useState(null);
@@ -10363,6 +10479,7 @@ function AdminStatus({ companies = [] }) {
 
       <RetentionArchives />
       <EtaAccuracyReport companies={companies} />
+      <AddressQualityReport users={users} />
     </div>
   );
 }
@@ -10370,6 +10487,51 @@ function AdminStatus({ companies = [] }) {
 // Predicted-vs-actual pickup-ETA error (computeEtaAccuracy over
 // fetchEtaAccuracyData). Collapsible + fetch-once-per-open, same shape
 // as RetentionArchives.
+// Dashboard-level summary for the two address-quality signals — see
+// usersNeedingAddressConfirmation/usersWithStreetLevelAddress's own
+// comments. Deliberately just a summary + a pointer, not a second
+// interactive list: AdminUsers already has both as actionable toggle
+// filters (tap a row there → edit → fix via StreetInput), so this panel
+// exists to give the numbers dashboard-level visibility for an admin who
+// isn't specifically looking at the Users tab, not to duplicate that list.
+function AddressQualityReport({ users = [] }) {
+  const [open, setOpen] = useState(false);
+  const unresolved = React.useMemo(() => usersNeedingAddressConfirmation(users), [users]);
+  const streetLevel = React.useMemo(() => usersWithStreetLevelAddress(users), [users]);
+  const totalFlagged = unresolved.length + streetLevel.length;
+
+  return (
+    <div style={{ border: `1px solid ${COLORS.wire}`, borderRadius: 4, marginTop: 12, overflow: "hidden" }}>
+      <div onClick={() => setOpen(v => !v)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 8px", cursor: "pointer", background: COLORS.surface }}>
+        <span style={{ fontSize: 10, color: COLORS.ghost }}>{open ? "▾" : "▸"}</span>
+        <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.chalk }}>Address quality</span>
+        <span style={{ fontSize: 9, color: totalFlagged > 0 ? COLORS.amber : COLORS.ghost }}>
+          {totalFlagged > 0 ? `${totalFlagged} flagged` : "all clear"}
+        </span>
+      </div>
+      {open && (
+        <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: "8px 10px", display: "flex", flexWrap: "wrap", gap: 16 }}>
+            <div>
+              <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.6 }}>NOT GEOCODED AT ALL</div>
+              <div style={{ fontSize: 14, fontWeight: 800, color: unresolved.length > 0 ? COLORS.amber : COLORS.green, fontFamily: FONTS.head }}>{unresolved.length}</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 8, color: COLORS.ghost, letterSpacing: 0.6 }}>RESOLVED, NO HOUSE NUMBER</div>
+              <div style={{ fontSize: 14, fontWeight: 800, color: streetLevel.length > 0 ? COLORS.amber : COLORS.green, fontFamily: FONTS.head }}>{streetLevel.length}</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 10, color: COLORS.ghost, lineHeight: 1.5 }}>
+            {totalFlagged === 0
+              ? "Every agent/driver home address resolved to a real coordinate with a house number in the label."
+              : <>Fix these from the <b>Users</b> tab — both counts appear there as tap-to-show filters, right on each flagged row's edit form. "Not geocoded" means dispatch pooling has no coordinate to rank by at all; "no house number" means the coordinate works but a driver reading the label has nothing to identify which house — some of those are genuinely just a street/farm name and don't need fixing, but worth a glance.</>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EtaAccuracyReport({ companies = [] }) {
   const [open, setOpen] = useState(false);
   // Raw rows are fetched once per open; the report is DERIVED so client
@@ -11355,7 +11517,7 @@ export function AdminApp({ state, dispatch, user, notifClickHandlerRef }) {
       {tab === "history" && <AdminHistory state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "utilization" && hasAdminPermission(user, "manageDispatch") && <AdminFleetUtilization state={scopedState} user={user} dispatch={dispatch} />}
       {tab === "activity" && hasAdminPermission(user, "viewAuditLog") && <AdminActivityLog />}
-      {tab === "status" && hasAdminPermission(user, "manageDispatch") && <AdminStatus companies={state.companies} />}
+      {tab === "status" && hasAdminPermission(user, "manageDispatch") && <AdminStatus companies={state.companies} users={state.users} />}
       {tab === "ai" && hasAdminPermission(user, "manageDispatch") && <AdminAIAssistant user={user} />}
       {tab === "portal" && <ClientPortalApp state={scopedState} dispatch={dispatch} user={{ ...user, is_master_client: isMasterAdmin(user, state.companies) }} />}
       {tab === "tickets" && <AdminTickets state={scopedState} dispatch={dispatch} user={user} />}

@@ -71,6 +71,7 @@ import {
   auditLogPeriodKey,
   groupAuditLogsByPeriod,
   usersNeedingAddressConfirmation,
+  usersWithStreetLevelAddress,
 } from "../admin/AdminSection.jsx";
 
 // 12:00 SAST (well clear of any midnight boundary) for a given SAST
@@ -1229,6 +1230,32 @@ describe("usersNeedingAddressConfirmation — flags label-only home addresses fr
   it("handles an empty/undefined users list", () => {
     expect(usersNeedingAddressConfirmation([])).toEqual([]);
     expect(usersNeedingAddressConfirmation(undefined)).toEqual([]);
+  });
+});
+
+describe("usersWithStreetLevelAddress — flags resolved addresses missing a house number", () => {
+  it("flags an agent/driver with real coordinates but no leading house number in the label", () => {
+    const users = [
+      { id: 1, role: ROLE.AGENT, home_address: { label: "Cedric Close, Mitchells Plain", area: "Mitchells Plain", lat: -34.03, lng: 18.59 } },
+      { id: 2, role: ROLE.DRIVER, home_address: { label: "Voortrekker Rd, Bellville", area: "Bellville", lat: -33.9, lng: 18.6 } },
+    ];
+    expect(usersWithStreetLevelAddress(users).map(u => u.id)).toEqual([1, 2]);
+  });
+
+  it("does not flag an address that has a house number, is unresolved, has no address, or is a non-agent/driver role", () => {
+    const users = [
+      { id: 1, role: ROLE.AGENT, home_address: { label: "11 Cedric Close, Mitchells Plain", area: "Mitchells Plain", lat: -34.03, lng: 18.59 } },
+      // Unresolved — belongs to usersNeedingAddressConfirmation instead, not this one.
+      { id: 2, role: ROLE.AGENT, home_address: { label: "Cedric Close, Mitchells Plain", area: "Mitchells Plain", lat: null, lng: null } },
+      { id: 3, role: ROLE.AGENT, home_address: null },
+      { id: 4, role: ROLE.ADMIN, home_address: { label: "Cedric Close", area: "X", lat: -34, lng: 18 } },
+    ];
+    expect(usersWithStreetLevelAddress(users)).toEqual([]);
+  });
+
+  it("handles an empty/undefined users list", () => {
+    expect(usersWithStreetLevelAddress([])).toEqual([]);
+    expect(usersWithStreetLevelAddress(undefined)).toEqual([]);
   });
 });
 
