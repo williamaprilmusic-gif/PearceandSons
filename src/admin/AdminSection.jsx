@@ -3752,6 +3752,15 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
   };
   const driver = state.users.find(u => String(u.id) === String(trip.driver_id));
   const passengers = trip.agent_ids.map(id => state.users.find(u => String(u.id) === String(id))).filter(Boolean);
+  // Shared by allAgentPhones below AND the passenger-row ☎ display
+  // further down in the passengers.map loop — FOUND VIA /code-review:
+  // these used to independently re-derive the identical
+  // pickup_sequence_coords lookup (copy-pasted, not shared), which both
+  // duplicated the find() work per agent and risked the two silently
+  // drifting apart if only one copy was ever edited.
+  const agentPickupCoord = (agentId) =>
+    trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(agentId))
+      ?? (String(trip.agent_ids[0]) === String(agentId) ? trip.pickup_sequence_coords?.[0] : null);
   // FOUND VIA DIRECT USER REPORT ("it only displays 1 agent's number"):
   // the trip-level PHONE field below used to just render trip.phone —
   // the PRIMARY agent's number, stamped on the trip at booking time.
@@ -3761,12 +3770,13 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
   // itself (see its own "FOUND VIA direct user report" comment below) —
   // this reuses that exact profile-phone-wins/booking-time-fallback
   // priority so the summary field and the per-passenger rows never
-  // disagree about a shared agent's number.
-  const allAgentPhones = passengers.map(p => {
-    const pickup = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(p.id))
-      ?? (String(trip.agent_ids[0]) === String(p.id) ? trip.pickup_sequence_coords?.[0] : null);
-    return p.phone || pickup?.phone || null;
-  }).filter(Boolean);
+  // disagree about a shared agent's number. De-duplicated (Set) — FOUND
+  // VIA /code-review: two agents sharing one number (e.g. a household
+  // booking two seats) used to render it twice under a "PHONES:" label,
+  // falsely implying two distinct contacts.
+  const allAgentPhones = [...new Set(
+    passengers.map(p => p.phone || agentPickupCoord(p.id)?.phone).filter(Boolean)
+  )];
   const canEdit = ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state) && dispatch != null;
   // Use the assigned driver's own vehicle capacity, not the global default —
   // a driver with an 8-seat minibus would be incorrectly blocked at 4 seats
@@ -3966,9 +3976,10 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
             // pickup_sequence_coords the moment any user record is
             // missing; index pairing then attributed pickup points to the
             // wrong passengers. Index-0 fallback covers the primary agent
-            // on legacy coords that predate agent_id stamping.
-            const pickup = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(p.id))
-              ?? (String(trip.agent_ids[0]) === String(p.id) ? trip.pickup_sequence_coords?.[0] : null);
+            // on legacy coords that predate agent_id stamping. (Shared
+            // with allAgentPhones above via agentPickupCoord — see its
+            // own comment.)
+            const pickup = agentPickupCoord(p.id);
             // Per-agent dropoff — OUTBOUND trips have one home address per agent.
             // Try: (1) stored dropoff_sequence_coords entry by agent_id,
             // (2) position-0 fallback for the primary agent on legacy coords,
