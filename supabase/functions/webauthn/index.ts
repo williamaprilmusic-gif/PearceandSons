@@ -334,6 +334,13 @@ async function registrationOptions(userId: number, username: string, password: s
   const pwCheck = await verifyPassword(supabase, userId, password);
   if (pwCheck === 'locked') return err('Too many failed attempts. Please try again later.', 429);
   if (!pwCheck) return err('Incorrect password', 401);
+  const challenge = randomChallenge();
+  await supabase.from('webauthn_challenges')
+    .delete().eq('user_id', userId).eq('type', 'registration');
+  const { error } = await supabase.from('webauthn_challenges').insert({
+    user_id: userId, challenge, type: 'registration',
+  });
+  if (error) return err('Failed to store challenge: ' + error.message);
   // FOUND VIA /code-review: the client's "change biometric" flow used to
   // be three full round trips (a standalone remove, then this, then
   // register) — three separate password re-verifications for one
@@ -341,6 +348,18 @@ async function registrationOptions(userId: number, username: string, password: s
   // flag, drops it back to the normal two (this + register) without
   // relaxing the security bar: password is still checked exactly once
   // per round trip, same as every other action here.
+  //
+  // Placed AFTER the challenge-storage step above, not before it (an
+  // earlier version of this fix did) — FOUND VIA /code-review: the
+  // client treats "this call returned successfully" as its ONLY signal
+  // that the old credential is really gone (see webauthnRegister's
+  // onReplaced). With the delete first, a challenge-insert failure
+  // AFTER a successful delete would return an error here while the
+  // credential was already gone — the client would see a failure and
+  // wrongly assume nothing was removed. Deleting last means the only
+  // way to reach it is past every other failure point in this
+  // function, so "the response succeeded" and "the delete (if
+  // requested) succeeded" stay equivalent facts.
   if (replace) {
     // Deletes EVERY credential this account has, not just the one
     // belonging to whichever device is re-enrolling right now — nothing
@@ -350,17 +369,10 @@ async function registrationOptions(userId: number, username: string, password: s
     // "just this device"). There's no per-device picker in the UI to
     // remove just one, so this is a deliberate "one biometric identity"
     // model — the client-side confirm step discloses this before
-    // calling, so it's not a silent surprise. FOUND VIA /code-review.
+    // calling, so it's not a silent surprise.
     const { error: delErr } = await supabase.from('webauthn_credentials').delete().eq('app_user_id', userId);
     if (delErr) return err('Failed to clear the existing credential: ' + delErr.message);
   }
-  const challenge = randomChallenge();
-  await supabase.from('webauthn_challenges')
-    .delete().eq('user_id', userId).eq('type', 'registration');
-  const { error } = await supabase.from('webauthn_challenges').insert({
-    user_id: userId, challenge, type: 'registration',
-  });
-  if (error) return err('Failed to store challenge: ' + error.message);
   const { data: existing } = await supabase.from('webauthn_credentials')
     .select('credential_id_b64').eq('app_user_id', userId);
   const excludeCredentials = (existing || []).map((c: { credential_id_b64: string }) => ({

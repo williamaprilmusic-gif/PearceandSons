@@ -73,6 +73,7 @@ import {
   fetchTripDelays,
   fetchTripHistory,
   fmtSastDateTime,
+  formatAgentNames,
   getOfflineQueue,
   getAdminCompanyIds,
   getDriverLoad,
@@ -679,7 +680,11 @@ async function exportComplianceAudit(trips, users, auditLogs, fromDateStr, toDat
   // Type-safe ID comparison — bigint vs string vs number all normalised to string
   const idEq = (a, b) => String(a) === String(b);
 
-  const agentNames = (t) => formatAgentNames(t.agent_ids, users, " | ");
+  // This CSV is used for regulatory/compliance submissions — the
+  // unknown-agent-id fallback MUST stay a bare id (never "#id"), since
+  // changing an already-established export column's format is its own
+  // bug even when the change comes from a well-intentioned dedup.
+  const agentNames = (t) => formatAgentNames(t.agent_ids, users, { separator: " | ", fallback: (id) => String(id) });
   const driverName = (t) => {
     if (!t.driver_id) return "";
     return users.find(u => idEq(u.id, t.driver_id))?.name || String(t.driver_id);
@@ -1230,19 +1235,6 @@ function scheduledTimeToMinutes(timeStr) {
 // rather than reusing this one.
 export function usersByIdMap(users) {
   return new Map(users.map(u => [String(u.id), u]));
-}
-
-// Shared by exportComplianceAudit's CSV agentNames() and AdminDispatch's
-// dispatch-card agentNamesFor() — FOUND VIA /code-review: these had
-// drifted into two independent copies of the same agent-id → name
-// lookup, with different unknown-id fallbacks (bare "123" vs "#123"),
-// risking a future fix to one being missed on the other. Separator is a
-// parameter since the two call sites want different ones (CSV: " | ",
-// dispatch card: ", ") — not a difference worth two whole functions.
-export function formatAgentNames(agentIds, users, separator = ", ") {
-  return (agentIds || [])
-    .map(id => users.find(u => String(u.id) === String(id))?.name || `#${id}`)
-    .join(separator);
 }
 
 // Resolves the ONE company a booking belongs to via its first agent's

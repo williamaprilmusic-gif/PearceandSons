@@ -19076,6 +19076,24 @@ export function tripDriverPayment(t, feeRates) {
 // lone \r (not just \r\n), so a field containing a bare carriage return
 // can't slip through unquoted and corrupt row boundaries for CSV parsers
 // that treat lone \r as a line break.
+// Shared by AdminSection.jsx's exportComplianceAudit (CSV) and
+// AdminDispatch (dispatch-card display), plus this file's own
+// ClientPortalTripRow — FOUND VIA /code-review: these had drifted into
+// three independent copies of the same agent-id → name lookup with
+// three different unknown-id fallbacks (bare id, "#id", and raw id
+// again), risking a future fix to one being missed on the others.
+// `separator` and `fallback` are parameters rather than forcing one
+// convention on every caller — exportComplianceAudit's CSV column has
+// to keep its EXACT pre-existing bare-id fallback (this is a document
+// used for regulatory/compliance submissions; silently reformatting an
+// already-exported column is its own bug), while other callers are free
+// to use the default.
+export function formatAgentNames(agentIds, users, { separator = ", ", fallback = (id) => `#${id}` } = {}) {
+  return (agentIds || [])
+    .map(id => users.find(u => String(u.id) === String(id))?.name || fallback(id))
+    .join(separator);
+}
+
 export function csvEscapeCell(val) {
   let s = val == null ? "" : String(val);
   if (/^[=+\-@]/.test(s)) s = "'" + s;
@@ -19735,7 +19753,7 @@ function ClientPortalSummaryCard({ trips, label }) {
 }
 
 function ClientPortalTripRow({ trip, users }) {
-  const agentNames = (trip.agent_ids || []).map(id => users.find(u => String(u.id) === String(id))?.name || id).join(", ");
+  const agentNames = formatAgentNames(trip.agent_ids, users, { fallback: (id) => id });
   const statusColor = {
     [TRIP_STATE.ARCHIVED_COMPLETED]: COLORS.green,
     [TRIP_STATE.IN_TRANSIT]: COLORS.amber,
