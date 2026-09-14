@@ -3752,6 +3752,21 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
   };
   const driver = state.users.find(u => String(u.id) === String(trip.driver_id));
   const passengers = trip.agent_ids.map(id => state.users.find(u => String(u.id) === String(id))).filter(Boolean);
+  // FOUND VIA DIRECT USER REPORT ("it only displays 1 agent's number"):
+  // the trip-level PHONE field below used to just render trip.phone —
+  // the PRIMARY agent's number, stamped on the trip at booking time.
+  // For a merged multi-agent trip that's misleading under a bare
+  // "PHONE:" label (reads as THE contact number, not "one of several"),
+  // and the passenger section already fixed this same problem for
+  // itself (see its own "FOUND VIA direct user report" comment below) —
+  // this reuses that exact profile-phone-wins/booking-time-fallback
+  // priority so the summary field and the per-passenger rows never
+  // disagree about a shared agent's number.
+  const allAgentPhones = passengers.map(p => {
+    const pickup = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(p.id))
+      ?? (String(trip.agent_ids[0]) === String(p.id) ? trip.pickup_sequence_coords?.[0] : null);
+    return p.phone || pickup?.phone || null;
+  }).filter(Boolean);
   const canEdit = ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(trip.state) && dispatch != null;
   // Use the assigned driver's own vehicle capacity, not the global default —
   // a driver with an 8-seat minibus would be incorrectly blocked at 4 seats
@@ -3850,7 +3865,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
             <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>TYPE: </span>{trip.trip_type}</span>
             <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DATE: </span>{trip.scheduled_date}</span>
             <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>TIME: </span>{trip.scheduled_time}</span>
-            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>PHONE: </span>{trip.phone}</span>
+            <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>{allAgentPhones.length > 1 ? "PHONES: " : "PHONE: "}</span>{allAgentPhones.length > 0 ? allAgentPhones.join(", ") : (trip.phone || "—")}</span>
             <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>PICKUP #: </span>{trip.pickup_order_num ?? "—"}</span>
             <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DROP #: </span>{trip.drop_sequence_num ?? "—"}</span>
             {driver && <span style={{ fontSize: 10, width: "48%" }}><span style={{ color: COLORS.ghost }}>DRIVER: </span>{driver.name}</span>}
