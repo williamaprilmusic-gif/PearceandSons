@@ -19065,17 +19065,6 @@ export function tripDriverPayment(t, feeRates) {
   return { perAgent, perExtraKm, total: perAgent + perExtraKm };
 }
 
-// Shared CSV cell escaper — every CSV export in this app (exportTripsToCsv,
-// exportGpsTrailToCsv here, plus AdminSection.jsx's exportComplianceAudit/
-// fleetUtilizationToCsv/usersToCsv) used to hand-duplicate this same logic.
-// CSV/formula-injection guard: a field starting with =, +, -, or @ can be
-// interpreted as a formula by Excel/Sheets when the file is opened,
-// potentially executing attacker-controlled content from a user-editable
-// field (agent/driver name, pickup label, etc.) — prefixing with a single
-// quote neutralizes it while keeping the value readable. Also catches a
-// lone \r (not just \r\n), so a field containing a bare carriage return
-// can't slip through unquoted and corrupt row boundaries for CSV parsers
-// that treat lone \r as a line break.
 // Shared by AdminSection.jsx's exportComplianceAudit (CSV) and
 // AdminDispatch (dispatch-card display), plus this file's own
 // ClientPortalTripRow — FOUND VIA /code-review: these had drifted into
@@ -19094,6 +19083,17 @@ export function formatAgentNames(agentIds, users, { separator = ", ", fallback =
     .join(separator);
 }
 
+// Shared CSV cell escaper — every CSV export in this app (exportTripsToCsv,
+// exportGpsTrailToCsv here, plus AdminSection.jsx's exportComplianceAudit/
+// fleetUtilizationToCsv/usersToCsv) used to hand-duplicate this same logic.
+// CSV/formula-injection guard: a field starting with =, +, -, or @ can be
+// interpreted as a formula by Excel/Sheets when the file is opened,
+// potentially executing attacker-controlled content from a user-editable
+// field (agent/driver name, pickup label, etc.) — prefixing with a single
+// quote neutralizes it while keeping the value readable. Also catches a
+// lone \r (not just \r\n), so a field containing a bare carriage return
+// can't slip through unquoted and corrupt row boundaries for CSV parsers
+// that treat lone \r as a line break.
 export function csvEscapeCell(val) {
   let s = val == null ? "" : String(val);
   if (/^[=+\-@]/.test(s)) s = "'" + s;
