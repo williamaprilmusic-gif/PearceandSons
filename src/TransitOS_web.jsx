@@ -17946,13 +17946,23 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   };
 
   // OUTBOUND trips: all agents board at ONE location (company/work site).
-  // Confirm all pickups at once, then navigate to the first home dropoff.
+  // Confirm all pickups at once, then navigate to the first dropoff.
   const isOutboundRun = myActiveTrips.length > 0 && myActiveTrips.every(t => t.direction === "OUTBOUND");
-  const outboundAllSamePickup = isOutboundRun && (() => {
+  // True when every remaining pickup is at the same physical point.
+  const allSamePickupLocation = (() => {
     const lats = pickupStops.map(s => s.lat?.toFixed(3));
     const lngs = pickupStops.map(s => s.lng?.toFixed(3));
     return lats.length > 0 && new Set(lats).size === 1 && new Set(lngs).size === 1;
   })();
+  // The group-pickup list (every passenger shown together, each with its own
+  // pickup / no-show control) applies whenever agents board at one shared
+  // point. OUTBOUND always qualifies (the norm: everyone boards at the work
+  // site, including a single-agent run, matching the prior behavior). For a
+  // non-outbound run it only qualifies with 2+ passengers at that one point —
+  // a single-passenger inbound stop keeps the per-agent card. Marking an
+  // individual agent a no-show from this list is the whole point: one of
+  // several people booked at the same pickup didn't show.
+  const useGroupPickup = allSamePickupLocation && (isOutboundRun || pickupStops.length > 1);
 
   const confirmPickupAll = async () => {
     try {
@@ -18172,11 +18182,11 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
 
       {tripStarted && !allPickedUp && curPickup && (
         <>
-          {/* ── OUTBOUND: single pickup location, all agents board together ── */}
-          {outboundAllSamePickup ? (
+          {/* ── Single shared pickup location, all agents board together ── */}
+          {useGroupPickup ? (
             <Card style={{ gap: 12, borderColor: COLORS.amber, background: "rgba(245,166,35,.04)" }}>
               <div style={{ fontSize: 9, letterSpacing: 2, color: COLORS.amber, fontWeight: 800, textTransform: "uppercase" }}>
-                🚌 OUTBOUND — PICK UP ALL PASSENGERS
+                🚌 {isOutboundRun ? "OUTBOUND — " : ""}PICK UP ALL PASSENGERS
               </div>
               <div style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${COLORS.wire}` }}>
                 <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", marginBottom: 4 }}>PICKUP LOCATION</div>
