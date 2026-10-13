@@ -17649,6 +17649,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         // per-stop contact number the data model is meant to carry.
         agent_name: agentUser?.name || trip.agent_name, phone: agentUser?.phone || p.phone || trip.phone,
         done: !!(agentId != null && trip.completed_pickups?.some(c => String(c) === String(agentId))),
+        // Recorded as a no-show (via TRIP/MARK_NO_SHOW) rather than a real
+        // pickup. A no-show is added to completed_pickups too — so it reads
+        // as `done` for trip-progression — which is why we track it
+        // separately here: the passenger list must show it as "didn't show",
+        // not a green boarded ✓.
+        noShow: !!(agentId != null && (trip.no_shows || []).some(ns => String(ns.agent_id) === String(agentId))),
         isManual: trip.pickup_is_manual || false,
         // Booked pickup time — previously absent from this list entirely,
         // so a driver actively navigating had no way to check whether
@@ -18178,12 +18184,20 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
               </div>
               {/* Passenger list */}
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                {pickupStops.map((s, i) => (
+                {pickupStops.map((s, i) => {
+                  // A no-show is stored as `done` for progression, so order
+                  // the checks no-show first: no-show (red) → boarded (green)
+                  // → still waiting (amber).
+                  const rowColor = s.noShow ? COLORS.red : s.done ? COLORS.green : COLORS.amber;
+                  const rowBg = s.noShow ? "rgba(220,53,69,.1)" : s.done ? "rgba(29,185,84,.1)" : COLORS.card;
+                  const rowBorder = s.noShow ? "rgba(220,53,69,.3)" : s.done ? "rgba(29,185,84,.3)" : COLORS.wire;
+                  return (
                   <div key={`${s.trip_id}-${s.agent_id ?? i}`}
-                    style={{ display: "flex", alignItems: "center", gap: 10, background: s.done ? "rgba(29,185,84,.1)" : COLORS.card, borderRadius: 4, padding: "8px 10px", border: `1px solid ${s.done ? "rgba(29,185,84,.3)" : COLORS.wire}` }}>
-                    <span style={{ fontSize: 16, color: s.done ? COLORS.green : COLORS.amber }}>{s.done ? "✓" : "◉"}</span>
+                    style={{ display: "flex", alignItems: "center", gap: 10, background: rowBg, borderRadius: 4, padding: "8px 10px", border: `1px solid ${rowBorder}` }}>
+                    <span style={{ fontSize: 16, color: rowColor }}>{s.noShow ? "🚫" : s.done ? "✓" : "◉"}</span>
                     <div style={{ flex: 1 }}>
-                      <div style={{ fontWeight: 700, fontSize: 12, color: s.done ? COLORS.green : COLORS.chalk }}>{s.agent_name}</div>
+                      <div style={{ fontWeight: 700, fontSize: 12, color: s.done || s.noShow ? rowColor : COLORS.chalk }}>{s.agent_name}</div>
+                      {s.noShow && <div style={{ fontSize: 9, color: COLORS.red, fontWeight: 700, letterSpacing: 1 }}>NO SHOW — NOT PICKED UP</div>}
                     </div>
                     {!s.done && call && (
                       <Button title="📞" variant="ghost" size="sm"
@@ -18194,8 +18208,13 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
                       <Button title="💬" variant="ghost" size="sm"
                         onClick={() => setChatWith({ trip: myActiveTrips.find(t => String(t.trip_id) === String(s.trip_id)), otherUser: { id: s.agent_id, name: s.agent_name, role: ROLE.AGENT } })} />
                     )}
+                    {!s.done && (
+                      <Button title="🚫" variant="danger" size="sm"
+                        onClick={() => setNoShowFor({ trip_id: s.trip_id, agent_id: s.agent_id, agent_name: s.agent_name })} />
+                    )}
                   </div>
-                ))}
+                  );
+                })}
               </div>
               <Button
                 title={`✓ ALL ${pickupStops.filter(s => !s.done).length} PASSENGERS ON BOARD`}
@@ -18204,7 +18223,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
                 style={{ padding: 18, fontSize: 15, letterSpacing: 1 }}
               />
               <div style={{ fontSize: 9, color: COLORS.ghost, textAlign: "center" }}>
-                Confirm once everyone listed above is in the vehicle — next stop: first drop-off
+                Mark anyone who didn't show with 🚫 first, then confirm once the rest are in the vehicle — next stop: first drop-off
               </div>
             </Card>
           ) : (
