@@ -199,6 +199,24 @@ describe("tripDriverPayment — paid to the driver, per successful agent + extra
     expect(result.perAgent).toBe(120); // falls back to all 3 agents * 40
   });
 
+  it("does not pay for a no-show even if a corrupt row left them in completed_dropoffs — regression for real trip 453", () => {
+    // Trip 453 (OUTBOUND, agents 106/104/52): agent 106 was marked a
+    // no-show but — via the pre-fix geofence/drop-off path — also ended up
+    // IN completed_dropoffs, so they were both a no-show AND counted as a
+    // successful drop-off, overpaying the driver one full per-agent rate.
+    // A no-show is never a successful drop-off, so pay must exclude them
+    // regardless of what completed_dropoffs literally contains.
+    const trip = {
+      state: TRIP_STATE.ARCHIVED_COMPLETED,
+      agent_ids: [106, 104, 52],
+      completed_dropoffs: [106, 104, 52], // 106 wrongly present
+      no_shows: [{ agent_id: "106", ts: 1, location: null, note: null }],
+      est_distance_km: 20,
+    };
+    const result = tripDriverPayment(trip, feeRates);
+    expect(result.perAgent).toBe(80); // only 104 + 52 count — 2 * 40, not 3
+  });
+
   it("pays extra-km once the road-factored distance exceeds the 40km threshold", () => {
     const trip = {
       state: TRIP_STATE.ARCHIVED_COMPLETED,

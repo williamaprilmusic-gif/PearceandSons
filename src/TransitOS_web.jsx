@@ -886,6 +886,27 @@ function computeNoShowRisk(agentId, allTrips) {
   return { risk, rate, noShows, total };
 }
 
+// Was this agent marked a no-show on this trip? A no-show is still added to
+// completed_pickups so pickup PROGRESSION can move past them (the driver
+// isn't left stuck waiting at an empty stop), but they never actually got
+// in the vehicle. Handles both the hydrated (`no_shows`) and raw-row
+// (`noshows`) field shapes so it's safe in reducers AND Supabase handlers.
+function isNoShowAgent(trip, agentId) {
+  return (trip.no_shows || trip.noshows || []).some(ns => ns && String(ns.agent_id) === String(agentId));
+}
+
+// IDs of agents who actually BOARDED the vehicle on this trip: handled
+// pickups (completed_pickups) MINUS anyone the driver marked a no-show.
+// This — never raw completed_pickups — is the correct set anywhere the
+// meaning is "picked up / in the vehicle / still needs a drop-off". Using
+// raw completed_pickups there is the root cause of a no-show reading as
+// "✓ picked up" and of a drop-off stop being generated (and confirmed) for
+// a passenger who never boarded. Handles both field shapes (see above).
+function boardedAgentIds(trip) {
+  const noShow = new Set((trip.no_shows || trip.noshows || []).map(ns => ns && String(ns.agent_id)));
+  return (trip.completed_pickups || trip.completedpickups || []).filter(id => !noShow.has(String(id)));
+}
+
 // Returns a combined risk for a whole trip (worst of all its agents).
 export function tripNoShowRisk(trip, allTrips) {
   const agentIds = trip.agent_ids || [];
@@ -2693,6 +2714,11 @@ function WazeNavPanel({ trip, user, state, setNavTarget }) {
   // completed_pickups/completed_dropoffs are arrays of agent IDs who were confirmed
   const completedPickups = trip.completed_pickups || trip.completedpickups || [];
   const completedDropoffs = trip.completed_dropoffs || trip.completeddropoffs || [];
+  // Agents who actually boarded (completed_pickups minus no-shows). A
+  // no-show sits in completedPickups for pickup-progression but has NO
+  // drop-off — building a DROPOFF stop off raw completedPickups would send
+  // the driver to drop off a passenger who never got in the vehicle.
+  const boarded = boardedAgentIds(trip);
 
   // Build the ordered sequence of remaining stops
   const remaining = [];
@@ -2703,14 +2729,17 @@ function WazeNavPanel({ trip, user, state, setNavTarget }) {
     }
   }
   for (const coord of (trip.dropoff_sequence_coords || [])) {
-    if (completedPickups.some(c => String(c) === String(coord.agent_id)) && !completedDropoffs.some(c => String(c) === String(coord.agent_id))) {
+    if (boarded.some(c => String(c) === String(coord.agent_id)) && !completedDropoffs.some(c => String(c) === String(coord.agent_id))) {
       const agent = state.users.find(u => String(u.id) === String(coord.agent_id));
       remaining.push({ type: "DROPOFF", coord, agentName: agent?.name || "Passenger", agentId: coord.agent_id });
     }
   }
 
   const current = remaining[0] || null;
-  const totalStops = agentIds.length * 2;
+  // Every agent has a pickup leg, but only BOARDED agents have a drop-off
+  // leg — a no-show's drop-off never happens, so counting it here would
+  // leave the progress bar permanently short of 100%.
+  const totalStops = agentIds.length + boarded.length;
   const doneStops = completedPickups.length + completedDropoffs.length;
   const pct = totalStops > 0 ? Math.round((doneStops / totalStops) * 100) : 0;
 
@@ -5414,6 +5443,15 @@ function appReducer(state, action) {
       if (!(trip.completed_pickups || []).some(c => String(c) === String(action.agent_id))) {
         return { ...state, _error: "This agent hasn't been confirmed picked up yet." };
       }
+      // A no-show was never in the vehicle, so there's nothing to drop off —
+      // reject it outright. Without this, a no-show (who IS in
+      // completed_pickups for progression) could be drop-off-confirmed by
+      // the geofence or a stray tap and land in completed_dropoffs, exactly
+      // the corruption seen on real trip 453 (agent in BOTH lists). Matches
+      // handleSupabaseAction's identical guard.
+      if (isNoShowAgent(trip, action.agent_id)) {
+        return { ...state, _error: "This agent was marked a no-show — no drop-off to confirm." };
+      }
       // Prefer action.confirmed_at over Date.now() — see the identical
       // fix/reasoning on CONFIRM_AGENT_PICKUP above.
       const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
@@ -5426,7 +5464,10 @@ function appReducer(state, action) {
         };
       }
       const newCompletedDropoffs = [...new Set([...(trip.completed_dropoffs || []), action.agent_id])];
-      const allDroppedOff = trip.agent_ids.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      // Trip completes once every BOARDED agent is dropped — no-shows have
+      // no drop-off, so including them (via raw agent_ids) would strand the
+      // trip in IN_TRANSIT forever waiting on a drop-off that can't happen.
+      const allDroppedOff = boardedAgentIds(trip).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       // FOUND VIA AUDIT (2026-08-09): missing the already-completed guard
       // its real-handler counterpart has (and that CONFIRM_AGENT_PICKUP,
       // its own sibling case just above, already has for the IN_TRANSIT
@@ -11831,6 +11872,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!dropoffCompletedPickups.some(c => String(c) === String(action.agent_id))) {
         throw new Error("This agent hasn't been confirmed picked up yet.");
       }
+      // A no-show never boarded, so there's no drop-off to record — reject
+      // it. Without this the geofence (or a stray tap) could drop-off-confirm
+      // a no-show who's only in completedpickups for progression, landing
+      // them in completeddropoffs too — the exact state found on real trip
+      // 453. Mirrors the demo reducer's identical guard.
+      if (isNoShowAgent(tripRow, action.agent_id)) {
+        throw new Error("This agent was marked a no-show — no drop-off to confirm.");
+      }
       if (tripRow.status === TRIP_STATE.ARCHIVED_COMPLETED) {
         // Already completed — a replayed/duplicate confirmation (e.g. the
         // offline-sync queue retrying this exact action after its success
@@ -11864,7 +11913,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const newCompletedDropoffs = (tripRow.completeddropoffs || []).some(c => String(c) === String(action.agent_id))
         ? (tripRow.completeddropoffs || [])
         : [...(tripRow.completeddropoffs || []), action.agent_id];
-      const allDroppedOff = tripAgentIds.every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      // Complete once every BOARDED agent is dropped — excluding no-shows,
+      // who have no drop-off (including them would strand the trip in
+      // IN_TRANSIT forever). See boardedAgentIds / the demo reducer's twin.
+      const allDroppedOff = boardedAgentIds(tripRow).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
       // reverseGeocode (this agent's own dropoff address) and, only when
       // this confirmation completes the trip, computeActualRouteKm (the
@@ -14175,7 +14227,10 @@ function agentTrackingRefPoint(trip, userId, users) {
   const myDropoffCoord = trip.dropoff_sequence_coords?.find(c => String(c.agent_id) === String(userId))
     ?? (myAgentIdx >= 0 ? trip.dropoff_sequence_coords?.[myAgentIdx] : null)
     ?? (trip.direction === "OUTBOUND" && myUser?.home_address ? myUser.home_address : null);
-  const referencePoint = (trip.completed_pickups?.some(c => String(c) === String(userId)) ? myDropoffCoord : myPickupCoord) ?? null;
+  // Only switch the live-tracking reference to the drop-off once the agent
+  // has actually BOARDED — a no-show is in completed_pickups for progression
+  // but never got in, so pointing their tracker at a drop-off is wrong.
+  const referencePoint = (boardedAgentIds(trip).some(c => String(c) === String(userId)) ? myDropoffCoord : myPickupCoord) ?? null;
   const isActiveTripForTracking = [TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(trip.state);
   return { driverId: isActiveTripForTracking ? trip.driver_id : null, referencePoint };
 }
@@ -14368,7 +14423,7 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
               return <span style={{ fontSize: 9, color: COLORS.ghost }}>Waiting for your driver's shuttle status…</span>;
             }
             const { distanceKm, etaMin } = shuttleStatus.summary;
-            const headingToward = trip.completed_pickups?.some(c => String(c) === String(user.id)) ? "your drop-off" : "you";
+            const headingToward = boardedAgentIds(trip).some(c => String(c) === String(user.id)) ? "your drop-off" : "you";
             return (
               <div style={{ background: "rgba(29,185,84,.08)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 4, padding: 12 }}>
                 <div style={{ fontSize: 13, fontWeight: 700, color: shuttleStatus.stale ? COLORS.ghost : COLORS.green }}>
@@ -15106,12 +15161,16 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
             latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
             kind: "pickup", actionType: "TRIP/CONFIRM_AGENT_PICKUP", geofenceTriggeredRef, dispatchRef,
           });
-          // Check dropoffs — agents confirmed picked up but not yet dropped.
+          // Check dropoffs — agents who actually BOARDED but aren't dropped
+          // yet. Prerequisite is boardedAgentIds, NOT raw completedPickups:
+          // a no-show sits in completedPickups for progression but never got
+          // in, so driving past their drop-off coord must not auto-confirm a
+          // drop-off for them (it previously did — see real trip 453).
           autoConfirmGeofenceStop({
             agentIds, completedList: completedDropoffs, coordsField: "dropoff_sequence_coords", trip,
             latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
             kind: "dropoff", actionType: "TRIP/CONFIRM_AGENT_DROPOFF", geofenceTriggeredRef, dispatchRef,
-            prerequisiteList: completedPickups,
+            prerequisiteList: boardedAgentIds(trip),
           });
         }
       }
@@ -15218,8 +15277,13 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
           // Current nav target: first un-done pickup, else first un-done dropoff
           const undonePkup = (activeTripForNav.pickup_sequence_coords || [])
             .find(p => !(activeTripForNav.completed_pickups || []).some(c => String(c) === String(p.agent_id)));
+          // Only BOARDED agents have a drop-off — a no-show (absent from
+          // completed_dropoffs but never getting one) must not become the
+          // deviation-check target, or the driver is flagged "off course"
+          // against a stop that will never be reached.
+          const navBoarded = boardedAgentIds(activeTripForNav);
           const undoneDrop = (activeTripForNav.dropoff_sequence_coords || [])
-            .find(d => !(activeTripForNav.completed_dropoffs || []).some(c => String(c) === String(d.agent_id)));
+            .find(d => navBoarded.some(c => String(c) === String(d.agent_id)) && !(activeTripForNav.completed_dropoffs || []).some(c => String(c) === String(d.agent_id)));
           const navTarget = undonePkup || undoneDrop;
           if (navTarget?.lat) {
             const devKm = haversineKm(latitude, longitude, navTarget.lat, navTarget.lng);
@@ -16996,6 +17060,11 @@ function DriverTripDropoffs({ trip, state }) {
     });
     dropCoords = derived;
   }
+  // A no-show never boarded, so has no drop-off — drop their (tagged) stop
+  // from this card's list so it stays consistent with the passenger list
+  // above, which now shows them as NO SHOW rather than a drop-off. Untagged
+  // legacy coords (no agent_id) can't be matched and are left as-is.
+  dropCoords = dropCoords.filter(dc => dc.agent_id == null || !isNoShowAgent(trip, dc.agent_id));
   // Same wrong-anchor fix as AdminTripDropoffs just above — see that
   // component's comment for the full explanation.
   const anchor = trip.pickup_sequence_coords?.[0] || defaultCompanyAnchor(state);
@@ -17262,7 +17331,11 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
         const passengers = (trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null]).map(aid => {
           const u = state.users.find(x => String(x.id) === String(aid));
           const coord = trip.pickup_sequence_coords?.find(c => String(c.agent_id) === String(aid)) || pickupCoord;
-          const pickedUp = trip.completed_pickups?.some(c => String(c) === String(aid));
+          // A no-show is in completed_pickups for progression but was NOT
+          // picked up — surface it as a no-show, never a green "✓ PICKED UP"
+          // (the reported trip-453 bug: driver saw the no-show as boarded).
+          const noShow = aid != null && isNoShowAgent(trip, aid);
+          const pickedUp = !noShow && trip.completed_pickups?.some(c => String(c) === String(aid));
           return {
             // Profile phone wins when set (most current); coord?.phone —
             // this agent's OWN booking-time number, via
@@ -17274,7 +17347,7 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
             // straight to trip.phone (the PRIMARY agent's number) whenever
             // their profile phone was unset.
             id: aid, name: u?.name || trip.agent_name || "Unknown Agent", phone: u?.phone || coord?.phone || trip.phone,
-            pickupLabel: coord?.label || trip.custom_pickup, coord, pickedUp,
+            pickupLabel: coord?.label || trip.custom_pickup, coord, pickedUp, noShow,
           };
         });
         const isExpanded = expandedTripIds.has(trip.trip_id);
@@ -17340,10 +17413,12 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
               {passengers.length > 1 ? `PASSENGERS (${passengers.length})` : "PASSENGER"}
             </div>
             {passengers.map((p, i) => (
-              <div key={p.id ?? i} style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${p.pickedUp ? "rgba(29,185,84,.35)" : COLORS.wire}` }}>
+              <div key={p.id ?? i} style={{ background: COLORS.surface, borderRadius: 3, padding: 10, border: `1px solid ${p.noShow ? "rgba(220,53,69,.35)" : p.pickedUp ? "rgba(29,185,84,.35)" : COLORS.wire}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                   <div style={{ fontFamily: FONTS.head, fontSize: 13, fontWeight: 700 }}>{p.name}</div>
-                  {p.pickedUp && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, border: "1px solid rgba(29,185,84,.4)", borderRadius: 2, padding: "1px 6px" }}>✓ PICKED UP</span>}
+                  {p.noShow
+                    ? <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.red, border: "1px solid rgba(220,53,69,.4)", borderRadius: 2, padding: "1px 6px" }}>🚫 NO SHOW</span>
+                    : p.pickedUp && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.green, border: "1px solid rgba(29,185,84,.4)", borderRadius: 2, padding: "1px 6px" }}>✓ PICKED UP</span>}
                 </div>
                 <div style={{ fontSize: 10, color: COLORS.green, marginTop: 3 }}>◉ {p.pickupLabel}</div>
                 {p.id != null && isTripActiveForComms(trip) && (
@@ -17734,9 +17809,6 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
     if (dropCoords.length === 0) return;
     dropCoords.forEach((coord, coordIdx) => {
       if (!coord) return;
-      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
-      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, trip_ids: [], passengers: [], done: false, isManual: trip.dropoff_is_manual || false };
-      if (!dropoffGroups[key].trip_ids.includes(trip.trip_id)) dropoffGroups[key].trip_ids.push(trip.trip_id);
       // Each coord entry has an agent_id when built from extradropoffs —
       // attach only that specific agent to this stop. Fall back to all
       // trip agents for single-dropoff trips (INBOUND / legacy data).
@@ -17753,11 +17825,22 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       // could see later stops as already complete. Fall back to positional
       // correspondence with agent_ids for a genuine multi-stop untagged
       // trip; a single untagged entry still means "everyone drops here."
-      const resolvedDropAgentIds = coord.agent_id
+      const resolvedDropAgentIds = (coord.agent_id
         ? [coord.agent_id]
         : dropCoords.length === 1
           ? (trip.agent_ids && trip.agent_ids.length ? trip.agent_ids : [null])
-          : [trip.agent_ids?.[coordIdx]].filter(Boolean);
+          : [trip.agent_ids?.[coordIdx]].filter(Boolean)
+      // A no-show never boarded, so has no drop-off — drop them from this
+      // stop's passenger list. Done BEFORE the group is created so a stop
+      // whose only passenger is a no-show isn't materialised at all (an
+      // empty-passenger group reads as vacuously "done" and the driver would
+      // see a drop-off stop for someone who was never picked up — exactly
+      // the trip-453 bug). `null` (untagged single-drop) isn't a no-show.
+      ).filter(aid => aid == null || !isNoShowAgent(trip, aid));
+      if (resolvedDropAgentIds.length === 0) return;
+      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
+      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, trip_ids: [], passengers: [], done: false, isManual: trip.dropoff_is_manual || false };
+      if (!dropoffGroups[key].trip_ids.includes(trip.trip_id)) dropoffGroups[key].trip_ids.push(trip.trip_id);
       resolvedDropAgentIds.forEach(aid => {
         const u = state.users.find(x => String(x.id) === String(aid));
         if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(aid) && p.trip_id === trip.trip_id)) {
@@ -19077,8 +19160,15 @@ export function tripDriverPayment(t, feeRates) {
   // full per-agent rate on a trip where nobody was actually dropped off.
   // `!= null` only falls back to the raw list when the field was truly
   // never populated, and correctly yields 0 for a genuine empty array.
+  // A no-show is never a successful drop-off, so must never count toward
+  // driver pay — subtract them here as well as relying on completed_dropoffs.
+  // This also self-heals legacy/corrupt rows where a no-show wrongly leaked
+  // INTO completed_dropoffs (real trip 453: no-show agent in both lists),
+  // which would otherwise overpay the driver one full per-agent rate.
+  const noShowIds = new Set((t.no_shows || []).map(ns => String(ns.agent_id)));
   const successfulAgentCount = t.completed_dropoffs != null
-    ? t.completed_dropoffs.length : (t.agent_ids || []).length;
+    ? t.completed_dropoffs.filter(id => !noShowIds.has(String(id))).length
+    : (t.agent_ids || []).filter(id => !noShowIds.has(String(id))).length;
   // actual_distance_km is the REAL distance driven, computed from the
   // trip's own recorded GPS trail (pickup to last drop-off) — already
   // real-road-following, so it must NOT be multiplied by ROAD_FACTOR
@@ -19249,6 +19339,10 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
       ? new Set(t.completed_dropoffs.map(String)) : null;
     const agentDriverPayShare = (aid) => {
       if (!feeRates || t.state !== TRIP_STATE.ARCHIVED_COMPLETED || aid == null) return 0;
+      // A no-show never counts as a successful drop-off even if a legacy/
+      // corrupt row has them in completed_dropoffs (see tripDriverPayment's
+      // twin fix and real trip 453) — so they earn the driver nothing here.
+      if (isNoShowAgent(t, aid)) return 0;
       const wasSuccessful = successfulDropoffAgentIds ? successfulDropoffAgentIds.has(String(aid)) : true;
       return wasSuccessful ? feeRates.driver_pay_per_agent_zar : 0;
     };
