@@ -5472,7 +5472,14 @@ function appReducer(state, action) {
       // Trip completes once every BOARDED agent is dropped — no-shows have
       // no drop-off, so including them (via raw agent_ids) would strand the
       // trip in IN_TRANSIT forever waiting on a drop-off that can't happen.
-      const allDroppedOff = boardedAgentIds(trip).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      // ALSO require every agent to be HANDLED first (picked up or no-show):
+      // the old raw agent_ids.every() check couldn't be satisfied until all
+      // pickups were done (you can't drop an un-picked-up agent), but a
+      // boarded-only check CAN be — e.g. the geofence auto-confirming one
+      // drop-off while other agents are still awaiting pickup — which would
+      // otherwise complete the trip early and strand them.
+      const allHandled = (trip.agent_ids || []).every(id => (trip.completed_pickups || []).some(c => String(c) === String(id)));
+      const allDroppedOff = allHandled && boardedAgentIds(trip).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       // FOUND VIA AUDIT (2026-08-09): missing the already-completed guard
       // its real-handler counterpart has (and that CONFIRM_AGENT_PICKUP,
       // its own sibling case just above, already has for the IN_TRANSIT
@@ -11922,8 +11929,13 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         : [...(tripRow.completeddropoffs || []), action.agent_id];
       // Complete once every BOARDED agent is dropped — excluding no-shows,
       // who have no drop-off (including them would strand the trip in
-      // IN_TRANSIT forever). See boardedAgentIds / the demo reducer's twin.
-      const allDroppedOff = boardedAgentIds(tripRow).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
+      // IN_TRANSIT forever). ALSO require every agent to be HANDLED first
+      // (picked up or no-show): a boarded-only check could otherwise be
+      // satisfied by a partial set (e.g. the geofence auto-confirming one
+      // drop-off before other pickups finish) and complete the trip early,
+      // stranding the un-picked-up agents. See boardedAgentIds / the demo twin.
+      const allHandledDrop = tripAgentIds.every(id => (tripRow.completedpickups || []).some(c => String(c) === String(id)));
+      const allDroppedOff = allHandledDrop && boardedAgentIds(tripRow).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
       // reverseGeocode (this agent's own dropoff address) and, only when
       // this confirmation completes the trip, computeActualRouteKm (the
