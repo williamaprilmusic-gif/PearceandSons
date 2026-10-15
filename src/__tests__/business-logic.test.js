@@ -16,6 +16,7 @@ import {
   agentFeeCategory,
   agentFeeAmount,
   tripTotalFeeAmount,
+  billableAgentIds,
   tripDriverPayment,
   haversineKm,
   isMasterAdmin,
@@ -150,6 +151,33 @@ describe("tripTotalFeeAmount — full rate per agent, not divided", () => {
   it("falls back to a single null-agent row for a trip with no agent_ids", () => {
     const trip = { state: TRIP_STATE.ARCHIVED_COMPLETED, no_shows: [] };
     expect(tripTotalFeeAmount(trip, feeRates)).toBe(100);
+  });
+
+  it("still bills the No Show fee for an agent removed from the trip after no-showing (Option A)", () => {
+    // Agent 2 no-showed, then an admin removed them from the trip — so
+    // they're gone from agent_ids but their no_shows record remains. The
+    // no-show happened, so the client is still billed the No Show fee.
+    const trip = { state: TRIP_STATE.ARCHIVED_COMPLETED, agent_ids: [1, 3], no_shows: [{ agent_id: 2 }] };
+    // agent 1: normal (100), agent 3: normal (100), agent 2 (removed): no_show (120)
+    expect(tripTotalFeeAmount(trip, feeRates)).toBe(320);
+  });
+});
+
+describe("billableAgentIds — current passengers plus removed-after-no-show agents", () => {
+  it("returns just the current passengers when no one was removed", () => {
+    expect(billableAgentIds({ agent_ids: [1, 2], no_shows: [] })).toEqual(["1", "2"]);
+  });
+
+  it("appends an orphaned no-show (removed from agent_ids) after the current passengers", () => {
+    expect(billableAgentIds({ agent_ids: [1, 3], no_shows: [{ agent_id: 2 }] })).toEqual(["1", "3", "2"]);
+  });
+
+  it("does not duplicate a no-show who is still a current passenger", () => {
+    expect(billableAgentIds({ agent_ids: [1, 2], no_shows: [{ agent_id: 2 }] })).toEqual(["1", "2"]);
+  });
+
+  it("falls back to a single null entry when there are no agents at all", () => {
+    expect(billableAgentIds({ agent_ids: [], no_shows: [] })).toEqual([null]);
   });
 });
 

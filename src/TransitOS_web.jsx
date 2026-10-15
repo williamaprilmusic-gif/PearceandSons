@@ -19104,6 +19104,22 @@ export function exceptionLabel(t) {
 // deletes cleanly, never reaching this state). This agent being booked
 // late AND no-showing is billed as a no-show — the more consequential
 // outcome — rather than double-counted or picking one arbitrarily.
+// Agents who must appear on the invoice for this trip: every current
+// passenger PLUS anyone with a no-show record who was later REMOVED from
+// the trip (admin removal / cancel keeps the no_shows entry on purpose).
+// The no-show genuinely happened, so — per explicit decision (Option A) —
+// it still bills the No Show fee even though the agent is no longer in
+// agent_ids. Orphaned no-shows are appended after the current passengers,
+// in no_shows order, so a normal trip's billing order is unchanged.
+export function billableAgentIds(t) {
+  const current = (t.agent_ids || []).map(String);
+  const seen = new Set(current);
+  const orphanedNoShows = (t.no_shows || [])
+    .map(ns => ns && String(ns.agent_id))
+    .filter(id => id != null && !seen.has(id));
+  const all = [...current, ...orphanedNoShows];
+  return all.length ? all : [null];
+}
 export function agentFeeCategory(t, aid) {
   // Fee category is only meaningful for a RESOLVED trip — per explicit
   // decision, an active/unresolved trip (still UNASSIGNED_BOOKING,
@@ -19143,8 +19159,9 @@ export function agentFeeAmount(t, aid, feeRates) {
 // doesn't need to call this separately, but the two always agree.
 export function tripTotalFeeAmount(t, feeRates) {
   if (!feeRates) return null;
-  const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
-  return agentIds.reduce((sum, aid) => sum + (agentFeeAmount(t, aid, feeRates) || 0), 0);
+  // billableAgentIds, not raw agent_ids — so a no-show who was removed from
+  // the trip still contributes their No Show fee to the total (Option A).
+  return billableAgentIds(t).reduce((sum, aid) => sum + (agentFeeAmount(t, aid, feeRates) || 0), 0);
 }
 
 // Driver payment reference — what Pearce & Sons pays the DRIVER for this trip,
@@ -19331,6 +19348,13 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
     // One row per passenger — each has their own pickup/dropoff address,
     // timing, and GPS location even on a shared multi-passenger trip.
     const agentIds = t.agent_ids && t.agent_ids.length ? t.agent_ids : [null];
+    // rowAgentIds adds any no-show who was later removed from the trip, so
+    // they still get their own No Show fee row (Option A) — appended after
+    // the current passengers, so the extra-km split below (indexed over the
+    // original agentIds) is untouched and an orphaned no-show, whose index
+    // falls past that split, simply earns 0 extra-km driver pay (correct —
+    // they drove nowhere).
+    const rowAgentIds = billableAgentIds(t);
     // Driver Pay - Per Agent: each successfully-dropped-off agent's own
     // flat share (driver_pay_per_agent_zar), 0 for a no-show. Found
     // broken via a direct user report: this used to show
@@ -19378,7 +19402,7 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
       const remainder = totalCents - base * n;
       return agentIds.map((_, i) => base + (i === n - 1 ? remainder : 0));
     })();
-    agentIds.forEach((aid, aidIdx) => {
+    rowAgentIds.forEach((aid, aidIdx) => {
       const agentUser = aid != null ? users?.find(u => String(u.id) === String(aid)) : null;
 
       // ── Per-agent pickup ─────────────────────────────────────────────────
@@ -19521,7 +19545,10 @@ export function exportTripsToCsv(trips, users, driverStatusList = [], filenamePr
           const feeCat = agentFeeCategory(t, aid);
           const feeAmt = agentFeeAmount(t, aid, feeRates);
           const driverPayPerAgent = agentDriverPayShare(aid);
-          const driverPayExtraKm = extraKmShareCentsByIdx[aidIdx] / 100;
+          // `|| 0` — an orphaned no-show's index falls past extraKmShareCentsByIdx
+          // (built over the original passengers only), and they earn no
+          // extra-km pay anyway (never transported).
+          const driverPayExtraKm = (extraKmShareCentsByIdx[aidIdx] || 0) / 100;
           categoryTotals[feeCat].count += 1;
           categoryTotals[feeCat].fee += feeAmt;
           categoryTotals[feeCat].driverPay += driverPayPerAgent;
