@@ -4025,14 +4025,16 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
                     {agentDropoff && agentDropoff.label && agentDropoff.label !== (pickup?.label) && (
                       <div style={{ fontSize: 9, color: COLORS.red }}>◎ {agentDropoff.label}</div>
                     )}
-                    {/* Actual GPS pickup address — recorded when driver taps PICKED UP */}
-                    {trip.pickup_locations?.[p.id]?.label && (
+                    {/* Actual GPS pickup address — recorded when driver taps PICKED UP.
+                        Suppressed for a no-show: they were never picked up, so any
+                        stale/legacy location entry must not read as a real pickup. */}
+                    {!noShow && trip.pickup_locations?.[p.id]?.label && (
                       <div style={{ fontSize: 9, color: COLORS.green, marginTop: 1 }}>
                         📍 Picked up {actualPickupOrderFor(trip, p.id) ? `(#${actualPickupOrderFor(trip, p.id)} of the run) ` : ""}at: {trip.pickup_locations[p.id].label}
                       </div>
                     )}
                     {/* Actual GPS dropoff address — recorded when driver taps DROPPED OFF */}
-                    {trip.dropoff_locations?.[p.id]?.label && (
+                    {!noShow && trip.dropoff_locations?.[p.id]?.label && (
                       <div style={{ fontSize: 9, color: COLORS.teal, marginTop: 1 }}>
                         📍 Dropped off {actualDropOrderFor(trip, p.id) ? `(#${actualDropOrderFor(trip, p.id)} of the run) ` : ""}at: {trip.dropoff_locations[p.id].label}
                       </div>

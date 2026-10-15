@@ -4447,7 +4447,12 @@ function appReducer(state, action) {
         const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
-      const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
+      // String()-normalized — a plain `!==` here leaves the removed agent's
+      // id stranded in completed_pickups whenever the array's id shape
+      // (string, via sidArr hydration) differs from action.agent_id's,
+      // the exact mismatch every other id compare in this file guards
+      // against. Matches the Supabase handler's sameId() cleanup.
+      const newCompletedPickups = (trip.completed_pickups || []).filter(id => String(id) !== String(action.agent_id));
       const newAgentName = newAgentIds[0] ? (state.users.find(u => String(u.id) === String(newAgentIds[0]))?.name || trip.agent_name) : trip.agent_name;
 
       let newTripsRemove;
@@ -6104,7 +6109,9 @@ function appReducer(state, action) {
         const belongsToRemoved = String(c.agent_id) === String(action.agent_id) || (!c.agent_id && String(trip.agent_ids[i]) === String(action.agent_id));
         return !belongsToRemoved;
       });
-      const newCompletedPickups = (trip.completed_pickups || []).filter(id => id !== action.agent_id);
+      // String()-normalized — see TRIP/REMOVE_AGENT's identical fix above
+      // for why a raw `!==` can strand the removed agent in completed_pickups.
+      const newCompletedPickups = (trip.completed_pickups || []).filter(id => String(id) !== String(action.agent_id));
       const newAgentName = newAgentIds[0] ? (state.users.find(u => String(u.id) === String(newAgentIds[0]))?.name || trip.agent_name) : trip.agent_name;
 
       let newTripsAgentCancel;
@@ -18096,10 +18103,12 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
           .filter(p => String(p.trip_id) === String(tid))
           .map(p => p.id);
         // If no passengers mapped to this trip (legacy grouped trip), fall back
-        // to confirming all remaining unconfirmed agents on this trip
+        // to confirming all remaining unconfirmed agents on this trip — minus
+        // no-shows, who never boarded (confirming their drop-off is rejected
+        // by the handler, so including them here just raises a spurious error).
         const agentsToDrop = agentsAtThisStop.length > 0
           ? agentsAtThisStop
-          : (t.agent_ids || []).filter(id => !(t.completed_dropoffs || []).some(c => String(c) === String(id)));
+          : (t.agent_ids || []).filter(id => !(t.completed_dropoffs || []).some(c => String(c) === String(id)) && !isNoShowAgent(t, id));
         for (const aid of agentsToDrop) {
           if ((t.completed_dropoffs || []).some(c => String(c) === String(aid))) continue; // already done
           // Unlike confirmPickup/confirmPickupAll, this never queued on a
