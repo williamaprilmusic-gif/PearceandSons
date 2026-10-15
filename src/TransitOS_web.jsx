@@ -891,7 +891,7 @@ function computeNoShowRisk(agentId, allTrips) {
 // isn't left stuck waiting at an empty stop), but they never actually got
 // in the vehicle. Handles both the hydrated (`no_shows`) and raw-row
 // (`noshows`) field shapes so it's safe in reducers AND Supabase handlers.
-function isNoShowAgent(trip, agentId) {
+export function isNoShowAgent(trip, agentId) {
   return (trip.no_shows || trip.noshows || []).some(ns => ns && String(ns.agent_id) === String(agentId));
 }
 
@@ -902,7 +902,7 @@ function isNoShowAgent(trip, agentId) {
 // raw completed_pickups there is the root cause of a no-show reading as
 // "✓ picked up" and of a drop-off stop being generated (and confirmed) for
 // a passenger who never boarded. Handles both field shapes (see above).
-function boardedAgentIds(trip) {
+export function boardedAgentIds(trip) {
   const noShow = new Set((trip.no_shows || trip.noshows || []).map(ns => ns && String(ns.agent_id)));
   return (trip.completed_pickups || trip.completedpickups || []).filter(id => !noShow.has(String(id)));
 }

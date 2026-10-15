@@ -53,6 +53,7 @@ import {
   copyShareLink,
   csvEscapeCell,
   defaultCompanyAnchor,
+  isNoShowAgent,
   docExpiryStatus,
   driverRouteAndPolicySync,
   driverAvgRating,
@@ -3991,8 +3992,11 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
               ?? (trip.direction === "OUTBOUND" && state.users.find(u => String(u.id) === String(p.id))?.home_address
                 ? { ...state.users.find(u => String(u.id) === String(p.id)).home_address, _derived: true }
                 : null);
-            const pickedUp = trip.completed_pickups?.some(c => String(c) === String(p.id));
-            const droppedOff = (trip.completed_dropoffs || []).some(c => String(c) === String(p.id));
+            // A no-show is in completed_pickups for pickup-progression but
+            // never boarded — show it as a no-show, not "✓ picked up".
+            const noShow = isNoShowAgent(trip, p.id);
+            const pickedUp = !noShow && trip.completed_pickups?.some(c => String(c) === String(p.id));
+            const droppedOff = !noShow && (trip.completed_dropoffs || []).some(c => String(c) === String(p.id));
             const driverName = trip.driver_id ? state.users.find(u => String(u.id) === String(trip.driver_id))?.name : null;
             const isRelocating = String(relocatingId) === String(p.id);
             const isConfirmingRemove = String(removingId) === String(p.id);
@@ -4002,6 +4006,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
                   <DriverAvatar name={p.name} isOnline={p.is_online} size={28} />
                   <div style={{ flex: 1 }}>
                     <span style={{ fontSize: 11, fontWeight: 700 }}>{p.name}</span>
+                    {noShow && <span style={{ fontSize: 9, color: COLORS.red, marginLeft: 6 }}>🚫 no show</span>}
                     {pickedUp && <span style={{ fontSize: 9, color: COLORS.green, marginLeft: 6 }}>✓ picked up</span>}
                     {droppedOff && driverName && <span style={{ fontSize: 9, color: COLORS.teal, marginLeft: 6 }}>✓ dropped by {driverName}</span>}
                     <div style={{ fontSize: 9, color: COLORS.ghost }}>{pickup?.label || "—"}</div>
@@ -7620,8 +7625,6 @@ function computeLiveSequenceForDriver(driverTrips, state) {
     if (dropCoords.length === 0) return;
     dropCoords.forEach((coord, coordIdx) => {
       if (!coord) return;
-      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
-      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, passengers: [], done: false };
       // dropoff_sequence_coords entries hydrated fresh from Supabase (the
       // normal case for essentially every real trip — see the DB-row
       // mapping that builds { lat, lng } with no agent_id) carry no
@@ -7637,11 +7640,19 @@ function computeLiveSequenceForDriver(driverTrips, state) {
       // elsewhere in this codebase for this exact data shape (see e.g. the
       // dropCoord lookup in the CSV/passenger-list builder: find by
       // agent_id, else dropoff_sequence_coords[aidIdx], else [0]).
-      const resolvedAgentIds = coord.agent_id
+      const resolvedAgentIds = (coord.agent_id
         ? [coord.agent_id]
         : dropCoords.length === 1
           ? (trip.agent_ids || [trip.agent_id]).filter(Boolean)
-          : [trip.agent_ids?.[coordIdx]].filter(Boolean);
+          : [trip.agent_ids?.[coordIdx]].filter(Boolean)
+      // A no-show never boarded, so has no drop-off — drop them here so
+      // this live sequence matches the driver's own screen (its stated
+      // contract) and a no-show-only stop isn't materialised as a vacuously
+      // "done" empty group.
+      ).filter(aid => aid == null || !isNoShowAgent(trip, aid));
+      if (resolvedAgentIds.length === 0) return;
+      const key = `${parseFloat(coord.lat).toFixed(4)},${parseFloat(coord.lng).toFixed(4)}`;
+      if (!dropoffGroups[key]) dropoffGroups[key] = { lat: coord.lat, lng: coord.lng, label: coord.label || trip.custom_dropoff, passengers: [], done: false };
       resolvedAgentIds.forEach(aid => {
         const u = state.users.find(x => String(x.id) === String(aid));
         if (!dropoffGroups[key].passengers.find(p => String(p.id) === String(aid) && p.trip_id === trip.trip_id)) {
