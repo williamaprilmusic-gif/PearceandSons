@@ -4577,7 +4577,13 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         const isUnassigned = key === "UNASSIGNED";
         const driverUser = isUnassigned ? null : findUserByKey(key);
         const groupTrips = groups[key];
-        const isCollapsed = !expandedGroups.has(key);
+        // Driver groups collapse by default, BUT force every visible group
+        // open whenever a search/date filter or a specific-driver selection
+        // is active — otherwise the matches an admin just searched for would
+        // sit hidden inside collapsed headers, defeating the search this
+        // list was given. A manual toggle still works on top of this.
+        const forceExpand = searchQuery.trim().length > 0 || !!dateFilter || !!selectedDriverId;
+        const isCollapsed = !forceExpand && !expandedGroups.has(key);
         return (
           <div key={key}>
             <div
