@@ -17,6 +17,7 @@ import {
   agentFeeAmount,
   tripTotalFeeAmount,
   billableAgentIds,
+  tripCompletesAfterAgentLeaves,
   tripDriverPayment,
   haversineKm,
   isMasterAdmin,
@@ -178,6 +179,47 @@ describe("billableAgentIds — current passengers plus removed-after-no-show age
 
   it("falls back to a single null entry when there are no agents at all", () => {
     expect(billableAgentIds({ agent_ids: [], no_shows: [] })).toEqual([null]);
+  });
+});
+
+describe("tripCompletesAfterAgentLeaves — auto-complete when a cancel/remove leaves nothing to drop", () => {
+  const base = { state: TRIP_STATE.IN_TRANSIT };
+
+  it("completes when every remaining agent is already dropped off", () => {
+    // A no-show'd/cancelling agent (2) is gone; 1 and 3 were already dropped.
+    expect(tripCompletesAfterAgentLeaves({
+      ...base, remainingAgentIds: [1, 3], completedDropoffs: [1, 3], noShowAgentIds: [],
+    })).toBe(true);
+  });
+
+  it("completes when the only remaining agent is a no-show (nothing to drop)", () => {
+    expect(tripCompletesAfterAgentLeaves({
+      ...base, remainingAgentIds: [1, 2], completedDropoffs: [1], noShowAgentIds: [2],
+    })).toBe(true);
+  });
+
+  it("does NOT complete while a remaining agent still needs dropping off", () => {
+    expect(tripCompletesAfterAgentLeaves({
+      ...base, remainingAgentIds: [1, 3], completedDropoffs: [1], noShowAgentIds: [],
+    })).toBe(false);
+  });
+
+  it("does NOT complete when the trip isn't IN_TRANSIT yet", () => {
+    expect(tripCompletesAfterAgentLeaves({
+      state: TRIP_STATE.DRIVER_CONFIRMED, remainingAgentIds: [1], completedDropoffs: [1], noShowAgentIds: [],
+    })).toBe(false);
+  });
+
+  it("does NOT complete when no agents remain (that's the last-agent cancel/archive path)", () => {
+    expect(tripCompletesAfterAgentLeaves({
+      ...base, remainingAgentIds: [], completedDropoffs: [], noShowAgentIds: [],
+    })).toBe(false);
+  });
+
+  it("normalizes id shape (string dropoffs vs numeric remaining)", () => {
+    expect(tripCompletesAfterAgentLeaves({
+      ...base, remainingAgentIds: [1, 2], completedDropoffs: ["1", "2"], noShowAgentIds: [],
+    })).toBe(true);
   });
 });
 

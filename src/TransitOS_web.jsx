@@ -907,6 +907,26 @@ export function boardedAgentIds(trip) {
   return (trip.completed_pickups || trip.completedpickups || []).filter(id => !noShow.has(String(id)));
 }
 
+// Should an IN_TRANSIT trip auto-complete once `remainingAgentIds` are all
+// that's left on it (i.e. after an agent cancels or is removed)? True when
+// every remaining agent has either already been dropped off or was a
+// no-show — nothing left for the driver to do. Without this, cancelling or
+// removing the LAST un-dropped agent mid-trip strands the trip IN_TRANSIT
+// forever (the driver's own screen reads "RUN COMPLETE" but no further
+// drop-off event fires to archive it), leaving the driver stuck BUSY.
+// Field-shape agnostic: caller passes the raw arrays from either the
+// hydrated (no_shows/completed_dropoffs) or DB-row (noshows/completeddropoffs)
+// representation. The empty-remainder case is deliberately NOT handled here —
+// removing the last agent goes through the cancel/archive path instead.
+export function tripCompletesAfterAgentLeaves({ state, remainingAgentIds, completedDropoffs, noShowAgentIds }) {
+  if (state !== TRIP_STATE.IN_TRANSIT) return false;
+  const remaining = (remainingAgentIds || []).map(String);
+  if (remaining.length === 0) return false;
+  const dropped = new Set((completedDropoffs || []).map(String));
+  const noShow = new Set((noShowAgentIds || []).map(String));
+  return remaining.every(id => noShow.has(id) || dropped.has(id));
+}
+
 // Returns a combined risk for a whole trip (worst of all its agents).
 export function tripNoShowRisk(trip, allTrips) {
   const agentIds = trip.agent_ids || [];
@@ -4504,7 +4524,30 @@ function appReducer(state, action) {
           trip_id: trip.trip_id, ts: now(), read: false,
         }] : []),
       ];
-      return { ...state, trips: newTripsRemove, notifications: [...removeNotifs, ...state.notifications], _error: null };
+      // If removing this agent leaves nothing left to drop (every remaining
+      // agent already dropped or a no-show), complete the trip now and free
+      // the driver — otherwise it would sit IN_TRANSIT forever. See
+      // tripCompletesAfterAgentLeaves.
+      const removeCompletesTrip = tripCompletesAfterAgentLeaves({
+        state: trip.state, remainingAgentIds: newAgentIds,
+        completedDropoffs: trip.completed_dropoffs, noShowAgentIds: (trip.no_shows || []).map(ns => ns.agent_id),
+      });
+      let finalTripsRemove = newTripsRemove;
+      let removeDriverStatus = state.driver_status;
+      if (removeCompletesTrip) {
+        const removeCompleteTs = now();
+        finalTripsRemove = newTripsRemove.map(t => String(t.trip_id) === String(trip.trip_id)
+          ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: removeCompleteTs, completed_at_epoch: Date.now() }
+          : t);
+        if (trip.driver_id) {
+          const remainingActive = finalTripsRemove.filter(t => String(t.driver_id) === String(trip.driver_id) &&
+            [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
+          removeDriverStatus = state.driver_status.map(d => String(d.driver_id) === String(trip.driver_id)
+            ? { ...d, state: remainingActive.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remainingActive[0]?.trip_id || null }
+            : d);
+        }
+      }
+      return { ...state, trips: finalTripsRemove, driver_status: removeDriverStatus, notifications: [...removeNotifs, ...state.notifications], _error: null };
     }
 
     case "TRIP/RELOCATE_AGENT": {
@@ -6149,7 +6192,29 @@ function appReducer(state, action) {
       } else {
         newTripsAgentCancel = state.trips.map(t => String(t.trip_id) === String(trip.trip_id) ? { ...t, agent_ids: newAgentIds, pickup_sequence_coords: newPickupCoords, dropoff_sequence_coords: newDropoffCoordsAC, completed_pickups: newCompletedPickups, agent_name: newAgentName } : t);
       }
-      return { ...state, trips: newTripsAgentCancel, notifications: [...cancelNotifs, ...state.notifications], _error: null };
+      // If this cancellation leaves nothing left to drop (every remaining
+      // agent already dropped or a no-show), complete the trip and free the
+      // driver — same fix/reasoning as TRIP/REMOVE_AGENT above.
+      const cancelCompletesTrip = tripCompletesAfterAgentLeaves({
+        state: trip.state, remainingAgentIds: newAgentIds,
+        completedDropoffs: trip.completed_dropoffs, noShowAgentIds: (trip.no_shows || []).map(ns => ns.agent_id),
+      });
+      let finalTripsAgentCancel = newTripsAgentCancel;
+      let cancelDriverStatus = state.driver_status;
+      if (cancelCompletesTrip) {
+        const cancelCompleteTs = now();
+        finalTripsAgentCancel = newTripsAgentCancel.map(t => String(t.trip_id) === String(trip.trip_id)
+          ? { ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: cancelCompleteTs, completed_at_epoch: Date.now() }
+          : t);
+        if (trip.driver_id) {
+          const remainingActive = finalTripsAgentCancel.filter(t => String(t.driver_id) === String(trip.driver_id) &&
+            [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state));
+          cancelDriverStatus = state.driver_status.map(d => String(d.driver_id) === String(trip.driver_id)
+            ? { ...d, state: remainingActive.length === 0 ? DRIVER_STATE.AVAILABLE : DRIVER_STATE.BUSY, current_trip_id: remainingActive[0]?.trip_id || null }
+            : d);
+        }
+      }
+      return { ...state, trips: finalTripsAgentCancel, driver_status: cancelDriverStatus, notifications: [...cancelNotifs, ...state.notifications], _error: null };
     }
 
     case "TICKET/CREATE": {
@@ -8723,17 +8788,40 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         if (newPrimaryUser) update.agentname = newPrimaryUser.fullname;
       }
 
+      // If removing this agent leaves nothing left to drop (every remaining
+      // agent already dropped off or a no-show), complete the trip in this
+      // same write — otherwise it sits IN_TRANSIT forever with no drop-off
+      // event left to archive it. See tripCompletesAfterAgentLeaves.
+      const rmRemainingAgentIds = [tripRow.agentid, ...(tripRow.extraagentids || [])]
+        .filter(Boolean).filter(id => !sameId(id, action.agent_id));
+      const rmCompletesTrip = tripCompletesAfterAgentLeaves({
+        state: tripRow.status, remainingAgentIds: rmRemainingAgentIds,
+        completedDropoffs: tripRow.completeddropoffs, noShowAgentIds: (tripRow.noshows || []).map(ns => ns.agent_id),
+      });
+      const rmNowTs = nowEpoch();
+      if (rmCompletesTrip) { update.status = TRIP_STATE.ARCHIVED_COMPLETED; update.completedat = rmNowTs; }
       // Optimistic-concurrency write — see withUpdatedAtGuard. Guards against
       // the same class of race as TRIP/ADD_AGENT: two admins each removing a
       // different passenger from the same trip at nearly the same time would
       // otherwise silently undo one of the two removals.
-      update.updatedat = nowEpoch();
+      update.updatedat = rmNowTs;
       const { data: rmWriteResult, error: rmErr } = await withUpdatedAtGuard(
         supabase.from("trips").update(update).eq("id", action.trip_id), tripRow.updatedat
       ).select("id");
       if (rmErr) throw rmErr;
       if (!rmWriteResult || rmWriteResult.length === 0) {
         throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      }
+      // Free the driver if that completion left them with no active trips —
+      // mirrors the AGENT_CANCEL archive/delete branch's driver-status update.
+      if (rmCompletesTrip && tripRow.driverid) {
+        const { data: rmRemainingTrips } = await supabase.from("trips").select("id").eq("driverid", tripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+        await supabase.from("driver_status").update({
+          state: rmRemainingTrips && rmRemainingTrips.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
+          currenttripid: rmRemainingTrips?.[0]?.id || null,
+          updatedat: new Date(rmNowTs).toISOString(),
+        }).eq("driverid", tripRow.driverid);
       }
 
       if (tripRow.driverid) {
@@ -9978,6 +10066,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const { data: acNewPrimaryUser } = await supabase.from("users").select("fullname").eq("id", acUpdate.agentid).maybeSingle();
         if (acNewPrimaryUser) acUpdate.agentname = acNewPrimaryUser.fullname;
       }
+      // If this cancellation leaves nothing left to drop (every remaining
+      // agent already dropped off or a no-show), complete the trip in this
+      // same write — otherwise it sits IN_TRANSIT forever with no drop-off
+      // event left to archive it. See tripCompletesAfterAgentLeaves.
+      const acCompletesTrip = tripCompletesAfterAgentLeaves({
+        state: acTripRow.status, remainingAgentIds: acOtherAgentIds,
+        completedDropoffs: acTripRow.completeddropoffs, noShowAgentIds: (acTripRow.noshows || []).map(ns => ns.agent_id),
+      });
+      if (acCompletesTrip) { acUpdate.status = TRIP_STATE.ARCHIVED_COMPLETED; acUpdate.completedat = acNowTs; }
       acUpdate.updatedat = acNowTs;
       // Optimistic-concurrency write — FOUND VIA A PROACTIVE SWEEP: this
       // was a completely unguarded `.eq("id", ...)` write with no
@@ -9995,6 +10092,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         acTripRow.updatedat
       ).select("id"));
       if (!acPartialRes.data || acPartialRes.data.length === 0) throw new Error("This trip was just changed by someone else — please refresh and try again.");
+      // Free the driver if that completion left them with no active trips —
+      // mirrors the acWasOnlyAgent archive/delete branch's driver update.
+      if (acCompletesTrip && acTripRow.driverid) {
+        const { data: acCompRemaining } = await supabase.from("trips").select("id").eq("driverid", acTripRow.driverid)
+          .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+        await supabase.from("driver_status").update({
+          state: acCompRemaining && acCompRemaining.length > 0 ? DRIVER_STATE.BUSY : DRIVER_STATE.AVAILABLE,
+          currenttripid: acCompRemaining?.[0]?.id || null,
+          updatedat: new Date(acNowTs).toISOString(),
+        }).eq("driverid", acTripRow.driverid);
+      }
 
       if (acTripRow.driverid) {
         // Scoped to the SAME DATE as the trip being modified — a 7th copy
