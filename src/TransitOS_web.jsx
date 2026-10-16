@@ -6089,6 +6089,15 @@ function appReducer(state, action) {
 
       const otherAgentIds = trip.agent_ids.filter(id => String(id) !== String(action.agent_id));
       const wasOnlyAgent = otherAgentIds.length === 0;
+      // Whether removing this agent leaves nothing left to drop (every
+      // remaining agent already dropped or a no-show) — drives both the
+      // auto-completion in the partial branch below AND the notification
+      // wording here, so an admin isn't told "driver keeps the rest of the
+      // run" when the run actually just finished. Mirrors the Supabase handler.
+      const cancelCompletesTrip = tripCompletesAfterAgentLeaves({
+        state: trip.state, remainingAgentIds: otherAgentIds,
+        completedDropoffs: trip.completed_dropoffs, noShowAgentIds: (trip.no_shows || []).map(ns => ns.agent_id),
+      });
 
       const cancelNotifs = [];
       // Driver + admin notification fires for EVERY agent-initiated
@@ -6098,13 +6107,13 @@ function appReducer(state, action) {
       if (trip.driver_id) {
         cancelNotifs.push({
           id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [trip.driver_id],
-          message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — the trip has been cancelled" : ""}.`,
+          message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — the trip has been cancelled" : cancelCompletesTrip ? " — that was the last drop-off left, so the run is now complete" : ""}.`,
           trip_id: trip.trip_id, ts: cancelNowTs, read: false,
         });
       }
       cancelNotifs.push({
         id: mkId(), type: "TRIP_CANCELLED", for_roles: [ROLE.ADMIN],
-        message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — trip cancelled, driver freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
+        message: `${cancellingAgent?.name || "An agent"} cancelled their spot on trip ${trip.trip_id}${wasOnlyAgent ? " — trip cancelled, driver freed up" : cancelCompletesTrip ? " — everyone else was already dropped off, so the run auto-completed and the driver's freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
         trip_id: trip.trip_id, ts: cancelNowTs, read: false,
       });
       if (isLate) {
@@ -6195,10 +6204,8 @@ function appReducer(state, action) {
       // If this cancellation leaves nothing left to drop (every remaining
       // agent already dropped or a no-show), complete the trip and free the
       // driver — same fix/reasoning as TRIP/REMOVE_AGENT above.
-      const cancelCompletesTrip = tripCompletesAfterAgentLeaves({
-        state: trip.state, remainingAgentIds: newAgentIds,
-        completedDropoffs: trip.completed_dropoffs, noShowAgentIds: (trip.no_shows || []).map(ns => ns.agent_id),
-      });
+      // cancelCompletesTrip was computed up front (it also drives the
+      // notification wording); newAgentIds === otherAgentIds here.
       let finalTripsAgentCancel = newTripsAgentCancel;
       let cancelDriverStatus = state.driver_status;
       if (cancelCompletesTrip) {
@@ -9916,17 +9923,29 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // try/catch meant a failure on the FIRST notification silently
       // skipped every step after it too, including the audit-log write,
       // with nothing but one console.error to show for it.
-      const acSendCancelNotifications = async () => {
+      // `completed` is passed true by the partial branch when this
+      // cancellation left nothing else to drop, so the trip auto-completed
+      // (every other agent already dropped off) — the wording below reflects
+      // that instead of the usual "driver keeps the rest of the run". The
+      // whole-trip-cancelled branch never passes it (that path uses
+      // acWasOnlyAgent), so it defaults false.
+      const acSendCancelNotifications = async ({ completed = false } = {}) => {
+        const driverTail = acWasOnlyAgent ? " — the trip has been cancelled"
+          : completed ? " — that was the last drop-off left, so the run is now complete"
+          : "";
+        const adminTail = acWasOnlyAgent ? " — trip cancelled, driver freed up"
+          : completed ? " — everyone else was already dropped off, so the run auto-completed and the driver's freed up"
+          : " — removed from the trip, driver keeps the rest of the run";
         if (acTripRow.driverid) {
           await bestEffort("AGENT_CANCEL driver notify", () => insertNotification({
             type: "TRIP_CANCELLED", for_roles: [ROLE.DRIVER], for_user_ids: [acTripRow.driverid],
-            message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — the trip has been cancelled" : ""}.`,
+            message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${driverTail}.`,
             trip_id: action.trip_id, ts: acNowTs, read: false,
           }));
         }
         await bestEffort("AGENT_CANCEL admin notify", () => insertNotification({
           type: "TRIP_CANCELLED", for_roles: [ROLE.ADMIN],
-          message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${acWasOnlyAgent ? " — trip cancelled, driver freed up" : " — removed from the trip, driver keeps the rest of the run"}.`,
+          message: `${cancellingAgentName} cancelled their spot on trip ${action.trip_id}${adminTail}.`,
           trip_id: action.trip_id, ts: acNowTs, read: false,
         }));
         if (acIsLate) {
@@ -9940,7 +9959,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         // rethrows — no bestEffort wrapper needed here.
         await logAuditAction({
           actorId: action.agent_id, actorName: cancellingAgentName, actionType: "TRIP/AGENT_CANCEL",
-          tripId: action.trip_id, details: `Agent cancelled their own spot${acIsLate ? " (LATE)" : ""}${acWasOnlyAgent ? " — whole trip cancelled" : " — removed, trip continues"}`,
+          tripId: action.trip_id, details: `Agent cancelled their own spot${acIsLate ? " (LATE)" : ""}${acWasOnlyAgent ? " — whole trip cancelled" : completed ? " — removed, trip auto-completed (nothing left to drop)" : " — removed, trip continues"}`,
         });
       };
 
@@ -10140,8 +10159,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
       // Notifications LAST and genuinely best-effort — see the identical
-      // fix/comment in the acWasOnlyAgent branch above.
-      await acSendCancelNotifications();
+      // fix/comment in the acWasOnlyAgent branch above. Pass whether this
+      // cancellation auto-completed the trip so the wording matches reality.
+      await acSendCancelNotifications({ completed: acCompletesTrip });
       refetch(); // fire-and-forget — see handleSupabaseAction's header comment
       return;
     }
