@@ -9305,6 +9305,18 @@ function AdminUsers({ state, dispatch, user }) {
   ).filter(u => !showOnlyUnconfirmed || needsAddressConfirmationIds.has(u.id))
    .filter(u => !showOnlyStreetLevel || streetLevelAddressIds.has(u.id))
    .filter(u => showArchived || !u.archived);
+  // Group the (filtered) list by role — Admins, then Drivers, then Agents,
+  // then any other role present — each under its own header, per explicit
+  // request (previously one flat mixed list). Preserves each group's
+  // existing order and drops no one: a role outside the preferred order is
+  // appended rather than hidden.
+  const USER_ROLE_ORDER = [ROLE.ADMIN, ROLE.DRIVER, ROLE.AGENT];
+  const USER_ROLE_LABEL = { [ROLE.ADMIN]: "Admins", [ROLE.DRIVER]: "Drivers", [ROLE.AGENT]: "Agents", [ROLE.CLIENT]: "Clients" };
+  const userRoleGroups = [
+    ...USER_ROLE_ORDER,
+    ...[...new Set(filteredUsers.map(u => u.role))].filter(r => !USER_ROLE_ORDER.includes(r)),
+  ].map(role => ({ role, label: USER_ROLE_LABEL[role] || role, users: filteredUsers.filter(u => u.role === role) }))
+   .filter(g => g.users.length > 0);
   const toggleSelected = (id) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
@@ -9583,7 +9595,14 @@ function AdminUsers({ state, dispatch, user }) {
       <Card body={false}>
         {filteredUsers.length === 0 ? (
           <Empty icon="👤" text={`No users match "${userSearch}"`} />
-        ) : filteredUsers.map(u => {
+        ) : userRoleGroups.map(group => (
+          <React.Fragment key={group.role}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px 6px", background: COLORS.surface, borderBottom: `1px solid ${COLORS.wire}` }}>
+              <RoleBadge role={group.role} />
+              <span style={{ fontFamily: FONTS.head, fontSize: 12, fontWeight: 800, color: COLORS.chalk, letterSpacing: 1, textTransform: "uppercase" }}>{group.label}</span>
+              <span style={{ fontSize: 10, color: COLORS.ghost }}>({group.users.length})</span>
+            </div>
+            {group.users.map(u => {
           const isExpanded = editingId === u.id;
           const isEditingThisRow = isExpanded && editModeId === u.id;
           const driverStatus = u.role === ROLE.DRIVER ? state.driver_status.find(d => String(d.driver_id) === String(u.id)) : null;
@@ -9679,7 +9698,9 @@ function AdminUsers({ state, dispatch, user }) {
               )}
             </React.Fragment>
           );
-        })}
+            })}
+          </React.Fragment>
+        ))}
       </Card>
     </div>
   );
