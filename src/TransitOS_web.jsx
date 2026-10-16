@@ -5654,9 +5654,15 @@ function appReducer(state, action) {
       // Supabase side; the local/demo reducer silently never set
       // dropoff_timestamps at all, a real pre-existing gap found while
       // adding the new location field alongside it.
+      // Only agents who actually BOARDED are dropped off at completion — a
+      // no-show never got in the vehicle, so must not be stamped as dropped
+      // (that's the exact completed_dropoffs-vs-no_shows conflation fixed
+      // across this file; keep it out of here too so a bulk complete can't
+      // reintroduce it).
+      const completeBoarded = trip.agent_ids.filter(aid => !isNoShowAgent(trip, aid));
       const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}) };
       const newDropoffLocations = { ...(trip.dropoff_locations || {}) };
-      trip.agent_ids.forEach(aid => {
+      completeBoarded.forEach(aid => {
         newDropoffTimestamps[aid] = completeNowTs;
         if (action.driver_coord) newDropoffLocations[aid] = { lat: action.driver_coord.lat, lng: action.driver_coord.lng };
       });
@@ -5667,7 +5673,7 @@ function appReducer(state, action) {
               // field a few cases above (TRIP/CONFIRM_AGENT_DROPOFF's
               // completion branch).
               ...t, state: TRIP_STATE.ARCHIVED_COMPLETED, completed_at: completeNowTs, completed_at_epoch: Date.now(), actual_distance_km: null,
-              completed_dropoffs: [...t.agent_ids], dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations,
+              completed_dropoffs: completeBoarded, dropoff_timestamps: newDropoffTimestamps, dropoff_locations: newDropoffLocations,
             }
           : t
       );
@@ -12143,7 +12149,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // this is what lets the trip sheet show which driver actually
       // dropped which agent, since driverid is already on the trip row
       // and this confirms the drop event happened, not just the booking.
-      const tripAgentIdsForDrop = [tripRow.agentid, ...(tripRow.extraagentids || [])].filter(Boolean);
+      // Only agents who actually BOARDED get stamped as dropped — exclude
+      // no-shows (never in the vehicle), matching the completed_dropoffs /
+      // no_shows invariant enforced everywhere else in this file.
+      const tripAgentIdsForDrop = [tripRow.agentid, ...(tripRow.extraagentids || [])]
+        .filter(Boolean)
+        .filter(id => !isNoShowAgent(tripRow, id));
       const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}) };
       tripAgentIdsForDrop.forEach(id => { newDropoffTimestamps[id] = nowTs; });
       // reverseGeocode (the driver's current position) and
