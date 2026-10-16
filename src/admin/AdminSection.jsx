@@ -4159,13 +4159,17 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
   // given search this session), it had no text search at all — finding
   // "did agent X's booking get assigned" meant scrolling/scanning by eye.
   const [searchQuery, setSearchQuery] = useState("");
-  // Per-driver-group collapse — each group's trip list starts expanded
-  // (matches the existing behavior before this was added), toggled by
-  // tapping that group's own header. Keyed by the same string group key
-  // used for `groups`/`orderedKeys` below ("UNASSIGNED" or a driver id).
-  const [collapsedGroups, setCollapsedGroups] = useState(new Set());
+  // Per-driver-group collapse — driver groups start COLLAPSED (per explicit
+  // request) so the tab opens as a tidy list of driver headers to expand on
+  // demand, while the actionable UNASSIGNED queue starts expanded. Tracked
+  // as the set of EXPANDED keys (default: just "UNASSIGNED") rather than
+  // collapsed ones, since the driver ids aren't known at mount — an empty
+  // "expanded" set then naturally means every driver group is collapsed.
+  // Keyed by the same string group key used for `groups`/`orderedKeys`
+  // below ("UNASSIGNED" or a driver id).
+  const [expandedGroups, setExpandedGroups] = useState(new Set(["UNASSIGNED"]));
   const toggleGroupCollapsed = (key) => {
-    setCollapsedGroups(prev => {
+    setExpandedGroups(prev => {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key); else next.add(key);
       return next;
@@ -4573,7 +4577,7 @@ function AdminTrips({ state, dispatch, user, jumpTripId, onJumpConsumed }) {
         const isUnassigned = key === "UNASSIGNED";
         const driverUser = isUnassigned ? null : findUserByKey(key);
         const groupTrips = groups[key];
-        const isCollapsed = collapsedGroups.has(key);
+        const isCollapsed = !expandedGroups.has(key);
         return (
           <div key={key}>
             <div
