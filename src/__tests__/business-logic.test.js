@@ -18,6 +18,7 @@ import {
   tripTotalFeeAmount,
   billableAgentIds,
   tripCompletesAfterAgentLeaves,
+  tripHasNothingLeftToDrop,
   tripDriverPayment,
   haversineKm,
   isMasterAdmin,
@@ -219,6 +220,41 @@ describe("tripCompletesAfterAgentLeaves — auto-complete when a cancel/remove l
   it("normalizes id shape (string dropoffs vs numeric remaining)", () => {
     expect(tripCompletesAfterAgentLeaves({
       ...base, remainingAgentIds: [1, 2], completedDropoffs: ["1", "2"], noShowAgentIds: [],
+    })).toBe(true);
+  });
+});
+
+describe("tripHasNothingLeftToDrop — MARK_NO_SHOW auto-complete (no-show'd agent stays on the trip)", () => {
+  it("concludes when the last un-picked-up agent no-shows after the others were dropped", () => {
+    // The real stranding bug: A (1) boarded + dropped, B (2) never at pickup
+    // and just marked a no-show. Nothing left to transport.
+    expect(tripHasNothingLeftToDrop({
+      agentIds: [1, 2], completedDropoffs: [1], noShowAgentIds: [2],
+    })).toBe(true);
+  });
+
+  it("concludes when every agent was a no-show (nobody boarded)", () => {
+    expect(tripHasNothingLeftToDrop({
+      agentIds: [1, 2], completedDropoffs: [], noShowAgentIds: [1, 2],
+    })).toBe(true);
+  });
+
+  it("does NOT conclude while a boarded agent still needs dropping off", () => {
+    // A (1) no-show, B (2) boarded but not yet dropped — driver must finish B.
+    expect(tripHasNothingLeftToDrop({
+      agentIds: [1, 2], completedDropoffs: [], noShowAgentIds: [1],
+    })).toBe(false);
+  });
+
+  it("does NOT conclude for an empty agent list", () => {
+    expect(tripHasNothingLeftToDrop({
+      agentIds: [], completedDropoffs: [], noShowAgentIds: [],
+    })).toBe(false);
+  });
+
+  it("normalizes id shape (string dropoffs/no-shows vs numeric agents)", () => {
+    expect(tripHasNothingLeftToDrop({
+      agentIds: [1, 2], completedDropoffs: ["1"], noShowAgentIds: ["2"],
     })).toBe(true);
   });
 });

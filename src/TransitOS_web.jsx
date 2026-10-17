@@ -927,6 +927,27 @@ export function tripCompletesAfterAgentLeaves({ state, remainingAgentIds, comple
   return remaining.every(id => noShow.has(id) || dropped.has(id));
 }
 
+// Sibling of tripCompletesAfterAgentLeaves, for the MARK_NO_SHOW path (where
+// the no-shown agent STAYS on the trip rather than being removed): once a
+// no-show is recorded, has the trip run out of anyone left to transport?
+// True when EVERY agent on the trip is either already dropped off or a
+// no-show. This generalizes the old "every agent was a no-show" completion
+// check — which only fired when NOBODY boarded — to also cover the mixed
+// case: real passengers already dropped off, then the LAST un-picked-up
+// agent is marked a no-show. That case previously stranded the trip
+// IN_TRANSIT forever with nothing left to drop (e.g. a 2-agent trip where A
+// is picked up and geofence-dropped, then B — never at pickup — no-shows).
+// State-agnostic on purpose: the caller still runs the DRIVER_CONFIRMED->
+// IN_TRANSIT->ARCHIVED_COMPLETED transition sequence, so this must also
+// return true for the all-no-show-from-DRIVER_CONFIRMED case.
+export function tripHasNothingLeftToDrop({ agentIds, completedDropoffs, noShowAgentIds }) {
+  const ids = (agentIds || []).map(String);
+  if (ids.length === 0) return false;
+  const dropped = new Set((completedDropoffs || []).map(String));
+  const noShow = new Set((noShowAgentIds || []).map(String));
+  return ids.every(id => dropped.has(id) || noShow.has(id));
+}
+
 // Returns a combined risk for a whole trip (worst of all its agents).
 export function tripNoShowRisk(trip, allTrips) {
   const agentIds = trip.agent_ids || [];
@@ -5601,24 +5622,27 @@ function appReducer(state, action) {
         location: action.driver_coord ? { lat: action.driver_coord.lat, lng: action.driver_coord.lng } : null,
         note: action.note?.trim() || null,
       };
-      // Per explicit requirement: once every agent is handled (picked up
-      // or no-show), the trip needs to go one of two ways depending on
-      // whether ANYONE was actually picked up. If at least one real
-      // pickup happened, there's still a drop-off to do — IN_TRANSIT,
-      // same as before. But if EVERY agent on the trip turned out to be
-      // a no-show (nobody actually got in the vehicle), there's nothing
-      // left to drop off at all — the trip should conclude entirely
-      // rather than sit in IN_TRANSIT forever waiting for a drop-off
-      // that will never happen. existingNoShowIds is checked BEFORE
-      // adding this one, since a trip already fully no-showed before
-      // this call shouldn't be possible (allHandled would already have
-      // fired), but this keeps the check correct regardless of order.
-      const allNoShowIds = new Set([...(trip.no_shows || []).map(ns => ns.agent_id), action.agent_id]);
-      const everyoneWasNoShow = allHandled && trip.agent_ids.every(id => allNoShowIds.has(id));
+      // Per explicit requirement: once every agent is handled (picked up or
+      // no-show), the trip goes one of two ways. If a boarded agent still
+      // needs a drop-off, there's work left — advance to / stay IN_TRANSIT.
+      // But if NOBODY is left in the vehicle (every agent is either already
+      // dropped off or a no-show), there's nothing left to drop at all, so
+      // the trip must conclude rather than sit IN_TRANSIT forever waiting on
+      // a drop-off that will never come.
+      // nothingLeftToDrop — conclude the trip when every agent is either
+      // already dropped off OR a no-show (nobody left in the vehicle). Covers
+      // both the all-no-show case AND the mixed case (real drop-offs done,
+      // then the last un-picked-up agent no-shows) that used to strand the
+      // trip IN_TRANSIT. See tripHasNothingLeftToDrop.
+      const nothingLeftToDrop = allHandled && tripHasNothingLeftToDrop({
+        agentIds: trip.agent_ids,
+        completedDropoffs: trip.completed_dropoffs,
+        noShowAgentIds: [...(trip.no_shows || []).map(ns => ns.agent_id), action.agent_id],
+      });
       let newState = trip.state;
       let inTransitAt = trip.in_transit_at;
       let completedAt = trip.completed_at;
-      if (allHandled && everyoneWasNoShow && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
+      if (nothingLeftToDrop && trip.state !== TRIP_STATE.ARCHIVED_COMPLETED) {
         // The state machine requires passing THROUGH IN_TRANSIT — there's
         // no direct DRIVER_CONFIRMED -> ARCHIVED_COMPLETED edge, since a
         // trip normally only reaches ARCHIVED_COMPLETED via TRIP/COMPLETE
@@ -5633,7 +5657,7 @@ function appReducer(state, action) {
         newState = TRIP_STATE.ARCHIVED_COMPLETED;
         inTransitAt = inTransitAt || nowTs;
         completedAt = nowTs;
-      } else if (allHandled && !everyoneWasNoShow && trip.state !== TRIP_STATE.IN_TRANSIT) {
+      } else if (allHandled && !nothingLeftToDrop && trip.state !== TRIP_STATE.IN_TRANSIT) {
         try { assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT); }
         catch (e) { return { ...state, _error: e.message }; }
         newState = TRIP_STATE.IN_TRANSIT;
@@ -12197,10 +12221,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // sitting in IN_TRANSIT forever. See the in-memory reducer's case
       // for the full rationale. Set of STRINGS (not raw ids) for the same
       // id-shape reason as nsAllHandled above.
-      const nsAllNoShowIds = new Set([...(tripRow.noshows || []).map(ns => String(ns.agent_id)), String(action.agent_id)]);
-      const nsEveryoneWasNoShow = nsAllHandled && nsAgentIds.every(id => nsAllNoShowIds.has(String(id)));
+      // nsNothingLeftToDrop — see the in-memory reducer's twin and
+      // tripHasNothingLeftToDrop: conclude the trip when every agent is
+      // already dropped off OR a no-show, not only when EVERYONE no-showed.
+      // Covers the mixed case (real drop-offs done, then the last
+      // un-picked-up agent no-shows) that previously stranded the trip.
+      const nsNothingLeftToDrop = nsAllHandled && tripHasNothingLeftToDrop({
+        agentIds: nsAgentIds,
+        completedDropoffs: tripRow.completeddropoffs,
+        noShowAgentIds: [...(tripRow.noshows || []).map(ns => ns.agent_id), action.agent_id],
+      });
       let nsNewState = tripRow.status, nsInTransitAt = tripRow.intransitat, nsCompletedAt = tripRow.completedat;
-      if (nsAllHandled && nsEveryoneWasNoShow && tripRow.status !== TRIP_STATE.ARCHIVED_COMPLETED) {
+      if (nsNothingLeftToDrop && tripRow.status !== TRIP_STATE.ARCHIVED_COMPLETED) {
         // See the in-memory reducer's case — the state machine requires
         // passing THROUGH IN_TRANSIT, no direct edge to ARCHIVED_COMPLETED
         // exists from any earlier state.
@@ -12209,7 +12241,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         nsNewState = TRIP_STATE.ARCHIVED_COMPLETED;
         nsInTransitAt = nsInTransitAt || nsNowTs;
         nsCompletedAt = nsNowTs;
-      } else if (nsAllHandled && !nsEveryoneWasNoShow && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
+      } else if (nsAllHandled && !nsNothingLeftToDrop && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
         assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
         nsNewState = TRIP_STATE.IN_TRANSIT;
         nsInTransitAt = nsNowTs;
