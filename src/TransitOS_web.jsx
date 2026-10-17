@@ -5499,7 +5499,10 @@ function appReducer(state, action) {
       // their individual stop. This is the dropoff equivalent of
       // CONFIRM_AGENT_PICKUP: each agent gets their own location stamped
       // separately rather than all at once when the trip completes.
-      // When ALL agents are confirmed dropped off, TRIP/COMPLETE fires.
+      // When the last BOARDED agent is dropped off (allDroppedOff below),
+      // this handler archives the trip inline — the standalone TRIP/COMPLETE
+      // action is dead code (never dispatched); real completion lives here,
+      // in MARK_NO_SHOW, and in the cancel/remove auto-complete branches.
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
       // Must be picked up before being dropped off — matches
