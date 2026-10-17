@@ -10608,11 +10608,29 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             const extraDrop = tripRow.extradropoffs?.[i];
             if (extraDrop) newExtraDropoffs.push(extraDrop);
           }
-          // Capacity check before merging
+          // Capacity check before merging. Per-day seat load, matching the
+          // non-merge path's gate below (driverTripsRawSameDay): the merged
+          // trip is NOT necessarily the driver's only same-day work, so every
+          // OTHER active same-day trip's seats must count too. Without this,
+          // the auto-merge is a back door around the per-day capacity gate —
+          // e.g. a driver already full for the day across a 06:00 + 18:00 pair
+          // can still have a 3rd booking merged into the 06:00 leg (its own
+          // merged seat count alone is under capacity), overcommitting the
+          // vehicle past its seats: the exact "12 passengers on a 4-seat van"
+          // overbooking the non-merge gate was added (via direct user report)
+          // to prevent. Excludes mergeTargetTrip (its seats ARE mergedSeats)
+          // and action.trip_id (being folded in, then deleted).
           const mergedSeats = 1 + newExtraAgentIds.length;
           const mergeCapacity = driverRow.capacity || DRIVER_CAPACITY;
-          if (mergedSeats > mergeCapacity) {
-            throw new Error(`Driver doesn't have room — merging would need ${mergedSeats} seats, vehicle holds ${mergeCapacity}.`);
+          const { data: mergeDriverSameDayActive } = await supabase.from("trips").select("id, extraagentids")
+            .eq("driverid", action.driver_id)
+            .eq("scheduleddate", tripRow.scheduleddate)
+            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
+          const otherSameDaySeats = (mergeDriverSameDayActive || [])
+            .filter(t => String(t.id) !== String(mergeTargetTrip.id) && String(t.id) !== String(action.trip_id))
+            .reduce((s, r) => s + Math.max(1, 1 + (r.extraagentids?.length || 0)), 0);
+          if (otherSameDaySeats + mergedSeats > mergeCapacity) {
+            throw new Error(`Driver doesn't have room — merging would put ${otherSameDaySeats + mergedSeats} seats on this driver's day, vehicle holds ${mergeCapacity}.`);
           }
           // Optimistic-concurrency write: the UPDATE is conditioned on
           // mergeTargetTrip.updatedat still matching what we just read. If
@@ -10668,8 +10686,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
               if (retryExtraDrop) retryExtraDropoffs.push(retryExtraDrop);
             }
             const retrySeats = 1 + retryExtraAgentIds.length;
-            if (retrySeats > mergeCapacity) {
-              throw new Error(`Driver doesn't have room — merging would need ${retrySeats} seats, vehicle holds ${mergeCapacity}. (Another change was made to this driver's trip moments ago — please recheck and retry.)`);
+            // Same per-day load check as the non-retry path above (reusing the
+            // other-same-day snapshot; the concurrency guard is on the merge
+            // target itself).
+            if (otherSameDaySeats + retrySeats > mergeCapacity) {
+              throw new Error(`Driver doesn't have room — merging would put ${otherSameDaySeats + retrySeats} seats on this driver's day, vehicle holds ${mergeCapacity}. (Another change was made to this driver's trip moments ago — please recheck and retry.)`);
             }
             must(await supabase.from("trips").update({
               extraagentids: retryExtraAgentIds, extrapickups: retryExtraPickups, extradropoffs: retryExtraDropoffs,
