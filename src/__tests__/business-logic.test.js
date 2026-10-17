@@ -1077,22 +1077,23 @@ describe("computeDispatchWhatIf — pre-dispatch seat + route + policy preview",
     expect(computeDispatchWhatIf(stateWith([], []), 9, [mkTrip("A", [1], NEAR, NEAR)])).toBeNull();
   });
 
-  it("adds the incoming seats to the driver's current same-day load", () => {
+  it("reports only the resulting trip's own seats — a separate existing same-day trip is NOT summed in (per trip-record)", () => {
     const existing = { ...mkTrip("E", [1, 2], NEAR, NEAR), trip_id: "E", state: TRIP_STATE.DRIVER_CONFIRMED, driver_id: 9 };
     const sel = [mkTrip("NEW", [3], NEAR, NEAR)];
     const w = computeDispatchWhatIf(stateWith([existing], [{ driver_id: 9, capacity: 4 }]), 9, sel);
-    expect(w.currentLoad).toBe(2);
     expect(w.incomingSeats).toBe(1);
-    expect(w.newLoad).toBe(3);
+    expect(w.newLoad).toBe(1);                 // the new trip is its own vehicle load; E's 2 seats don't compete
     expect(w.capacity).toBe(4);
     expect(w.overCapacity).toBe(false);
     expect(w.multiDay).toBe(false);
-    expect(w.route.otherActiveTrips).toBe(1);
+    expect(w.route.otherActiveTrips).toBe(1);  // E still shares the driver's day for ROUTE sequencing
   });
 
-  it("flags over-capacity when the combined seats exceed the vehicle", () => {
-    const existing = { ...mkTrip("E", [1, 2, 3], NEAR, NEAR), trip_id: "E", state: TRIP_STATE.ASSIGNED, driver_id: 9 };
-    const w = computeDispatchWhatIf(stateWith([existing], [{ driver_id: 9, capacity: 4 }]), 9, [mkTrip("NEW", [4, 5], NEAR, NEAR)]);
+  it("flags over-capacity when the merged same-day selection itself exceeds the vehicle", () => {
+    // Three same-day bookings combine into ONE trip = 5 seats > capacity 4.
+    const w = computeDispatchWhatIf(stateWith([], [{ driver_id: 9, capacity: 4 }]), 9, [
+      mkTrip("A", [1, 2], NEAR, NEAR), mkTrip("B", [3, 4], NEAR, NEAR), mkTrip("C", [5], NEAR, NEAR),
+    ]);
     expect(w.newLoad).toBe(5);
     expect(w.overCapacity).toBe(true);
   });
@@ -1115,7 +1116,6 @@ describe("computeDispatchWhatIf — pre-dispatch seat + route + policy preview",
     const t = { ...mkTrip("T", [1], NEAR, NEAR), trip_id: "T", state: TRIP_STATE.ASSIGNED, driver_id: 9 };
     const w = computeDispatchWhatIf(stateWith([t], [{ driver_id: 9, capacity: 4 }]), 9, [{ ...t }]);
     expect(w.route.otherActiveTrips).toBe(0); // excluded from the route's "existing" set
-    expect(w.currentLoad).toBe(0);            // getDriverLoad sees it, but it's subtracted back out
     expect(w.incomingSeats).toBe(1);
     expect(w.newLoad).toBe(1);                // re-dispatch of one already-there trip = still 1, not 2
   });

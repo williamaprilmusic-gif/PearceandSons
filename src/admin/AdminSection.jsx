@@ -1923,7 +1923,6 @@ export function computeAutoAssignPlan(state, options = {}) {
     .filter(t => !t.scheduled_date || t.scheduled_date >= todaySlash)
     .sort((a, b) => `${a.scheduled_date} ${a.scheduled_time || ""}`.localeCompare(`${b.scheduled_date} ${b.scheduled_time || ""}`));
 
-  const provisional = new Map(); // `${driver_id}|${date}` -> seats added by this plan
   // Synthetic trips appended per assignment so scoreDriverForTrip's
   // load term reflects what this batch has already handed each driver.
   const scoringTrips = [...(state.trips || [])];
@@ -1944,9 +1943,12 @@ export function computeAutoAssignPlan(state, options = {}) {
       if (usersById.get(String(ds.driver_id))?.archived) continue; // removed account, kept for trip history
       if (!isDriverOnShift(ds, date, time)) continue;
       const cap = ds.capacity || DRIVER_CAPACITY;
-      const key = `${ds.driver_id}|${date}`;
-      const load = getDriverLoad(state, ds.driver_id, date) + (provisional.get(key) || 0);
-      if (load + seats > cap) continue;
+      // Per trip-record capacity: this booking becomes its own trip (one
+      // vehicle load), so only its own seats are gated. The driver's other
+      // same-day trips — existing, or ones assigned earlier in this same
+      // auto-assign pass — are separate loads at other times, so they don't
+      // compete for these seats.
+      if (seats > cap) continue;
       const u = usersById.get(String(ds.driver_id));
       const livePos = state.driver_positions?.[ds.driver_id];
       const liveFresh = livePos && (nowMs - new Date(livePos.updated_at).getTime()) <= 30000;
@@ -1962,8 +1964,6 @@ export function computeAutoAssignPlan(state, options = {}) {
       skipped.push({ trip_id: trip.trip_id, reason: "no on-shift driver with room" });
       continue;
     }
-    const key = `${best.ds.driver_id}|${date}`;
-    provisional.set(key, (provisional.get(key) || 0) + seats);
     scoringTrips.push({
       trip_id: `_auto_${trip.trip_id}`, driver_id: best.ds.driver_id,
       state: TRIP_STATE.ASSIGNED, agent_ids: tripAgentIds.length ? tripAgentIds : ["_"],
@@ -2485,8 +2485,6 @@ export function formatShiftHandoverText(h) {
 // Route km is the haversine estimate (matches the demo reducer); the
 // live Supabase path may shave a little off via TomTom optimisation,
 // hence "~".
-const ACTIVE_STATES_FOR_LOAD = [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT];
-
 export function computeDispatchWhatIf(state, driverId, selectedTrips) {
   const ds = (state.driver_status || []).find(d => String(d.driver_id) === String(driverId));
   if (!ds || !selectedTrips || selectedTrips.length === 0) return null;
@@ -2505,24 +2503,22 @@ export function computeDispatchWhatIf(state, driverId, selectedTrips) {
   const dates = [...byDate.keys()];
   const multiDay = dates.length > 1;
 
-  // Seats: the WORST day — highest resulting on-vehicle count. currentLoad
-  // for a day excludes any selected trip already on this driver (a
-  // re-dispatch changes nothing), so it's not double-counted.
+  // Seats: capacity is per trip-record. Each day's selected bookings become
+  // ONE merged trip (single-day combine) or one per-day trip (multi-day
+  // bulk) — so the resulting vehicle load for a day is just that day's
+  // selected seats. The driver's OTHER same-day trips are separate loads at
+  // other times and don't compete for these seats, so they're NOT added in.
+  // Report the WORST (fullest) resulting day's trip.
   let worst = null;
   for (const [d, dayTrips] of byDate) {
-    const alreadyOnDriver = allTrips.filter(t =>
-      String(t.driver_id) === String(driverId) && ACTIVE_STATES_FOR_LOAD.includes(t.state)
-      && t.scheduled_date === d && selectedIds.has(String(t.trip_id)));
-    const currentLoad = getDriverLoad(state, driverId, d) - seatsOf(alreadyOnDriver);
     const incomingSeats = seatsOf(dayTrips);
-    const newLoad = currentLoad + incomingSeats;
-    if (!worst || newLoad > worst.newLoad) worst = { date: d, currentLoad, incomingSeats, newLoad };
+    if (!worst || incomingSeats > worst.incomingSeats) worst = { date: d, incomingSeats };
   }
 
   const result = {
     multiDay, dayCount: dates.length,
-    currentLoad: worst.currentLoad, incomingSeats: worst.incomingSeats, newLoad: worst.newLoad,
-    capacity, overCapacity: worst.newLoad > capacity, worstDate: multiDay ? worst.date : null,
+    incomingSeats: worst.incomingSeats, newLoad: worst.incomingSeats,
+    capacity, overCapacity: worst.incomingSeats > capacity, worstDate: multiDay ? worst.date : null,
     route: null,
   };
 
@@ -2578,7 +2574,7 @@ function DispatchWhatIfPanel({ whatIf, driverName }) {
       <div style={{ display: "flex", justifyContent: "space-between" }}>
         <span style={{ color: COLORS.mist }}>Seats{whatIf.multiDay ? ` (busiest of ${whatIf.dayCount} days${whatIf.worstDate ? `, ${whatIf.worstDate}` : ""})` : ""}</span>
         <span style={{ color: seatColor, fontWeight: 700 }}>
-          {whatIf.currentLoad} + {whatIf.incomingSeats} = {whatIf.newLoad} / {whatIf.capacity}
+          {whatIf.newLoad} / {whatIf.capacity}
           {whatIf.overCapacity ? " — over capacity" : ""}
         </span>
       </div>
@@ -5855,25 +5851,24 @@ function AdminDispatch({ state, dispatch, user }) {
       // car can't fit.
       const driverCapacity = ds.capacity || DRIVER_CAPACITY;
       if (isMultiDaySelection) {
-        // Check each distinct date against its FULL batch total (every
-        // selected trip's agents landing on that date, from seatsByDate
-        // above) — not just one trip's own agent count. A driver who
-        // already has room for agent A alone on day 1 isn't necessarily
-        // able to also take agent B's day-1 booking from this same batch.
+        // Capacity is per trip-record: each date's selected bookings become
+        // ONE trip (one vehicle load) for that day, so only that day's own
+        // batch total is checked against capacity — the driver's other
+        // same-day trips are separate loads and don't compete for the seats.
         return [...seatsByDate.entries()].every(([date, seats]) => {
           if (!isDriverOnShift(ds, date, tripTimeStr)) return false;
-          return getDriverLoad(state, ds.driver_id, date) + Math.max(1, seats) <= driverCapacity;
+          return Math.max(1, seats) <= driverCapacity;
         });
       }
-      const checkDate = primaryTrip?.scheduled_date;
-      return getDriverLoad(state, ds.driver_id, checkDate) + Math.max(1, totalSeats) <= driverCapacity;
+      // Single-day: the selection merges into one trip whose seats are
+      // totalSeats; per trip-record, that's the whole constraint.
+      return Math.max(1, totalSeats) <= driverCapacity;
     });
     return {
       unassignedAllDates, availableDates, unassignedByDay, availableDirections, unassignedByDirection,
       tripHomeAreas, agentNamesFor, availableAreas, unassigned, selectedTrips, primaryTrip, seatsByDate,
       isMultiDaySelection, totalSeats, overCapacity, underCapacityWarning, availableDriversRaw,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.trips, state.users, state.driver_status, dayFilter, directionFilter, areaFilter, selectedTripIds]);
 
   // Cancellation-risk score per not-yet-started booking (late-cancel +

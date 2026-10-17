@@ -1756,22 +1756,26 @@ function resolveDriverActiveTripDate(driverTrips) {
 }
 
 export function getDriverLoad(state, driver_id, scheduledDate) {
-  // Counts PASSENGERS (summed across the driver's active trips ON THE
-  // GIVEN DATE), not trips, and not across all dates. A driver's trips
-  // on the SAME day all run on one vehicle at once — DriverNavTab
-  // flattens a day's active trips into a single combined route — so the
-  // real capacity constraint is "how many people are aboard this one
-  // day," and DRIVER_CAPACITY is a seat count (the UI says "X/4 seats"
-  // everywhere). Trips on DIFFERENT days never share a vehicle at the
-  // same time, so they must never compete for the same 4 seats — a
-  // driver already assigned to 4 different days of one agent's week
-  // booking is NOT "full" for a 5th, unrelated day. scheduledDate is
-  // required (not optional) so a caller can't accidentally omit it and
-  // silently fall back to the old, wrong all-dates behavior; pass the
-  // trip's own scheduled_date when checking whether it can be assigned.
-  return state.trips
+  // Returns the driver's BUSIEST single active trip on the given date —
+  // the seat count of their fullest vehicle load that day, NOT the sum
+  // across the day's trips. Capacity is enforced PER TRIP-RECORD: trips
+  // that genuinely share a vehicle at the same moment are always merged
+  // into ONE trip record first (auto-merge on single dispatch,
+  // DISPATCH_MULTI on batch), so two SEPARATE same-day records are never
+  // simultaneous — a driver can legitimately run an AM load and a PM load
+  // each up to full capacity, and summing them was an over-correction
+  // that falsely flagged such a driver "over capacity" (e.g. a 3-seat
+  // 06:00 run + a 2-seat 18:00 run reading as 5/4). DRIVER_CAPACITY is a
+  // per-trip seat count (the UI says "X/4 seats"), so the meaningful
+  // "how full is this driver" figure is their fullest single run.
+  // scheduledDate is required so a caller can't silently fall back to an
+  // all-dates figure. Used for FULLNESS DISPLAYS only; the hard capacity
+  // gates check the specific trip being assigned/merged against capacity
+  // directly, never this driver-day aggregate.
+  const seats = state.trips
     .filter(t => String(t.driver_id) === String(driver_id) && ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state) && t.scheduled_date === scheduledDate)
-    .reduce((seats, t) => seats + Math.max(1, t.agent_ids?.length || 0), 0);
+    .map(t => Math.max(1, t.agent_ids?.length || 0));
+  return seats.length ? Math.max(...seats) : 0;
 }
 
 // Counts DISTINCT TRIP RECORDS for a driver on a given date — a
@@ -4901,16 +4905,12 @@ function appReducer(state, action) {
       if (totalSeats > dispatchMultiDriverCapacity) {
         return { ...state, _error: `Selected trips need ${totalSeats} seats — only ${dispatchMultiDriverCapacity} fit on this driver's vehicle.` };
       }
-      // Also account for the driver's EXISTING load before mutating
-      // anything — the delegated ASSIGN_DRIVER below would catch an
-      // overflow, but only AFTER the merge has already deleted the
-      // secondary trips, leaving them merged-but-unassigned on a
-      // rejection. Checking here keeps the whole operation atomic: an
-      // over-capacity dispatch is refused with zero mutation.
-      const driverExistingSeats = getDriverLoad(state, action.driver_id, primary.scheduled_date);
-      if (driverExistingSeats + totalSeats > dispatchMultiDriverCapacity) {
-        return { ...state, _error: `Driver doesn't have room — ${driverExistingSeats}/${dispatchMultiDriverCapacity} seats taken, these trips need ${totalSeats}.` };
-      }
+      // Capacity is per trip-record: this merged trip is ONE vehicle load,
+      // so the only seat constraint is the merged total above (totalSeats ≤
+      // capacity). The driver's OTHER same-day trips are separate loads at
+      // other times (truly-simultaneous ones would have merged into this
+      // record), so they must NOT be summed in — doing so was the
+      // over-correction that blocked a legitimate second same-day run.
       const mergedAgentIds = [...primary.agent_ids, ...secondaries.flatMap(t => t.agent_ids)];
       const mergedPickupCoords = [...primary.pickup_sequence_coords, ...secondaries.flatMap(t => t.pickup_sequence_coords)];
       // Merge per-agent dropoffs from every secondary into the primary.
@@ -5011,11 +5011,15 @@ function appReducer(state, action) {
         return { ...state, _error: "That driver's account is archived — un-archive it before dispatching." };
       }
 
-      const currentLoad = getDriverLoad(state, action.driver_id, trip.scheduled_date);
+      // Capacity is per trip-record — this trip is one vehicle load, so only
+      // ITS own seats are checked against capacity. The driver's other
+      // same-day trips are separate loads at other times (simultaneous ones
+      // would have been merged into one record), so they don't compete for
+      // these seats.
       const incomingSeats = Math.max(1, trip.agent_ids?.length || 0);
       const driverCapacity = drvStatus.capacity || DRIVER_CAPACITY;
-      if (currentLoad + incomingSeats > driverCapacity) {
-        return { ...state, _error: `Driver doesn't have room — ${currentLoad}/${driverCapacity} seats taken, this trip needs ${incomingSeats}.` };
+      if (incomingSeats > driverCapacity) {
+        return { ...state, _error: `Driver doesn't have room — this trip needs ${incomingSeats} seats, vehicle holds ${driverCapacity}.` };
       }
 
       // Assign → ASSIGNED (driver must explicitly accept before DRIVER_CONFIRMED)
@@ -5074,7 +5078,9 @@ function appReducer(state, action) {
 
       const driverUser = state.users.find(u => String(u.id) === String(action.driver_id));
       const driverRec = state.driver_status.find(d => String(d.driver_id) === String(action.driver_id));
-      const newLoad = currentLoad + incomingSeats;
+      // Per trip-record: this trip's own seats are its vehicle load, so it's
+      // "fully booked" when they reach capacity (not a cross-trip day sum).
+      const newLoad = incomingSeats;
       const isFullyBooked = newLoad >= driverCapacity;
 
       const notif = {
@@ -5257,11 +5263,13 @@ function appReducer(state, action) {
       const newDrv = state.driver_status.find(d => String(d.driver_id) === String(action.driver_id));
       if (!newDrv) return { ...state, _error: "New driver not found." };
 
-      const newLoad = getDriverLoad(state, action.driver_id, trip.scheduled_date);
+      // Per trip-record capacity — this trip is one vehicle load, so only
+      // its own seats are checked against the new driver's capacity (their
+      // other same-day trips are separate loads).
       const incomingSeats = Math.max(1, trip.agent_ids?.length || 0);
       const newCap = newDrv.capacity || DRIVER_CAPACITY;
-      if (newLoad + incomingSeats > newCap) {
-        return { ...state, _error: `New driver doesn't have room — ${newLoad}/${newCap} seats taken, this trip needs ${incomingSeats}.` };
+      if (incomingSeats > newCap) {
+        return { ...state, _error: `New driver doesn't have room — this trip needs ${incomingSeats} seats, vehicle holds ${newCap}.` };
       }
 
       // Same-date only — driver_route_km / cap / exceeds are per-driver-
@@ -10231,17 +10239,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (totalSeats > dispatchMultiDriverCapacitySupa) {
         throw new Error(`Selected trips need ${totalSeats} seats — only ${dispatchMultiDriverCapacitySupa} fit on this driver's vehicle.`);
       }
-      // Account for the driver's EXISTING passenger load before mutating
-      // anything — critical here because the merge below WRITES to the DB
-      // (deletes secondary rows, updates the primary). Without this, an
-      // over-capacity dispatch onto an already-loaded driver would persist
-      // the merge and only then hit the delegated ASSIGN_DRIVER rejection,
-      // leaving orphaned DB state. Checking first keeps it atomic.
-      const { data: driverExistingTrips } = await supabase.from("trips").select("extraagentids").eq("driverid", action.driver_id).eq("scheduleddate", primaryRow.scheduleddate).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
-      const driverExistingSeats = (driverExistingTrips || []).reduce((s, r) => s + Math.max(1, 1 + (r.extraagentids?.length || 0)), 0);
-      if (driverExistingSeats + totalSeats > dispatchMultiDriverCapacitySupa) {
-        throw new Error(`Driver doesn't have room — ${driverExistingSeats}/${dispatchMultiDriverCapacitySupa} seats taken, these trips need ${totalSeats}.`);
-      }
+      // Capacity is per trip-record: this combine produces ONE merged
+      // vehicle load, so the totalSeats check above is the whole seat
+      // constraint. The driver's other same-day trips are separate loads at
+      // other times (truly-simultaneous bookings are exactly what this
+      // combine merges into one record), so they must NOT be summed in.
       // Fold every secondary trip's agent(s) + pickup point(s) into the
       // primary's extraagentids/extrapickups/extradropoffs — same shape TRIP/ADD_AGENT
       // writes, so the merged trip is indistinguishable from one built up
@@ -10608,29 +10610,15 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
             const extraDrop = tripRow.extradropoffs?.[i];
             if (extraDrop) newExtraDropoffs.push(extraDrop);
           }
-          // Capacity check before merging. Per-day seat load, matching the
-          // non-merge path's gate below (driverTripsRawSameDay): the merged
-          // trip is NOT necessarily the driver's only same-day work, so every
-          // OTHER active same-day trip's seats must count too. Without this,
-          // the auto-merge is a back door around the per-day capacity gate —
-          // e.g. a driver already full for the day across a 06:00 + 18:00 pair
-          // can still have a 3rd booking merged into the 06:00 leg (its own
-          // merged seat count alone is under capacity), overcommitting the
-          // vehicle past its seats: the exact "12 passengers on a 4-seat van"
-          // overbooking the non-merge gate was added (via direct user report)
-          // to prevent. Excludes mergeTargetTrip (its seats ARE mergedSeats)
-          // and action.trip_id (being folded in, then deleted).
+          // Capacity is per trip-record: this merge produces ONE combined
+          // vehicle load, so the only seat constraint is the merged trip's
+          // own total. The driver's other same-day trips are separate loads
+          // at other times (truly-simultaneous bookings are what get merged
+          // into THIS record), so they don't count toward this trip's seats.
           const mergedSeats = 1 + newExtraAgentIds.length;
           const mergeCapacity = driverRow.capacity || DRIVER_CAPACITY;
-          const { data: mergeDriverSameDayActive } = await supabase.from("trips").select("id, extraagentids")
-            .eq("driverid", action.driver_id)
-            .eq("scheduleddate", tripRow.scheduleddate)
-            .in("status", [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
-          const otherSameDaySeats = (mergeDriverSameDayActive || [])
-            .filter(t => String(t.id) !== String(mergeTargetTrip.id) && String(t.id) !== String(action.trip_id))
-            .reduce((s, r) => s + Math.max(1, 1 + (r.extraagentids?.length || 0)), 0);
-          if (otherSameDaySeats + mergedSeats > mergeCapacity) {
-            throw new Error(`Driver doesn't have room — merging would put ${otherSameDaySeats + mergedSeats} seats on this driver's day, vehicle holds ${mergeCapacity}.`);
+          if (mergedSeats > mergeCapacity) {
+            throw new Error(`Driver doesn't have room — merging would need ${mergedSeats} seats, vehicle holds ${mergeCapacity}.`);
           }
           // Optimistic-concurrency write: the UPDATE is conditioned on
           // mergeTargetTrip.updatedat still matching what we just read. If
@@ -10686,11 +10674,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
               if (retryExtraDrop) retryExtraDropoffs.push(retryExtraDrop);
             }
             const retrySeats = 1 + retryExtraAgentIds.length;
-            // Same per-day load check as the non-retry path above (reusing the
-            // other-same-day snapshot; the concurrency guard is on the merge
-            // target itself).
-            if (otherSameDaySeats + retrySeats > mergeCapacity) {
-              throw new Error(`Driver doesn't have room — merging would put ${otherSameDaySeats + retrySeats} seats on this driver's day, vehicle holds ${mergeCapacity}. (Another change was made to this driver's trip moments ago — please recheck and retry.)`);
+            // Same per-trip merged-seat check as the non-retry path above.
+            if (retrySeats > mergeCapacity) {
+              throw new Error(`Driver doesn't have room — merging would need ${retrySeats} seats, vehicle holds ${mergeCapacity}. (Another change was made to this driver's trip moments ago — please recheck and retry.)`);
             }
             must(await supabase.from("trips").update({
               extraagentids: retryExtraAgentIds, extrapickups: retryExtraPickups, extradropoffs: retryExtraDropoffs,
@@ -10766,19 +10752,17 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         }
       }
       const { data: driverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id).neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
-      // Seat-based load: sum passengers (primary + extra agents) across the
-      // driver's active trips ON THE SAME DATE as the trip being assigned
-      // — not across all dates. Trips on different days never share a
-      // vehicle at the same time, so a driver already assigned to 4
-      // different days of one agent's week booking must NOT be treated
-      // as "full" for an unrelated 5th day. (Matches getDriverLoad in
-      // the local reducer.)
+      // Capacity is per trip-record: this trip is ONE vehicle load, so only
+      // its own seats are gated against capacity. The driver's other
+      // same-day trips are separate loads at other times (truly-simultaneous
+      // bookings get merged into one record first), so they don't compete
+      // for these seats. driverTripsRawSameDay is still computed below — but
+      // only for ROUTE sequencing/compliance, which genuinely is per-day
+      // (the driver drives those stops as one chained route).
       const driverTripsRawSameDay = (driverTripsRaw || []).filter(t => t.scheduleddate === tripRow.scheduleddate);
-      const seatsOf = (r) => Math.max(1, 1 + (r.extraagentids?.length || 0));
-      const currentLoad = driverTripsRawSameDay.filter(t => String(t.id) !== String(action.trip_id)).reduce((s, r) => s + seatsOf(r), 0);
       const incomingSeats = Math.max(1, 1 + (tripRow.extraagentids?.length || 0));
       const assignDriverCapacitySupa = driverRow.capacity || DRIVER_CAPACITY;
-      if (currentLoad + incomingSeats > assignDriverCapacitySupa) throw new Error(`Driver doesn't have room — ${currentLoad}/${assignDriverCapacitySupa} seats taken, this trip needs ${incomingSeats}.`);
+      if (incomingSeats > assignDriverCapacitySupa) throw new Error(`Driver doesn't have room — this trip needs ${incomingSeats} seats, vehicle holds ${assignDriverCapacitySupa}.`);
       assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
       // FOUND VIA DIRECT USER REPORT ("COMPLIANCE: Driver 1's vehicle
       // capacity is 4 but 12 passengers are assigned"): this used the
@@ -10843,7 +10827,8 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           driverroutekm: routeDistanceKm, driverroutecapkm: policyCapKm, driverrouteexceedspolicy: exceedsPolicy,
         }).eq("id", t.id);
       }
-      const newLoad = currentLoad + incomingSeats;
+      // Per trip-record: this trip's own seats are its vehicle load.
+      const newLoad = incomingSeats;
       // driver_status.updatedat is timestamptz, not bigint like trips.*at
       // columns — sending the raw epoch number (nowTs) fails with a 22008
       // "date/time field value out of range" error. Postgres's DEFAULT
@@ -11667,17 +11652,18 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       if (!newDriverRow) throw new Error("New driver not found.");
       await assertDriverDocsCurrent(action.driver_id);
 
-      // Per-day seat capacity for the NEW driver — same date-scoped rule
-      // as ASSIGN_DRIVER (trips on different days never share a vehicle).
+      // Capacity is per trip-record: this trip is ONE vehicle load, so only
+      // its own seats are gated against the new driver's capacity (their
+      // other same-day trips are separate loads). newDriverSameDay is still
+      // fetched below — but only for ROUTE sequencing, which genuinely is
+      // per-day (those stops chain into one route).
       const { data: newDriverTripsRaw } = await supabase.from("trips").select("*").eq("driverid", action.driver_id)
         .neq("status", TRIP_STATE.ARCHIVED_COMPLETED).neq("status", TRIP_STATE.ARCHIVED_CANCELLED);
       const newDriverSameDay = (newDriverTripsRaw || []).filter(t => t.scheduleddate === tripRow.scheduleddate && String(t.id) !== String(action.trip_id));
-      const seatsOf = (r) => Math.max(1, 1 + (r.extraagentids?.length || 0));
-      const newCurrentLoad = newDriverSameDay.reduce((s, r) => s + seatsOf(r), 0);
-      const incomingSeats = seatsOf(tripRow);
+      const incomingSeats = Math.max(1, 1 + (tripRow.extraagentids?.length || 0));
       const newDriverCapacity = newDriverRow.capacity || DRIVER_CAPACITY;
-      if (newCurrentLoad + incomingSeats > newDriverCapacity) {
-        throw new Error(`New driver doesn't have room — ${newCurrentLoad}/${newDriverCapacity} seats taken, this trip needs ${incomingSeats}.`);
+      if (incomingSeats > newDriverCapacity) {
+        throw new Error(`New driver doesn't have room — this trip needs ${incomingSeats} seats, vehicle holds ${newDriverCapacity}.`);
       }
 
       // Recompute the NEW driver's same-date route with this trip folded
@@ -17450,15 +17436,12 @@ function DriverTripsTab({ state, dispatch, user, myTrips, setTab, call, setNavTa
     if (timeCmp !== 0) return timeCmp;
     return (a.pickup_order_num || 99) - (b.pickup_order_num || 99);
   });
-  // "FULLY BOOKED" badge scoped to TODAY only, via getDriverLoad — FOUND
-  // VIA DIRECT USER REPORT (same bug as the home-screen header badge):
-  // this used to sum agent_ids across every active trip regardless of
-  // date, so 2 seats from a DIFFERENT day's trip counted toward TODAY's
-  // capacity — the comment here claimed to "match getDriverLoad's
-  // seat-counting logic," which was true of the per-seat FORMULA but not
-  // of getDriverLoad's (required, not optional) date scoping. Calling the
-  // real helper instead of reimplementing an unscoped copy keeps this
-  // badge consistent with the header's.
+  // "FULLY BOOKED" badge via getDriverLoad = the driver's busiest single
+  // trip today (capacity is per trip-record — see getDriverLoad). So this
+  // reads "your fullest run today is at capacity," not a sum across the
+  // day's separate runs (which are separate vehicle loads and may each be
+  // full without the driver being unable to take another). Calling the
+  // shared helper keeps this badge consistent with the home-screen header's.
   const load = getDriverLoad(state, user.id, todayDateStr());
   // totalPassengers stays an all-dates figure deliberately — it's shown
   // as "X trips this period" summary context, not a capacity/seat check,
@@ -19009,15 +18992,10 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // in this list never bleed into today's navigation route.
   const myTrips = allMyTrips;
   const activeTrips = myTrips.filter(t => ![TRIP_STATE.ARCHIVED_COMPLETED, TRIP_STATE.ARCHIVED_CANCELLED].includes(t.state));
-  // Seats used, scoped to TODAY only — FOUND VIA DIRECT USER REPORT: this
-  // used to sum agent_ids across EVERY active trip regardless of date
-  // (e.g. showing "5/4 FULLY BOOKED" when 2 of those 5 seats belonged to
-  // a DIFFERENT day's trip), the exact all-dates bug getDriverLoad's own
-  // header comment already documents and exists specifically to avoid —
-  // "a driver already assigned to 4 different days of one agent's week
-  // booking is NOT full for a 5th, unrelated day." Reuses that same
-  // helper (already correctly used on the admin/dispatch side for this
-  // exact reason) instead of a second, differently-scoped seat count.
+  // Seats used on the driver's busiest single trip today (capacity is per
+  // trip-record — see getDriverLoad). Reuses the shared helper rather than
+  // a separately-scoped seat count so this header badge and the per-trip
+  // card badge always agree.
   const load = getDriverLoad(state, user.id, todayDateStr());
   const myAppCapacity = myStatus?.capacity || DRIVER_CAPACITY;
   const full = load >= myAppCapacity;
