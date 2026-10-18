@@ -4243,7 +4243,7 @@ function appReducer(state, action) {
         // admin would have no context for. driver_status/driver_positions/
         // tickets/direct_messages all cascade automatically and need no
         // guard.
-        const hasAnyTrip = workingState.trips.some(t => t.agent_ids.some(id => String(id) === String(targetId)) || t.driver_id === targetId);
+        const hasAnyTrip = workingState.trips.some(t => t.agent_ids.some(id => String(id) === String(targetId)) || String(t.driver_id) === String(targetId));
         if (hasAnyTrip) {
           // Mirrors the live handler: can't hard-delete a user with trip
           // history (the trips stay), so ARCHIVE them instead — unless

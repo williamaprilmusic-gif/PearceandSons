@@ -4821,7 +4821,7 @@ function AdminProfileSearch({ state, user, dispatch }) {
   // "all their trips" genuinely means all of them, not just the recent
   // window the rest of the app deliberately limits itself to.
   const liveTrips = selectedUser
-    ? state.trips.filter(t => selectedUser.role === ROLE.AGENT ? t.agent_ids?.some(id => String(id) === String(selectedUser.id)) : t.driver_id === selectedUser.id)
+    ? state.trips.filter(t => selectedUser.role === ROLE.AGENT ? t.agent_ids?.some(id => String(id) === String(selectedUser.id)) : String(t.driver_id) === String(selectedUser.id))
     : [];
   const liveTripIds = new Set(liveTrips.map(t => t.trip_id));
   const allTrips = [...liveTrips, ...(historyTrips || []).filter(t => !liveTripIds.has(t.trip_id))]
