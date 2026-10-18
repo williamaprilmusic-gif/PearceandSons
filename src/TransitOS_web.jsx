@@ -7227,12 +7227,15 @@ export async function fetchDirectMessages(userIdA, userIdB) {
 // thread. The admin side never needed this: it always starts from a
 // known recipient (picked from the staff directory), so it could go
 // straight to fetchDirectMessages. Returns one entry per counterpart,
-// each carrying their most recent message (for a preview) and an
-// unread count (messages sent TO this user that haven't been marked
-// read — direct_messages doesn't have its own read flag, so "unread"
-// here means "arrived after this thread's own last-read timestamp,"
-// tracked client-side in localStorage per counterpart since there's no
-// server-side read-state column to add without a schema change).
+// each carrying their most recent message (last_message/last_ts_epoch
+// for the preview row) and last_sender_id (so the list can prefix
+// "You:" on threads where this user sent the latest message). There is
+// deliberately NO per-conversation unread count here: direct_messages
+// has no read-state column, and unread is surfaced globally instead via
+// DIRECT_MESSAGE notification rows (their own `read` flag), which the
+// Messages tab marks read on open — see MessagesTab. Don't reintroduce a
+// per-thread unread field on the strength of an old comment; the UI
+// reads none.
 export async function fetchMyConversations(myUserId, users) {
   const { data, error } = await supabase.from("direct_messages").select("*")
     .or(`senderid.eq.${myUserId},recipientid.eq.${myUserId}`)
