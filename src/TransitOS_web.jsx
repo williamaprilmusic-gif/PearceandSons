@@ -19420,13 +19420,17 @@ export function formatAgentNames(agentIds, users, { separator = ", ", fallback =
 // interpreted as a formula by Excel/Sheets when the file is opened,
 // potentially executing attacker-controlled content from a user-editable
 // field (agent/driver name, pickup label, etc.) — prefixing with a single
-// quote neutralizes it while keeping the value readable. Also catches a
-// lone \r (not just \r\n), so a field containing a bare carriage return
-// can't slip through unquoted and corrupt row boundaries for CSV parsers
-// that treat lone \r as a line break.
+// quote neutralizes it while keeping the value readable. A LEADING TAB or
+// CARRIAGE RETURN is covered too: some spreadsheet apps strip leading
+// whitespace before parsing, so "\t=cmd" still evaluates as a formula —
+// prefixing (not just quoting) is what actually neutralizes it, since a
+// quoted "=1+1" is still evaluated by Excel. Quoting (below) additionally
+// catches a lone \r (not just \r\n), so a field containing a bare carriage
+// return can't slip through unquoted and corrupt row boundaries for CSV
+// parsers that treat lone \r as a line break.
 export function csvEscapeCell(val) {
   let s = val == null ? "" : String(val);
-  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 

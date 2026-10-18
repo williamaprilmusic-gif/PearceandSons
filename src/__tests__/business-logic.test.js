@@ -779,6 +779,11 @@ describe("csvEscapeCell — CSV quoting + formula-injection guard", () => {
     expect(csvEscapeCell("@mention")).toBe("'@mention");
     expect(csvEscapeCell("-5")).toBe("'-5"); // a leading "-" is guarded too, even on an otherwise-plain number
   });
+
+  it("neutralizes a formula hidden behind a leading tab or carriage return (apps that strip leading whitespace)", () => {
+    expect(csvEscapeCell("\t=cmd|'/C calc'!A0")).toBe("'\t=cmd|'/C calc'!A0"); // leading tab: prefixed; no comma/quote/CRLF so not quoted
+    expect(csvEscapeCell("\r=1+1")).toBe('"\'\r=1+1"'); // leading CR: prefixed, then quoted because it contains \r
+  });
 });
 
 describe("auditLogCategory — action-type category prefix", () => {
