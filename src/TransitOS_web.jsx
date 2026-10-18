@@ -2373,6 +2373,26 @@ function setOfflineQueue(q) {
 function isNetworkError(e) {
   return e instanceof TypeError || /fetch|network|failed to connect/i.test(e?.message || "");
 }
+// An optimistic-concurrency conflict (withUpdatedAtGuard's write matched no
+// rows because the trip's updatedat moved between this handler's read and
+// its write) — distinct from a network blip AND from a genuinely permanent
+// rejection. On the offline-replay path it's transient and RETRYABLE: a
+// fresh re-read next time almost always succeeds, because the only trigger
+// is another writer landing inside this handler's sub-second read→write
+// window. Matched on the two exact phrasings every withUpdatedAtGuard /
+// rowcount guard throws ("just updated by another confirmation", "just
+// changed by someone else") — deliberately NOT the bare "try again", which
+// also appears on permanent errors (expired session, trip already
+// dispatched) that must stay dropped. See drainQueue's bounded retry.
+export function isConcurrencyConflict(e) {
+  return /\bjust (updated|changed) by\b/i.test(e?.message || "");
+}
+// A queued action hitting a concurrency conflict is left queued and retried
+// on later 'online'/sweep ticks, but only this many times — so an item that
+// somehow conflicts every single time (rather than the expected transient
+// race) still can't loop forever, it's dropped like any other permanent
+// failure once the budget is spent.
+const MAX_CONCURRENCY_REPLAY_ATTEMPTS = 5;
 let _offlineQidSeq = 0;
 function enqueueOfflineAction(action) {
   const q = getOfflineQueue();
@@ -2461,6 +2481,25 @@ function useOfflineSync(dispatch) {
               // every future reconnect; only network-shaped failures stay.
               if (isNetworkError(e)) {
                 console.warn(`[Offline] Replay failed for ${action.type} (network — will retry):`, e.message);
+              } else if (isConcurrencyConflict(e)) {
+                // Transient optimistic-concurrency race (see
+                // isConcurrencyConflict) — retryable like a network blip, a
+                // fresh re-read next tick almost always wins. Bounded by a
+                // per-item attempt counter persisted onto the queued item,
+                // so a pathological always-conflicting item still gives up
+                // rather than retrying every sweep forever.
+                const attempts = (action._attempts || 0) + 1;
+                if (attempts >= MAX_CONCURRENCY_REPLAY_ATTEMPTS) {
+                  console.warn(`[Offline] Replay gave up for ${action.type} after ${attempts} concurrency conflicts:`, e.message);
+                  drop = true;
+                } else {
+                  // Persist the bumped counter by _qid without rewriting the
+                  // whole queue from a stale view — same discipline as the
+                  // drop path below, so a concurrently-enqueued item is
+                  // never clobbered.
+                  setOfflineQueue(getOfflineQueue().map(a => a._qid === action._qid ? { ...a, _attempts: attempts } : a));
+                  console.warn(`[Offline] Replay hit a concurrency conflict for ${action.type} (attempt ${attempts}/${MAX_CONCURRENCY_REPLAY_ATTEMPTS} — will retry):`, e.message);
+                }
               } else {
                 console.warn(`[Offline] Replay permanently failed for ${action.type} (not a network error, giving up):`, e.message);
                 drop = true;

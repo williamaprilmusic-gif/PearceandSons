@@ -32,6 +32,7 @@ import {
   earliestScheduledTime,
   companyPolicyDistanceCapKm,
   csvEscapeCell,
+  isConcurrencyConflict,
   tripRowToApp,
   userRowToApp,
   driverStatusRowToApp,
@@ -783,6 +784,26 @@ describe("csvEscapeCell — CSV quoting + formula-injection guard", () => {
   it("neutralizes a formula hidden behind a leading tab or carriage return (apps that strip leading whitespace)", () => {
     expect(csvEscapeCell("\t=cmd|'/C calc'!A0")).toBe("'\t=cmd|'/C calc'!A0"); // leading tab: prefixed; no comma/quote/CRLF so not quoted
     expect(csvEscapeCell("\r=1+1")).toBe('"\'\r=1+1"'); // leading CR: prefixed, then quoted because it contains \r
+  });
+});
+
+describe("isConcurrencyConflict — retryable optimistic-concurrency failures on offline replay", () => {
+  it("matches the exact phrasings every withUpdatedAtGuard / rowcount guard throws", () => {
+    expect(isConcurrencyConflict(new Error("This trip was just updated by another confirmation — please try again."))).toBe(true);
+    expect(isConcurrencyConflict(new Error("This trip was just changed by someone else — please refresh and try again."))).toBe(true);
+  });
+
+  it("does NOT match permanent errors that merely say 'try again' (must stay dropped, not retried)", () => {
+    expect(isConcurrencyConflict(new Error("Your account couldn't be found — sign out and back in, then try again."))).toBe(false);
+    expect(isConcurrencyConflict(new Error("Couldn't submit your rating — your session may have expired. Please try again."))).toBe(false);
+    expect(isConcurrencyConflict(new Error("Couldn't cancel — this booking may have already been dispatched or changed. Please refresh and try again."))).toBe(false);
+    expect(isConcurrencyConflict(new Error("The trip you're merging into no longer exists — it may have just been cancelled or reassigned. Please try again."))).toBe(false);
+  });
+
+  it("does NOT match network errors (those are handled by isNetworkError) or empty input", () => {
+    expect(isConcurrencyConflict(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isConcurrencyConflict(null)).toBe(false);
+    expect(isConcurrencyConflict({})).toBe(false);
   });
 });
 
