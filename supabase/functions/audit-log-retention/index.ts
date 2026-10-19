@@ -25,7 +25,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2.39.0";
 const ARCHIVE_BUCKET = "retention-archives";
 
 Deno.serve(async (req) => {
-  const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
+  // Case-tolerant lookup — Deno.env is case-sensitive, so read both the
+  // conventional upper-snake name and the legacy mixed-case one this repo
+  // has historically used, whichever the live Supabase secret is set to.
+  const RESEND_KEY = Deno.env.get("RESEND_API_KEY") ?? Deno.env.get("Resend_API_Key") ?? "";
   const TO = "williamaprilmusic@gmail.com";
   const FROM = "Pearce & Sons <onboarding@resend.dev>";
 
