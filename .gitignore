@@ -26,3 +26,7 @@ dist-ssr
 
 # Not app assets — local reference files, not tracked
 /App Ringtones and message tones/
+
+# Supabase CLI local state (project-ref, pooler URL, version stamps) — infra
+# identifiers that belong to the local link, not the repo
+supabase/.temp/
