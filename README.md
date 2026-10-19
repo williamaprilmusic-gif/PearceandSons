@@ -47,7 +47,7 @@ npm test          # Vitest — pure business-logic unit tests (fee/pay calculati
                    # straight from TransitOS_web.jsx; no rendered-component tests yet.
 ```
 
-`.env` holds local secrets (Supabase URL/anon key, TomTom key, etc.) — gitignored, not `VITE_`-prefixed where it shouldn't be bundled into the client.
+`.env` (gitignored) holds local secrets — the TomTom key, the Sentry DSN, and the server-side edge-function secrets. See `.env.example` for the full list and naming. The Supabase project URL and the **publishable** (anon) client key are not in `.env`; they are embedded directly in `src/TransitOS_web.jsx`, because the publishable key is a client-side, RLS-gated key that is safe to ship in the bundle. Only values meant for the client are `VITE_`-prefixed (so Vite bundles them); server secrets are never `VITE_`-prefixed.
 
 ## Deploying
 

@@ -325,6 +325,12 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !route?.points?.length) return;
+    // Only frame-to-fit on the very first route draw. A mid-drive auto-reroute
+    // (see the off-route effect below) replaces `route`, and fitBounds here
+    // would zoom back out to the whole route every time — overriding the
+    // driver's follow-zoom, which the driver-marker effect only pans (never
+    // re-zooms) to restore. Capture this before removeLayer resets the ref.
+    const isFirstRouteDraw = !routeLayerRef.current;
     if (routeLayerRef.current) map.removeLayer(routeLayerRef.current);
     const latlngs = route.points.map(p => [p.lat, p.lng]);
     // opacity 0.85 here must match routeFadeIn's "to" keyframe value (see
@@ -349,7 +355,7 @@ export function DriverNavMap({ destination, driverPosition, onExit, hazardReport
         }).addTo(map);
       }
     }
-    map.fitBounds(routeLayerRef.current.getBounds(), { padding: [40, 40] });
+    if (isFirstRouteDraw) map.fitBounds(routeLayerRef.current.getBounds(), { padding: [40, 40] });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [route]);
 

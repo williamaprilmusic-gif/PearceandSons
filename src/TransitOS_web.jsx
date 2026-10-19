@@ -3725,7 +3725,7 @@ export function tallyHazardVotes(votes, source) {
 // window. An admin can also clear one manually before it expires via
 // ADMIN/CLEAR_ROUTE_ADVISORY.
 export const ADMIN_ADVISORY_WINDOW_HOURS = 24;
-function isValidCoord(c) {
+export function isValidCoord(c) {
   if (c == null || c.lat == null || c.lng == null) return false;
   if (c.lat === 0 && c.lng === 0) return false; // geocoder fallback sentinel
   if (Number.isNaN(c.lat) || Number.isNaN(c.lng)) return false;
@@ -4743,6 +4743,12 @@ function appReducer(state, action) {
       }
       const pickupCoord = action.pickup_coord || { lat: -33.9249, lng: 18.4241, label: action.pickup_label };
       const dropCoord = action.dropoff_coord || defaultCompanyAnchor(state);
+      // Validate client-supplied coords before any distance math — a stale or
+      // modified client could send NaN/out-of-range lat/lng that would make
+      // haversineKm (and every km threshold derived from it) produce garbage.
+      if (!isValidCoord(pickupCoord) || !isValidCoord(dropCoord)) {
+        return { ...state, _error: "We couldn't read the pick-up or drop-off location for this booking — please re-select both points on the map and try again." };
+      }
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
       // Road-distance estimate (same 1.35 correction factor used everywhere
       // else in the UI to turn straight-line Haversine km into an approximate
@@ -9561,6 +9567,12 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         const fallbackAddr = fallbackCo?.addresslat != null ? { label: fallbackCo.addresslabel, area: fallbackCo.addressarea, lat: fallbackCo.addresslat, lng: fallbackCo.addresslng } : null;
         dropCoord = fallbackAddr || { label: "Cape Town CBD", area: "Cape Town CBD", lat: -33.9249, lng: 18.4241 };
       }
+      // Validate client-supplied coords before any distance math — a stale or
+      // modified client could send NaN/out-of-range lat/lng that would make
+      // haversineKm (and every km threshold derived from it) produce garbage.
+      if (!isValidCoord(pickupCoord) || !isValidCoord(dropCoord)) {
+        throw new Error("We couldn't read the pick-up or drop-off location for this booking — please re-select both points on the map and try again.");
+      }
       const estDistKm = haversineKm(pickupCoord.lat, pickupCoord.lng, dropCoord.lat, dropCoord.lng);
       const roadDistKm = estDistKm * ROAD_FACTOR;
       const nowTs = nowEpoch();
@@ -10805,7 +10817,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       const incomingSeats = Math.max(1, 1 + (tripRow.extraagentids?.length || 0));
       const assignDriverCapacitySupa = driverRow.capacity || DRIVER_CAPACITY;
       if (incomingSeats > assignDriverCapacitySupa) throw new Error(`Driver doesn't have room — this trip needs ${incomingSeats} seats, vehicle holds ${assignDriverCapacitySupa}.`);
-      assertTripTransition(tripRow.status, TRIP_STATE.DRIVER_CONFIRMED);
+      // Assign → ASSIGNED (driver must explicitly accept before DRIVER_CONFIRMED).
+      // Validate against the state actually written below (ASSIGNED), matching
+      // the demo twin in appReducer and the TRIP_TRANSITIONS note above.
+      assertTripTransition(tripRow.status, TRIP_STATE.ASSIGNED);
       // FOUND VIA DIRECT USER REPORT ("COMPLIANCE: Driver 1's vehicle
       // capacity is 4 but 12 passengers are assigned"): this used the
       // UNSCOPED driverTripsRaw (every active trip across every date)
@@ -14382,6 +14397,9 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
             const sel = form.direction === opt.id;
             return (
               <div key={opt.id} onClick={() => canBook && set("direction", opt.id)}
+                role="button" tabIndex={canBook ? 0 : -1} aria-pressed={sel} aria-disabled={!canBook}
+                aria-label={`${opt.label} — ${opt.desc}`}
+                onKeyDown={e => { if (canBook && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); set("direction", opt.id); } }}
                 style={{ display: "flex", alignItems: "center", gap: 12, border: `1px solid ${sel ? COLORS.amber2 : COLORS.wire}`, borderRadius: 4, padding: "12px 14px", background: sel ? COLORS.amber : "transparent", cursor: canBook ? "pointer" : "not-allowed", opacity: canBook ? 1 : .5 }}>
                 <span style={{ fontSize: 18 }}>{opt.id === "INBOUND" ? "🏠→🏢" : "🏢→🏠"}</span>
                 <div style={{ flex: 1 }}>
@@ -15358,7 +15376,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         lastBroadcastRef.current = now;
         channel.send({
           type: "broadcast", event: "pos",
-          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, ts: now },
+          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, a: accuracy ?? null, ts: now },
         });
       }
 
@@ -15696,7 +15714,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
         const speedKmh = speed != null ? speed * 3.6 : null;
         channel.send({
           type: "broadcast", event: "pos",
-          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, ts: capturedNow },
+          payload: { t: currentTripId ?? null, la: latitude, lo: longitude, h: heading ?? null, s: speedKmh != null ? Math.round(speedKmh) : null, a: accuracy ?? null, ts: capturedNow },
         });
         supabase.from("driver_positions").upsert({
           driverid: user.id, lat: latitude, lng: longitude,

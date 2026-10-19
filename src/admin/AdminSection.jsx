@@ -6968,7 +6968,7 @@ function AdminLiveMap({ state, user, dispatch }) {
       ch.on("broadcast", { event: "pos" }, ({ payload }) => {
         setLivePositions(prev => ({
           ...prev,
-          [id]: { lat: payload.la, lng: payload.lo, heading: payload.h, speed_kmh: payload.s, trip_id: payload.t, updated_at: new Date(payload.ts).toISOString() },
+          [id]: { lat: payload.la, lng: payload.lo, heading: payload.h, speed_kmh: payload.s, accuracy_m: payload.a ?? null, trip_id: payload.t, updated_at: new Date(payload.ts).toISOString() },
         }));
       });
       ch.subscribe();

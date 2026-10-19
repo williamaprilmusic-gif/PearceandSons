@@ -22,7 +22,10 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SLA_GRACE_MINUTES = 10;
 
 Deno.serve(async (req) => {
-  const RESEND_KEY = Deno.env.get("Resend_API_Key") ?? "";
+  // Case-tolerant lookup — Deno.env is case-sensitive, so read both the
+  // conventional upper-snake name and the legacy mixed-case one this repo
+  // has historically used, whichever the live Supabase secret is set to.
+  const RESEND_KEY = Deno.env.get("RESEND_API_KEY") ?? Deno.env.get("Resend_API_Key") ?? "";
   const TO = "williamaprilmusic@gmail.com";
   const FROM = "Pearce & Sons <onboarding@resend.dev>";
 
@@ -35,7 +38,7 @@ Deno.serve(async (req) => {
   if (!CRON_AUTH_TOKEN || req.headers.get("Authorization") !== `Bearer ${CRON_AUTH_TOKEN}`) {
     return json({ error: "Unauthorized" }, 401);
   }
-  if (!RESEND_KEY) return json({ error: "Missing Resend_API_Key secret" }, 500);
+  if (!RESEND_KEY) return json({ error: "Missing RESEND_API_KEY (or Resend_API_Key) secret" }, 500);
   if (!SUPABASE_URL || !SERVICE_KEY) return json({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }, 500);
 
   const sb = createClient(SUPABASE_URL, SERVICE_KEY);
