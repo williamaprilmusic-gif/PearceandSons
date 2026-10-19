@@ -17,6 +17,7 @@ import {
   agentFeeAmount,
   tripTotalFeeAmount,
   billableAgentIds,
+  isValidCoord,
   tripCompletesAfterAgentLeaves,
   tripHasNothingLeftToDrop,
   tripDriverPayment,
@@ -352,6 +353,33 @@ describe("haversineKm — great-circle distance", () => {
     const km = haversineKm(-33.9249, 18.4241, -33.9715, 18.6021);
     expect(km).toBeGreaterThan(15);
     expect(km).toBeLessThan(23);
+  });
+});
+
+describe("isValidCoord — booking/route coordinate guard", () => {
+  it("accepts a real in-bounds Cape Town coordinate", () => {
+    expect(isValidCoord({ lat: -33.9249, lng: 18.4241 })).toBe(true);
+  });
+
+  it("rejects null/missing lat or lng (a booking with no location)", () => {
+    expect(isValidCoord(null)).toBe(false);
+    expect(isValidCoord({ lat: null, lng: 18.4241 })).toBe(false);
+    expect(isValidCoord({ lat: -33.9249, lng: undefined })).toBe(false);
+  });
+
+  it("rejects the (0,0) geocoder-fallback sentinel", () => {
+    expect(isValidCoord({ lat: 0, lng: 0 })).toBe(false);
+  });
+
+  it("rejects NaN and non-finite coordinates a modified client could send", () => {
+    expect(isValidCoord({ lat: NaN, lng: 18.4241 })).toBe(false);
+    expect(isValidCoord({ lat: Infinity, lng: 18.4241 })).toBe(false);
+    expect(isValidCoord({ lat: -33.9249, lng: -Infinity })).toBe(false);
+  });
+
+  it("rejects coordinates outside the Cape Town operating bounds", () => {
+    expect(isValidCoord({ lat: 51.5074, lng: -0.1278 })).toBe(false); // London
+    expect(isValidCoord({ lat: -33.9249, lng: 200 })).toBe(false); // impossible lng
   });
 });
 
