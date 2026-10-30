@@ -17956,7 +17956,7 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
   );
 }
 
-function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, tripStarted, setTripStarted, driverPosition }) {
+function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, driverPosition }) {
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
   const [noShowFor, setNoShowFor] = useState(null); // { trip_id, agent_id, agent_name } | null
@@ -18204,6 +18204,27 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const allComplete = allPickedUp && dropStops.length > 0 && dropStops.every(s => s.done);
 
   const [startTripError, setStartTripError] = useState(null);
+  // "Started" is DERIVED from the current run, not a sticky boolean — FOUND
+  // VIA /audit (frontend) right after the single-run change (b208547): the
+  // old flag, lifted to DriverApp so it survived tab switches, was NEVER
+  // reset between runs. Under the single-run model a driver runs same-day
+  // trips sequentially, so when run 1 completed and run 2 surfaced (same
+  // mounted DriverNavTab), the flag was still true — run 2 rendered with no
+  // START TRIP button and the pickup UI already "live", skipping
+  // RECORD_ROUTE and the 2h early-start gate (and, if run 2 was still
+  // ASSIGNED, throwing an illegal ASSIGNED→IN_TRANSIT on first confirm).
+  // A run is "started" once it's IN_TRANSIT or has a recorded route_total_km
+  // (the exact stand-in admin's Active Trips uses). Deriving it: (a) auto-
+  // resets for each new run (a fresh run has no route and isn't IN_TRANSIT),
+  // (b) survives tab switches for free (the trip stays IN_TRANSIT / keeps its
+  // route_total_km — the original reason the flag was lifted to the parent),
+  // and (c) is correct after a full page reload mid-run, which the sticky
+  // flag never was. justStarted is a brief optimistic override so the UI
+  // flips the instant Start Trip is tapped (before the RECORD_ROUTE refetch
+  // lands); it clears whenever the current run changes (navTripKey).
+  const [justStarted, setJustStarted] = useState(false);
+  React.useEffect(() => { setJustStarted(false); }, [navTripKey]);
+  const tripStarted = justStarted || (!!myActiveTrips[0] && (myActiveTrips[0].state === TRIP_STATE.IN_TRANSIT || myActiveTrips[0].route_total_km != null));
   const handleStartTrip = async () => {
     setStartTripError(null);
     // A driver may not start a trip more than TRIP_EARLY_START_MS before
@@ -18249,12 +18270,15 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       const livePos = state.driver_positions?.[user.id];
       const driverCoord = livePos ? { lat: livePos.lat, lng: livePos.lng } : defaultCompanyAnchor(state);
       await dispatch({ type: "TRIP/RECORD_ROUTE", trips: myActiveTrips, driver_coord: driverCoord });
-      // tripStarted only flips once every step above has actually
-      // succeeded — previously this was set unconditionally at the very
-      // top of the function, so a mid-loop failure left the driver on a
-      // screen that already looked "started" with no Waze prompt and no
-      // way to tell what had gone wrong.
-      setTripStarted(true);
+      // justStarted (the optimistic override) only flips once every step
+      // above has actually succeeded — previously this was set
+      // unconditionally at the very top of the function, so a mid-loop
+      // failure left the driver on a screen that already looked "started"
+      // with no Waze prompt and no way to tell what had gone wrong. The
+      // derived tripStarted then stays true on its own once RECORD_ROUTE's
+      // route_total_km refetches in, so this optimistic flag is just the
+      // bridge over that brief window.
+      setJustStarted(true);
       const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
       if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual, tripId: firstPickup.trip_id ?? null });
     } catch (e) {
@@ -19015,16 +19039,11 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
   // switching to another tab (Messages, Alerts, etc.) and back to Navigate
   // doesn't lose the active route; { lat, lng, label, isManual } | null.
   const [navTarget, setNavTarget] = useState(null);
-  // Same reasoning, same fix — FOUND VIA AUDIT: this was local to
-  // DriverNavTab (`useState(false)`), which fully unmounts/remounts every
-  // time the driver switches away from and back to the Navigate tab
-  // (DriverNavTab is only rendered behind `tab === "navigate"` below), so
-  // a driver mid-trip who glanced at Messages or Alerts and came back was
-  // silently dropped back onto the pre-start "Ready to go? START TRIP"
-  // screen — even though the trip was already under way with real
-  // pickup/dropoff progress — and tapping START TRIP again would
-  // re-dispatch TRIP/RECORD_ROUTE on an already-in-progress trip.
-  const [tripStarted, setTripStarted] = useState(false);
+  // (tripStarted used to be lifted here too, to survive tab switches. It's
+  // now DERIVED inside DriverNavTab from the current run's state /
+  // route_total_km — see the comment there — which survives tab switches
+  // AND page reloads on its own and auto-resets per sequential run, so no
+  // parent state is needed.)
 
   // Register handler for NOTIFICATION_CLICKED — drivers mostly get
   // trip notifications and DMs. Jump to Navigate for an active trip
@@ -19132,7 +19151,7 @@ function DriverApp({ state, dispatch, user, notifClickHandlerRef }) {
       </div>
       <div style={{ flex: 1, overflowY: "auto" }}>
         {tab === "trips" && <DriverTripsTab state={state} dispatch={dispatch} user={user} myTrips={myTrips} setTab={setTab} call={call} setNavTarget={setNavTarget} />}
-        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} navTarget={navTarget} setNavTarget={setNavTarget} tripStarted={tripStarted} setTripStarted={setTripStarted} driverPosition={location.position} />}
+        {tab === "navigate" && <DriverNavTab state={state} dispatch={dispatch} user={user} call={call} myTrips={myTrips} navTarget={navTarget} setNavTarget={setNavTarget} driverPosition={location.position} />}
         {tab === "messages" && <MessagesTab user={user} dispatch={dispatch} state={state} />}
         {tab === "help" && <HelpTab state={state} user={user} dispatch={dispatch} />}
         {tab === "history" && <DriverHistoryTab myTrips={myTrips} state={state} />}
