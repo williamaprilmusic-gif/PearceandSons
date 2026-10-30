@@ -123,7 +123,7 @@ function DirectionBadge({ direction }) {
   return (
     <span
       title={inbound ? "Inbound — home → work" : "Outbound — work → home"}
-      style={{ fontSize: 8, fontWeight: 800, letterSpacing: 0.5, whiteSpace: "nowrap", color, border: `1px solid ${color}`, borderRadius: 2, padding: "2px 5px" }}
+      style={{ fontSize: 10, fontWeight: 800, letterSpacing: 0.5, whiteSpace: "nowrap", color, border: `1px solid ${color}`, borderRadius: 2, padding: "2px 5px" }}
     >
       {inbound ? "▸ IN" : "◂ OUT"}
     </span>

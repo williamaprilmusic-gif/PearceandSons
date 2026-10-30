@@ -17956,6 +17956,19 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
   );
 }
 
+// Keep internal error codes off the driver's screen — FOUND VIA /audit:
+// e.message can be a raw state-machine code ("[SM] Trip: X → Y ILLEGAL",
+// thrown by assertTripTransition) or a Postgres/PostgREST string. Show those
+// as a generic retry message; pass through only messages that are already
+// plain, user-facing sentences (e.g. "Start trip denied — …", "This trip
+// isn't assigned to you.").
+function friendlyDriverActionError(e, fallback) {
+  const msg = e && e.message ? String(e.message) : "";
+  if (!msg) return fallback;
+  const internal = /\[SM\]|ILLEGAL|permission denied|JWT|PGRST|violates |duplicate key|syntax error|null value|constraint|supabase/i;
+  return internal.test(msg) ? fallback : msg;
+}
+
 function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavTarget, driverPosition }) {
   const [chatWith, setChatWith] = useState(null);
   const [showDelayForm, setShowDelayForm] = useState(false);
@@ -18282,7 +18295,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
       if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual, tripId: firstPickup.trip_id ?? null });
     } catch (e) {
-      setStartTripError(e.message || "Couldn't start the trip — please try again.");
+      setStartTripError(friendlyDriverActionError(e, "Couldn't start the trip — please try again."));
     }
   };
   // Fresh GPS read at the moment of confirming a pickup or drop-off —
@@ -18342,7 +18355,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         return;
       }
     } catch (e) {
-      setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
+      setStartTripError(friendlyDriverActionError(e, "Couldn't confirm pickup — please try again."));
       return;
     }
     const remaining = pickupStops.filter(s => String(s.trip_id) !== String(trip_id) || String(s.agent_id) !== String(agent_id)).filter(s => !s.done);
@@ -18396,7 +18409,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         }
       }
     } catch (e) {
-      setStartTripError(e.message || "Couldn't confirm pickup — please try again.");
+      setStartTripError(friendlyDriverActionError(e, "Couldn't confirm pickup — please try again."));
       return;
     }
     // Navigate to first home dropoff
@@ -18458,7 +18471,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         }
       }
     } catch (e) {
-      setStartTripError(e.message || "Couldn't complete drop-off — please try again.");
+      setStartTripError(friendlyDriverActionError(e, "Couldn't complete drop-off — please try again."));
       return;
     }
     const remaining = dropStops.filter(s => s !== group).filter(s => !s.done);
