@@ -47,6 +47,7 @@ import {
   computeFleetUtilization,
   tallyHazardVotes,
   HAZARD_CLEAR_NET_DISMISS,
+  resolveDriverCurrentTrip,
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
@@ -2251,5 +2252,56 @@ describe("computeEtaAccuracy — predicted vs actual pickup ETA", () => {
     expect(txt).toContain("BY CLIENT");
     expect(txt).toContain("Acme");
     expect(txt).toContain("~2×");
+  });
+});
+
+// resolveDriverCurrentTrip — the single "current run" a driver is on,
+// the unit of work for the nav screen and GPS auto-confirm. Separate
+// same-day trip RECORDS are distinct sequential runs (AM vs PM), never a
+// combined route — see the function's own comment / getDriverLoad.
+describe("resolveDriverCurrentTrip", () => {
+  // Build today's date string in the exact YYYY/MM/DD shape todayDateStr
+  // produces, so trips read as due-today without mocking the clock.
+  const d = new Date();
+  const today = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}`;
+  const future = `${d.getFullYear() + 1}/01/01`;
+  const T = (id, state, epoch, date = today) => ({ trip_id: id, state, scheduled_time_epoch: epoch, scheduled_date: date });
+
+  it("returns null when the driver has no active run", () => {
+    expect(resolveDriverCurrentTrip([])).toBeNull();
+    expect(resolveDriverCurrentTrip(null)).toBeNull();
+    expect(resolveDriverCurrentTrip([T("a", TRIP_STATE.ARCHIVED_COMPLETED, 100)])).toBeNull();
+  });
+
+  it("picks the earliest-scheduled of two same-day confirmed runs", () => {
+    const pm = T("pm", TRIP_STATE.DRIVER_CONFIRMED, 18_000);
+    const am = T("am", TRIP_STATE.DRIVER_CONFIRMED, 6_000);
+    const current = resolveDriverCurrentTrip([pm, am]);
+    expect(current.trip_id).toBe("am");
+  });
+
+  it("an IN_TRANSIT run wins even over an earlier-scheduled confirmed run", () => {
+    const earlierConfirmed = T("c", TRIP_STATE.DRIVER_CONFIRMED, 6_000);
+    const laterInTransit = T("x", TRIP_STATE.IN_TRANSIT, 18_000);
+    const current = resolveDriverCurrentTrip([earlierConfirmed, laterInTransit]);
+    expect(current.trip_id).toBe("x");
+  });
+
+  it("falls back to the earliest ASSIGNED run when nothing is confirmed/in-transit", () => {
+    const a2 = T("a2", TRIP_STATE.ASSIGNED, 9_000);
+    const a1 = T("a1", TRIP_STATE.ASSIGNED, 7_000);
+    expect(resolveDriverCurrentTrip([a2, a1]).trip_id).toBe("a1");
+  });
+
+  it("never returns a future-day run ahead of today's", () => {
+    const todays = T("today", TRIP_STATE.DRIVER_CONFIRMED, 12_000, today);
+    const tomorrows = T("future", TRIP_STATE.DRIVER_CONFIRMED, 1_000, future);
+    expect(resolveDriverCurrentTrip([tomorrows, todays]).trip_id).toBe("today");
+  });
+
+  it("returns a single trip object, not an array", () => {
+    const current = resolveDriverCurrentTrip([T("solo", TRIP_STATE.DRIVER_CONFIRMED, 5_000)]);
+    expect(Array.isArray(current)).toBe(false);
+    expect(current.trip_id).toBe("solo");
   });
 });

@@ -111,6 +111,25 @@ function hasAdminPermission(user, permission) {
   return !!ADMIN_PERMISSIONS[level][permission];
 }
 
+// Compact INBOUND/OUTBOUND indicator for admin trip displays — per user
+// request to surface each trip's direction admin-side the way the driver
+// screen already does. Admin sees the real semantics (home→work vs
+// work→home), unlike the privacy-limited agent views. Renders nothing for
+// a trip with no direction recorded rather than guessing one.
+function DirectionBadge({ direction }) {
+  if (direction !== "INBOUND" && direction !== "OUTBOUND") return null;
+  const inbound = direction === "INBOUND";
+  const color = inbound ? COLORS.green : COLORS.amber;
+  return (
+    <span
+      title={inbound ? "Inbound — home → work" : "Outbound — work → home"}
+      style={{ fontSize: 8, fontWeight: 800, letterSpacing: 0.5, whiteSpace: "nowrap", color, border: `1px solid ${color}`, borderRadius: 2, padding: "2px 5px" }}
+    >
+      {inbound ? "▸ IN" : "◂ OUT"}
+    </span>
+  );
+}
+
 // All id membership tests below are String-normalized — Supabase bigint
 // ids (company/branch, user, driver, trip) can surface as number or
 // string depending on hydration path, and a raw Set.has() mismatch here
@@ -3816,6 +3835,7 @@ function TripDetailRow({ trip, state, dispatch, initiallyOpen, user }) {
           {trip.agent_ids.length} passenger{trip.agent_ids.length !== 1 ? "s" : ""}
         </span>
         {trip.long_distance_flag && <span style={{ fontSize: 8, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 2, padding: "2px 5px" }}>40km+</span>}
+        <DirectionBadge direction={trip.direction} />
         <StateBadge state={trip.state} />
         <span style={{ color: COLORS.ghost, fontSize: 11 }}>{open ? "▲" : "▼"}</span>
       </div>
@@ -7717,12 +7737,15 @@ function ActiveDriverCard({ ds, driverTrips, state }) {
     <Card>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span style={{ fontFamily: FONTS.head, fontSize: 14, fontWeight: 700 }}>{driverUser?.name || "Driver"}</span>
-        {/* Real trip state, not a hardcoded IN_TRANSIT — this card now
-            also shows a DRIVER_CONFIRMED driver who's started navigating
-            to their first pickup but hasn't picked everyone up yet (see
-            the widened filter above); showing "IN TRANSIT" for that case
-            would misleadingly imply pickups are already done. */}
-        <StateBadge state={driverTrips[0].state} />
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <DirectionBadge direction={direction} />
+          {/* Real trip state, not a hardcoded IN_TRANSIT — this card now
+              also shows a DRIVER_CONFIRMED driver who's started navigating
+              to their first pickup but hasn't picked everyone up yet (see
+              the widened filter above); showing "IN TRANSIT" for that case
+              would misleadingly imply pickups are already done. */}
+          <StateBadge state={driverTrips[0].state} />
+        </div>
       </div>
       <div style={{ fontSize: 9, color: COLORS.ghost, textTransform: "uppercase", letterSpacing: 1, marginTop: 6 }}>
         {allPickedUp ? "Drop-offs" : "Pickups"}
@@ -8072,7 +8095,7 @@ function AdminActiveTrips({ state }) {
   // for as long as this admin tab stays mounted) — memoizing keeps the
   // O(drivers×trips) work tied to the SAME state actually changing size
   // (driver_status/trips), not to unrelated parent re-renders.
-  const { activeDrivers, driverTripsById } = React.useMemo(() => {
+  const { startedTrips, dsByDriverId } = React.useMemo(() => {
     // FOUND VIA DIRECT USER REPORT ("driver already started the trip but i
     // cant see active trips in admin"): this only ever matched IN_TRANSIT,
     // which a trip doesn't reach until EVERY passenger has been picked up
@@ -8089,16 +8112,22 @@ function AdminActiveTrips({ state }) {
     const inTransitTrips = state.trips.filter(t =>
       t.state === TRIP_STATE.IN_TRANSIT || (t.state === TRIP_STATE.DRIVER_CONFIRMED && t.route_total_km != null)
     );
-    const byId = new Map();
-    for (const t of inTransitTrips) {
-      const key = String(t.driver_id);
-      if (!byId.has(key)) byId.set(key, []);
-      byId.get(key).push(t);
-    }
-    return {
-      activeDrivers: state.driver_status.filter(ds => byId.has(String(ds.driver_id))),
-      driverTripsById: byId,
-    };
+    const dsByDriverId = new Map(state.driver_status.map(ds => [String(ds.driver_id), ds]));
+    // One card per STARTED RUN, not one merged card per driver — FOUND VIA
+    // DIRECT USER REPORT (trip 515 started with a separate same-day trip,
+    // flattening both trips' passengers together): separate same-day trip
+    // records are distinct, sequential runs and must never be combined
+    // into one pickup/drop sequence, exactly as the driver's own nav
+    // screen was just fixed to stop doing (resolveDriverCurrentTrip). This
+    // view promises "exactly as it appears on each driver's own navigation
+    // screen," and computeLiveSequenceForDriver already renders a
+    // single-trip array correctly, so passing ONE trip per card restores
+    // that promise. Only trips whose driver has a driver_status row show,
+    // matching the previous behavior; earliest-scheduled first.
+    const startedTrips = inTransitTrips
+      .filter(t => dsByDriverId.has(String(t.driver_id)))
+      .sort((a, b) => (a.scheduled_time_epoch ?? Infinity) - (b.scheduled_time_epoch ?? Infinity));
+    return { startedTrips, dsByDriverId };
   }, [state.driver_status, state.trips]);
   return (
     <div className="pad">
@@ -8108,10 +8137,10 @@ function AdminActiveTrips({ state }) {
         screen — this can differ from the planned dispatch order once a driver has
         actually started driving.
       </div>
-      {activeDrivers.length === 0 ? (
+      {startedTrips.length === 0 ? (
         <Empty icon="🚦" text="No drivers currently on a live route" />
-      ) : activeDrivers.map(ds => (
-        <ActiveDriverCard key={ds.driver_id} ds={ds} driverTrips={driverTripsById.get(String(ds.driver_id)) || []} state={state} />
+      ) : startedTrips.map(trip => (
+        <ActiveDriverCard key={trip.trip_id} ds={dsByDriverId.get(String(trip.driver_id))} driverTrips={[trip]} state={state} />
       ))}
     </div>
   );

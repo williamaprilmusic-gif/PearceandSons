@@ -1755,6 +1755,49 @@ function resolveDriverActiveTripDate(driverTrips) {
   return { targetDate: earliestDate(assignedDue) ?? todayStr };
 }
 
+// The single trip RECORD a driver is actively running right now — the
+// unit of work for the nav screen and the GPS auto-confirm loop. FOUND
+// VIA DIRECT USER REPORT (trip 515 started and a SEPARATE same-day trip
+// started with it, flattening both trips' passengers onto one screen):
+// the nav flow used to treat the whole DAY as the unit and combine every
+// same-day active trip into one route. That contradicted the app's own
+// model — see getDriverLoad: two separate same-day trip RECORDS are never
+// simultaneous (genuinely concurrent passengers are always merged into
+// ONE record at dispatch, via auto-merge / DISPATCH_MULTI), so separate
+// records are distinct, sequential runs (an AM load vs a PM load). A
+// driver therefore runs exactly ONE record at a time and should only ever
+// see/start that one. resolveDriverActiveTripDate first narrows to the
+// single active DAY (preserving every invariant it documents — overdue
+// vs today, confirmed-over-assigned, IN_TRANSIT-wins, undated->today);
+// within that day this picks the single current record: an IN_TRANSIT run
+// always wins (a started run must never lose scope to an unstarted one),
+// else the earliest-scheduled DRIVER_CONFIRMED run, else the earliest
+// ASSIGNED run (Start Trip auto-accepts an ASSIGNED trip). When that run
+// completes it archives out of the pool and the next same-day run becomes
+// current automatically — earliest first. Returns null when the driver
+// has no active run. `driverTrips` is expected to already be scoped to
+// one driver. Shares resolveDriverActiveTripDate so nav display and GPS
+// auto-confirm can never disagree on which run is "active."
+export function resolveDriverCurrentTrip(driverTrips) {
+  const { targetDate } = resolveDriverActiveTripDate(driverTrips);
+  const onDay = (driverTrips || []).filter(t =>
+    [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) &&
+    (!t.scheduled_date || t.scheduled_date === targetDate)
+  );
+  if (onDay.length === 0) return null;
+  // Earliest by scheduled time; an undated run sorts last rather than
+  // hijacking the front of the queue.
+  const earliestOf = (state) => onDay
+    .filter(t => t.state === state)
+    .sort((a, b) => (a.scheduled_time_epoch ?? Infinity) - (b.scheduled_time_epoch ?? Infinity))[0] ?? null;
+  return (
+    earliestOf(TRIP_STATE.IN_TRANSIT) ||
+    earliestOf(TRIP_STATE.DRIVER_CONFIRMED) ||
+    earliestOf(TRIP_STATE.ASSIGNED) ||
+    null
+  );
+}
+
 export function getDriverLoad(state, driver_id, scheduledDate) {
   // Returns the driver's BUSIEST single active trip on the given date —
   // the seat count of their fullest vehicle load that day, NOT the sum
@@ -15398,41 +15441,44 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
       // identical coordinate on tomorrow's and the day-after's trips —
       // silently auto-confirming pickup (and cascading to IN_TRANSIT) on
       // trips that hadn't happened yet, corrupting future-day trip data.
-      // Uses the SAME resolveDriverActiveTripDate DriverNavTab's own nav
-      // screen is built from — FOUND VIA /simplify (altitude pass): a
-      // first version of this fix used a looser `<= today` RANGE check
-      // here instead of the single-target-day logic, which still let a
+      // Uses the SAME resolveDriverCurrentTrip DriverNavTab's own nav
+      // screen is built from — scoped to the single CURRENT RUN, not the
+      // whole day. FOUND VIA /simplify (altitude pass): a first version of
+      // this fix used a looser `<= today` RANGE check here, which let a
       // driver with both an overdue trip AND today's trip cross-confirm
-      // between the two different days — the exact same bug class this
-      // fix exists to close, just reintroduced via a second, divergent
-      // rule. One shared resolver means nav display and GPS auto-confirm
-      // can never disagree on which day is "active" again.
-      const { targetDate: geoTargetDate } = resolveDriverActiveTripDate(activeTripsRef.current);
-      if (dispatchRef.current && activeTripsRef.current?.length) {
-        for (const trip of activeTripsRef.current) {
-          if (!["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(trip.state)) continue;
-          if (trip.scheduled_date && trip.scheduled_date !== geoTargetDate) continue;
-          const completedPickups = trip.completed_pickups || [];
-          const completedDropoffs = trip.completed_dropoffs || [];
-          const agentIds = trip.agent_ids || [];
-          // Check pickups first — agents not yet confirmed picked up.
-          autoConfirmGeofenceStop({
-            agentIds, completedList: completedPickups, coordsField: "pickup_sequence_coords", trip,
-            latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
-            kind: "pickup", actionType: "TRIP/CONFIRM_AGENT_PICKUP", geofenceTriggeredRef, dispatchRef,
-          });
-          // Check dropoffs — agents who actually BOARDED but aren't dropped
-          // yet. Prerequisite is boardedAgentIds, NOT raw completedPickups:
-          // a no-show sits in completedPickups for progression but never got
-          // in, so driving past their drop-off coord must not auto-confirm a
-          // drop-off for them (it previously did — see real trip 453).
-          autoConfirmGeofenceStop({
-            agentIds, completedList: completedDropoffs, coordsField: "dropoff_sequence_coords", trip,
-            latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
-            kind: "dropoff", actionType: "TRIP/CONFIRM_AGENT_DROPOFF", geofenceTriggeredRef, dispatchRef,
-            prerequisiteList: boardedAgentIds(trip),
-          });
-        }
+      // between two different days; a later version scoped to a single DAY
+      // but still looped over EVERY same-day trip — so driving near a
+      // SEPARATE same-day run's pickup could silently auto-confirm that
+      // run's passenger before the driver had even started it (the same
+      // cross-trip bleed the nav screen was just fixed for — trip 515).
+      // One shared resolver, at RUN granularity, means nav display and GPS
+      // auto-confirm can never disagree on which run is "active" again.
+      const geoCurrentTrip = resolveDriverCurrentTrip(activeTripsRef.current);
+      if (
+        dispatchRef.current && geoCurrentTrip &&
+        ["DRIVER_CONFIRMED", "IN_TRANSIT"].includes(geoCurrentTrip.state)
+      ) {
+        const trip = geoCurrentTrip;
+        const completedPickups = trip.completed_pickups || [];
+        const completedDropoffs = trip.completed_dropoffs || [];
+        const agentIds = trip.agent_ids || [];
+        // Check pickups first — agents not yet confirmed picked up.
+        autoConfirmGeofenceStop({
+          agentIds, completedList: completedPickups, coordsField: "pickup_sequence_coords", trip,
+          latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
+          kind: "pickup", actionType: "TRIP/CONFIRM_AGENT_PICKUP", geofenceTriggeredRef, dispatchRef,
+        });
+        // Check dropoffs — agents who actually BOARDED but aren't dropped
+        // yet. Prerequisite is boardedAgentIds, NOT raw completedPickups:
+        // a no-show sits in completedPickups for progression but never got
+        // in, so driving past their drop-off coord must not auto-confirm a
+        // drop-off for them (it previously did — see real trip 453).
+        autoConfirmGeofenceStop({
+          agentIds, completedList: completedDropoffs, coordsField: "dropoff_sequence_coords", trip,
+          latitude, longitude, geofenceRadiusKm: GEOFENCE_RADIUS_KM,
+          kind: "dropoff", actionType: "TRIP/CONFIRM_AGENT_DROPOFF", geofenceTriggeredRef, dispatchRef,
+          prerequisiteList: boardedAgentIds(trip),
+        });
       }
       // Feature: Speed anomaly detection ───────────────────────────────────
       // Stationary: driver in IN_TRANSIT but speed < 2 km/h for 8+ minutes
@@ -17920,39 +17966,39 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   // Falls back to state.trips only if the prop is missing (defensive,
   // e.g. older call sites).
   const navSourceTrips = myTrips ?? state.trips.filter(t => String(t.driver_id) === String(user.id));
-  // Exactly ONE day's worth of trips — FOUND VIA DIRECT USER REPORT, THEN
-  // CORRECTED VIA CODE REVIEW: 3 independently-booked DAY trips for the
-  // same agent/driver on 3 CONSECUTIVE days all got confirmed together,
-  // and with nothing here comparing scheduled_date, all 3 showed up in
-  // myActiveTrips at once — meaning pickupStops' flatMap below combined
-  // tomorrow's and the day after's pickup into TODAY's route alongside
-  // today's own stop. resolveDriverActiveTripDate resolves the single
-  // target day (only trips due today-or-earlier are candidates; IN_TRANSIT
-  // wins outright, else earliest due date) — also used by the geofence
-  // auto-confirm loop, so nav display and GPS auto-confirm can never pick
-  // a different target day from each other. This is ALSO what keeps the
-  // now-unfiltered myTrips (which includes future week-series days) from
-  // bleeding a future day's pickups into today's navigation route.
+  // Exactly ONE RUN at a time — the single trip RECORD the driver is
+  // currently running — NOT every active trip for the day. FOUND VIA
+  // DIRECT USER REPORT (trip 515 started and a SEPARATE same-day trip
+  // started with it, showing both trips' passengers together): this used
+  // to return every same-day ASSIGNED/DRIVER_CONFIRMED/IN_TRANSIT trip and
+  // flatMap them into one combined route, which contradicted the app's own
+  // model (see getDriverLoad / resolveDriverCurrentTrip) — separate
+  // same-day trip records are distinct, sequential runs (an AM load vs a
+  // PM load), never a single simultaneous route. Now resolves the one
+  // current run; the next same-day run only surfaces here once the current
+  // one completes and archives out, earliest first. A PRIOR fix in this
+  // same spot (3 consecutive-day trips all bleeding into one route) is
+  // subsumed: resolveDriverCurrentTrip still goes through
+  // resolveDriverActiveTripDate, so a future day's run can never appear
+  // here either. resolveDriverCurrentTrip is ALSO what the geofence
+  // auto-confirm loop uses, so nav display and GPS auto-confirm can never
+  // disagree on which run is active. ASSIGNED runs still qualify (Start
+  // Trip auto-accepts an ASSIGNED trip — see handleStartTrip below).
   // useMemo — FOUND VIA /simplify (efficiency pass), MADE ACTUALLY
   // EFFECTIVE VIA /code-review: driverPosition changes on every GPS tick
   // (several times a minute while driving), which re-renders this
-  // component; without memoization the full filter/find/reduce/sort
-  // chain below re-ran on every single tick even though its real inputs
-  // rarely change. The memo only pays off because DriverApp's own
-  // allMyTrips/myTrips are now ALSO memoized on state.trips — otherwise
-  // navSourceTrips would be a new array reference every tick regardless,
-  // "changing" this memo's dependency every time and recomputing anyway.
-  // ASSIGNED trips are included in the final list (Start Trip auto-
-  // accepts an ASSIGNED trip as part of starting it — see handleStartTrip
-  // below) even though resolveDriverActiveTripDate deliberately excludes
-  // them from DECIDING the target date (see that function's own comment).
+  // component; without memoization the full resolve chain re-ran on every
+  // single tick even though its real inputs rarely change. The memo only
+  // pays off because DriverApp's own allMyTrips/myTrips are now ALSO
+  // memoized on state.trips — otherwise navSourceTrips would be a new array
+  // reference every tick regardless, "changing" this memo's dependency
+  // every time and recomputing anyway. Returned as a (0- or 1-element)
+  // ARRAY so every downstream consumer (pickupStops' flatMap, the
+  // RECORD_ROUTE batch, myActiveTrips[0], length checks) is unchanged.
   const myActiveTrips = React.useMemo(() => {
     const ownTrips = navSourceTrips.filter(t => String(t.driver_id) === String(user.id));
-    const { targetDate } = resolveDriverActiveTripDate(ownTrips);
-    return ownTrips.filter(t =>
-      [TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT].includes(t.state) &&
-      (!t.scheduled_date || t.scheduled_date === targetDate)
-    ).sort((a, b) => (a.pickup_order_num || 99) - (b.pickup_order_num || 99));
+    const currentTrip = resolveDriverCurrentTrip(ownTrips);
+    return currentTrip ? [currentTrip] : [];
   }, [navSourceTrips, user.id]);
 
   // One stop per PASSENGER, not per trip — a multi-passenger trip
@@ -18124,17 +18170,17 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const dropGroupCoords = dropGroupList.map(g => ({ lat: g.lat, lng: g.lng }));
   const navAnchor = lastPickupCoord || defaultCompanyAnchor(state);
   // useSortedDropoffs is a hook — called unconditionally here (before any
-  // early-return). Direction is taken from the first active trip; for mixed
-  // runs the TSP is direction-agnostic anyway.
+  // early-return). navDirection is the current run's own direction
+  // (myActiveTrips holds exactly one run now — see resolveDriverCurrentTrip),
+  // so INBOUND and OUTBOUND can never be mixed into one route.
   const navTripKey = myActiveTrips.map(t => t.trip_id).join("-");
   // For INBOUND: the destination is the company office — TomTom optimises the full
   // route: driver_start → pickup_home_A → pickup_home_B → ... → office (min km).
   // For OUTBOUND: no fixed destination — optimise drop sequence from office outward.
   const navDestination = navDirection === "INBOUND" ? defaultCompanyAnchor(state) : null;
-  // Earliest scheduled time across this batch of active trips — same
-  // "whichever pickup comes first" epoch used below to gate Start Trip —
-  // so TomTom optimises for the traffic conditions the driver will actually
-  // be in, not whatever traffic looks like right now.
+  // The run's scheduled time (one trip; the min/sort is a harmless no-op now)
+  // — used to gate Start Trip below, so TomTom optimises for the traffic the
+  // driver will actually be in, not whatever traffic looks like right now.
   const navDepartAtEpoch = myActiveTrips.map(t => t.scheduled_time_epoch).filter(Boolean).sort((a, b) => a - b)[0] ?? null;
   const [tomtomSortedCoords] = useSortedDropoffs(dropGroupCoords, navAnchor, navDirection, navTripKey, undefined, navDestination, navDepartAtEpoch);
   // Re-order the groups to match TomTom's coord sequence. Match by lat/lng
@@ -18161,10 +18207,10 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
   const handleStartTrip = async () => {
     setStartTripError(null);
     // A driver may not start a trip more than TRIP_EARLY_START_MS before
-    // its scheduled time — see tripStartWindowOpensAt. Checked against the
-    // EARLIEST scheduled trip in this batch (a driver's several active
-    // trips for the day are started together as one route), so the
-    // restriction is based on whichever pickup comes first. Trips already
+    // its scheduled time — see tripStartWindowOpensAt. myActiveTrips now
+    // holds exactly the one current run (see resolveDriverCurrentTrip), so
+    // this gates that single run; a later same-day run only becomes
+    // startable here once the current one completes. Trips already
     // IN_TRANSIT or DRIVER_CONFIRMED with a route already recorded are
     // unaffected — this only gates the initial "start trip" action itself.
     const windowOpensAt = tripStartWindowOpensAt(earliestScheduledTrip(myActiveTrips));
