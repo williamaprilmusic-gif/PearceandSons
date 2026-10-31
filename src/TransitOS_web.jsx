@@ -8218,7 +8218,7 @@ async function applySessionToken(token) {
 // debounced) will pick up the same DB change moments later regardless of
 // whether this specific refetch() call is awaited or not; this call is
 // just a same-tab freshness nudge, not the only path to a synced UI.
-async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
+export async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetchers = {}) {
   switch (action.type) {
     case "AUTH/LOGIN_BIOMETRIC": {
       // Biometric already verified by Edge Function — just set the session
