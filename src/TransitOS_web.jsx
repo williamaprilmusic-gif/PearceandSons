@@ -2144,6 +2144,95 @@ function checkBookingRateLimit(userId) {
   }
 }
 
+// ── Shared modal accessibility helpers ────────────────────────────────────
+// FOUND VIA /audit: the app's fixed-overlay modals had no dialog semantics
+// or keyboard support. useModalA11y wires up, for a modal given a ref to its
+// content element and its close callback: focus moved into the dialog on
+// open, Escape-to-close, a Tab focus trap keeping focus inside the dialog,
+// and focus returned to the previously-focused element when the modal
+// closes. The content element should carry role="dialog" aria-modal="true"
+// an aria-label and tabIndex={-1} so it can receive focus when it has no
+// focusable child yet.
+function useModalA11y(dialogRef, onClose) {
+  const onCloseRef = React.useRef(onClose);
+  React.useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  React.useEffect(() => {
+    const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const previouslyFocused = typeof document !== "undefined" ? document.activeElement : null;
+    const node = dialogRef.current;
+    // Focus the dialog CONTAINER itself (it carries tabIndex={-1}), not its
+    // first focusable child — otherwise a keyboard/screen-reader user lands on
+    // the ✕ Close button instead of the dialog, so the first actionable thing
+    // announced would be dismissal. From the container, Tab advances to the
+    // first real control.
+    node?.focus?.();
+    const onKeyDown = (e) => {
+      // Bubble phase, and NO stopPropagation: if two of these modals were ever
+      // stacked, each has its own document listener — swallowing the event
+      // could close the background dialog instead of the visible one.
+      if (e.key === "Escape") { onCloseRef.current?.(); return; }
+      if (e.key === "Tab" && node) {
+        const items = node.querySelectorAll(FOCUSABLE);
+        if (!items.length) return;
+        const firstEl = items[0];
+        const lastEl = items[items.length - 1];
+        const active = document.activeElement;
+        // Keep focus inside the dialog — also pulls focus back in if it has
+        // escaped to <body> (e.g. after a submit swaps in a success view).
+        if (!node.contains(active)) { e.preventDefault(); firstEl.focus(); }
+        else if (e.shiftKey && active === firstEl) { e.preventDefault(); lastEl.focus(); }
+        else if (!e.shiftKey && active === lastEl) { e.preventDefault(); firstEl.focus(); }
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      if (previouslyFocused && previouslyFocused.focus) {
+        try { previouslyFocused.focus(); } catch { /* element may no longer exist */ }
+      }
+    };
+    // dialogRef is a stable ref object; onClose is read through onCloseRef so
+    // it needn't be a dependency — the effect runs once per mount.
+  }, [dialogRef]);
+}
+
+// Keyboard-operable radio group — replaces the mouse-only `<div onClick>`
+// option pickers. Implements the WAI-ARIA radiogroup pattern: roving
+// tabindex (only the selected option, or the first when none is selected, is
+// in the tab order) plus arrow-key navigation, and each option is a real
+// <button role="radio" aria-checked>. Visuals match the prior pickers.
+function ModalRadioGroup({ label, options, value, onChange, accent = COLORS.red, accentBg = "rgba(220,53,69,0.08)" }) {
+  const refs = React.useRef([]);
+  const move = (i) => {
+    const n = options.length;
+    const idx = ((i % n) + n) % n;
+    onChange(options[idx]);
+    refs.current[idx]?.focus();
+  };
+  const onKeyDown = (e, i) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") { e.preventDefault(); move(i + 1); }
+    else if (e.key === "ArrowUp" || e.key === "ArrowLeft") { e.preventDefault(); move(i - 1); }
+  };
+  const selectedIndex = options.indexOf(value);
+  return (
+    <div role="radiogroup" aria-label={label} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {options.map((o, i) => {
+        const checked = value === o;
+        const tabIndex = checked ? 0 : (selectedIndex === -1 && i === 0 ? 0 : -1);
+        return (
+          <button type="button" key={o} role="radio" aria-checked={checked}
+            ref={el => { refs.current[i] = el; }} tabIndex={tabIndex}
+            onClick={() => onChange(o)} onKeyDown={e => onKeyDown(e, i)}
+            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, textAlign: "left", width: "100%", font: "inherit", border: `1px solid ${checked ? accent : COLORS.wire}`, background: checked ? accentBg : COLORS.surface, cursor: "pointer" }}>
+            <span aria-hidden="true" style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${checked ? accent : COLORS.ghost}`, background: checked ? accent : "transparent", flexShrink: 0, display: "inline-block" }} />
+            <span style={{ fontSize: 11, color: COLORS.chalk }}>{o}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 // ── Trip dispute resolution ───────────────────────────────────────────────
 const DISPUTE_CATEGORIES = [
   "Driver did not arrive",
@@ -2162,6 +2251,8 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
   const [description, setDescription] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
   const [err, setErr] = React.useState(null);
+  const dialogRef = React.useRef(null);
+  useModalA11y(dialogRef, onClose);
 
   const submit = async () => {
     if (!category) { setErr("Please select a category."); return; }
@@ -2178,7 +2269,7 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
       });
       onClose();
     } catch (e) {
-      setErr(e.message || "Failed to file dispute.");
+      setErr(friendlyActionError(e, "Failed to file dispute."));
       setSubmitting(false);
     }
   };
@@ -2186,20 +2277,14 @@ function DisputeFilingModal({ trip, user, dispatch, onClose }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="File a dispute" tabIndex={-1} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12, maxHeight: "85vh", overflowY: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between" }}>
           <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>⚠ FILE A DISPUTE</span>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
         </div>
         <div style={{ fontSize: 10, color: COLORS.ghost }}>Trip #{trip.trip_id} · {trip.scheduled_date}. Your dispute will be reviewed by dispatch within 24 hours.</div>
         <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>CATEGORY *</div>
-        {DISPUTE_CATEGORIES.map(c => (
-          <div key={c} onClick={() => setCategory(c)}
-            style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, border: `1px solid ${category === c ? COLORS.red : COLORS.wire}`, background: category === c ? "rgba(220,53,69,0.08)" : COLORS.surface, cursor: "pointer" }}>
-            <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${category === c ? COLORS.red : COLORS.ghost}`, background: category === c ? COLORS.red : "transparent", flexShrink: 0 }} />
-            <span style={{ fontSize: 11, color: COLORS.chalk }}>{c}</span>
-          </div>
-        ))}
+        <ModalRadioGroup label="Dispute category" options={DISPUTE_CATEGORIES} value={category} onChange={setCategory} />
         <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.chalk, letterSpacing: 0.5 }}>DESCRIPTION *</div>
         <textarea value={description} onChange={e => setDescription(e.target.value)}
           placeholder="Describe what happened in detail…" rows={4} maxLength={800}
@@ -7024,6 +7109,21 @@ function notifRowToApp(row) {
   return { id: sid(row.id), type: row.type, for_roles: row.forroles || [], for_user_ids: row.userid != null ? [sid(row.userid)] : [], message: row.message, trip_id: sid(row.tripid), ts: epochToDisplay(row.timestamp), ts_epoch: row.timestamp, read: row.isread };
 }
 
+// Defensive guard for ids/timestamps interpolated into PostgREST `.or()`
+// filter STRINGS (which aren't parameterized the way .eq()/.in() args are) —
+// FOUND VIA /audit + /code-review. Returns the value as a digits-only string
+// safe to splice into a filter, or null when it isn't a non-negative integer.
+// Validates the raw digits rather than Number()+Number.isInteger because the
+// latter would wrongly accept "" and null (both coerce to 0) and "1e3"/"0x10",
+// and round-tripping a large bigint id through Number could lose precision.
+// For a valid numeric id this yields the exact token the code interpolated
+// before, so query behaviour is unchanged.
+function asFilterId(value) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  return /^\d+$/.test(s) ? s : null;
+}
+
 async function fetchAllFromSupabase() {
   // Trips: always include every trip that isn't finished yet (regardless of
   // age — an unassigned booking from last week still needs to show up), but
@@ -7045,8 +7145,12 @@ async function fetchAllFromSupabase() {
     const d = new Date();
     return new Date(d.getFullYear(), d.getMonth() - 1, 1).getTime();
   })();
+  // prevMonthStart is always an integer epoch here; the guard only stops a
+  // NaN from ever being spliced into the filter string (it would break the
+  // query), falling back to 0 (gte 0 ≈ all completed) so the app still loads.
+  const prevMonthStartFilter = asFilterId(prevMonthStart) ?? 0;
   const tripsQuery = supabase.from("trips").select("*")
-    .or(`status.neq.${TRIP_STATE.ARCHIVED_COMPLETED},completedat.gte.${prevMonthStart}`)
+    .or(`status.neq.${TRIP_STATE.ARCHIVED_COMPLETED},completedat.gte.${prevMonthStartFilter}`)
     .order("id", { ascending: false });
 
   const [usersRes, driversRes, tripsRes] = await Promise.all([
@@ -7340,8 +7444,10 @@ async function computeActualRouteKm(tripId, pickupTimestamps, dropoffTimestamps,
 }
 
 export async function fetchDirectMessages(userIdA, userIdB) {
+  const a = asFilterId(userIdA), b = asFilterId(userIdB);
+  if (a === null || b === null) return []; // non-numeric id can't address a real thread
   const { data, error } = await supabase.from("direct_messages").select("*")
-    .or(`and(senderid.eq.${userIdA},recipientid.eq.${userIdB}),and(senderid.eq.${userIdB},recipientid.eq.${userIdA})`)
+    .or(`and(senderid.eq.${a},recipientid.eq.${b}),and(senderid.eq.${b},recipientid.eq.${a})`)
     .order("timestamp", { ascending: true });
   if (error) throw error;
   return (data || []).map(m => ({
@@ -7366,8 +7472,10 @@ export async function fetchDirectMessages(userIdA, userIdB) {
 // per-thread unread field on the strength of an old comment; the UI
 // reads none.
 export async function fetchMyConversations(myUserId, users) {
+  const me = asFilterId(myUserId);
+  if (me === null) return []; // non-numeric id can't own any conversation
   const { data, error } = await supabase.from("direct_messages").select("*")
-    .or(`senderid.eq.${myUserId},recipientid.eq.${myUserId}`)
+    .or(`senderid.eq.${me},recipientid.eq.${me}`)
     .order("timestamp", { ascending: false });
   if (error) throw error;
   const byCounterpart = new Map();
@@ -9700,10 +9808,14 @@ export async function handleSupabaseAction(action, activeUserRef, refetch, extra
       // that same date/direction with no rejection at all. Matches the
       // .contains("extraagentids", [...]) pattern already used elsewhere
       // in this codebase for the same array column.
+      const dupCheckAgentId = asFilterId(action.agent_id);
+      if (dupCheckAgentId === null) {
+        throw new Error("Couldn't verify your booking — please sign out and back in, then try again.");
+      }
       const { data: existingBookings } = await supabase
         .from("trips")
         .select("id, status, direction")
-        .or(`agentid.eq.${action.agent_id},extraagentids.cs.{${action.agent_id}}`)
+        .or(`agentid.eq.${dupCheckAgentId},extraagentids.cs.{${dupCheckAgentId}}`)
         .eq("scheduleddate", action.scheduled_date)
         .in("status", [TRIP_STATE.UNASSIGNED_BOOKING, TRIP_STATE.ASSIGNED, TRIP_STATE.DRIVER_CONFIRMED, TRIP_STATE.IN_TRANSIT]);
       const dupTrip = (existingBookings || []).find(t => t.direction === action.direction);
@@ -14454,7 +14566,7 @@ function AgentBookTab({ user, state, dispatch, setTab, myTrips }) {
           rollbackFailures++;
         }
       }
-      const reason = e.message || "Booking failed";
+      const reason = friendlyActionError(e, "Booking failed");
       if (createdTripIds.length === 0) {
         setErrs({ submit: `${reason} — nothing was booked. Please try again.` });
       } else if (rollbackFailures === 0) {
@@ -15078,7 +15190,7 @@ function HelpTab({ state, user, dispatch }) {
       await dispatch({ type: "TICKET/CREATE", user_id: user.id, role: user.role, trip_id: /^\d+$/.test(tripId) ? Number(tripId) : tripId, category, message: message.trim() });
       setCategory(""); setTripId(""); setMessage(""); setShowForm(false);
     } catch (e) {
-      setErr(e.message || "Failed to submit ticket.");
+      setErr(friendlyActionError(e, "Failed to submit ticket."));
     } finally {
       setSubmitting(false);
     }
@@ -17483,34 +17595,36 @@ function UnavailableReasonModal({ onConfirm, onCancel }) {
   const [reason, setReason] = React.useState("");
   const [note, setNote] = React.useState("");
   const [err, setErr] = React.useState(null);
+  const [submitting, setSubmitting] = React.useState(false);
+  const dialogRef = React.useRef(null);
+  useModalA11y(dialogRef, onCancel);
   const submit = () => {
+    if (submitting) return; // guard against a double-tap firing onConfirm twice
     if (!reason) { setErr("Please select a reason."); return; }
+    setSubmitting(true);
     onConfirm(reason, note.trim() || null);
   };
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
       onClick={e => { if (e.target === e.currentTarget) onCancel(); }}>
-      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Mark unavailable" tabIndex={-1} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between" }}>
           <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red, letterSpacing: 1 }}>✕ MARK UNAVAILABLE</span>
-          <button onClick={onCancel} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+          <button onClick={onCancel} aria-label="Close" style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
         </div>
         <div style={{ fontSize: 10, color: COLORS.ghost }}>Please give a reason — this is logged and visible to dispatch.</div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-          {UNAVAIL_REASONS.map(r => (
-            <div key={r} onClick={() => setReason(r)}
-              style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 10px", borderRadius: 4, border: `1px solid ${reason === r ? COLORS.red : COLORS.wire}`, background: reason === r ? "rgba(220,53,69,0.08)" : COLORS.surface, cursor: "pointer" }}>
-              <div style={{ width: 12, height: 12, borderRadius: "50%", border: `2px solid ${reason === r ? COLORS.red : COLORS.ghost}`, background: reason === r ? COLORS.red : "transparent", flexShrink: 0 }} />
-              <span style={{ fontSize: 11, color: COLORS.chalk }}>{r}</span>
-            </div>
-          ))}
-        </div>
+        <ModalRadioGroup label="Reason for unavailability" options={UNAVAIL_REASONS} value={reason} onChange={setReason} />
         <textarea value={note} onChange={e => setNote(e.target.value)} placeholder="Additional detail (optional)…" rows={2} maxLength={200}
           style={{ fontFamily: "inherit", fontSize: 11, background: COLORS.surface, border: `1px solid ${COLORS.wire}`, borderRadius: 4, padding: 8, color: COLORS.chalk, resize: "vertical", boxSizing: "border-box", width: "100%" }} />
         {err && <div style={{ fontSize: 10, color: COLORS.red }}>{err}</div>}
         <div style={{ display: "flex", gap: 8 }}>
+          {/* CANCEL is intentionally NOT disabled on submit: onConfirm here is
+              fire-and-forget (the parent unmounts the modal synchronously), so
+              `submitting` never resets — disabling CANCEL too could trap the
+              modal if onConfirm is ever made async. CONFIRM's guard is enough
+              to stop a double-fire. */}
           <Button title="CANCEL" variant="ghost" style={{ flex: 1 }} onClick={onCancel} />
-          <Button title="✕ CONFIRM UNAVAILABLE" variant="danger" style={{ flex: 1 }} onClick={submit} />
+          <Button title={submitting ? "SAVING…" : "✕ CONFIRM UNAVAILABLE"} variant="danger" style={{ flex: 1 }} onClick={submit} disabled={submitting} />
         </div>
       </div>
     </div>
@@ -17908,6 +18022,8 @@ function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubm
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
   const [done, setDone] = useState(false);
+  const dialogRef = useRef(null);
+  useModalA11y(dialogRef, onClose);
 
   const submit = async () => {
     if (!trip) { setErr("No active trip found."); return; }
@@ -17930,7 +18046,7 @@ function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubm
       });
       setDone(true);
     } catch (e) {
-      setErr(e.message || "Failed to record the no-show.");
+      setErr(friendlyActionError(e, "Failed to record the no-show."));
     } finally {
       setSubmitting(false);
     }
@@ -17938,10 +18054,10 @@ function NoShowModal({ trip, agentId, agentName, user, dispatch, onClose, onSubm
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
-      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Mark no show" tabIndex={-1} onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>MARK NO SHOW</div>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
         </div>
 
         {done ? (
@@ -17973,6 +18089,8 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState(null);
   const [done, setDone] = useState(false);
+  const dialogRef = useRef(null);
+  useModalA11y(dialogRef, onClose);
 
   const submit = async () => {
     if (!reason) { setErr("Please choose a reason."); return; }
@@ -17983,7 +18101,7 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
       await dispatch({ type: "TRIP/REPORT_DELAY", trip_id: trip.trip_id, driver_id: user.id, reason, note: note.trim() || undefined });
       setDone(true);
     } catch (e) {
-      setErr(e.message || "Failed to report delay.");
+      setErr(friendlyActionError(e, "Failed to report delay."));
     } finally {
       setSubmitting(false);
     }
@@ -17991,10 +18109,10 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.6)", zIndex: 600, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
-      <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Report delay or detour" tabIndex={-1} onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontFamily: FONTS.head, fontSize: 16, fontWeight: 800 }}>REPORT DELAY / DETOUR</div>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 18, cursor: "pointer" }}>✕</button>
         </div>
 
         {done ? (
@@ -18025,13 +18143,14 @@ function DelayReportModal({ trip, user, dispatch, onClose }) {
   );
 }
 
-// Keep internal error codes off the driver's screen — FOUND VIA /audit:
-// e.message can be a raw state-machine code ("[SM] Trip: X → Y ILLEGAL",
-// thrown by assertTripTransition) or a Postgres/PostgREST string. Show those
-// as a generic retry message; pass through only messages that are already
-// plain, user-facing sentences (e.g. "Start trip denied — …", "This trip
-// isn't assigned to you.").
-function friendlyDriverActionError(e, fallback) {
+// Keep internal error codes off a driver's OR agent's screen — FOUND VIA
+// /audit: e.message can be a raw state-machine code ("[SM] Trip: X → Y
+// ILLEGAL", thrown by assertTripTransition) or a Postgres/PostgREST string.
+// Show those as a generic retry message; pass through only messages that are
+// already plain, user-facing sentences (e.g. "Start trip denied — …", "This
+// trip isn't assigned to you."). Shared by driver-nav and agent-facing
+// submit handlers alike.
+function friendlyActionError(e, fallback) {
   const msg = e && e.message ? String(e.message) : "";
   if (!msg) return fallback;
   const internal = /\[SM\]|ILLEGAL|permission denied|JWT|PGRST|violates |duplicate key|syntax error|null value|constraint|supabase/i;
@@ -18364,7 +18483,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
       const firstPickup = pickupStops.find(s => !s.done) || pickupStops[0];
       if (firstPickup?.lat && firstPickup?.lng) setNavTarget({ lat: firstPickup.lat, lng: firstPickup.lng, label: firstPickup.label, isManual: firstPickup.isManual, tripId: firstPickup.trip_id ?? null });
     } catch (e) {
-      setStartTripError(friendlyDriverActionError(e, "Couldn't start the trip — please try again."));
+      setStartTripError(friendlyActionError(e, "Couldn't start the trip — please try again."));
     }
   };
   // Fresh GPS read at the moment of confirming a pickup or drop-off —
@@ -18424,7 +18543,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         return;
       }
     } catch (e) {
-      setStartTripError(friendlyDriverActionError(e, "Couldn't confirm pickup — please try again."));
+      setStartTripError(friendlyActionError(e, "Couldn't confirm pickup — please try again."));
       return;
     }
     const remaining = pickupStops.filter(s => String(s.trip_id) !== String(trip_id) || String(s.agent_id) !== String(agent_id)).filter(s => !s.done);
@@ -18478,7 +18597,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         }
       }
     } catch (e) {
-      setStartTripError(friendlyDriverActionError(e, "Couldn't confirm pickup — please try again."));
+      setStartTripError(friendlyActionError(e, "Couldn't confirm pickup — please try again."));
       return;
     }
     // Navigate to first home dropoff
@@ -18540,7 +18659,7 @@ function DriverNavTab({ state, dispatch, user, call, myTrips, navTarget, setNavT
         }
       }
     } catch (e) {
-      setStartTripError(friendlyDriverActionError(e, "Couldn't complete drop-off — please try again."));
+      setStartTripError(friendlyActionError(e, "Couldn't complete drop-off — please try again."));
       return;
     }
     const remaining = dropStops.filter(s => s !== group).filter(s => !s.done);
@@ -20146,6 +20265,8 @@ function AgentReportDelayModal({ dispatch, onClose }) {
   const [locError, setLocError] = useState(null);
   const [reportedKey, setReportedKey] = useState(null); // category currently submitting / just submitted
   const [error, setError] = useState(null);
+  const dialogRef = useRef(null);
+  useModalA11y(dialogRef, onClose);
 
   const getLocation = useCallback(() => {
     if (!navigator.geolocation) { setLocError("Location isn't available on this device/browser."); return; }
@@ -20168,7 +20289,7 @@ function AgentReportDelayModal({ dispatch, onClose }) {
       await dispatch({ type: "DRIVER/REPORT_HAZARD", source: "agent", category: categoryKey, lat: coord.lat, lng: coord.lng });
       setTimeout(onClose, 900);
     } catch (e) {
-      setError(e.message || "Couldn't report the delay — please try again.");
+      setError(friendlyActionError(e, "Couldn't report the delay — please try again."));
       setReportedKey(null);
     }
   };
@@ -20176,10 +20297,10 @@ function AgentReportDelayModal({ dispatch, onClose }) {
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
       onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
-      <div style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 14, alignItems: "center" }}>
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="Report a road delay" tabIndex={-1} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTopLeftRadius: 12, borderTopRightRadius: 12, border: `1px solid ${COLORS.wire}`, borderBottom: "none", padding: 20, display: "flex", flexDirection: "column", gap: 14, alignItems: "center" }}>
         <div style={{ display: "flex", justifyContent: "space-between", width: "100%" }}>
           <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.amber, letterSpacing: 1 }}>⚠ REPORT A ROAD DELAY</span>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
+          <button onClick={onClose} aria-label="Close" style={{ background: "none", border: "none", color: COLORS.ghost, fontSize: 16, cursor: "pointer" }}>✕</button>
         </div>
         {reportedKey && !error ? (
           <div style={{ fontSize: 12, color: COLORS.green, padding: "12px 0" }}>✓ Reported — drivers will see it on their nav map.</div>
@@ -21019,8 +21140,21 @@ function AppInner() {
         <AgentApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
       ) : activeUser.role === ROLE.CLIENT ? (
         <ClientPortalApp state={state} dispatch={dispatchWithToast} user={{ ...activeUser, is_master_client: isMasterAdmin({ ...activeUser, role: ROLE.ADMIN, admin_level: "FLEET_OPS" }, state.companies) }} />
-      ) : (
+      ) : activeUser.role === ROLE.DRIVER ? (
         <DriverApp state={state} dispatch={dispatchWithToast} user={activeUser} notifClickHandlerRef={notifClickHandlerRef} />
+      ) : (
+        // Fail CLOSED on an unrecognized role — FOUND VIA /audit. This used to
+        // be the final `else`, which handed the full DriverApp to ANY role
+        // that wasn't matched above. A corrupt/unexpected role should see a
+        // safe dead-end and be able to log out, never silently inherit the
+        // driver app.
+        <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, padding: 24, textAlign: "center", background: COLORS.ink }}>
+          <div style={{ fontFamily: FONTS.head, fontSize: 18, fontWeight: 800, color: COLORS.chalk }}>Account not recognized</div>
+          <div style={{ fontSize: 12, color: COLORS.ghost, maxWidth: 320 }}>
+            Your account role isn't set up for this app. Please contact support so they can fix your account, then sign in again.
+          </div>
+          <Button title="LOG OUT" variant="amber" onClick={handleLogout8} />
+        </div>
       )}
 
       {sessionWarning && activeUser && (
