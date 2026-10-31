@@ -5551,7 +5551,15 @@ function appReducer(state, action) {
     case "TRIP/CONFIRM_AGENT_PICKUP": {
       const trip = state.trips.find(t => String(t.trip_id) === String(action.trip_id));
       if (!trip) return state;
-      const newCompleted = [...trip.completed_pickups, action.agent_id];
+      // String()-normalized dedup, matching the live handler's identical
+      // newCompleted (TRIP/CONFIRM_AGENT_PICKUP in handleSupabaseAction): a
+      // retried/double-tap confirmation (e.g. a flaky-connection double-tap)
+      // must not push a second entry for the same agent — strict-equality
+      // dedup would miss an id-shape mismatch (string vs number). The `|| []`
+      // guard also matches the live handler.
+      const newCompleted = (trip.completed_pickups || []).some(c => String(c) === String(action.agent_id))
+        ? (trip.completed_pickups || [])
+        : [...(trip.completed_pickups || []), action.agent_id];
       const allPickedUp = trip.agent_ids.every(id => newCompleted.some(c => String(c) === String(id)));
       const nextNavIdx = (trip.current_nav_idx || 0) + 1;
       const nowTs = now();
@@ -5631,7 +5639,16 @@ function appReducer(state, action) {
           label: action.dropoff_label || null,
         };
       }
-      const newCompletedDropoffs = [...new Set([...(trip.completed_dropoffs || []), action.agent_id])];
+      // String()-normalized dedup, matching the live handler's identical
+      // newCompletedDropoffs (and allDroppedOff's own check below) — a plain
+      // `Set` dedupes by strict `===`, so if action.agent_id's type ever
+      // differs from what's stored (string vs number — the id-shape
+      // inconsistency this app's sid()/String() hydration layer papers over)
+      // it would push a genuine duplicate instead of recognizing the agent as
+      // already confirmed. See handleSupabaseAction's twin for the full note.
+      const newCompletedDropoffs = (trip.completed_dropoffs || []).some(c => String(c) === String(action.agent_id))
+        ? (trip.completed_dropoffs || [])
+        : [...(trip.completed_dropoffs || []), action.agent_id];
       // Trip completes once every BOARDED agent is dropped — no-shows have
       // no drop-off, so including them (via raw agent_ids) would strand the
       // trip in IN_TRANSIT forever waiting on a drop-off that can't happen.
