@@ -4245,7 +4245,7 @@ const INITIAL_STATE = {
 };
 
 /* ---------- IN-MEMORY REDUCER (fallback when Supabase isn't configured / reachable) ---------- */
-function appReducer(state, action) {
+export function appReducer(state, action) {
   switch (action.type) {
 
     case "AUTH/LOGIN_BIOMETRIC":

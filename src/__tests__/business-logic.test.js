@@ -48,6 +48,7 @@ import {
   tallyHazardVotes,
   HAZARD_CLEAR_NET_DISMISS,
   resolveDriverCurrentTrip,
+  appReducer,
 } from "../TransitOS_web.jsx";
 import {
   computeGroupSuggestions,
@@ -2303,5 +2304,108 @@ describe("resolveDriverCurrentTrip", () => {
     const current = resolveDriverCurrentTrip([T("solo", TRIP_STATE.DRIVER_CONFIRMED, 5_000)]);
     expect(Array.isArray(current)).toBe(false);
     expect(current.trip_id).toBe("solo");
+  });
+});
+
+// Duplicate / replayed confirmation must be a true no-op — a flaky-connection
+// double-tap or an offline-queued action replaying after reconnect. Guards the
+// fixes from the full-app code-review: a re-tap must NOT re-stamp the already-
+// recorded pickup/drop-off time or GPS (corrupting the visiting order derived
+// from the timestamps), push a duplicate into completed_pickups/_dropoffs,
+// advance the nav pointer, or re-send the IN_TRANSIT admin notification.
+// Exercises the in-memory appReducer (the synchronous twin of the Supabase
+// handler, which carries the identical gates).
+describe("appReducer — duplicate confirmation is a no-op", () => {
+  const baseState = (tripOverrides = {}) => ({
+    trips: [{
+      trip_id: "t1", driver_id: "d1", state: TRIP_STATE.DRIVER_CONFIRMED,
+      agent_ids: ["a1", "a2"], completed_pickups: [], completed_dropoffs: [],
+      no_shows: [], pickup_timestamps: {}, pickup_locations: {},
+      dropoff_timestamps: {}, dropoff_locations: {}, current_nav_idx: 0,
+      ...tripOverrides,
+    }],
+    driver_status: [{ driver_id: "d1", state: "BUSY", current_trip_id: "t1" }],
+    notifications: [],
+  });
+  const pickup = (s, agent_id, confirmed_at, coord) =>
+    appReducer(s, { type: "TRIP/CONFIRM_AGENT_PICKUP", trip_id: "t1", agent_id, confirmed_at, driver_coord: coord });
+  const dropoff = (s, agent_id, confirmed_at, coord, label) =>
+    appReducer(s, { type: "TRIP/CONFIRM_AGENT_DROPOFF", trip_id: "t1", agent_id, confirmed_at, driver_coord: coord, dropoff_label: label });
+
+  it("a repeated partial pickup preserves the original time/GPS and doesn't advance the nav pointer", () => {
+    let s = pickup(baseState(), "a1", 1000, { lat: 1, lng: 2 });
+    let t = s.trips[0];
+    expect(t.completed_pickups).toEqual(["a1"]);
+    expect(t.pickup_timestamps.a1).toBe(1000);
+    expect(t.pickup_locations.a1).toEqual({ lat: 1, lng: 2 });
+    expect(t.current_nav_idx).toBe(1);
+    expect(t.state).toBe(TRIP_STATE.DRIVER_CONFIRMED); // not all picked up yet
+    expect(s.notifications.length).toBe(0);
+
+    // Re-tap a1 with DIFFERENT time + coord — must change nothing.
+    s = pickup(s, "a1", 9999, { lat: 8, lng: 9 });
+    t = s.trips[0];
+    expect(t.completed_pickups).toEqual(["a1"]);       // no duplicate
+    expect(t.pickup_timestamps.a1).toBe(1000);          // preserved, not 9999
+    expect(t.pickup_locations.a1).toEqual({ lat: 1, lng: 2 }); // preserved
+    expect(t.current_nav_idx).toBe(1);                  // not advanced
+    expect(s.notifications.length).toBe(0);
+  });
+
+  it("the final pickup notifies exactly once; a re-tap of it does not re-notify or re-stamp", () => {
+    let s = baseState({ completed_pickups: ["a1"], pickup_timestamps: { a1: 1000 }, pickup_locations: { a1: { lat: 1, lng: 2 } }, current_nav_idx: 1 });
+    s = pickup(s, "a2", 2000, { lat: 3, lng: 4 });
+    let t = s.trips[0];
+    expect(t.state).toBe(TRIP_STATE.IN_TRANSIT);
+    expect(t.completed_pickups).toEqual(["a1", "a2"]);
+    expect(s.notifications.length).toBe(1);
+    expect(s.notifications[0].type).toBe("IN_TRANSIT");
+
+    // Re-tap the final agent — stays IN_TRANSIT, no second notification.
+    s = pickup(s, "a2", 7777, { lat: 5, lng: 6 });
+    t = s.trips[0];
+    expect(t.state).toBe(TRIP_STATE.IN_TRANSIT);
+    expect(t.pickup_timestamps.a2).toBe(2000);          // preserved, not 7777
+    expect(s.notifications.length).toBe(1);             // no new notification
+  });
+
+  it("a repeated partial drop-off preserves the original time/GPS and doesn't complete early", () => {
+    let s = baseState({ state: TRIP_STATE.IN_TRANSIT, completed_pickups: ["a1", "a2"], pickup_timestamps: { a1: 1000, a2: 2000 } });
+    s = dropoff(s, "a1", 3000, { lat: 10, lng: 11 }, "Home A");
+    let t = s.trips[0];
+    expect(t.completed_dropoffs).toEqual(["a1"]);
+    expect(t.dropoff_timestamps.a1).toBe(3000);
+    expect(t.dropoff_locations.a1).toEqual({ lat: 10, lng: 11, label: "Home A" });
+    expect(t.state).toBe(TRIP_STATE.IN_TRANSIT);        // a2 still aboard
+
+    // Re-tap a1 with DIFFERENT values — must change nothing.
+    s = dropoff(s, "a1", 8888, { lat: 20, lng: 21 }, "WRONG");
+    t = s.trips[0];
+    expect(t.completed_dropoffs).toEqual(["a1"]);        // no duplicate
+    expect(t.dropoff_timestamps.a1).toBe(3000);          // preserved
+    expect(t.dropoff_locations.a1).toEqual({ lat: 10, lng: 11, label: "Home A" }); // preserved
+    expect(t.state).toBe(TRIP_STATE.IN_TRANSIT);
+  });
+
+  it("the final drop-off completes the trip; a replay after completion is a whole-state no-op", () => {
+    let s = baseState({ state: TRIP_STATE.IN_TRANSIT, completed_pickups: ["a1", "a2"], completed_dropoffs: ["a1"], dropoff_timestamps: { a1: 3000 }, dropoff_locations: { a1: { lat: 10, lng: 11, label: "Home A" } }, pickup_timestamps: { a1: 1000, a2: 2000 } });
+    s = dropoff(s, "a2", 4000, { lat: 12, lng: 13 }, "Home B");
+    let t = s.trips[0];
+    expect(t.state).toBe(TRIP_STATE.ARCHIVED_COMPLETED);
+    expect(t.completed_dropoffs).toEqual(["a1", "a2"]);
+    const completedAt = t.completed_at;
+    expect(completedAt).toBeTruthy();
+
+    // Replay a2 after completion — the already-completed guard returns the
+    // same state object untouched (no re-stamp of completed_at).
+    const before = s;
+    s = dropoff(s, "a2", 9999, { lat: 30, lng: 31 }, "AGAIN");
+    expect(s).toBe(before);
+    expect(s.trips[0].completed_at).toBe(completedAt);
+  });
+
+  it("a pickup on a trip with no agent_ids array does not throw (|| [] guard)", () => {
+    const s = baseState({ agent_ids: undefined });
+    expect(() => pickup(s, "a1", 1000, { lat: 1, lng: 2 })).not.toThrow();
   });
 });
