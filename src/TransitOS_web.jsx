@@ -5557,31 +5557,47 @@ function appReducer(state, action) {
       // must not push a second entry for the same agent — strict-equality
       // dedup would miss an id-shape mismatch (string vs number). The `|| []`
       // guard also matches the live handler.
-      const newCompleted = (trip.completed_pickups || []).some(c => String(c) === String(action.agent_id))
+      const alreadyConfirmedPickup = (trip.completed_pickups || []).some(c => String(c) === String(action.agent_id));
+      const newCompleted = alreadyConfirmedPickup
         ? (trip.completed_pickups || [])
         : [...(trip.completed_pickups || []), action.agent_id];
-      const allPickedUp = trip.agent_ids.every(id => newCompleted.some(c => String(c) === String(id)));
-      const nextNavIdx = (trip.current_nav_idx || 0) + 1;
+      // `|| []` guard matches the dropoff twin below and the live handler —
+      // a trip row hydrated without an agent_ids array would otherwise throw
+      // inside the reducer and blank the dispatch.
+      const allPickedUp = (trip.agent_ids || []).every(id => newCompleted.some(c => String(c) === String(id)));
       const nowTs = now();
       let newState = trip.state;
       let inTransitAt = trip.in_transit_at;
+      // A GENUINE transition only — `allPickedUp` alone stays true on a
+      // duplicate/replayed confirm of the last agent, so gating on it re-ran
+      // the side effects below on every re-tap. FOUND VIA /code-review: a
+      // re-tap must be a true no-op. justTransitioned (real state change) and
+      // alreadyConfirmedPickup (this agent was new) are the gates for that.
+      let justTransitioned = false;
       if (allPickedUp && trip.state !== TRIP_STATE.IN_TRANSIT) {
         try { assertTripTransition(trip.state, TRIP_STATE.IN_TRANSIT); }
         catch (e) { return { ...state, _error: e.message }; }
         newState = TRIP_STATE.IN_TRANSIT;
         inTransitAt = nowTs;
+        justTransitioned = true;
       }
-      // Per-agent pickup timestamp (epoch ms) AND driver location at
-      // the moment of confirming this specific pickup — both keyed by
-      // agent id. Supabase handler writes both; local reducer was only
-      // writing pickup_locations, leaving pickup_timestamps blank in
-      // demo mode (CSV column always empty). Fixed to match Supabase.
-      // Prefer action.confirmed_at (the real moment the driver tapped
-      // confirm, captured client-side) over Date.now() (whenever this
-      // dispatch actually executes) — matters once an offline-queued
-      // action can replay later than when it was originally confirmed.
-      const newPickupTimestamps = { ...(trip.pickup_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
-      const newPickupLocations = action.driver_coord
+      // Advance the nav pointer only when a NEW agent was confirmed — a
+      // deduped re-tap must not skip a waypoint.
+      const nextNavIdx = alreadyConfirmedPickup ? (trip.current_nav_idx || 0) : (trip.current_nav_idx || 0) + 1;
+      // Per-agent pickup timestamp (epoch ms) AND driver location at the
+      // moment of confirming this specific pickup — both keyed by agent id,
+      // matching the Supabase handler. Written ONLY for a new confirmation:
+      // a duplicate/replay preserves the originally recorded values instead
+      // of re-stamping them with the later tap's confirmed_at/driver_coord,
+      // which would corrupt the actual visiting order derived from
+      // pickup_timestamps (actualPickupOrderFor / the CSV) — the very data
+      // the confirmed_at capture exists to protect. Prefer action.confirmed_at
+      // (the real moment the driver tapped confirm) over Date.now() (whenever
+      // this dispatch executes) for an offline-queued action that replays late.
+      const newPickupTimestamps = alreadyConfirmedPickup
+        ? (trip.pickup_timestamps || {})
+        : { ...(trip.pickup_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
+      const newPickupLocations = (!alreadyConfirmedPickup && action.driver_coord)
         ? { ...(trip.pickup_locations || {}), [action.agent_id]: { lat: action.driver_coord.lat, lng: action.driver_coord.lng } }
         : (trip.pickup_locations || {});
       const newTrips = state.trips.map(t =>
@@ -5589,7 +5605,9 @@ function appReducer(state, action) {
           ? { ...t, state: newState, in_transit_at: inTransitAt, completed_pickups: newCompleted, current_nav_idx: nextNavIdx, pickup_timestamps: newPickupTimestamps, pickup_locations: newPickupLocations }
           : t
       );
-      const notifs = allPickedUp ? [{
+      // Notify only on the real transition — not on every re-tap while
+      // allPickedUp is already true (would spam admins on each replay).
+      const notifs = justTransitioned ? [{
         id: mkId(), type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
         message: `Trip ${action.trip_id}: all passengers picked up. Now in transit.`,
         trip_id: action.trip_id, ts: nowTs, read: false,
@@ -5628,25 +5646,31 @@ function appReducer(state, action) {
       if (isNoShowAgent(trip, action.agent_id)) {
         return { ...state, _error: "This agent was marked a no-show — no drop-off to confirm." };
       }
+      // String()-normalized already-dropped check, matching the live
+      // handler's newCompletedDropoffs (and allDroppedOff's own check below)
+      // — a plain `Set` dedupes by strict `===`, so an id-shape mismatch
+      // (string vs number, which this app's sid()/String() hydration layer
+      // papers over) would push a genuine duplicate instead of recognizing
+      // the agent as already dropped. Also gates the per-agent timestamp/
+      // location writes below so a duplicate/replayed drop-off confirmation
+      // preserves the originally recorded values instead of re-stamping them
+      // with the later tap's confirmed_at/driver_coord — the same visiting-
+      // order corruption guarded on CONFIRM_AGENT_PICKUP.
+      const alreadyDropped = (trip.completed_dropoffs || []).some(c => String(c) === String(action.agent_id));
       // Prefer action.confirmed_at over Date.now() — see the identical
       // fix/reasoning on CONFIRM_AGENT_PICKUP above.
-      const newDropoffTimestamps = { ...(trip.dropoff_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
+      const newDropoffTimestamps = alreadyDropped
+        ? (trip.dropoff_timestamps || {})
+        : { ...(trip.dropoff_timestamps || {}), [action.agent_id]: action.confirmed_at ?? Date.now() };
       const newDropoffLocations = { ...(trip.dropoff_locations || {}) };
-      if (action.driver_coord) {
+      if (!alreadyDropped && action.driver_coord) {
         newDropoffLocations[action.agent_id] = {
           lat: action.driver_coord.lat,
           lng: action.driver_coord.lng,
           label: action.dropoff_label || null,
         };
       }
-      // String()-normalized dedup, matching the live handler's identical
-      // newCompletedDropoffs (and allDroppedOff's own check below) — a plain
-      // `Set` dedupes by strict `===`, so if action.agent_id's type ever
-      // differs from what's stored (string vs number — the id-shape
-      // inconsistency this app's sid()/String() hydration layer papers over)
-      // it would push a genuine duplicate instead of recognizing the agent as
-      // already confirmed. See handleSupabaseAction's twin for the full note.
-      const newCompletedDropoffs = (trip.completed_dropoffs || []).some(c => String(c) === String(action.agent_id))
+      const newCompletedDropoffs = alreadyDropped
         ? (trip.completed_dropoffs || [])
         : [...(trip.completed_dropoffs || []), action.agent_id];
       // Trip completes once every BOARDED agent is dropped — no-shows have
@@ -12085,16 +12109,24 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // trip, and a retried/duplicate confirmation (e.g. a flaky-connection
       // double-tap) must not push a second entry into completedpickups.
       if (!tripAgentIds.some(id => String(id) === String(action.agent_id))) throw new Error("Agent is not on this trip");
-      const newCompleted = (tripRow.completedpickups || []).some(c => String(c) === String(action.agent_id))
+      const alreadyConfirmedPickup = (tripRow.completedpickups || []).some(c => String(c) === String(action.agent_id));
+      const newCompleted = alreadyConfirmedPickup
         ? (tripRow.completedpickups || [])
         : [...(tripRow.completedpickups || []), action.agent_id];
       const allPickedUp = tripAgentIds.every(id => newCompleted.some(c => String(c) === String(id)));
       const nowTs = nowEpoch();
       let newState = tripRow.status, inTransitAt = tripRow.intransitat;
+      // A GENUINE transition only — `allPickedUp` stays true on a duplicate/
+      // replayed confirm of the last agent, so the per-agent timestamp/
+      // location re-stamp and the admin notification below must gate on an
+      // actual new confirmation/transition, not on allPickedUp. FOUND VIA
+      // /code-review (matches the in-memory reducer's twin).
+      let justTransitioned = false;
       if (allPickedUp && tripRow.status !== TRIP_STATE.IN_TRANSIT) {
         assertTripTransition(tripRow.status, TRIP_STATE.IN_TRANSIT);
         newState = TRIP_STATE.IN_TRANSIT;
         inTransitAt = nowTs;
+        justTransitioned = true;
       }
       // Real per-agent pickup time — this specific agent, this specific
       // moment, distinct from intransitat (which only marks when the
@@ -12105,13 +12137,19 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // replay minutes later once signal returns, and nowTs would stamp
       // that later replay time instead of the real moment of pickup,
       // corrupting actualPickupOrderFor's derived "real visiting order."
+      // Written ONLY for a new confirmation: a duplicate/replay preserves the
+      // originally recorded timestamp/location rather than overwriting it with
+      // the later tap's values (same corruption the confirmed_at capture
+      // exists to prevent) — and also skips the reverseGeocode network call.
       const confirmTs = action.confirmed_at ?? nowTs;
-      const newPickupTimestamps = { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: confirmTs };
+      const newPickupTimestamps = alreadyConfirmedPickup
+        ? (tripRow.pickuptimestamps || {})
+        : { ...(tripRow.pickuptimestamps || {}), [action.agent_id]: confirmTs };
       // Driver's GPS at the moment of confirming THIS pickup — saved as
       // lat/lng AND reverse-geocoded to a readable address label so the
       // CSV shows a real street address, not just coordinates.
       let newPickupLocations = tripRow.pickuplocations || {};
-      if (action.driver_coord) {
+      if (!alreadyConfirmedPickup && action.driver_coord) {
         const pickupLabel = await reverseGeocode(action.driver_coord.lat, action.driver_coord.lng);
         newPickupLocations = {
           ...newPickupLocations,
@@ -12141,7 +12179,10 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
         tripRow.updatedat
       ).select("id"));
       if (!pickupRes.data || pickupRes.data.length === 0) throw new Error("This trip was just updated by another confirmation — please try again.");
-      if (allPickedUp) {
+      if (justTransitioned) {
+        // Gate on the real transition, not allPickedUp — a duplicate/replayed
+        // confirm of the last agent keeps allPickedUp true and would re-send
+        // this IN_TRANSIT notification to every admin on each tap/replay.
         // bestEffort — the write above is already guarded/verified.
         await bestEffort("CONFIRM_AGENT_PICKUP in-transit notify", () => insertNotification({
           type: "IN_TRANSIT", for_roles: [ROLE.ADMIN],
@@ -12209,7 +12250,14 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // inconsistency the whole app's sid()/String() hydration layer
       // exists to paper over) it would push a genuine duplicate entry
       // instead of recognizing the agent as already confirmed.
-      const newCompletedDropoffs = (tripRow.completeddropoffs || []).some(c => String(c) === String(action.agent_id))
+      // alreadyDropped also gates the per-agent timestamp/location writes (and
+      // the reverseGeocode) below, so a duplicate/replayed drop-off for an
+      // agent already in completeddropoffs (but on a trip not yet complete)
+      // preserves the originally recorded values instead of re-stamping them
+      // with the later tap's confirmed_at/driver_coord — the same visiting-
+      // order corruption guarded on CONFIRM_AGENT_PICKUP. FOUND VIA /code-review.
+      const alreadyDropped = (tripRow.completeddropoffs || []).some(c => String(c) === String(action.agent_id));
+      const newCompletedDropoffs = alreadyDropped
         ? (tripRow.completeddropoffs || [])
         : [...(tripRow.completeddropoffs || []), action.agent_id];
       // Complete once every BOARDED agent is dropped — excluding no-shows,
@@ -12221,7 +12269,9 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // stranding the un-picked-up agents. See boardedAgentIds / the demo twin.
       const allHandledDrop = tripAgentIds.every(id => (tripRow.completedpickups || []).some(c => String(c) === String(id)));
       const allDroppedOff = allHandledDrop && boardedAgentIds(tripRow).every(id => newCompletedDropoffs.some(c => String(c) === String(id)));
-      const newDropoffTimestamps = { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
+      const newDropoffTimestamps = alreadyDropped
+        ? (tripRow.dropofftimestamps || {})
+        : { ...(tripRow.dropofftimestamps || {}), [action.agent_id]: confirmTs };
       // reverseGeocode (this agent's own dropoff address) and, only when
       // this confirmation completes the trip, computeActualRouteKm (the
       // trip's own recorded GPS trail) are independent — run them
@@ -12229,9 +12279,11 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
       // driver-facing "confirm dropoff" button's critical path.
       // FOUND VIA /code-review (raised on both review passes — the
       // first fix only parallelized the equivalent pair in the sibling
-      // TRIP/COMPLETE handler, not here).
+      // TRIP/COMPLETE handler, not here). The reverseGeocode is skipped for
+      // an already-dropped agent (a duplicate/replay) — its label write is
+      // gated the same way below.
       const [dropoffLabel, actualRouteKmDrop] = await Promise.all([
-        action.driver_coord
+        (!alreadyDropped && action.driver_coord)
           ? (action.dropoff_label ? Promise.resolve(action.dropoff_label) : reverseGeocode(action.driver_coord.lat, action.driver_coord.lng))
           : Promise.resolve(null),
         allDroppedOff
@@ -12239,7 +12291,7 @@ async function handleSupabaseAction(action, activeUserRef, refetch, extraRefetch
           : Promise.resolve(null),
       ]);
       const newDropoffLocations = { ...(tripRow.dropofflocations || {}) };
-      if (action.driver_coord) {
+      if (!alreadyDropped && action.driver_coord) {
         newDropoffLocations[action.agent_id] = {
           lat: action.driver_coord.lat,
           lng: action.driver_coord.lng,
