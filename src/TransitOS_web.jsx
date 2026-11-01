@@ -14776,7 +14776,11 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
   // (mounted app-wide in AgentApp) owns firing the actual notification, so
   // this call only drives the on-screen "your shuttle is X mins away" text.
   const { driverId: trackingDriverId, referencePoint: trackingReferencePoint } = agentTrackingRefPoint(trip, user.id, state.users);
-  const shuttleStatus = useAgentShuttleStatus(trackingDriverId, trackingReferencePoint, user?.id, false);
+  // seedFromServer=true: this is the on-screen display instance, so on cold
+  // start (driver app already closed, no live broadcast) seed the last-known
+  // pickup ETA from the agent-trip-eta edge function. AgentEtaNotifier leaves
+  // it off — the check-pickup-eta cron already covers app-closed push alerts.
+  const shuttleStatus = useAgentShuttleStatus(trackingDriverId, trackingReferencePoint, user?.id, false, trip?.trip_id, true);
   if (!trip) return <div className="pad"><span style={{ color: COLORS.ghost }}>Trip not found.</span></div>;
 
   const driverUser = state.users.find(u => String(u.id) === String(trip.driver_id));
@@ -14918,9 +14922,10 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
             // flips `tooStale` and we DROP the concrete number (an hour-old
             // "3 mins away" is worse than none), keeping only the paused note.
             // (Agents can't read driver_positions directly — RLS scopes it to
-            // admins and the driver — so with no broadcast at all this session
-            // there's no last-known point; that cold start shows the waiting
-            // message above.)
+            // admins and the driver — so on cold start the hook instead seeds
+            // the last-known pickup ETA once from the agent-trip-eta edge
+            // function; only if THAT also returns nothing does the waiting
+            // message above remain.)
             const showLastKnown = shuttleStatus.stale && !shuttleStatus.tooStale;
             return (
               <div style={{ background: shuttleStatus.stale ? "rgba(255,255,255,.04)" : "rgba(29,185,84,.08)", border: `1px solid ${shuttleStatus.stale ? "rgba(255,255,255,.12)" : "rgba(29,185,84,.3)"}`, borderRadius: 4, padding: 12 }}>
@@ -16030,7 +16035,7 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
 // summary text — otherwise having both mounted at once (agent viewing the
 // detail screen while the app-wide tracker is also running) would fire the
 // same threshold notification twice.
-function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fireEtaPush = true) {
+function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fireEtaPush = true, tripId = null, seedFromServer = false) {
   const [summary, setSummary] = useState(null); // { distanceKm, etaMin, updatedAt } — never lat/lng
   const [stale, setStale] = useState(false);
   const [tooStale, setTooStale] = useState(false); // last fix too old for the ETA to mean anything
@@ -16059,6 +16064,7 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
     };
     if (!supabase || !driverId) { reset(); return; }
     reset();
+    let cancelled = false; // guards the async seed below against a late apply after teardown
     // Reset push flags when driver/reference changes (new trip context).
     etaPushFiredRef.current = { fiveMin: false, arriving: false };
     const channel = supabase.channel(driverPositionChannelName(driverId));
@@ -16110,20 +16116,75 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
     const staleCheck = setInterval(() => {
       if (!lastUpdateRef.current) return;
       const age = Date.now() - lastUpdateRef.current;
-      const wantStale = age > BROADCAST_INTERVAL_MS * 3;
-      const wantTooStale = age > MAX_RETAINED_ETA_MS;
-      if (wantStale !== staleAppliedRef.current.stale) { staleAppliedRef.current.stale = wantStale; setStale(wantStale); }
-      if (wantTooStale !== staleAppliedRef.current.tooStale) { staleAppliedRef.current.tooStale = wantTooStale; setTooStale(wantTooStale); }
+      // ESCALATE ONLY (false→stale→tooStale). Un-staling back to "live"
+      // happens exclusively in the broadcast handler on a real incoming fix,
+      // never here from age alone — otherwise a one-shot seeded last-known
+      // value (no live stream behind it) with a recent timestamp would be
+      // flipped to a green "live" estimate that then never updates. The
+      // !applied guard also means each transition fires setState once, not
+      // every tick forever once a driver is offline.
+      if (age > BROADCAST_INTERVAL_MS * 3 && !staleAppliedRef.current.stale) { staleAppliedRef.current.stale = true; setStale(true); }
+      if (age > MAX_RETAINED_ETA_MS && !staleAppliedRef.current.tooStale) { staleAppliedRef.current.tooStale = true; setTooStale(true); }
     }, BROADCAST_INTERVAL_MS);
 
-    return () => { supabase.removeChannel(channel); clearInterval(staleCheck); };
+    // Cold-start seed: if the driver's app was already closed before this
+    // agent opened their trip, no broadcast will ever arrive, so the hook
+    // would show nothing. Agents can't read driver_positions (RLS), so a
+    // service-role edge function resolves THIS agent's pickup ETA from the
+    // driver's last-known fix and returns only derived values (never coords).
+    // Fired once, after TWO broadcast intervals, and ONLY if no live broadcast
+    // has shown up by then — the extra interval covers WebSocket subscribe
+    // latency + broadcast phase, so a live driver (the common case) almost
+    // always sets lastUpdateRef first and never triggers the call. On a slow
+    // connection where the first broadcast takes >8s, the seed may briefly
+    // show the (correct) last-known value as paused until that broadcast lands
+    // and flips it to live — honest at every moment, since no live data is
+    // actually flowing until then. A resumed broadcast always wins (newer ts).
+    let seedTimer = null;
+    if (seedFromServer && tripId != null) {
+      seedTimer = setTimeout(async () => {
+        if (cancelled || lastUpdateRef.current) return;
+        // Deliberately a RAW fetch, NOT supabase.functions.invoke: invoke
+        // rides the global fetch override whose 401 self-heal clears the
+        // session token and logs the user out. This is a best-effort seed on
+        // a hot path (every trip open), so a 401/any failure here must NEVER
+        // touch the session — attach the token ourselves and swallow all.
+        const tok = _cachedSessionToken;
+        if (!isJwtUsable(tok)) return; // no usable token → the call would 401 anyway
+        try {
+          const res = await fetch(`${SUPABASE_URL}/functions/v1/agent-trip-eta`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${tok}` },
+            body: JSON.stringify({ trip_id: tripId }),
+            signal: AbortSignal.timeout(15000), // don't leak a pending request if the function hangs/cold-starts
+          });
+          if (cancelled || !res.ok || lastUpdateRef.current) return;
+          const data = await res.json().catch(() => null);
+          if (cancelled || lastUpdateRef.current || !data?.available) return;
+          const upMs = typeof data.updatedAt === "number" ? data.updatedAt : Date.parse(data.updatedAt);
+          if (!upMs) return;
+          lastUpdateRef.current = upMs;
+          // A server seed is last-known by definition — never "live": mark it
+          // stale, and tooStale per the server or the local age cap, so it
+          // flows through the exact same display path as a stale broadcast.
+          // The escalate-only interval above will NOT un-stale it.
+          const tooOld = !!data.tooStale || (Date.now() - upMs > MAX_RETAINED_ETA_MS);
+          setSummary({ distanceKm: data.distanceKm ?? null, etaMin: data.etaMin ?? null, updatedAt: upMs });
+          staleAppliedRef.current = { stale: true, tooStale: tooOld };
+          setStale(true); setTooStale(tooOld);
+        } catch { /* best-effort seed — leave the waiting message on failure */ }
+      }, BROADCAST_INTERVAL_MS * 2);
+    }
+
+    return () => { cancelled = true; if (seedTimer) clearTimeout(seedTimer); supabase.removeChannel(channel); clearInterval(staleCheck); };
     // Deps: driverId + referencePoint (keyed by lat/lng, NOT the object — the
     // parent recomputes referencePoint inline every render, so depending on its
     // identity would tear down and re-subscribe the channel every render) +
     // agentUserId and fireEtaPush, both read in the broadcast handler's
-    // ETA-push path, so a stale closure would notify the wrong agent. Keep all
-    // four; don't "simplify" back to just driverId + lat/lng.
-  }, [driverId, referencePoint?.lat, referencePoint?.lng, agentUserId, fireEtaPush]);
+    // ETA-push path, so a stale closure would notify the wrong agent; and
+    // tripId + seedFromServer, read by the cold-start seed. Don't "simplify"
+    // back to just driverId + lat/lng.
+  }, [driverId, referencePoint?.lat, referencePoint?.lng, agentUserId, fireEtaPush, tripId, seedFromServer]);
 
   return { summary, stale, tooStale };
 }

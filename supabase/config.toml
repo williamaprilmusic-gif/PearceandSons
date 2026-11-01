@@ -9,3 +9,13 @@ entrypoint = "./functions/hello-world/index.ts"
 # Specifies static files to be bundled with the function. Supports glob patterns.
 # For example, if you want to serve static HTML pages in your function:
 # static_files = [ "./functions/hello-world/*.html" ]
+
+# agent-trip-eta authenticates the caller's app session JWT itself (signed
+# with PROJECT_JWT_SECRETS, not the Supabase JWT secret), so the gateway must
+# NOT verify the JWT — otherwise it 401s every call before the function runs.
+# Same reason every other app-JWT function here (session-login, webauthn, …)
+# is deployed with verify_jwt disabled.
+[functions.agent-trip-eta]
+enabled = true
+verify_jwt = false
+entrypoint = "./functions/agent-trip-eta/index.ts"
