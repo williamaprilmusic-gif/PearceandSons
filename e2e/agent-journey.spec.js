@@ -23,18 +23,41 @@ test.describe("agent (authenticated)", () => {
     expect(errors, errors.join("\n")).toEqual([]);
   });
 
-  // ── TEMPLATE: offline-ETA UI (fill in once the test agent has a seeded
-  // active trip). The shipped behaviour to assert:
-  //   - while the driver is broadcasting: "Shuttle is about N mins away"
-  //   - when the broadcast goes stale: past-tense "Shuttle was about N mins
-  //     away" + "live tracking paused"
-  //   - after MAX_RETAINED_ETA_MS: the number is dropped entirely.
-  //
-  // test("offline-ETA retains last-known then pauses", async ({ page }) => {
-  //   await page.goto("/");
-  //   // open the agent's active trip detail (selector TBD once seeded)…
-  //   await expect(page.getByText(/shuttle/i)).toBeVisible();
-  //   // simulate / wait for the broadcast to go stale, then:
-  //   await expect(page.getByText(/live tracking paused/i)).toBeVisible();
-  // });
+  // Offline-ETA cold start — the whole point of the driver-offline-ETA
+  // feature. The seeded test agent (id 9001) has a DRIVER_CONFIRMED trip
+  // (950001) to the seeded test driver (9002), who has a recent
+  // driver_positions fix but is NOT broadcasting live (their app is
+  // "closed" — exactly the cold-start case). So no realtime position ever
+  // arrives this session; after ~2 broadcast intervals the hook seeds the
+  // last-known ETA from the agent-trip-eta edge function and renders it in
+  // the past tense with "live tracking paused" — never any coordinate.
+  // Requires the seed rows (see project-transitos-e2e-harness memory); if
+  // they're gone this will time out on the ETA text rather than pass hollow.
+  test("offline-ETA shows last-known then pauses on the active trip", async ({ page }) => {
+    test.setTimeout(60_000);
+    await page.goto("/");
+
+    // Home screen once session + data have loaded.
+    await expect(page.getByText(/GOOD DAY, AGENT/i)).toBeVisible();
+
+    // The DRIVER_CONFIRMED trip surfaces as the tappable ACTIVE TRIP card;
+    // tapping it deep-links to that trip's detail view.
+    const activeCard = page.getByText(/ACTIVE TRIP/i);
+    await expect(activeCard).toBeVisible({ timeout: 15_000 });
+    await activeCard.click();
+
+    // Trip detail: the assigned driver card hosts the (text-only) ETA.
+    await expect(page.getByText(/Assigned Driver/i)).toBeVisible();
+
+    // Cold-start seed fires ~8s in (no live broadcast), marking the value
+    // stale → past-tense number + the paused note. "is" is accepted too in
+    // case a live broadcast ever races in first — either proves the pipeline.
+    await expect(page.getByText(/shuttle (is|was) about \d+ min/i)).toBeVisible({ timeout: 25_000 });
+    await expect(page.getByText(/live tracking paused/i)).toBeVisible();
+
+    // The feature's hard invariant: an agent screen must NEVER show a raw
+    // coordinate. Assert no lat/lng-looking decimal pair leaked into the DOM.
+    const body = await page.locator("body").innerText();
+    expect(body, "a coordinate-looking pair rendered on the agent screen").not.toMatch(/-?\d{1,2}\.\d{4,}\s*,\s*-?\d{1,3}\.\d{4,}/);
+  });
 });
