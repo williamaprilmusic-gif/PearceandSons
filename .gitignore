@@ -30,3 +30,9 @@ dist-ssr
 # Supabase CLI local state (project-ref, pooler URL, version stamps) — infra
 # identifiers that belong to the local link, not the repo
 supabase/.temp/
+
+# E2E (Playwright): test credentials + generated auth states + reports
+.env.e2e
+e2e/.auth/
+playwright-report/
+test-results/
