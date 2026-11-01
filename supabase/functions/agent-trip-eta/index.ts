@@ -97,7 +97,11 @@ Deno.serve(async (req) => {
   try {
     const claims = await verifyAppJwt(token);
     agentId = String(claims.app_user_id);
-  } catch {
+  } catch (e) {
+    // Log the reason (never the token): a PROJECT_JWT_SECRETS rotation mismatch,
+    // or a missing secret, would otherwise 401 every caller with no server
+    // signal as to why the whole feature went dark.
+    console.warn("agent-trip-eta auth failed:", e instanceof Error ? e.message : String(e));
     return json({ error: "Unauthorized" }, 401);
   }
 
@@ -143,15 +147,27 @@ Deno.serve(async (req) => {
     }
     if (refLat == null || refLng == null) return json({ available: false, reason: "no_pickup_point" });
 
-    const { data: pos } = await supabase.from("driver_positions")
+    const { data: pos, error: posErr } = await supabase.from("driver_positions")
       .select("lat, lng, speed_kmh, updatedat").eq("driverid", trip.driverid).maybeSingle();
+    if (posErr) throw posErr; // a real DB fault must 500 (+log) via the catch, not masquerade as "no_position"
     if (!pos || pos.lat == null || pos.lng == null) return json({ available: false, reason: "no_position" });
 
     const updatedAtMs = Date.parse(pos.updatedat);
-    if (!updatedAtMs) return json({ available: false, reason: "no_position" });
+    // Reject an unparseable (NaN) timestamp, and a future one (clock skew / bad
+    // write): a future fix makes `Date.now() - updatedAtMs` negative, so it
+    // could never read as stale and would yield a bogus "never ages" ETA.
+    if (!Number.isFinite(updatedAtMs)) {
+      console.warn("agent-trip-eta: unparseable driver_positions.updatedat:", pos.updatedat);
+      return json({ available: false, reason: "no_position" });
+    }
+    const ageMs = Date.now() - updatedAtMs;
+    if (ageMs < -60_000) {
+      console.warn("agent-trip-eta: future driver_positions.updatedat (clock skew?):", pos.updatedat);
+      return json({ available: false, reason: "no_position" });
+    }
     // Past the retention horizon the frozen ETA is meaningless — tell the
     // client so it shows "live tracking paused" without a stale number.
-    if (Date.now() - updatedAtMs > MAX_RETAINED_ETA_MS) {
+    if (ageMs > MAX_RETAINED_ETA_MS) {
       return json({ available: true, tooStale: true, updatedAt: updatedAtMs });
     }
 

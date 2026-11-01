@@ -15396,6 +15396,59 @@ export function driverPositionChannelName(driverId) {
   return `driver-pos-${driverId}`;
 }
 
+// Ref-counted driver-position subscription, keyed by topic.
+// @supabase/realtime-js returns the SAME channel object for a topic that's
+// already registered (RealtimeClient.channel dedupes by topic). Two hooks
+// watch the same driver at once — the app-wide AgentEtaNotifierForTrip and an
+// open AgentTripDetail — so if each called supabase.removeChannel() on its own
+// teardown, the first to unmount would rip the shared channel out from under
+// the other: ETA pushes go silent, or the detail view keeps rendering a frozen
+// "last known" ETA while the driver is actually broadcasting live. Instead we
+// keep ONE channel per topic, fan each broadcast out to every registered
+// listener, and only tear the channel down when the last listener leaves.
+const _driverPosSubs = new Map(); // topic -> { channel, listeners: Set<(payload)=>void>, teardownTimer }
+// supabase.removeChannel() is async (it awaits a LEAVE round-trip), and
+// realtime-js keeps returning the same channel object for the topic until that
+// completes. So a synchronous teardown-on-last-listener followed by an
+// immediate re-subscribe — a StrictMode double-mount, or a same-driver
+// trip/reference switch when this hook is the only listener — would hand the
+// remount a half-unsubscribed channel that never re-establishes. Defer the
+// teardown by a short grace window instead: a listener that arrives within it
+// simply reclaims the still-live channel (which also avoids a double
+// subscribe()); only a genuinely idle topic is actually torn down.
+const _DRIVER_POS_TEARDOWN_GRACE_MS = 3000;
+function subscribeDriverPosition(driverId, onPos) {
+  const topic = driverPositionChannelName(driverId);
+  let entry = _driverPosSubs.get(topic);
+  if (entry) {
+    if (entry.teardownTimer) { clearTimeout(entry.teardownTimer); entry.teardownTimer = null; } // reclaim before teardown fires
+  } else {
+    const channel = supabase.channel(topic);
+    entry = { channel, listeners: new Set(), teardownTimer: null };
+    const e = entry;
+    channel.on("broadcast", { event: "pos" }, ({ payload }) => {
+      e.listeners.forEach((fn) => {
+        try { fn(payload); }
+        catch (err) { console.warn("[driver-pos] listener error:", err instanceof Error ? err.message : String(err)); }
+      });
+    });
+    channel.subscribe(); // subscribed once, by the first consumer
+    _driverPosSubs.set(topic, entry);
+  }
+  entry.listeners.add(onPos);
+  const e = entry;
+  return () => {
+    e.listeners.delete(onPos);
+    if (e.listeners.size > 0 || e.teardownTimer) return;
+    e.teardownTimer = setTimeout(() => {
+      e.teardownTimer = null;
+      if (e.listeners.size > 0) return;            // reclaimed during the grace window
+      _driverPosSubs.delete(topic);                 // drop first, so any later subscribe builds a fresh entry
+      supabase.removeChannel(e.channel);
+    }, _DRIVER_POS_TEARDOWN_GRACE_MS);
+  };
+}
+
 // Two very different cadences on purpose:
 //   - BROADCAST_INTERVAL_MS: fast, cheap — a WebSocket message with a
 //     handful of numbers, no HTTP round-trip, no RLS check, no database
@@ -16067,8 +16120,7 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
     let cancelled = false; // guards the async seed below against a late apply after teardown
     // Reset push flags when driver/reference changes (new trip context).
     etaPushFiredRef.current = { fiveMin: false, arriving: false };
-    const channel = supabase.channel(driverPositionChannelName(driverId));
-    channel.on("broadcast", { event: "pos" }, ({ payload }) => {
+    const unsubscribePos = subscribeDriverPosition(driverId, (payload) => {
       const { la, lo, s } = payload; // la/lo used only for this immediate calculation, never stored
       let distanceKm = null, etaMin = null;
       if (referencePoint) {
@@ -16105,7 +16157,6 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
       setStale(false);
       setTooStale(false);
     });
-    channel.subscribe();
 
     // If no broadcast has arrived in a while (driver's tab closed,
     // connection dropped), mark stale — the UI then shows the last-known ETA
@@ -16141,6 +16192,7 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
     // and flips it to live — honest at every moment, since no live data is
     // actually flowing until then. A resumed broadcast always wins (newer ts).
     let seedTimer = null;
+    let seedAbort = null;
     if (seedFromServer && tripId != null) {
       seedTimer = setTimeout(async () => {
         if (cancelled || lastUpdateRef.current) return;
@@ -16150,19 +16202,33 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
         // a hot path (every trip open), so a 401/any failure here must NEVER
         // touch the session — attach the token ourselves and swallow all.
         const tok = _cachedSessionToken;
-        if (!isJwtUsable(tok)) return; // no usable token → the call would 401 anyway
+        if (!isJwtUsable(tok)) { console.warn("[agent-trip-eta seed] skipped — no usable session token"); return; }
+        // Own AbortController rather than AbortSignal.timeout: the latter isn't
+        // on older Safari (<16.4), where it throws synchronously inside the try
+        // and the seed silently never works; and this lets the effect cleanup
+        // abort an in-flight seed on unmount instead of leaking the request.
+        seedAbort = new AbortController();
+        const seedTimeout = setTimeout(() => seedAbort.abort(), 15000);
         try {
           const res = await fetch(`${SUPABASE_URL}/functions/v1/agent-trip-eta`, {
             method: "POST",
             headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY, "Authorization": `Bearer ${tok}` },
             body: JSON.stringify({ trip_id: tripId }),
-            signal: AbortSignal.timeout(15000), // don't leak a pending request if the function hangs/cold-starts
+            signal: seedAbort.signal,
           });
-          if (cancelled || !res.ok || lastUpdateRef.current) return;
+          if (cancelled || lastUpdateRef.current) return;
+          // A non-OK status is a real failure (function down / cold-start 500 /
+          // auth), distinct from a legitimate {available:false} — log it so a
+          // function stuck 500ing or a dead token isn't invisible to everyone.
+          if (!res.ok) { console.warn("[agent-trip-eta seed] HTTP", res.status); return; }
           const data = await res.json().catch(() => null);
           if (cancelled || lastUpdateRef.current || !data?.available) return;
           const upMs = typeof data.updatedAt === "number" ? data.updatedAt : Date.parse(data.updatedAt);
-          if (!upMs) return;
+          // Reject an unparseable (NaN), non-positive, or future timestamp: 0
+          // (epoch) is falsy and would read downstream as "no fix yet" (the
+          // staleCheck's `if (!lastUpdateRef.current)` short-circuits on it),
+          // and a future fix would read as perpetually fresh and never escalate.
+          if (!Number.isFinite(upMs) || upMs <= 0 || upMs > Date.now() + 60_000) { console.warn("[agent-trip-eta seed] bad updatedAt:", data.updatedAt); return; }
           lastUpdateRef.current = upMs;
           // A server seed is last-known by definition — never "live": mark it
           // stale, and tooStale per the server or the local age cap, so it
@@ -16172,11 +16238,17 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
           setSummary({ distanceKm: data.distanceKm ?? null, etaMin: data.etaMin ?? null, updatedAt: upMs });
           staleAppliedRef.current = { stale: true, tooStale: tooOld };
           setStale(true); setTooStale(tooOld);
-        } catch { /* best-effort seed — leave the waiting message on failure */ }
+        } catch (e) {
+          // best-effort seed — leave the waiting message on failure, but leave a
+          // trail (AbortError on timeout/unmount, TypeError on old Safari, etc.).
+          if (!cancelled) console.warn("[agent-trip-eta seed] failed:", e instanceof Error ? e.name : String(e));
+        } finally {
+          clearTimeout(seedTimeout);
+        }
       }, BROADCAST_INTERVAL_MS * 2);
     }
 
-    return () => { cancelled = true; if (seedTimer) clearTimeout(seedTimer); supabase.removeChannel(channel); clearInterval(staleCheck); };
+    return () => { cancelled = true; if (seedTimer) clearTimeout(seedTimer); if (seedAbort) seedAbort.abort(); unsubscribePos(); clearInterval(staleCheck); };
     // Deps: driverId + referencePoint (keyed by lat/lng, NOT the object — the
     // parent recomputes referencePoint inline every render, so depending on its
     // identity would tear down and re-subscribe the channel every render) +
