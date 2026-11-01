@@ -7475,11 +7475,23 @@ function AdminLiveMap({ state, user, dispatch }) {
             <StateBadge state={selected.stale ? "OFFLINE" : selected.state} />
           </div>
           {selected.pos ? (
+            <>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, fontSize: 10 }}>
               <span><span style={{ color: COLORS.ghost }}>UPDATED: </span>{timeSinceLabel(selected.pos.updated_at)}</span>
               {selected.pos.speed_kmh != null && <span><span style={{ color: COLORS.ghost }}>SPEED: </span>{Math.round(selected.pos.speed_kmh)} km/h</span>}
               {selected.pos.accuracy_m != null && <span><span style={{ color: COLORS.ghost }}>ACCURACY: </span>±{Math.round(selected.pos.accuracy_m)}m</span>}
             </div>
+            {/* The pin stays on the map at the driver's last reported point even
+                after their app stops broadcasting (closed/backgrounded tab, lost
+                signal). Greying the marker + the OFFLINE badge already signal
+                this, but spell it out here so a frozen pin is never read as the
+                driver's current live location. */}
+            {selected.stale && (
+              <div style={{ fontSize: 9, color: COLORS.amber, marginTop: 2 }}>
+                ⚠ Last known position — driver app not reporting live
+              </div>
+            )}
+            </>
           ) : (
             <span style={{ fontSize: 10, color: COLORS.ghost }}>No position data yet.</span>
           )}

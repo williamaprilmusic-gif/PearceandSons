@@ -14906,20 +14906,44 @@ function AgentTripDetail({ trip, state, dispatch, user, call, onBack }) {
             if (!shuttleStatus.summary) {
               return <span style={{ fontSize: 9, color: COLORS.ghost }}>Waiting for your driver's shuttle status…</span>;
             }
-            const { distanceKm, etaMin } = shuttleStatus.summary;
+            const { distanceKm, etaMin, updatedAt } = shuttleStatus.summary;
             const headingToward = boardedAgentIds(trip).some(c => String(c) === String(user.id)) ? "your drop-off" : "you";
+            // When the live broadcast stops (driver backgrounded or closed the
+            // app, or lost signal) the hook keeps the LAST computed ETA and
+            // flips `stale`. Rather than blanking the estimate — which left the
+            // agent with nothing — keep showing that last-known value, in the
+            // past tense with the time of the last fix, so there's still a
+            // usable number. A resumed broadcast overrides it instantly. Once
+            // the fix is too old to mean anything for a moving vehicle the hook
+            // flips `tooStale` and we DROP the concrete number (an hour-old
+            // "3 mins away" is worse than none), keeping only the paused note.
+            // (Agents can't read driver_positions directly — RLS scopes it to
+            // admins and the driver — so with no broadcast at all this session
+            // there's no last-known point; that cold start shows the waiting
+            // message above.)
+            const showLastKnown = shuttleStatus.stale && !shuttleStatus.tooStale;
             return (
-              <div style={{ background: "rgba(29,185,84,.08)", border: "1px solid rgba(29,185,84,.3)", borderRadius: 4, padding: 12 }}>
-                <div style={{ fontSize: 13, fontWeight: 700, color: shuttleStatus.stale ? COLORS.ghost : COLORS.green }}>
-                  {shuttleStatus.stale
-                    ? "Shuttle status unavailable — reconnecting…"
-                    : etaMin != null
-                    ? `Your shuttle is about ${etaMin} min${etaMin !== 1 ? "s" : ""} away`
-                    : "Tracking your shuttle…"}
+              <div style={{ background: shuttleStatus.stale ? "rgba(255,255,255,.04)" : "rgba(29,185,84,.08)", border: `1px solid ${shuttleStatus.stale ? "rgba(255,255,255,.12)" : "rgba(29,185,84,.3)"}`, borderRadius: 4, padding: 12 }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: shuttleStatus.stale ? COLORS.amber : COLORS.green }}>
+                  {!shuttleStatus.stale
+                    ? (etaMin != null ? `Your shuttle is about ${etaMin} min${etaMin !== 1 ? "s" : ""} away` : "Tracking your shuttle…")
+                    : showLastKnown && etaMin != null
+                    ? `Shuttle was about ${etaMin} min${etaMin !== 1 ? "s" : ""} away`
+                    : "Live tracking paused"}
                 </div>
-                {!shuttleStatus.stale && distanceKm != null && (
+                {distanceKm != null && !shuttleStatus.tooStale && (
                   <div style={{ fontSize: 10, color: COLORS.ghost, marginTop: 3 }}>
-                    ~{distanceKm.toFixed(1)} km from {headingToward}
+                    ~{distanceKm.toFixed(1)} km from {headingToward}{shuttleStatus.stale ? " (last known)" : ""}
+                  </div>
+                )}
+                {shuttleStatus.stale && (
+                  <div style={{ fontSize: 9, color: COLORS.ghost, marginTop: 3 }}>
+                    {/* asOf computed here (only when stale), not every live
+                        render. Append "· live tracking paused" only when the
+                        main line shows an ETA — otherwise the main line already
+                        reads "Live tracking paused" and we'd duplicate it. */}
+                    Last live update {new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    {showLastKnown && etaMin != null ? " · live tracking paused" : ""}
                   </div>
                 )}
               </div>
@@ -15380,6 +15404,10 @@ export function driverPositionChannelName(driverId) {
 //     like before was needless database load for data that's now mostly
 //     served live via broadcast anyway.
 const BROADCAST_INTERVAL_MS = 4000;
+// Once the driver's last position fix is older than this, a retained
+// "last known" ETA is no longer meaningful for a moving vehicle, so the
+// agent UI drops the concrete number and shows only a paused note.
+const MAX_RETAINED_ETA_MS = 5 * 60 * 1000;
 const DB_PERSIST_INTERVAL_MS = 25000;
 
 // ── Away detection ──────────────────────────────────────────────────────
@@ -16005,11 +16033,32 @@ function useDriverLocationTracking(user, isLoggedIn, currentTripId, activeTrips 
 function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fireEtaPush = true) {
   const [summary, setSummary] = useState(null); // { distanceKm, etaMin, updatedAt } — never lat/lng
   const [stale, setStale] = useState(false);
+  const [tooStale, setTooStale] = useState(false); // last fix too old for the ETA to mean anything
   // ETA push tracking — fire once per threshold crossing, not on every update.
   const etaPushFiredRef = React.useRef({ fiveMin: false, arriving: false });
+  // Epoch ms of the last broadcast actually received this subscription — the
+  // single source of truth for staleness, read in the interval below instead
+  // of threading it through a setSummary updater (which would be an impure
+  // state-updater and double-fire under StrictMode).
+  const lastUpdateRef = React.useRef(0);
+  // Last stale/tooStale values actually pushed to state, so the interval only
+  // calls setState on a real transition — not every 4s forever once a driver
+  // has gone offline.
+  const staleAppliedRef = React.useRef({ stale: false, tooStale: false });
 
   useEffect(() => {
-    if (!supabase || !driverId) { setSummary(null); return; }
+    // Clear any retained driver summary + staleness bookkeeping. Run both when
+    // there's no driver to track AND on a driver/reference context change
+    // (reassignment, pickup→drop-off switch, navigating between trips on the
+    // same mounted detail screen), so a previous driver's "last known" ETA is
+    // never shown — even briefly — against a new one before their first fix.
+    const reset = () => {
+      setSummary(null); setStale(false); setTooStale(false);
+      lastUpdateRef.current = 0;
+      staleAppliedRef.current = { stale: false, tooStale: false };
+    };
+    if (!supabase || !driverId) { reset(); return; }
+    reset();
     // Reset push flags when driver/reference changes (new trip context).
     etaPushFiredRef.current = { fiveMin: false, arriving: false };
     const channel = supabase.channel(driverPositionChannelName(driverId));
@@ -16044,25 +16093,39 @@ function useAgentShuttleStatus(driverId, referencePoint, agentUserId = null, fir
           }
         }
       }
-      setSummary({ distanceKm, etaMin, updatedAt: Date.now() });
+      lastUpdateRef.current = Date.now();
+      staleAppliedRef.current = { stale: false, tooStale: false };
+      setSummary({ distanceKm, etaMin, updatedAt: lastUpdateRef.current });
       setStale(false);
+      setTooStale(false);
     });
     channel.subscribe();
 
     // If no broadcast has arrived in a while (driver's tab closed,
-    // connection dropped), mark stale rather than keep showing an old
-    // "3 mins away" indefinitely.
+    // connection dropped), mark stale — the UI then shows the last-known ETA
+    // in the past tense rather than a live one. Past MAX_RETAINED_ETA_MS the
+    // frozen number is no longer worth showing, so flag tooStale and the UI
+    // drops it. Staleness is derived from lastUpdateRef (set on each real
+    // broadcast), never from a setSummary updater.
     const staleCheck = setInterval(() => {
-      setSummary(s => {
-        if (s && Date.now() - s.updatedAt > BROADCAST_INTERVAL_MS * 3) setStale(true);
-        return s;
-      });
+      if (!lastUpdateRef.current) return;
+      const age = Date.now() - lastUpdateRef.current;
+      const wantStale = age > BROADCAST_INTERVAL_MS * 3;
+      const wantTooStale = age > MAX_RETAINED_ETA_MS;
+      if (wantStale !== staleAppliedRef.current.stale) { staleAppliedRef.current.stale = wantStale; setStale(wantStale); }
+      if (wantTooStale !== staleAppliedRef.current.tooStale) { staleAppliedRef.current.tooStale = wantTooStale; setTooStale(wantTooStale); }
     }, BROADCAST_INTERVAL_MS);
 
     return () => { supabase.removeChannel(channel); clearInterval(staleCheck); };
-  }, [driverId, referencePoint?.lat, referencePoint?.lng]);
+    // Deps: driverId + referencePoint (keyed by lat/lng, NOT the object — the
+    // parent recomputes referencePoint inline every render, so depending on its
+    // identity would tear down and re-subscribe the channel every render) +
+    // agentUserId and fireEtaPush, both read in the broadcast handler's
+    // ETA-push path, so a stale closure would notify the wrong agent. Keep all
+    // four; don't "simplify" back to just driverId + lat/lng.
+  }, [driverId, referencePoint?.lat, referencePoint?.lng, agentUserId, fireEtaPush]);
 
-  return { summary, stale };
+  return { summary, stale, tooStale };
 }
 
 export function useWebRTCCall(currentUser) {
